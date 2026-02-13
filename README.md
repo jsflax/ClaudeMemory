@@ -32,23 +32,25 @@ Claude Code has built-in memory via `MEMORY.md` files. Here's why ClaudeMemory i
 ## Install
 
 ```bash
-git clone <repo-url>
-cd ClaudeMemory
-./scripts/install.sh
+curl -sL https://raw.githubusercontent.com/jsflax/ClaudeMemory/main/scripts/install.sh | bash
 ```
 
-This will:
-1. Build the release binary
-2. Install to `~/.claude/bin/memory` with resource bundles
-3. Register as a `memory` MCP server with Claude Code (user scope)
-4. Add instructions to `~/.claude/CLAUDE.md` so Claude always uses it
+This downloads the pre-built binary, registers the MCP server, and configures Claude Code — takes a few seconds.
+
+To build from source instead:
+
+```bash
+git clone https://github.com/jsflax/ClaudeMemory.git
+cd ClaudeMemory
+./scripts/install.sh --from-source
+```
 
 Start a new Claude Code session — memory tools are immediately available.
 
 ## Uninstall
 
 ```bash
-./scripts/uninstall.sh
+curl -sL https://raw.githubusercontent.com/jsflax/ClaudeMemory/main/scripts/uninstall.sh | bash
 ```
 
 Removes the binary and MCP registration. Database is preserved at `~/.claude/memory.sqlite` (delete manually if desired).

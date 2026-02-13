@@ -1,0 +1,30 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build release binary
+        run: swift build -c release
+
+      - name: Package artifacts
+        run: |
+          mkdir -p staging
+          cp .build/release/ClaudeMemory staging/memory
+          cp -R .build/release/ClaudeMemory_ClaudeMemoryLib.bundle staging/
+          cp -R .build/release/swift-transformers_Hub.bundle staging/
+          cp -R .build/release/SwiftLM_SwiftLM.bundle staging/
+          cd staging && tar czf ../claude-memory-macos-arm64.tar.gz *
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: claude-memory-macos-arm64.tar.gz
+          generate_release_notes: true
