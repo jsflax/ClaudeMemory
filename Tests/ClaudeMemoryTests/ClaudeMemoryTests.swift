@@ -292,30 +292,62 @@ private func makeTools() async throws -> MemoryTools {
     #expect(text(from: result).contains("Deleted 1 memories"))
 }
 
-@Test func forget_all() async throws {
+@Test func forget_all_requiresFilter() async throws {
     let tools = try await makeTools()
 
     _ = try await tools.handle(CallTool.Parameters(
         name: "remember",
-        arguments: ["content": .string("first memory to be deleted")]
+        arguments: ["content": .string("first memory to be preserved")]
     ))
     _ = try await tools.handle(CallTool.Parameters(
         name: "remember",
-        arguments: ["content": .string("second memory to be deleted")]
+        arguments: ["content": .string("second memory to be preserved")]
     ))
 
-    let result = try await tools.handle(CallTool.Parameters(
-        name: "forget",
+    // Calling forget with no arguments should fail (safety check)
+    await #expect(throws: (any Error).self) {
+        try await tools.handle(CallTool.Parameters(
+            name: "forget",
+            arguments: nil
+        ))
+    }
+
+    // Memories should still exist
+    let stats = try await tools.handle(CallTool.Parameters(
+        name: "stats",
         arguments: nil
     ))
-    #expect(text(from: result).contains("Deleted all 2 memories"))
+    #expect(text(from: stats).contains("Total memories: 2"))
+}
 
-    // Verify empty
-    let recall = try await tools.handle(CallTool.Parameters(
-        name: "recall",
-        arguments: ["query": .string("memory deleted")]
+@Test func forget_byStringEncodedId() async throws {
+    let tools = try await makeTools()
+
+    let r1 = try await tools.handle(CallTool.Parameters(
+        name: "remember",
+        arguments: ["content": .string("memory to delete by string id")]
     ))
-    #expect(text(from: recall) == "No memories found.")
+    _ = try await tools.handle(CallTool.Parameters(
+        name: "remember",
+        arguments: ["content": .string("memory to keep")]
+    ))
+
+    let id = extractId(from: text(from: r1))!
+
+    // Pass id as a string (simulating MCP client behavior)
+    let result = try await tools.handle(CallTool.Parameters(
+        name: "forget",
+        arguments: ["id": .string(String(id))]
+    ))
+    #expect(result.isError != true)
+    #expect(text(from: result).contains("Deleted memory"))
+
+    // Only one memory should remain
+    let stats = try await tools.handle(CallTool.Parameters(
+        name: "stats",
+        arguments: nil
+    ))
+    #expect(text(from: stats).contains("Total memories: 1"))
 }
 
 // MARK: - List Topics

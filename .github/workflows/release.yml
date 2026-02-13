@@ -7,7 +7,7 @@ on:
 
 jobs:
   build:
-    runs-on: macos-15
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
 
@@ -28,3 +28,22 @@ jobs:
         with:
           files: claude-memory-macos-arm64.tar.gz
           generate_release_notes: true
+
+      - name: Update Homebrew formula
+        env:
+          TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
+        run: |
+          SHA=$(shasum -a 256 claude-memory-macos-arm64.tar.gz | awk '{print $1}')
+          VERSION=${GITHUB_REF_NAME#v}
+
+          git clone https://x-access-token:${TAP_TOKEN}@github.com/jsflax/homebrew-tap.git tap
+          cd tap
+
+          # Update version and sha256 in existing formula
+          sed -i '' "s/version \".*\"/version \"${VERSION}\"/" Formula/claude-memory.rb
+          sed -i '' "s/sha256 \".*\"/sha256 \"${SHA}\"/" Formula/claude-memory.rb
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/claude-memory.rb
+          git diff --cached --quiet || git commit -m "Update claude-memory to ${VERSION}" && git push

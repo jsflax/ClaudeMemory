@@ -6,6 +6,84 @@ public func log(_ message: String) {
     FileHandle.standardError.write(Data("[claude-memory] \(message)\n".utf8))
 }
 
+// MARK: - Codable Argument Decoding
+
+extension Optional where Wrapped == [String: MCP.Value] {
+    func decode<T: Decodable>(_ type: T.Type) throws -> T {
+        let data = try JSONEncoder().encode(self ?? [:])
+        return try JSONDecoder().decode(type, from: data)
+    }
+}
+
+struct FlexibleInt: Decodable {
+    let value: Int
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if let int = try? container.decode(Int.self) {
+            value = int
+        } else if let string = try? container.decode(String.self), let int = Int(string) {
+            value = int
+        } else {
+            throw DecodingError.typeMismatch(
+                Int.self,
+                DecodingError.Context(codingPath: decoder.codingPath, debugDescription: "Expected an integer or string-encoded integer")
+            )
+        }
+    }
+}
+
+private struct RememberArgs: Decodable {
+    let content: String
+    let topic: String?
+    let project: String?
+    let source: String?
+    let expiresInDays: FlexibleInt?
+
+    enum CodingKeys: String, CodingKey {
+        case content, topic, project, source
+        case expiresInDays = "expires_in_days"
+    }
+}
+
+private struct RecallArgs: Decodable {
+    let query: String
+    let project: String?
+    let topic: String?
+    let limit: FlexibleInt?
+}
+
+private struct ForgetArgs: Decodable {
+    let id: FlexibleInt?
+    let topic: String?
+    let project: String?
+}
+
+private struct UpdateArgs: Decodable {
+    let query: String
+    let newContent: String
+    let project: String?
+
+    enum CodingKeys: String, CodingKey {
+        case query, project
+        case newContent = "new_content"
+    }
+}
+
+private struct MergeArgs: Decodable {
+    let ids: [FlexibleInt]
+    let content: String
+    let topic: String?
+    let project: String?
+}
+
+private struct StatsArgs: Decodable {
+    let project: String?
+}
+
+private struct ListTopicsArgs: Decodable {
+    let project: String?
+}
+
 /// Implements the MCP tool handlers for the ClaudeMemory server.
 ///
 /// Tools:
@@ -218,13 +296,13 @@ public actor MemoryTools {
         case "recall":
             return try await handleRecall(params.arguments)
         case "forget":
-            return handleForget(params.arguments)
+            return try handleForget(params.arguments)
         case "list_topics":
-            return handleListTopics(params.arguments)
+            return try handleListTopics(params.arguments)
         case "update":
             return try await handleUpdate(params.arguments)
         case "stats":
-            return handleStats(params.arguments)
+            return try handleStats(params.arguments)
         case "merge":
             return try await handleMerge(params.arguments)
         default:
@@ -235,14 +313,16 @@ public actor MemoryTools {
     // MARK: - remember
 
     private func handleRemember(_ args: [String: Value]?) async throws -> CallTool.Result {
-        guard let content = args?["content"]?.stringValue, !content.isEmpty else {
+        let a = try args.decode(RememberArgs.self)
+        guard !a.content.isEmpty else {
             throw MCPError.invalidParams("'content' is required")
         }
-        let topic = args?["topic"]?.stringValue ?? "general"
-        let project = args?["project"]?.stringValue ?? "global"
-        let source = args?["source"]?.stringValue ?? ""
+        let content = a.content
+        let topic = a.topic ?? "general"
+        let project = a.project ?? "global"
+        let source = a.source ?? ""
         let expiresAt: Date
-        if let days = args?["expires_in_days"]?.intValue, days > 0 {
+        if let days = a.expiresInDays?.value, days > 0 {
             expiresAt = Date().addingTimeInterval(Double(days) * 86400)
         } else {
             expiresAt = .distantFuture
@@ -267,12 +347,14 @@ public actor MemoryTools {
     // MARK: - recall
 
     private func handleRecall(_ args: [String: Value]?) async throws -> CallTool.Result {
-        guard let query = args?["query"]?.stringValue, !query.isEmpty else {
+        let a = try args.decode(RecallArgs.self)
+        guard !a.query.isEmpty else {
             throw MCPError.invalidParams("'query' is required")
         }
-        let projectFilter = args?["project"]?.stringValue
-        let topicFilter = args?["topic"]?.stringValue
-        let limit = args?["limit"]?.intValue ?? 10
+        let query = a.query
+        let projectFilter = a.project
+        let topicFilter = a.topic
+        let limit = a.limit?.value ?? 10
 
         // Build base query — if project specified, include both project-specific AND global memories
         // Always filter out expired memories
@@ -332,9 +414,11 @@ public actor MemoryTools {
 
     // MARK: - forget
 
-    private func handleForget(_ args: [String: Value]?) -> CallTool.Result {
+    private func handleForget(_ args: [String: Value]?) throws -> CallTool.Result {
+        let a = try args.decode(ForgetArgs.self)
+
         // Delete by ID takes priority
-        if let id = args?["id"]?.intValue {
+        if let id = a.id?.value {
             let id64 = Int64(id)
             let matches = lattice.objects(Memory.self).where { $0.primaryKey == id64 }
             guard let mem = matches.first else {
@@ -349,10 +433,7 @@ public actor MemoryTools {
             )
         }
 
-        let topicFilter = args?["topic"]?.stringValue
-        let projectFilter = args?["project"]?.stringValue
-
-        switch (topicFilter, projectFilter) {
+        switch (a.topic, a.project) {
         case let (topic?, project?):
             let count = lattice.count(Memory.self, where: { $0.topic == topic && $0.project == project })
             lattice.delete(Memory.self, where: { $0.topic == topic && $0.project == project })
@@ -375,25 +456,23 @@ public actor MemoryTools {
                 isError: false
             )
         case (nil, nil):
-            let count = lattice.count(Memory.self)
-            lattice.delete(Memory.self)
-            return CallTool.Result(
-                content: [.text("Deleted all \(count) memories.")],
-                isError: false
-            )
+            throw MCPError.invalidParams("Specify 'id', 'topic', or 'project'. Refusing to delete all memories without an explicit filter.")
         }
     }
 
     // MARK: - update
 
     private func handleUpdate(_ args: [String: Value]?) async throws -> CallTool.Result {
-        guard let query = args?["query"]?.stringValue, !query.isEmpty else {
+        let a = try args.decode(UpdateArgs.self)
+        guard !a.query.isEmpty else {
             throw MCPError.invalidParams("'query' is required")
         }
-        guard let newContent = args?["new_content"]?.stringValue, !newContent.isEmpty else {
+        guard !a.newContent.isEmpty else {
             throw MCPError.invalidParams("'new_content' is required")
         }
-        let projectFilter = args?["project"]?.stringValue
+        let query = a.query
+        let newContent = a.newContent
+        let projectFilter = a.project
 
         var results = lattice.objects(Memory.self)
         if let projectFilter {
@@ -431,17 +510,15 @@ public actor MemoryTools {
     // MARK: - merge
 
     private func handleMerge(_ args: [String: Value]?) async throws -> CallTool.Result {
-        guard let idsArray = args?["ids"]?.arrayValue, !idsArray.isEmpty else {
-            throw MCPError.invalidParams("'ids' is required and must be a non-empty array of memory IDs")
-        }
-        guard let content = args?["content"]?.stringValue, !content.isEmpty else {
+        let a = try args.decode(MergeArgs.self)
+        guard !a.content.isEmpty else {
             throw MCPError.invalidParams("'content' is required")
         }
-
-        let ids = idsArray.compactMap { $0.intValue }.map { Int64($0) }
+        let ids = a.ids.map { Int64($0.value) }
         guard ids.count >= 2 else {
             throw MCPError.invalidParams("'ids' must contain at least 2 memory IDs to merge")
         }
+        let content = a.content
 
         // Fetch the source memories
         var sources: [Memory] = []
@@ -454,8 +531,8 @@ public actor MemoryTools {
         }
 
         // Use first source for defaults
-        let topic = args?["topic"]?.stringValue ?? sources[0].topic
-        let project = args?["project"]?.stringValue ?? sources[0].project
+        let topic = a.topic ?? sources[0].topic
+        let project = a.project ?? sources[0].project
 
         // Embed the merged content
         var embeddingVec = Vector<Float>([])
@@ -484,8 +561,9 @@ public actor MemoryTools {
 
     // MARK: - stats
 
-    private func handleStats(_ args: [String: Value]?) -> CallTool.Result {
-        let projectFilter = args?["project"]?.stringValue
+    private func handleStats(_ args: [String: Value]?) throws -> CallTool.Result {
+        let a = try args.decode(StatsArgs.self)
+        let projectFilter = a.project
 
         var base = lattice.objects(Memory.self)
         if let projectFilter {
@@ -532,8 +610,9 @@ public actor MemoryTools {
 
     // MARK: - list_topics
 
-    private func handleListTopics(_ args: [String: Value]?) -> CallTool.Result {
-        let projectFilter = args?["project"]?.stringValue
+    private func handleListTopics(_ args: [String: Value]?) throws -> CallTool.Result {
+        let a = try args.decode(ListTopicsArgs.self)
+        let projectFilter = a.project
 
         var base = lattice.objects(Memory.self)
         if let projectFilter {
