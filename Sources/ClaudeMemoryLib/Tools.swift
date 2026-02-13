@@ -393,7 +393,7 @@ public actor MemoryTools {
                 let m = match.object
                 let dist = String(format: "%.3f", match.distance)
                 let expires = m.expiresAt == .distantFuture ? "" : ", expires: \(Self.dateFormatter.string(from: m.expiresAt))"
-                return "[id:\(m.primaryKey!)] [\(m.project)/\(m.topic)] (relevance: \(dist)\(expires)) \(m.content)"
+                return "[id:\(m.primaryKey!)] [\(m.project)/\(m.topic)] (distance: \(dist)\(expires)) \(m.content)"
             }
             return CallTool.Result(content: [.text(lines.joined(separator: "\n\n"))], isError: false)
         } else {

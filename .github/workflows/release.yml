@@ -33,6 +33,7 @@ jobs:
           generate_release_notes: true
 
       - name: Update Homebrew formula
+        if: env.TAP_TOKEN != ''
         env:
           TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
         run: |
@@ -49,4 +50,4 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Formula/claude-memory.rb
-          git diff --cached --quiet || git commit -m "Update claude-memory to ${VERSION}" && git push
+          git diff --cached --quiet || (git commit -m "Update claude-memory to ${VERSION}" && git push)
