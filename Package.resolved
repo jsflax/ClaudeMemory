@@ -1,5 +1,5 @@
 {
-  "originHash" : "7b209482ea78d308ef4ede007cf8702c3107951219847ebb1a5001d204279c37",
+  "originHash" : "4a30d5d151b9cfa05c30aae26f3dce9573c3968d152fb78f804fc298ef58d42c",
   "pins" : [
     {
       "identity" : "async-http-client",
@@ -80,6 +80,15 @@
       "state" : {
         "revision" : "13e7513b3ba0afa13967daf77af2fb4ad087306c",
         "version" : "4.13.5"
+      }
+    },
+    {
+      "identity" : "lattice",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/jsflax/lattice.git",
+      "state" : {
+        "branch" : "main",
+        "revision" : "8decea33a95df2a42d1f4552f64e9f1f321b14a8"
       }
     },
     {
@@ -341,6 +350,15 @@
       "state" : {
         "branch" : "main",
         "revision" : "ca0eeb29d3b3c9b7deefddaa7311aa4eb6739010"
+      }
+    },
+    {
+      "identity" : "swiftlm",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/jsflax/SwiftLM.git",
+      "state" : {
+        "branch" : "main",
+        "revision" : "c1f9214c6da4ee6204c2b514c8093f82312fa84d"
       }
     },
     {
