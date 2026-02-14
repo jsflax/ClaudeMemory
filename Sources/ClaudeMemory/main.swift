@@ -18,7 +18,7 @@ try FileManager.default.createDirectory(atPath: dbDir, withIntermediateDirectori
 
 // MARK: - Init Lattice
 
-let lattice = try Lattice(Memory.self, Edge.self, configuration: .init(fileURL: URL(fileURLWithPath: dbPath)))
+let lattice = try Lattice(Memory.self, Edge.self, Checkpoint.self, Episode.self, configuration: .init(fileURL: URL(fileURLWithPath: dbPath)))
 log("Database at \(dbPath)")
 
 // MARK: - Init Embedding Service
@@ -115,6 +115,75 @@ let server = Server(
         - Edges are cleaned up when memories are deleted (forget) or merged.
         - Project is a soft ranking signal in recall — same-project memories rank higher, but \
         cross-project results still surface if semantically relevant.
+
+        ## Task Continuity
+        Use **checkpoint**, **resume**, and **list_tasks** to save and restore work-in-progress \
+        state across sessions. Tasks are identified by `[task:N]` IDs (distinct from memory `[id:N]`).
+
+        **When to checkpoint:**
+        - At the END of a session when work is unfinished — save plan, progress, and context
+        - After completing a significant milestone within a task
+        - When the user asks to pause or switch tasks
+        - Before any operation that might lose context (e.g., switching projects)
+
+        **When to resume:**
+        - At the START of a conversation: use `list_tasks` to check for active/paused work
+        - When the user says "continue", "pick up where we left off", or references a previous task
+        - After loading task state, use the plan/progress/context to orient yourself
+
+        **Best practices:**
+        - Keep **plan** structured (numbered steps, checkboxes)
+        - Keep **progress** updated with what's done and what's next
+        - Put file paths, key decisions, and blockers in **context**
+        - Mark tasks **completed** when done, **paused** when shelving
+        - Use project scoping to organize tasks by codebase
+
+        ## Episodic Memory
+        Use **begin_episode**, **end_episode**, **recall_episode**, and **list_episodes** to group \
+        memories into narrative sessions. Episodes answer "what happened during X?" rather than \
+        individual facts.
+
+        **Auto-episode**: You don't have to explicitly begin episodes. The first `remember` in a \
+        session auto-creates an episode. If there's a >30 minute gap between remembers, a new \
+        episode starts automatically. Explicit `begin_episode` overrides auto-episodes.
+
+        **When to begin an episode explicitly:**
+        - Starting a focused work session (debugging, feature implementation, code review)
+        - When you want a descriptive title instead of "Session: {date}"
+
+        **When to end an episode:**
+        - At the end of a focused work session
+        - Provide a summary of what was accomplished for future recall
+        - Episodes auto-end when a new one starts (explicitly or via time gap)
+
+        **When to recall an episode:**
+        - When the user references a past session ("what happened when we debugged X?")
+        - Use `list_episodes` to find the right episode ID, then `recall_episode` for details
+
+        **Best practices:**
+        - Let auto-episodes handle casual sessions
+        - Use explicit episodes for important work sessions
+        - Provide summaries at end_episode for quick future reference
+        - Episodes use `[episode:N]` IDs (distinct from `[id:N]` and `[task:N]`)
+
+        ## Memory Consolidation
+        Use **find_clusters** and **consolidate** to clean up redundant memories.
+
+        **Workflow:**
+        1. `find_clusters` with optional project/topic filters to discover similar memory groups
+        2. Review the clusters — each shows member memories and suggested consolidation
+        3. Write a concise summary that captures the essential knowledge from the cluster
+        4. `consolidate` with the memory IDs and your written summary
+
+        **What happens on consolidate:**
+        - A new summary memory is created with your content and an embedding
+        - Original memories get importance set to 0 (they still exist but rank lower in recall)
+        - `summarized_by` edges link originals to the summary for graph traversal
+
+        **When to consolidate:**
+        - When `recall` returns many similar memories on the same topic
+        - During periodic maintenance of a project's memory space
+        - When you notice fragmented knowledge that would be better as one coherent memory
         """,
     capabilities: .init(tools: .init(listChanged: false))
 )

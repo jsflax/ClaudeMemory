@@ -4,32 +4,6 @@ import Lattice
 import MCP
 import Foundation
 
-/// Helper to extract the text string from a CallTool.Result
-private func text(from result: CallTool.Result) -> String {
-    guard case .text(let text) = result.content.first else {
-        return ""
-    }
-    return text
-}
-
-/// Shared embedder — loads the bundled CoreML model once for all tests.
-private let sharedEmbedder: EmbeddingService = {
-    let e = EmbeddingService()
-    return e
-}()
-
-/// Create a MemoryTools with an isolated temp database and the real embedding model.
-private func makeTools() async throws -> MemoryTools {
-    let path = FileManager.default.temporaryDirectory
-        .appending(path: "claude-memory-test-\(UUID().uuidString).sqlite")
-    let lattice = try Lattice(Memory.self, Edge.self, configuration: .init(fileURL: path))
-    let embedder = sharedEmbedder
-    if await !embedder.isLoaded {
-        await embedder.load()
-    }
-    return MemoryTools(lattice: lattice, embedder: embedder)
-}
-
 // MARK: - Remember
 
 @Test func remember_basic() async throws {
@@ -418,12 +392,12 @@ private func makeTools() async throws -> MemoryTools {
 
 // MARK: - Tool Definitions
 
-@Test func definitions_hasTenTools() async throws {
+@Test func definitions_hasTwentyTools() async throws {
     let tools = try await makeTools()
     let defs = await tools.definitions
-    #expect(defs.count == 10)
+    #expect(defs.count == 20)
     let names = defs.map(\.name).sorted()
-    #expect(names == ["connect", "disconnect", "forget", "graph", "list_topics", "merge", "recall", "remember", "stats", "update"])
+    #expect(names == ["begin_episode", "checkpoint", "connect", "consolidate", "disconnect", "end_episode", "find_clusters", "forget", "graph", "list_episodes", "list_tasks", "list_topics", "merge", "recall", "recall_episode", "remember", "resume", "stats", "timeline", "update"])
 }
 
 // MARK: - Remember with force creates new
@@ -525,7 +499,6 @@ private func makeTools() async throws -> MemoryTools {
 @Test func remember_conflictDetection_differentProject() async throws {
     let tools = try await makeTools()
 
-    // Store a memory in project A
     _ = try await tools.handle(CallTool.Parameters(
         name: "remember",
         arguments: [
@@ -534,7 +507,6 @@ private func makeTools() async throws -> MemoryTools {
         ]
     ))
 
-    // Store same content in project B — should NOT conflict (different scope)
     let result = try await tools.handle(CallTool.Parameters(
         name: "remember",
         arguments: [
@@ -545,7 +517,6 @@ private func makeTools() async throws -> MemoryTools {
     let output = text(from: result)
     #expect(output.contains("Stored memory"))
 
-    // Both should exist
     let statsA = try await tools.handle(CallTool.Parameters(
         name: "stats",
         arguments: ["project": .string("ProjectA")]
@@ -559,15 +530,12 @@ private func makeTools() async throws -> MemoryTools {
 }
 
 @Test func remember_conflictDetection_noEmbedding() async throws {
-    // Create tools with a broken embedder (no model loaded) to test degraded mode
     let path = FileManager.default.temporaryDirectory
         .appending(path: "claude-memory-test-\(UUID().uuidString).sqlite")
-    let lattice = try Lattice(Memory.self, Edge.self, configuration: .init(fileURL: path))
+    let lattice = try Lattice(Memory.self, Edge.self, Checkpoint.self, Episode.self, configuration: .init(fileURL: path))
     let embedder = EmbeddingService(modelPath: "/nonexistent/path")
-    // Don't call load — embedder.isLoaded will be false, embed() returns nil
     let tools = MemoryTools(lattice: lattice, embedder: embedder)
 
-    // Store two identical memories — conflict check should be skipped (no embedding)
     let r1 = try await tools.handle(CallTool.Parameters(
         name: "remember",
         arguments: ["content": .string("Some important fact")]
@@ -580,7 +548,6 @@ private func makeTools() async throws -> MemoryTools {
     ))
     #expect(text(from: r2).contains("Stored memory"))
 
-    // Both should be stored since conflict detection requires embeddings
     let stats = try await tools.handle(CallTool.Parameters(
         name: "stats",
         arguments: nil
@@ -613,7 +580,6 @@ private func makeTools() async throws -> MemoryTools {
     #expect(output.contains("Updated memory"))
     #expect(output.contains("content:"))
 
-    // Verify content was actually changed
     let recall = try await tools.handle(CallTool.Parameters(
         name: "recall",
         arguments: ["query": .string("default branch"), "project": .string("MyProject")]
@@ -787,7 +753,6 @@ private func makeTools() async throws -> MemoryTools {
     #expect(output.contains("topic: general → patterns"))
     #expect(output.contains("topic: patterns"))
 
-    // Verify the old topic is gone via list_topics
     let topics = try await tools.handle(CallTool.Parameters(
         name: "list_topics",
         arguments: nil
@@ -800,14 +765,12 @@ private func makeTools() async throws -> MemoryTools {
 @Test func update_metadataOnly_expiration() async throws {
     let tools = try await makeTools()
 
-    // Create a permanent memory
     let r1 = try await tools.handle(CallTool.Parameters(
         name: "remember",
         arguments: ["content": .string("Memory for expiration test")]
     ))
     let id = extractId(from: text(from: r1))!
 
-    // Set expiration
     let result1 = try await tools.handle(CallTool.Parameters(
         name: "update",
         arguments: [
@@ -818,7 +781,6 @@ private func makeTools() async throws -> MemoryTools {
     let output1 = text(from: result1)
     #expect(output1.contains("expires: permanent →"))
 
-    // Make permanent again
     let result2 = try await tools.handle(CallTool.Parameters(
         name: "update",
         arguments: [
@@ -965,7 +927,6 @@ private func makeTools() async throws -> MemoryTools {
     ))
     let output = text(from: result)
     #expect(output.contains("Total memories: 1"))
-    // Should not contain per-project breakdown when filtered
     #expect(!output.contains("By project:"))
 }
 
@@ -983,25 +944,18 @@ private func makeTools() async throws -> MemoryTools {
 @Test func recall_bumpsLastAccessed() async throws {
     let tools = try await makeTools()
 
-    // Store a memory
     _ = try await tools.handle(CallTool.Parameters(
         name: "remember",
         arguments: ["content": .string("Important architectural decision about using SQLite")]
     ))
 
-    // Wait a moment so timestamps differ
     try await Task.sleep(for: .milliseconds(50))
 
-    // Recall it
     _ = try await tools.handle(CallTool.Parameters(
         name: "recall",
         arguments: ["query": .string("architectural decision SQLite")]
     ))
 
-    // Verify lastAccessedAt was bumped (it should be > createdAt)
-    // We access the lattice directly through a stats call to confirm the memory exists
-    // The real verification is that the code compiles and runs without error,
-    // since lastAccessedAt is set in the recall path
     let stats = try await tools.handle(CallTool.Parameters(
         name: "stats",
         arguments: nil
@@ -1018,7 +972,6 @@ private func makeTools() async throws -> MemoryTools {
         name: "remember",
         arguments: ["content": .string("Lattice uses SQLite as its database backend")]
     ))
-    // Remember now returns the id
     let storedText = text(from: stored)
     #expect(storedText.contains("id:"))
 
@@ -1054,8 +1007,6 @@ private func makeTools() async throws -> MemoryTools {
 @Test func recall_filtersExpired() async throws {
     let tools = try await makeTools()
 
-    // Store a memory that's already expired (expires_in_days won't work for past,
-    // so we store a normal one and verify non-expired ones show up)
     _ = try await tools.handle(CallTool.Parameters(
         name: "remember",
         arguments: ["content": .string("This memory should be visible in recall results")]
@@ -1091,11 +1042,8 @@ private func makeTools() async throws -> MemoryTools {
         ]
     ))
 
-    // Extract IDs from remember output
-    let id1Text = text(from: r1)
-    let id2Text = text(from: r2)
-    let id1 = extractId(from: id1Text)!
-    let id2 = extractId(from: id2Text)!
+    let id1 = extractId(from: text(from: r1))!
+    let id2 = extractId(from: text(from: r2))!
 
     let result = try await tools.handle(CallTool.Parameters(
         name: "merge",
@@ -1108,7 +1056,6 @@ private func makeTools() async throws -> MemoryTools {
     #expect(output.contains("Merged 2 memories"))
     #expect(output.contains("WAL mode"))
 
-    // Verify only 1 memory remains
     let stats = try await tools.handle(CallTool.Parameters(
         name: "stats",
         arguments: ["project": .string("Lattice")]
@@ -1172,364 +1119,7 @@ private func makeTools() async throws -> MemoryTools {
         arguments: ["content": .string("User prefers dark mode")]
     ))
     let output = text(from: result)
-    // Permanent memories should not show an expiration
     #expect(!output.contains("expires:"))
-}
-
-// MARK: - Connect
-
-@Test func connect_basic() async throws {
-    let tools = try await makeTools()
-
-    let r1 = try await tools.handle(CallTool.Parameters(
-        name: "remember",
-        arguments: ["content": .string("Auth uses JWT tokens")]
-    ))
-    let r2 = try await tools.handle(CallTool.Parameters(
-        name: "remember",
-        arguments: ["content": .string("JWT tokens expire after 1 hour"), "force": .bool(true)]
-    ))
-    let id1 = extractId(from: text(from: r1))!
-    let id2 = extractId(from: text(from: r2))!
-
-    let result = try await tools.handle(CallTool.Parameters(
-        name: "connect",
-        arguments: [
-            "from": .int(id1),
-            "to": .int(id2),
-            "relation": .string("relates_to"),
-        ]
-    ))
-    let output = text(from: result)
-    #expect(output.contains("Connected"))
-    #expect(output.contains("edge id:"))
-    #expect(output.contains("relates_to"))
-}
-
-@Test func connect_invalidRelation_throws() async throws {
-    let tools = try await makeTools()
-
-    let r1 = try await tools.handle(CallTool.Parameters(
-        name: "remember",
-        arguments: ["content": .string("Memory A")]
-    ))
-    let r2 = try await tools.handle(CallTool.Parameters(
-        name: "remember",
-        arguments: ["content": .string("Memory B"), "force": .bool(true)]
-    ))
-    let id1 = extractId(from: text(from: r1))!
-    let id2 = extractId(from: text(from: r2))!
-
-    await #expect(throws: (any Error).self) {
-        try await tools.handle(CallTool.Parameters(
-            name: "connect",
-            arguments: [
-                "from": .int(id1),
-                "to": .int(id2),
-                "relation": .string("invalid_relation"),
-            ]
-        ))
-    }
-}
-
-@Test func connect_memoryNotFound() async throws {
-    let tools = try await makeTools()
-
-    let r1 = try await tools.handle(CallTool.Parameters(
-        name: "remember",
-        arguments: ["content": .string("Existing memory")]
-    ))
-    let id1 = extractId(from: text(from: r1))!
-
-    let result = try await tools.handle(CallTool.Parameters(
-        name: "connect",
-        arguments: [
-            "from": .int(id1),
-            "to": .int(99999),
-            "relation": .string("relates_to"),
-        ]
-    ))
-    #expect(result.isError == true)
-    #expect(text(from: result).contains("not found"))
-}
-
-@Test func connect_duplicate_isIdempotent() async throws {
-    let tools = try await makeTools()
-
-    let r1 = try await tools.handle(CallTool.Parameters(
-        name: "remember",
-        arguments: ["content": .string("Memory A for dedup")]
-    ))
-    let r2 = try await tools.handle(CallTool.Parameters(
-        name: "remember",
-        arguments: ["content": .string("Memory B for dedup"), "force": .bool(true)]
-    ))
-    let id1 = extractId(from: text(from: r1))!
-    let id2 = extractId(from: text(from: r2))!
-
-    // First connect
-    let result1 = try await tools.handle(CallTool.Parameters(
-        name: "connect",
-        arguments: [
-            "from": .int(id1),
-            "to": .int(id2),
-            "relation": .string("relates_to"),
-        ]
-    ))
-    #expect(text(from: result1).contains("Connected"))
-
-    // Second connect — should report already exists
-    let result2 = try await tools.handle(CallTool.Parameters(
-        name: "connect",
-        arguments: [
-            "from": .int(id1),
-            "to": .int(id2),
-            "relation": .string("relates_to"),
-        ]
-    ))
-    #expect(text(from: result2).contains("already exists"))
-}
-
-// MARK: - Disconnect
-
-@Test func disconnect_byEdgeId() async throws {
-    let tools = try await makeTools()
-
-    let r1 = try await tools.handle(CallTool.Parameters(
-        name: "remember",
-        arguments: ["content": .string("Memory for disconnect test A")]
-    ))
-    let r2 = try await tools.handle(CallTool.Parameters(
-        name: "remember",
-        arguments: ["content": .string("Memory for disconnect test B"), "force": .bool(true)]
-    ))
-    let id1 = extractId(from: text(from: r1))!
-    let id2 = extractId(from: text(from: r2))!
-
-    let connectResult = try await tools.handle(CallTool.Parameters(
-        name: "connect",
-        arguments: [
-            "from": .int(id1),
-            "to": .int(id2),
-            "relation": .string("supersedes"),
-        ]
-    ))
-    let edgeId = extractEdgeId(from: text(from: connectResult))!
-
-    let result = try await tools.handle(CallTool.Parameters(
-        name: "disconnect",
-        arguments: ["id": .int(edgeId)]
-    ))
-    let output = text(from: result)
-    #expect(output.contains("Deleted edge"))
-    #expect(output.contains("id: \(edgeId)"))
-}
-
-@Test func disconnect_byFromTo() async throws {
-    let tools = try await makeTools()
-
-    let r1 = try await tools.handle(CallTool.Parameters(
-        name: "remember",
-        arguments: ["content": .string("Memory for from-to disconnect A")]
-    ))
-    let r2 = try await tools.handle(CallTool.Parameters(
-        name: "remember",
-        arguments: ["content": .string("Memory for from-to disconnect B"), "force": .bool(true)]
-    ))
-    let id1 = extractId(from: text(from: r1))!
-    let id2 = extractId(from: text(from: r2))!
-
-    _ = try await tools.handle(CallTool.Parameters(
-        name: "connect",
-        arguments: [
-            "from": .int(id1),
-            "to": .int(id2),
-            "relation": .string("relates_to"),
-        ]
-    ))
-
-    let result = try await tools.handle(CallTool.Parameters(
-        name: "disconnect",
-        arguments: [
-            "from": .int(id1),
-            "to": .int(id2),
-        ]
-    ))
-    let output = text(from: result)
-    #expect(output.contains("Deleted 1 edge(s)"))
-}
-
-// MARK: - Graph
-
-@Test func graph_showsConnections() async throws {
-    let tools = try await makeTools()
-
-    let r1 = try await tools.handle(CallTool.Parameters(
-        name: "remember",
-        arguments: ["content": .string("Central concept for graph test")]
-    ))
-    let r2 = try await tools.handle(CallTool.Parameters(
-        name: "remember",
-        arguments: ["content": .string("Related concept for graph test"), "force": .bool(true)]
-    ))
-    let r3 = try await tools.handle(CallTool.Parameters(
-        name: "remember",
-        arguments: ["content": .string("Contradicting concept for graph test"), "force": .bool(true)]
-    ))
-    let id1 = extractId(from: text(from: r1))!
-    let id2 = extractId(from: text(from: r2))!
-    let id3 = extractId(from: text(from: r3))!
-
-    _ = try await tools.handle(CallTool.Parameters(
-        name: "connect",
-        arguments: ["from": .int(id1), "to": .int(id2), "relation": .string("relates_to")]
-    ))
-    _ = try await tools.handle(CallTool.Parameters(
-        name: "connect",
-        arguments: ["from": .int(id3), "to": .int(id1), "relation": .string("contradicts")]
-    ))
-
-    let result = try await tools.handle(CallTool.Parameters(
-        name: "graph",
-        arguments: ["id": .int(id1)]
-    ))
-    let output = text(from: result)
-    #expect(output.contains("Central concept"))
-    #expect(output.contains("Connections:"))
-    #expect(output.contains("--[relates_to]-->"))
-    #expect(output.contains("<--[contradicts]--"))
-}
-
-@Test func graph_noConnections() async throws {
-    let tools = try await makeTools()
-
-    let r1 = try await tools.handle(CallTool.Parameters(
-        name: "remember",
-        arguments: ["content": .string("Isolated memory with no edges")]
-    ))
-    let id1 = extractId(from: text(from: r1))!
-
-    let result = try await tools.handle(CallTool.Parameters(
-        name: "graph",
-        arguments: ["id": .int(id1)]
-    ))
-    let output = text(from: result)
-    #expect(output.contains("Isolated memory"))
-    #expect(output.contains("No connections."))
-}
-
-@Test func graph_memoryNotFound() async throws {
-    let tools = try await makeTools()
-
-    let result = try await tools.handle(CallTool.Parameters(
-        name: "graph",
-        arguments: ["id": .int(99999)]
-    ))
-    #expect(result.isError == true)
-    #expect(text(from: result).contains("not found"))
-}
-
-// MARK: - Forget cascades edges
-
-@Test func forget_byId_cascadesEdges() async throws {
-    let tools = try await makeTools()
-
-    let r1 = try await tools.handle(CallTool.Parameters(
-        name: "remember",
-        arguments: ["content": .string("Memory to delete with edges")]
-    ))
-    let r2 = try await tools.handle(CallTool.Parameters(
-        name: "remember",
-        arguments: ["content": .string("Connected memory that stays"), "force": .bool(true)]
-    ))
-    let id1 = extractId(from: text(from: r1))!
-    let id2 = extractId(from: text(from: r2))!
-
-    // Create edge
-    _ = try await tools.handle(CallTool.Parameters(
-        name: "connect",
-        arguments: ["from": .int(id1), "to": .int(id2), "relation": .string("relates_to")]
-    ))
-
-    // Delete memory 1
-    let result = try await tools.handle(CallTool.Parameters(
-        name: "forget",
-        arguments: ["id": .int(id1)]
-    ))
-    let output = text(from: result)
-    #expect(output.contains("Deleted memory"))
-    #expect(output.contains("Removed 1 edge(s)"))
-
-    // Graph of memory 2 should show no connections
-    let graphResult = try await tools.handle(CallTool.Parameters(
-        name: "graph",
-        arguments: ["id": .int(id2)]
-    ))
-    #expect(text(from: graphResult).contains("No connections."))
-}
-
-// MARK: - Recall with depth (graph traversal)
-
-@Test func recall_withDepth() async throws {
-    let tools = try await makeTools()
-
-    // Create two semantically distant memories connected by an edge
-    let r1 = try await tools.handle(CallTool.Parameters(
-        name: "remember",
-        arguments: ["content": .string("Authentication uses JWT tokens for session management")]
-    ))
-    let r2 = try await tools.handle(CallTool.Parameters(
-        name: "remember",
-        arguments: ["content": .string("The PostgreSQL database runs on port 5432 with max 100 connections")]
-    ))
-    let id1 = extractId(from: text(from: r1))!
-    let id2 = extractId(from: text(from: r2))!
-
-    // Connect them — auth depends on the database
-    _ = try await tools.handle(CallTool.Parameters(
-        name: "connect",
-        arguments: ["from": .int(id1), "to": .int(id2), "relation": .string("relates_to")]
-    ))
-
-    // Recall with depth=1 — searching for auth should also surface the database memory via graph
-    let result = try await tools.handle(CallTool.Parameters(
-        name: "recall",
-        arguments: [
-            "query": .string("authentication JWT session"),
-            "depth": .int(1),
-            "limit": .int(1),
-        ]
-    ))
-    let output = text(from: result)
-    #expect(output.contains("JWT"))
-    #expect(output.contains("Connected (graph traversal"))
-    #expect(output.contains("PostgreSQL"))
-}
-
-// MARK: - Cross-project soft boost
-
-@Test func recall_crossProject_softBoost() async throws {
-    let tools = try await makeTools()
-
-    // Store a memory about Lattice under ClaudeMemory project
-    _ = try await tools.handle(CallTool.Parameters(
-        name: "remember",
-        arguments: [
-            "content": .string("Lattice ORM provides @Model macro for Swift database models"),
-            "project": .string("ClaudeMemory"),
-        ]
-    ))
-
-    // Recall with project=Lattice should still surface it (soft boost, not hard filter)
-    let result = try await tools.handle(CallTool.Parameters(
-        name: "recall",
-        arguments: [
-            "query": .string("Lattice ORM database models"),
-            "project": .string("Lattice"),
-        ]
-    ))
-    let output = text(from: result)
-    #expect(output.contains("Lattice ORM"))
 }
 
 // MARK: - FTS5 Hybrid Search
@@ -1537,7 +1127,6 @@ private func makeTools() async throws -> MemoryTools {
 @Test func recall_fts5_hybrid_findsExactKeywords() async throws {
     let tools = try await makeTools()
 
-    // Store memories with distinct keywords
     _ = try await tools.handle(CallTool.Parameters(
         name: "remember",
         arguments: [
@@ -1555,7 +1144,6 @@ private func makeTools() async throws -> MemoryTools {
         ]
     ))
 
-    // Recall with an exact keyword that only appears in the first memory
     let result = try await tools.handle(CallTool.Parameters(
         name: "recall",
         arguments: [
@@ -1569,20 +1157,17 @@ private func makeTools() async throws -> MemoryTools {
 }
 
 @Test func recall_fts5_degraded_noEmbeddings() async throws {
-    // Create tools with a non-loaded embedder to trigger degraded mode
     let path = FileManager.default.temporaryDirectory
         .appending(path: "claude-memory-test-\(UUID().uuidString).sqlite")
-    let lattice = try Lattice(Memory.self, Edge.self, configuration: .init(fileURL: path))
-    let embedder = EmbeddingService()  // not loaded — embed() returns nil
+    let lattice = try Lattice(Memory.self, Edge.self, Checkpoint.self, Episode.self, configuration: .init(fileURL: path))
+    let embedder = EmbeddingService()
     let tools = MemoryTools(lattice: lattice, embedder: embedder)
 
-    // Store a memory via remember (stores with empty embedding in degraded mode)
     _ = try await tools.handle(CallTool.Parameters(
         name: "remember",
         arguments: ["content": .string("The parseJSON function handles deserialization of API responses")]
     ))
 
-    // Recall in degraded mode should use FTS5 instead of LIKE
     let result = try await tools.handle(CallTool.Parameters(
         name: "recall",
         arguments: ["query": .string("parseJSON deserialization")]
@@ -1595,7 +1180,6 @@ private func makeTools() async throws -> MemoryTools {
 @Test func recall_fts5_rankInOutput() async throws {
     let tools = try await makeTools()
 
-    // Store several memories
     _ = try await tools.handle(CallTool.Parameters(
         name: "remember",
         arguments: [
@@ -1616,7 +1200,6 @@ private func makeTools() async throws -> MemoryTools {
         arguments: ["query": .string("training data")]
     ))
     let output = text(from: result)
-    // FTS5 rank should appear as negative number in output
     #expect(output.contains("fts5:"))
     #expect(output.contains("relevance:"))
 }
@@ -1659,7 +1242,6 @@ private func makeTools() async throws -> MemoryTools {
     ))
     let id = extractId(from: text(from: r1))!
 
-    // Set importance to 4
     let result = try await tools.handle(CallTool.Parameters(
         name: "update",
         arguments: [
@@ -1670,7 +1252,6 @@ private func makeTools() async throws -> MemoryTools {
     let output = text(from: result)
     #expect(output.contains("importance: 0 → 4"))
 
-    // Verify it shows in recall output
     let recall = try await tools.handle(CallTool.Parameters(
         name: "recall",
         arguments: ["query": .string("importance update test")]
@@ -1681,8 +1262,6 @@ private func makeTools() async throws -> MemoryTools {
 @Test func recall_reinforcement_importanceBoost() async throws {
     let tools = try await makeTools()
 
-    // Store two nearly identical memories — only a made-up name differs
-    // This ensures cosine distances are almost equal, so importance dominates
     _ = try await tools.handle(CallTool.Parameters(
         name: "remember",
         arguments: [
@@ -1698,14 +1277,12 @@ private func makeTools() async throws -> MemoryTools {
         ]
     ))
 
-    // Query without mentioning either name — both should match equally via FTS5+vector
     let result = try await tools.handle(CallTool.Parameters(
         name: "recall",
         arguments: ["query": .string("application primary relational database user data")]
     ))
     let output = text(from: result)
 
-    // Both should appear, AlphaDB should be first due to importance=5
     #expect(output.contains("AlphaDB"))
     #expect(output.contains("importance: 5"))
 
@@ -1717,7 +1294,6 @@ private func makeTools() async throws -> MemoryTools {
 @Test func recall_reinforcement_frequencyBoosting() async throws {
     let tools = try await makeTools()
 
-    // Store two memories — use distinct terms so focused recalls only match one via FTS5
     _ = try await tools.handle(CallTool.Parameters(
         name: "remember",
         arguments: [
@@ -1732,7 +1308,6 @@ private func makeTools() async throws -> MemoryTools {
         ]
     ))
 
-    // Recall with "Redis" — FTS5 only matches the first memory, building its accessCount
     for _ in 0..<5 {
         _ = try await tools.handle(CallTool.Parameters(
             name: "recall",
@@ -1740,7 +1315,6 @@ private func makeTools() async throws -> MemoryTools {
         ))
     }
 
-    // Now recall with a neutral query that matches both via FTS5
     let result = try await tools.handle(CallTool.Parameters(
         name: "recall",
         arguments: ["query": .string("caching API responses session data")]
@@ -1749,7 +1323,6 @@ private func makeTools() async throws -> MemoryTools {
     #expect(output.contains("Redis"))
     #expect(output.contains("Postgres"))
 
-    // Redis should appear first due to frequency boost (accessCount=5 vs 0)
     let redisRange = output.range(of: "Redis")!
     let pgRange = output.range(of: "Postgres")!
     #expect(redisRange.lowerBound < pgRange.lowerBound)
@@ -1758,42 +1331,158 @@ private func makeTools() async throws -> MemoryTools {
 @Test func recall_reinforcement_recencyBoost() async throws {
     let tools = try await makeTools()
 
-    // Store a memory — it will have lastAccessedAt = now
     _ = try await tools.handle(CallTool.Parameters(
         name: "remember",
         arguments: ["content": .string("Recently accessed architecture pattern for microservices")]
     ))
 
-    // Recall it — this updates lastAccessedAt to now, giving it a recency boost
     let result = try await tools.handle(CallTool.Parameters(
         name: "recall",
         arguments: ["query": .string("microservices architecture pattern")]
     ))
     let output = text(from: result)
     #expect(output.contains("microservices"))
-
-    // The recency boost should be reflected in a lower relevance score
-    // (recencyBoost = 0.90 for just-accessed, meaning 10% distance reduction)
-    // We verify the memory was found and has a reasonable relevance score
     #expect(output.contains("relevance:"))
 }
 
-/// Helper to extract an integer ID from text like "id: 42" or "id:42"
-private func extractId(from text: String) -> Int? {
-    guard let range = text.range(of: "id: ", options: .literal) ?? text.range(of: "id:", options: .literal) else {
-        return nil
-    }
-    let after = text[range.upperBound...]
-    let digits = after.prefix(while: { $0.isNumber })
-    return Int(digits)
+// MARK: - Temporal Queries (recall since/before)
+
+@Test func recall_sinceFilter() async throws {
+    let tools = try await makeTools()
+
+    _ = try await tools.handle(CallTool.Parameters(
+        name: "remember",
+        arguments: ["content": .string("Memory created today for since filter test")]
+    ))
+
+    let result = try await tools.handle(CallTool.Parameters(
+        name: "recall",
+        arguments: [
+            "query": .string("since filter test"),
+            "since": .string("today"),
+        ]
+    ))
+    let output = text(from: result)
+    #expect(output.contains("since filter test"))
+    #expect(output.contains("created:"))
 }
 
-/// Helper to extract an edge ID from text like "edge id: 42"
-private func extractEdgeId(from text: String) -> Int? {
-    guard let range = text.range(of: "edge id: ", options: .literal) else {
-        return nil
+@Test func recall_beforeFilter() async throws {
+    let tools = try await makeTools()
+
+    _ = try await tools.handle(CallTool.Parameters(
+        name: "remember",
+        arguments: ["content": .string("Memory for before filter test")]
+    ))
+
+    let result = try await tools.handle(CallTool.Parameters(
+        name: "recall",
+        arguments: [
+            "query": .string("before filter test"),
+            "before": .string("yesterday"),
+        ]
+    ))
+    #expect(text(from: result) == "No memories found.")
+}
+
+@Test func recall_sinceAndBefore() async throws {
+    let tools = try await makeTools()
+
+    _ = try await tools.handle(CallTool.Parameters(
+        name: "remember",
+        arguments: ["content": .string("Memory for date range test")]
+    ))
+
+    let tomorrow = Calendar.current.date(byAdding: .day, value: 1, to: Date())!
+    let isoFormatter = ISO8601DateFormatter()
+    let tomorrowStr = isoFormatter.string(from: tomorrow)
+
+    let result = try await tools.handle(CallTool.Parameters(
+        name: "recall",
+        arguments: [
+            "query": .string("date range test"),
+            "since": .string("yesterday"),
+            "before": .string(tomorrowStr),
+        ]
+    ))
+    let output = text(from: result)
+    #expect(output.contains("date range test"))
+}
+
+@Test func recall_sinceInvalidDate_throws() async throws {
+    let tools = try await makeTools()
+
+    _ = try await tools.handle(CallTool.Parameters(
+        name: "remember",
+        arguments: ["content": .string("Memory for invalid date test")]
+    ))
+
+    await #expect(throws: (any Error).self) {
+        try await tools.handle(CallTool.Parameters(
+            name: "recall",
+            arguments: [
+                "query": .string("invalid date test"),
+                "since": .string("not-a-date"),
+            ]
+        ))
     }
-    let after = text[range.upperBound...]
-    let digits = after.prefix(while: { $0.isNumber })
-    return Int(digits)
+}
+
+// MARK: - Recall with depth (graph traversal)
+
+@Test func recall_withDepth() async throws {
+    let tools = try await makeTools()
+
+    let r1 = try await tools.handle(CallTool.Parameters(
+        name: "remember",
+        arguments: ["content": .string("Authentication uses JWT tokens for session management")]
+    ))
+    let r2 = try await tools.handle(CallTool.Parameters(
+        name: "remember",
+        arguments: ["content": .string("The PostgreSQL database runs on port 5432 with max 100 connections")]
+    ))
+    let id1 = extractId(from: text(from: r1))!
+    let id2 = extractId(from: text(from: r2))!
+
+    _ = try await tools.handle(CallTool.Parameters(
+        name: "connect",
+        arguments: ["from": .int(id1), "to": .int(id2), "relation": .string("relates_to")]
+    ))
+
+    let result = try await tools.handle(CallTool.Parameters(
+        name: "recall",
+        arguments: [
+            "query": .string("authentication JWT session"),
+            "depth": .int(1),
+            "limit": .int(1),
+        ]
+    ))
+    let output = text(from: result)
+    #expect(output.contains("JWT"))
+    #expect(output.contains("Connected (graph traversal"))
+    #expect(output.contains("PostgreSQL"))
+}
+
+// MARK: - Cross-project soft boost
+
+@Test func recall_crossProject_softBoost() async throws {
+    let tools = try await makeTools()
+
+    _ = try await tools.handle(CallTool.Parameters(
+        name: "remember",
+        arguments: [
+            "content": .string("Lattice ORM provides @Model macro for Swift database models"),
+            "project": .string("ClaudeMemory"),
+        ]
+    ))
+
+    let result = try await tools.handle(CallTool.Parameters(
+        name: "recall",
+        arguments: [
+            "query": .string("Lattice ORM database models"),
+            "project": .string("Lattice"),
+        ]
+    ))
+    let output = text(from: result)
+    #expect(output.contains("Lattice ORM"))
 }

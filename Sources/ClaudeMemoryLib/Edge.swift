@@ -9,6 +9,7 @@ import Foundation
 /// - `supersedes`: Newer knowledge replacing older knowledge
 /// - `derived_from`: Memory was derived/inferred from another
 /// - `part_of`: Memory is a sub-component of a larger concept
+/// - `summarized_by`: Memory was consolidated into a summary
 @Model
 public final class Edge {
     /// The primary key of the source memory.
