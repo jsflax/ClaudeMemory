@@ -22,10 +22,10 @@ Claude Code has built-in memory via `MEMORY.md` files. Here's why ClaudeMemory i
 
 | Tool | Description |
 |------|-------------|
-| `remember` | Store a memory with semantic embedding. Conflict detection blocks near-duplicates (`force: true` to override) |
-| `recall` | Semantic search with soft project boosting and optional graph traversal (`depth: 1-3`) |
+| `remember` | Store a memory with semantic embedding. Conflict detection blocks near-duplicates (`force: true` to override). Optional `importance: 1-5` |
+| `recall` | Semantic search with project boosting, reinforcement scoring (frequency + importance + recency), and optional graph traversal (`depth: 1-3`) |
 | `forget` | Delete by ID, topic, or project. Cascades edge cleanup |
-| `update` | Edit by ID or similarity — full replace, `append`, `prepend`, `find`+`replace`, or metadata-only (`topic`, `source`, `expires_in_days`) |
+| `update` | Edit by ID or similarity — full replace, `append`, `prepend`, `find`+`replace`, or metadata-only (`topic`, `source`, `expires_in_days`, `importance`) |
 | `merge` | Consolidate multiple memories into one. Cleans up source edges |
 | `connect` | Create a directed edge between memories (`relates_to`, `contradicts`, `supersedes`, `derived_from`, `part_of`) |
 | `disconnect` | Remove edges by edge ID or by (from, to) pair |
@@ -66,6 +66,7 @@ Removes the binary and MCP registration. Database is preserved at `~/.claude/mem
 - **Transport**: stdio MCP — server starts with each Claude Code session, loads embedding model once, stays alive for the session duration.
 - **Scoping**: Memories have `project` and `topic` fields. Project is a soft ranking signal — same-project and global memories rank higher, but cross-project results still surface if semantically relevant.
 - **Knowledge graph**: Connect memories with typed directed edges. Recall with `depth > 0` follows edges via BFS to surface connected knowledge. Edges auto-cleanup on forget/merge.
+- **Reinforcement scoring**: Recall ranking blends cosine similarity with three reinforcement signals — **frequency** (log-scaled access count, up to 15% boost), **importance** (explicit 1-5 rating, up to 20% boost), and **recency** (exponential decay from last access, up to 10% boost). Cosine similarity still dominates; reinforcement fine-tunes ordering among close matches.
 - **Conflict detection**: `remember` checks for near-duplicates (cosine distance < 0.12 same-project, < 0.05 cross-scope). Blocks storage with a warning; use `force: true` to override.
 - **Expiration**: Set `expires_in_days` for temporal context ("currently working on X"). Expired memories are filtered from recall automatically.
 

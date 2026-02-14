@@ -88,7 +88,7 @@
       "location" : "https://github.com/jsflax/lattice.git",
       "state" : {
         "branch" : "main",
-        "revision" : "15fc2a582499d7abb2c8564b8c25b95bc3fbeac8"
+        "revision" : "a72bc2d925bcc6ab705aefa00f8912e0e07bb9d6"
       }
     },
     {
@@ -97,7 +97,7 @@
       "location" : "https://github.com/jsflax/LatticeCore.git",
       "state" : {
         "branch" : "main",
-        "revision" : "1878f4582de7ad782a0eccd3902bb03d01deb3a3"
+        "revision" : "bcbad0fb8029cb9663852cfc96400a50c4475488"
       }
     },
     {

@@ -39,9 +39,10 @@ private struct RememberArgs: Decodable {
     let source: String?
     let expiresInDays: FlexibleInt?
     let force: Bool?
+    let importance: FlexibleInt?
 
     enum CodingKeys: String, CodingKey {
-        case content, topic, project, source, force
+        case content, topic, project, source, force, importance
         case expiresInDays = "expires_in_days"
     }
 }
@@ -77,9 +78,10 @@ private struct UpdateArgs: Decodable {
     let topic: String?
     let source: String?
     let expiresInDays: FlexibleInt?
+    let importance: FlexibleInt?
 
     enum CodingKeys: String, CodingKey {
-        case id, query, project, content, append, prepend, find, replace, topic, source
+        case id, query, project, content, append, prepend, find, replace, topic, source, importance
         case expiresInDays = "expires_in_days"
     }
 }
@@ -188,6 +190,10 @@ public actor MemoryTools {
                         "force": .object([
                             "type": .string("boolean"),
                             "description": .string("Skip conflict detection and store even if near-duplicates exist. Use after reviewing a conflict warning."),
+                        ]),
+                        "importance": .object([
+                            "type": .string("integer"),
+                            "description": .string("Importance rating (1-5). Higher values boost this memory in recall ranking. Omit or 0 for default."),
                         ]),
                     ]),
                     "required": .array([.string("content")]),
@@ -320,6 +326,10 @@ public actor MemoryTools {
                         "expires_in_days": .object([
                             "type": .string("integer"),
                             "description": .string("Update expiration. 0 = make permanent, >0 = expire in N days from now."),
+                        ]),
+                        "importance": .object([
+                            "type": .string("integer"),
+                            "description": .string("Update importance rating (1-5). Higher values boost this memory in recall ranking. 0 to clear."),
                         ]),
                     ]),
                     "additionalProperties": .bool(false),
@@ -506,6 +516,15 @@ public actor MemoryTools {
         } else {
             expiresAt = .distantFuture
         }
+        let importance: Int
+        if let imp = a.importance?.value {
+            guard (1...5).contains(imp) else {
+                throw MCPError.invalidParams("'importance' must be between 1 and 5, got \(imp)")
+            }
+            importance = imp
+        } else {
+            importance = 0
+        }
 
         var embeddingVec = Vector<Float>([])
         if let floats = try await embedder.embed(text: content) {
@@ -541,13 +560,14 @@ public actor MemoryTools {
             }
         }
 
-        let memory = Memory(content: content, topic: topic, project: project, source: source, embedding: embeddingVec, expiresAt: expiresAt)
+        let memory = Memory(content: content, topic: topic, project: project, source: source, embedding: embeddingVec, expiresAt: expiresAt, importance: importance)
         lattice.add(memory)
 
         let expiresNote = expiresAt == .distantFuture ? "" : ", expires: \(Self.dateFormatter.string(from: expiresAt))"
+        let importanceNote = importance > 0 ? ", importance: \(importance)" : ""
         log("Stored memory [\(project)/\(topic)]: \(content.prefix(80))")
         return CallTool.Result(
-            content: [.text("Stored memory (id: \(memory.primaryKey!), project: \(project), topic: \(topic)\(expiresNote)): \(content.prefix(100))\(content.count > 100 ? "..." : "")")],
+            content: [.text("Stored memory (id: \(memory.primaryKey!), project: \(project), topic: \(topic)\(expiresNote)\(importanceNote)): \(content.prefix(100))\(content.count > 100 ? "..." : "")")],
             isError: false
         )
     }
@@ -574,33 +594,56 @@ public actor MemoryTools {
             results = results.where { $0.topic == topicFilter }
         }
 
+        // FTS5 query: use anyOf so any matching term qualifies
+        let ftsQuery: TextQuery = ._anyOf(query.split(separator: " ").map(String.init))
+
         // Semantic search with vector similarity
         if let queryEmbedding = try await embedder.embed(text: query) {
             // Soft project boost: fetch wider net, then re-rank
             let fetchLimit = projectFilter != nil ? limit * 3 : limit
+            let embedding = Vector<Float>(queryEmbedding)
+
+            // Hybrid: FTS5 (any term) intersected with vector similarity
             let nearest = results
-                .nearest(to: Vector<Float>(queryEmbedding), on: \.embedding, limit: fetchLimit, distance: .cosine)
+                .matching(ftsQuery, on: \.content)
+                .nearest(to: embedding, on: \.embedding, limit: fetchLimit, distance: .cosine)
 
             if nearest.isEmpty {
                 return CallTool.Result(content: [.text("No memories found.")], isError: false)
             }
 
-            // Apply soft project boosting on distances
-            let boosted: [(object: Memory, distance: Double)] = nearest.map { match in
+            // Apply soft project boosting and reinforcement scoring on distances
+            let now = Date()
+            let boosted: [(object: Memory, distance: Double, ftsRank: Double?)] = nearest.map { match in
                 let m = match.object
-                let boost: Double
+                let cosine = match.distances["embedding"] ?? match.distance
+
+                // Project boost
+                let projectBoost: Double
                 if let projectFilter {
                     if m.project == projectFilter {
-                        boost = 0.7   // same-project: strong boost
+                        projectBoost = 0.7   // same-project: strong boost
                     } else if m.project == "global" {
-                        boost = 0.85  // global: moderate boost
+                        projectBoost = 0.85  // global: moderate boost
                     } else {
-                        boost = 1.0   // other-project: no boost
+                        projectBoost = 1.0   // other-project: no boost
                     }
                 } else {
-                    boost = 1.0       // no project filter: no boost
+                    projectBoost = 1.0       // no project filter: no boost
                 }
-                return (object: m, distance: match.distance * boost)
+
+                // Frequency boost — log-scaled accessCount (caps at 15% reduction)
+                let frequencyBoost = 1.0 - min(log2(1.0 + Double(m.accessCount)) * 0.04, 0.15)
+
+                // Importance boost — explicit 1-5 rating (caps at 20% reduction)
+                let importanceBoost = m.importance > 0 ? 1.0 - Double(m.importance - 1) * 0.05 : 1.0
+
+                // Recency boost — exponential decay from lastAccessedAt (10% max for just-accessed)
+                let daysSinceAccess = now.timeIntervalSince(m.lastAccessedAt) / 86400.0
+                let recencyBoost = 1.0 - 0.1 * exp(-daysSinceAccess / 30.0)
+
+                let distance = cosine * projectBoost * frequencyBoost * importanceBoost * recencyBoost
+                return (object: m, distance: distance, ftsRank: match.distances["content"])
             }
 
             // Re-sort by boosted distance and take top `limit`
@@ -617,17 +660,20 @@ public actor MemoryTools {
             let threshold = p75 * 1.2
             let filtered = topResults.filter { $0.distance <= threshold }
 
-            // Bump lastAccessedAt on recalled memories
-            let now = Date()
+            // Bump lastAccessedAt and accessCount on recalled memories
+            let accessNow = Date()
             for match in filtered {
-                match.object.lastAccessedAt = now
+                match.object.lastAccessedAt = accessNow
+                match.object.accessCount += 1
             }
 
             let lines = filtered.map { match in
                 let m = match.object
                 let dist = String(format: "%.3f", match.distance)
+                let ftsInfo = match.ftsRank.map { ", fts5: \(String(format: "%.3f", $0))" } ?? ""
+                let impInfo = m.importance > 0 ? ", importance: \(m.importance)" : ""
                 let expires = m.expiresAt == .distantFuture ? "" : ", expires: \(Self.dateFormatter.string(from: m.expiresAt))"
-                return "[id:\(m.primaryKey!)] [\(m.project)/\(m.topic)] (relevance: \(dist)\(expires)) \(m.content)"
+                return "[id:\(m.primaryKey!)] [\(m.project)/\(m.topic)] (relevance: \(dist)\(ftsInfo)\(impInfo)\(expires)) \(m.content)"
             }
 
             var output = lines.joined(separator: "\n\n")
@@ -641,6 +687,7 @@ public actor MemoryTools {
                     let connNow = Date()
                     for mem in connected {
                         mem.lastAccessedAt = connNow
+                        mem.accessCount += 1
                         let expires = mem.expiresAt == .distantFuture ? "" : ", expires: \(Self.dateFormatter.string(from: mem.expiresAt))"
                         output += "\n\n[id:\(mem.primaryKey!)] [\(mem.project)/\(mem.topic)]\(expires) \(mem.content)"
                     }
@@ -649,17 +696,18 @@ public actor MemoryTools {
 
             return CallTool.Result(content: [.text(output)], isError: false)
         } else {
-            // Degraded mode: text search with SQL LIKE (no embedding model loaded)
-            // Still apply project soft boost by sorting
+            // Degraded mode: FTS5 full-text search (no embedding model loaded)
             if let projectFilter {
                 results = results.where { $0.project == projectFilter || $0.project == "global" }
             }
-            let filtered = results.where { $0.content.contains(query) }
+            let ftsResults = results.matching(ftsQuery, on: \.content, limit: limit)
 
             var lines: [String] = []
-            for m in filtered.prefix(limit) {
+            for match in ftsResults {
+                let m = match.object
+                let ftsInfo = match.distances["content"].map { " (fts5: \(String(format: "%.3f", $0)))" } ?? ""
                 let expires = m.expiresAt == .distantFuture ? "" : ", expires: \(Self.dateFormatter.string(from: m.expiresAt))"
-                lines.append("[id:\(m.primaryKey!)] [\(m.project)/\(m.topic)]\(expires) \(m.content)")
+                lines.append("[id:\(m.primaryKey!)] [\(m.project)/\(m.topic)]\(ftsInfo)\(expires) \(m.content)")
             }
             if lines.isEmpty {
                 return CallTool.Result(content: [.text("No memories found.")], isError: false)
@@ -742,7 +790,7 @@ public actor MemoryTools {
 
         // 2. Validate at least one edit field
         let hasContentEdit = a.content != nil || a.append != nil || a.prepend != nil || a.find != nil
-        let hasMetadataEdit = a.topic != nil || a.source != nil || a.expiresInDays != nil
+        let hasMetadataEdit = a.topic != nil || a.source != nil || a.expiresInDays != nil || a.importance != nil
         guard hasContentEdit || hasMetadataEdit else {
             throw MCPError.invalidParams("Provide at least one edit: content, append, prepend, find+replace, topic, source, or expires_in_days.")
         }
@@ -834,6 +882,14 @@ public actor MemoryTools {
                 mem.expiresAt = Date().addingTimeInterval(Double(days) * 86400)
                 changes.append("expires: \(oldExpires) → \(Self.dateFormatter.string(from: mem.expiresAt))")
             }
+        }
+        if let imp = a.importance?.value {
+            guard (0...5).contains(imp) else {
+                throw MCPError.invalidParams("'importance' must be between 0 and 5, got \(imp)")
+            }
+            let old = mem.importance
+            mem.importance = imp
+            changes.append("importance: \(old) → \(imp)")
         }
 
         // 8. Re-embed only if content changed

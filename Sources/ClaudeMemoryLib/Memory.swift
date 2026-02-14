@@ -17,7 +17,7 @@ import Foundation
 @Model
 public final class Memory {
     /// The memory content — a natural-language description of the knowledge to store.
-    var content: String
+    @FullText var content: String
 
     /// Category for organizing memories (e.g., "preferences", "architecture", "debugging", "patterns").
     var topic: String
@@ -45,6 +45,12 @@ public final class Memory {
     /// Defaults to `Date.distantFuture` (never expires).
     var expiresAt: Date
 
+    /// How many times this memory has been returned by recall. Used for frequency-based ranking boost.
+    var accessCount: Int
+
+    /// Explicit importance rating (1-5). 0 means unset. Higher values boost recall ranking.
+    var importance: Int
+
     init(
         content: String,
         topic: String = "general",
@@ -53,7 +59,9 @@ public final class Memory {
         embedding: Vector<Float> = Vector<Float>([]),
         createdAt: Date = Date(),
         lastAccessedAt: Date = Date(),
-        expiresAt: Date = Date.distantFuture
+        expiresAt: Date = Date.distantFuture,
+        accessCount: Int = 0,
+        importance: Int = 0
     ) {
         self.content = content
         self.topic = topic
@@ -63,5 +71,7 @@ public final class Memory {
         self.createdAt = createdAt
         self.lastAccessedAt = lastAccessedAt
         self.expiresAt = expiresAt
+        self.accessCount = accessCount
+        self.importance = importance
     }
 }

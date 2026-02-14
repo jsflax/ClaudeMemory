@@ -1532,6 +1532,252 @@ private func makeTools() async throws -> MemoryTools {
     #expect(output.contains("Lattice ORM"))
 }
 
+// MARK: - FTS5 Hybrid Search
+
+@Test func recall_fts5_hybrid_findsExactKeywords() async throws {
+    let tools = try await makeTools()
+
+    // Store memories with distinct keywords
+    _ = try await tools.handle(CallTool.Parameters(
+        name: "remember",
+        arguments: [
+            "content": .string("The handleRecall function in Tools.swift implements semantic search"),
+            "project": .string("ClaudeMemory"),
+            "force": .bool(true),
+        ]
+    ))
+    _ = try await tools.handle(CallTool.Parameters(
+        name: "remember",
+        arguments: [
+            "content": .string("Swift uses ARC for automatic reference counting"),
+            "project": .string("global"),
+            "force": .bool(true),
+        ]
+    ))
+
+    // Recall with an exact keyword that only appears in the first memory
+    let result = try await tools.handle(CallTool.Parameters(
+        name: "recall",
+        arguments: [
+            "query": .string("handleRecall Tools"),
+            "project": .string("ClaudeMemory"),
+        ]
+    ))
+    let output = text(from: result)
+    #expect(output.contains("handleRecall"))
+    #expect(output.contains("fts5:"))
+}
+
+@Test func recall_fts5_degraded_noEmbeddings() async throws {
+    // Create tools with a non-loaded embedder to trigger degraded mode
+    let path = FileManager.default.temporaryDirectory
+        .appending(path: "claude-memory-test-\(UUID().uuidString).sqlite")
+    let lattice = try Lattice(Memory.self, Edge.self, configuration: .init(fileURL: path))
+    let embedder = EmbeddingService()  // not loaded — embed() returns nil
+    let tools = MemoryTools(lattice: lattice, embedder: embedder)
+
+    // Store a memory via remember (stores with empty embedding in degraded mode)
+    _ = try await tools.handle(CallTool.Parameters(
+        name: "remember",
+        arguments: ["content": .string("The parseJSON function handles deserialization of API responses")]
+    ))
+
+    // Recall in degraded mode should use FTS5 instead of LIKE
+    let result = try await tools.handle(CallTool.Parameters(
+        name: "recall",
+        arguments: ["query": .string("parseJSON deserialization")]
+    ))
+    let output = text(from: result)
+    #expect(output.contains("parseJSON"))
+    #expect(output.contains("fts5:"))
+}
+
+@Test func recall_fts5_rankInOutput() async throws {
+    let tools = try await makeTools()
+
+    // Store several memories
+    _ = try await tools.handle(CallTool.Parameters(
+        name: "remember",
+        arguments: [
+            "content": .string("Machine learning models require training data and validation sets"),
+            "force": .bool(true),
+        ]
+    ))
+    _ = try await tools.handle(CallTool.Parameters(
+        name: "remember",
+        arguments: [
+            "content": .string("The training pipeline processes data in batches"),
+            "force": .bool(true),
+        ]
+    ))
+
+    let result = try await tools.handle(CallTool.Parameters(
+        name: "recall",
+        arguments: ["query": .string("training data")]
+    ))
+    let output = text(from: result)
+    // FTS5 rank should appear as negative number in output
+    #expect(output.contains("fts5:"))
+    #expect(output.contains("relevance:"))
+}
+
+// MARK: - Reinforcement / Importance Scoring
+
+@Test func remember_withImportance() async throws {
+    let tools = try await makeTools()
+    let result = try await tools.handle(CallTool.Parameters(
+        name: "remember",
+        arguments: [
+            "content": .string("Critical architecture decision about using event sourcing"),
+            "importance": .int(5),
+        ]
+    ))
+    let output = text(from: result)
+    #expect(output.contains("Stored memory"))
+    #expect(output.contains("importance: 5"))
+}
+
+@Test func remember_importanceOutOfRange_throws() async throws {
+    let tools = try await makeTools()
+    await #expect(throws: (any Error).self) {
+        try await tools.handle(CallTool.Parameters(
+            name: "remember",
+            arguments: [
+                "content": .string("Bad importance value"),
+                "importance": .int(6),
+            ]
+        ))
+    }
+}
+
+@Test func update_importance() async throws {
+    let tools = try await makeTools()
+
+    let r1 = try await tools.handle(CallTool.Parameters(
+        name: "remember",
+        arguments: ["content": .string("Memory for importance update test")]
+    ))
+    let id = extractId(from: text(from: r1))!
+
+    // Set importance to 4
+    let result = try await tools.handle(CallTool.Parameters(
+        name: "update",
+        arguments: [
+            "id": .int(id),
+            "importance": .int(4),
+        ]
+    ))
+    let output = text(from: result)
+    #expect(output.contains("importance: 0 → 4"))
+
+    // Verify it shows in recall output
+    let recall = try await tools.handle(CallTool.Parameters(
+        name: "recall",
+        arguments: ["query": .string("importance update test")]
+    ))
+    #expect(text(from: recall).contains("importance: 4"))
+}
+
+@Test func recall_reinforcement_importanceBoost() async throws {
+    let tools = try await makeTools()
+
+    // Store two nearly identical memories — only a made-up name differs
+    // This ensures cosine distances are almost equal, so importance dominates
+    _ = try await tools.handle(CallTool.Parameters(
+        name: "remember",
+        arguments: [
+            "content": .string("The application uses AlphaDB as the primary relational database for user data"),
+            "importance": .int(5),
+        ]
+    ))
+    _ = try await tools.handle(CallTool.Parameters(
+        name: "remember",
+        arguments: [
+            "content": .string("The application uses BetaDB as the primary relational database for user data"),
+            "force": .bool(true),
+        ]
+    ))
+
+    // Query without mentioning either name — both should match equally via FTS5+vector
+    let result = try await tools.handle(CallTool.Parameters(
+        name: "recall",
+        arguments: ["query": .string("application primary relational database user data")]
+    ))
+    let output = text(from: result)
+
+    // Both should appear, AlphaDB should be first due to importance=5
+    #expect(output.contains("AlphaDB"))
+    #expect(output.contains("importance: 5"))
+
+    let alphaRange = output.range(of: "AlphaDB")!
+    let betaRange = output.range(of: "BetaDB")!
+    #expect(alphaRange.lowerBound < betaRange.lowerBound)
+}
+
+@Test func recall_reinforcement_frequencyBoosting() async throws {
+    let tools = try await makeTools()
+
+    // Store two memories — use distinct terms so focused recalls only match one via FTS5
+    _ = try await tools.handle(CallTool.Parameters(
+        name: "remember",
+        arguments: [
+            "content": .string("The project uses Redis for caching API responses and session data"),
+        ]
+    ))
+    _ = try await tools.handle(CallTool.Parameters(
+        name: "remember",
+        arguments: [
+            "content": .string("The project uses Postgres for caching API responses and session data"),
+            "force": .bool(true),
+        ]
+    ))
+
+    // Recall with "Redis" — FTS5 only matches the first memory, building its accessCount
+    for _ in 0..<5 {
+        _ = try await tools.handle(CallTool.Parameters(
+            name: "recall",
+            arguments: ["query": .string("Redis")]
+        ))
+    }
+
+    // Now recall with a neutral query that matches both via FTS5
+    let result = try await tools.handle(CallTool.Parameters(
+        name: "recall",
+        arguments: ["query": .string("caching API responses session data")]
+    ))
+    let output = text(from: result)
+    #expect(output.contains("Redis"))
+    #expect(output.contains("Postgres"))
+
+    // Redis should appear first due to frequency boost (accessCount=5 vs 0)
+    let redisRange = output.range(of: "Redis")!
+    let pgRange = output.range(of: "Postgres")!
+    #expect(redisRange.lowerBound < pgRange.lowerBound)
+}
+
+@Test func recall_reinforcement_recencyBoost() async throws {
+    let tools = try await makeTools()
+
+    // Store a memory — it will have lastAccessedAt = now
+    _ = try await tools.handle(CallTool.Parameters(
+        name: "remember",
+        arguments: ["content": .string("Recently accessed architecture pattern for microservices")]
+    ))
+
+    // Recall it — this updates lastAccessedAt to now, giving it a recency boost
+    let result = try await tools.handle(CallTool.Parameters(
+        name: "recall",
+        arguments: ["query": .string("microservices architecture pattern")]
+    ))
+    let output = text(from: result)
+    #expect(output.contains("microservices"))
+
+    // The recency boost should be reflected in a lower relevance score
+    // (recencyBoost = 0.90 for just-accessed, meaning 10% distance reduction)
+    // We verify the memory was found and has a reasonable relevance score
+    #expect(output.contains("relevance:"))
+}
+
 /// Helper to extract an integer ID from text like "id: 42" or "id:42"
 private func extractId(from text: String) -> Int? {
     guard let range = text.range(of: "id: ", options: .literal) ?? text.range(of: "id:", options: .literal) else {
