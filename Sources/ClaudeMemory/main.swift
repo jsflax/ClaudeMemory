@@ -92,7 +92,8 @@ let server = Server(
 
         **Tools:**
         - **connect**: Create an edge between two memories. Relation types: `relates_to`, \
-        `contradicts`, `supersedes`, `derived_from`, `part_of`. Duplicate edges are idempotent.
+        `contradicts`, `supersedes`, `derived_from`, `part_of`, `summarized_by`. Duplicate edges \
+        are idempotent.
         - **disconnect**: Remove edges by edge ID or by (from, to) memory pair.
         - **graph**: View a memory's neighborhood — shows connected memories up to a given depth.
         - **recall with depth**: Set `depth: 1` (or up to 3) to follow edges from recalled \
