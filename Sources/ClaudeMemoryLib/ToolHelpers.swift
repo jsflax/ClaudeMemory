@@ -32,6 +32,32 @@ struct FlexibleInt: Decodable {
     }
 }
 
+/// Decodes an array of integers from either a JSON array or a comma-separated string.
+/// Handles MCP clients that pass `[1, 2, 3]` as `"1, 2, 3"`.
+struct FlexibleIntArray: Decodable {
+    let values: [Int]
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if let array = try? container.decode([FlexibleInt].self) {
+            values = array.map(\.value)
+        } else if let string = try? container.decode(String.self) {
+            let parsed = string.split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+            guard !parsed.isEmpty else {
+                throw DecodingError.typeMismatch(
+                    [Int].self,
+                    DecodingError.Context(codingPath: decoder.codingPath, debugDescription: "Expected an array of integers or comma-separated string of integers")
+                )
+            }
+            values = parsed
+        } else {
+            throw DecodingError.typeMismatch(
+                [Int].self,
+                DecodingError.Context(codingPath: decoder.codingPath, debugDescription: "Expected an array of integers or comma-separated string of integers")
+            )
+        }
+    }
+}
+
 func parseTemporalDate(_ input: String) -> Date? {
     let now = Date()
     let cal = Calendar.current
@@ -147,7 +173,7 @@ struct UpdateArgs: Decodable {
 }
 
 struct MergeArgs: Decodable {
-    let ids: [FlexibleInt]
+    let ids: FlexibleIntArray
     let content: String
     let topic: String?
     let project: String?
@@ -274,7 +300,7 @@ struct FindClustersArgs: Decodable {
 }
 
 struct ConsolidateArgs: Decodable {
-    let ids: [FlexibleInt]
+    let ids: FlexibleIntArray
     let content: String
     let topic: String?
     let project: String?

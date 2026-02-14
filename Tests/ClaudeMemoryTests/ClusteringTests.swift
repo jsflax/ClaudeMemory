@@ -402,3 +402,60 @@ import Foundation
     ))
     #expect(text(from: update2).contains("importance: 0 → 0"))
 }
+
+// MARK: - FlexibleIntArray (comma-separated string)
+
+@Test func consolidate_idsAsCommaSeparatedString() async throws {
+    let tools = try await makeTools()
+
+    let r1 = try await tools.handle(CallTool.Parameters(
+        name: "remember",
+        arguments: ["content": .string("Flexible array test memory alpha"), "force": .bool(true)]
+    ))
+    let id1 = extractId(from: text(from: r1))!
+
+    let r2 = try await tools.handle(CallTool.Parameters(
+        name: "remember",
+        arguments: ["content": .string("Flexible array test memory beta"), "force": .bool(true)]
+    ))
+    let id2 = extractId(from: text(from: r2))!
+
+    // Pass ids as a comma-separated string instead of a JSON array
+    let result = try await tools.handle(CallTool.Parameters(
+        name: "consolidate",
+        arguments: [
+            "ids": .string("\(id1), \(id2)"),
+            "content": .string("Combined flexible array test summary"),
+        ]
+    ))
+    let output = text(from: result)
+    #expect(output.contains("Created summary"))
+    #expect(output.contains("Deprioritized 2"))
+}
+
+@Test func merge_idsAsCommaSeparatedString() async throws {
+    let tools = try await makeTools()
+
+    let r1 = try await tools.handle(CallTool.Parameters(
+        name: "remember",
+        arguments: ["content": .string("Merge flex test alpha"), "force": .bool(true)]
+    ))
+    let id1 = extractId(from: text(from: r1))!
+
+    let r2 = try await tools.handle(CallTool.Parameters(
+        name: "remember",
+        arguments: ["content": .string("Merge flex test beta"), "force": .bool(true)]
+    ))
+    let id2 = extractId(from: text(from: r2))!
+
+    // Pass ids as a comma-separated string
+    let result = try await tools.handle(CallTool.Parameters(
+        name: "merge",
+        arguments: [
+            "ids": .string("\(id1), \(id2)"),
+            "content": .string("Combined merge flex test"),
+        ]
+    ))
+    let output = text(from: result)
+    #expect(output.contains("Merged"))
+}

@@ -151,7 +151,7 @@ extension MemoryTools {
         guard !a.content.isEmpty else {
             throw MCPError.invalidParams("'content' is required")
         }
-        let ids = a.ids.map { Int64($0.value) }
+        let ids = a.ids.values.map { Int64($0) }
         guard ids.count >= 2 else {
             throw MCPError.invalidParams("'ids' must contain at least 2 memory IDs to consolidate")
         }
