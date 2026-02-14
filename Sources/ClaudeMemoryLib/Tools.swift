@@ -38,9 +38,10 @@ private struct RememberArgs: Decodable {
     let project: String?
     let source: String?
     let expiresInDays: FlexibleInt?
+    let force: Bool?
 
     enum CodingKeys: String, CodingKey {
-        case content, topic, project, source
+        case content, topic, project, source, force
         case expiresInDays = "expires_in_days"
     }
 }
@@ -50,6 +51,7 @@ private struct RecallArgs: Decodable {
     let project: String?
     let topic: String?
     let limit: FlexibleInt?
+    let depth: FlexibleInt?
 }
 
 private struct ForgetArgs: Decodable {
@@ -59,13 +61,26 @@ private struct ForgetArgs: Decodable {
 }
 
 private struct UpdateArgs: Decodable {
-    let query: String
-    let newContent: String
+    // Targeting (one required)
+    let id: FlexibleInt?
+    let query: String?
     let project: String?
 
+    // Content editing (all optional, mutually exclusive)
+    let content: String?
+    let append: String?
+    let prepend: String?
+    let find: String?
+    let replace: String?
+
+    // Field-level metadata updates (all optional)
+    let topic: String?
+    let source: String?
+    let expiresInDays: FlexibleInt?
+
     enum CodingKeys: String, CodingKey {
-        case query, project
-        case newContent = "new_content"
+        case id, query, project, content, append, prepend, find, replace, topic, source
+        case expiresInDays = "expires_in_days"
     }
 }
 
@@ -84,13 +99,42 @@ private struct ListTopicsArgs: Decodable {
     let project: String?
 }
 
+private struct ConnectArgs: Decodable {
+    let from: FlexibleInt
+    let to: FlexibleInt
+    let relation: String
+}
+
+private struct DisconnectArgs: Decodable {
+    let id: FlexibleInt?
+    let from: FlexibleInt?
+    let to: FlexibleInt?
+    let relation: String?
+}
+
+private struct GraphArgs: Decodable {
+    let id: FlexibleInt
+    let depth: FlexibleInt?
+}
+
+/// Valid relation types for knowledge graph edges.
+private let validRelations: Set<String> = [
+    "relates_to", "contradicts", "supersedes", "derived_from", "part_of",
+]
+
 /// Implements the MCP tool handlers for the ClaudeMemory server.
 ///
 /// Tools:
 /// - **remember**: Store a memory with semantic embedding for later recall.
-/// - **recall**: Search memories by semantic similarity, scoped by project.
-/// - **forget**: Delete memories by ID, topic, project, or all.
+/// - **recall**: Search memories by semantic similarity, with soft project boosting and optional graph traversal.
+/// - **forget**: Delete memories by ID, topic, project (cascades edges).
 /// - **list_topics**: List all memory topics with counts, optionally filtered by project.
+/// - **update**: Edit existing memories by ID or similarity.
+/// - **stats**: Overview of the memory database.
+/// - **merge**: Consolidate multiple memories into one (cleans up source edges).
+/// - **connect**: Create a directed edge between two memories.
+/// - **disconnect**: Remove edges by ID or by (from, to) pair.
+/// - **graph**: View a memory's neighborhood in the knowledge graph.
 public actor MemoryTools {
     let lattice: Lattice
     let embedder: EmbeddingService
@@ -141,6 +185,10 @@ public actor MemoryTools {
                             "type": .string("integer"),
                             "description": .string("Number of days until this memory expires. Expired memories are automatically filtered from recall. Omit for permanent memories. Use for temporal context like 'currently working on X' or 'PR #42 needs review'."),
                         ]),
+                        "force": .object([
+                            "type": .string("boolean"),
+                            "description": .string("Skip conflict detection and store even if near-duplicates exist. Use after reviewing a conflict warning."),
+                        ]),
                     ]),
                     "required": .array([.string("content")]),
                     "additionalProperties": .bool(false),
@@ -150,7 +198,9 @@ public actor MemoryTools {
                 name: "recall",
                 description: """
                     Search memories by semantic similarity. Returns the most relevant stored \
-                    memories for a query. Results include both project-specific and global memories.
+                    memories for a query. Project is a soft ranking signal — same-project and \
+                    global memories rank higher, but cross-project results still surface if \
+                    semantically relevant. Use depth > 0 to follow knowledge graph edges.
                     """,
                 inputSchema: .object([
                     "type": .string("object"),
@@ -161,7 +211,7 @@ public actor MemoryTools {
                         ]),
                         "project": .object([
                             "type": .string("string"),
-                            "description": .string("Project to search within. Results include both project-specific AND global memories. If omitted, searches all memories."),
+                            "description": .string("Project to boost in ranking. Same-project and global memories rank higher, but cross-project results still appear if relevant. If omitted, no project boosting."),
                         ]),
                         "topic": .object([
                             "type": .string("string"),
@@ -171,6 +221,10 @@ public actor MemoryTools {
                             "type": .string("integer"),
                             "description": .string("Maximum number of results (default 10)."),
                         ]),
+                        "depth": .object([
+                            "type": .string("integer"),
+                            "description": .string("Graph traversal depth (0 = no traversal, 1 = follow direct edges, max 3). Default 0."),
+                        ]),
                     ]),
                     "required": .array([.string("query")]),
                     "additionalProperties": .bool(false),
@@ -178,7 +232,7 @@ public actor MemoryTools {
             ),
             Tool(
                 name: "forget",
-                description: "Delete stored memories. Can delete by ID (from recall output), or filter by topic, project, or delete all.",
+                description: "Delete stored memories. Can delete by ID (from recall output), or filter by topic, project, or delete all. Automatically removes associated knowledge graph edges.",
                 inputSchema: .object([
                     "type": .string("object"),
                     "properties": .object([
@@ -215,26 +269,59 @@ public actor MemoryTools {
             Tool(
                 name: "update",
                 description: """
-                    Find a memory by semantic similarity and replace its content. Useful for \
-                    correcting or refining an existing memory without creating a duplicate.
+                    Update an existing memory. Target by ID (preferred) or semantic similarity. \
+                    Supports full content replacement, append, prepend, find-and-replace, and \
+                    field-level metadata updates. Content edit modes are mutually exclusive. \
+                    Metadata updates (topic, source, expires_in_days) can combine with any content edit.
                     """,
                 inputSchema: .object([
                     "type": .string("object"),
                     "properties": .object([
+                        "id": .object([
+                            "type": .string("integer"),
+                            "description": .string("Target memory by ID (from recall output [id:N] prefix). Preferred over query."),
+                        ]),
                         "query": .object([
                             "type": .string("string"),
-                            "description": .string("Search query to find the memory to update."),
-                        ]),
-                        "new_content": .object([
-                            "type": .string("string"),
-                            "description": .string("Replacement content for the memory."),
+                            "description": .string("Find memory by semantic similarity. Used when ID is not known."),
                         ]),
                         "project": .object([
                             "type": .string("string"),
-                            "description": .string("Optional project scope for the search."),
+                            "description": .string("Project scope for similarity search (only used with query, not id)."),
+                        ]),
+                        "content": .object([
+                            "type": .string("string"),
+                            "description": .string("Full content replacement."),
+                        ]),
+                        "append": .object([
+                            "type": .string("string"),
+                            "description": .string("Text to append to existing content."),
+                        ]),
+                        "prepend": .object([
+                            "type": .string("string"),
+                            "description": .string("Text to prepend to existing content."),
+                        ]),
+                        "find": .object([
+                            "type": .string("string"),
+                            "description": .string("Text to find in content (used with replace)."),
+                        ]),
+                        "replace": .object([
+                            "type": .string("string"),
+                            "description": .string("Replacement text (used with find). Can be empty to delete matched text."),
+                        ]),
+                        "topic": .object([
+                            "type": .string("string"),
+                            "description": .string("Update the memory's topic."),
+                        ]),
+                        "source": .object([
+                            "type": .string("string"),
+                            "description": .string("Update the memory's source."),
+                        ]),
+                        "expires_in_days": .object([
+                            "type": .string("integer"),
+                            "description": .string("Update expiration. 0 = make permanent, >0 = expire in N days from now."),
                         ]),
                     ]),
-                    "required": .array([.string("query"), .string("new_content")]),
                     "additionalProperties": .bool(false),
                 ])
             ),
@@ -257,7 +344,8 @@ public actor MemoryTools {
                 description: """
                     Merge multiple memories into one. Use after recalling related memories to \
                     consolidate fragments into a single, well-organized memory. The original \
-                    memories are deleted and replaced with the merged content.
+                    memories are deleted and replaced with the merged content. Associated \
+                    knowledge graph edges are cleaned up automatically.
                     """,
                 inputSchema: .object([
                     "type": .string("object"),
@@ -284,6 +372,91 @@ public actor MemoryTools {
                     "additionalProperties": .bool(false),
                 ])
             ),
+            Tool(
+                name: "connect",
+                description: """
+                    Create a directed edge between two memories in the knowledge graph. \
+                    Edges represent typed relationships. Duplicate edges (same from, to, relation) \
+                    are idempotent.
+                    """,
+                inputSchema: .object([
+                    "type": .string("object"),
+                    "properties": .object([
+                        "from": .object([
+                            "type": .string("integer"),
+                            "description": .string("Source memory ID."),
+                        ]),
+                        "to": .object([
+                            "type": .string("integer"),
+                            "description": .string("Target memory ID."),
+                        ]),
+                        "relation": .object([
+                            "type": .string("string"),
+                            "enum": .array([
+                                .string("relates_to"),
+                                .string("contradicts"),
+                                .string("supersedes"),
+                                .string("derived_from"),
+                                .string("part_of"),
+                            ]),
+                            "description": .string("Relationship type: 'relates_to', 'contradicts', 'supersedes', 'derived_from', 'part_of'."),
+                        ]),
+                    ]),
+                    "required": .array([.string("from"), .string("to"), .string("relation")]),
+                    "additionalProperties": .bool(false),
+                ])
+            ),
+            Tool(
+                name: "disconnect",
+                description: """
+                    Remove edges from the knowledge graph. Target by edge ID, or by \
+                    (from, to) memory pair with optional relation filter.
+                    """,
+                inputSchema: .object([
+                    "type": .string("object"),
+                    "properties": .object([
+                        "id": .object([
+                            "type": .string("integer"),
+                            "description": .string("Delete a specific edge by its ID."),
+                        ]),
+                        "from": .object([
+                            "type": .string("integer"),
+                            "description": .string("Source memory ID (used with 'to')."),
+                        ]),
+                        "to": .object([
+                            "type": .string("integer"),
+                            "description": .string("Target memory ID (used with 'from')."),
+                        ]),
+                        "relation": .object([
+                            "type": .string("string"),
+                            "description": .string("Optional relation filter when using from+to targeting."),
+                        ]),
+                    ]),
+                    "additionalProperties": .bool(false),
+                ])
+            ),
+            Tool(
+                name: "graph",
+                description: """
+                    View a memory's neighborhood in the knowledge graph. Shows the memory \
+                    and its connections (edges) up to a specified depth.
+                    """,
+                inputSchema: .object([
+                    "type": .string("object"),
+                    "properties": .object([
+                        "id": .object([
+                            "type": .string("integer"),
+                            "description": .string("Memory ID to explore from."),
+                        ]),
+                        "depth": .object([
+                            "type": .string("integer"),
+                            "description": .string("How many hops to traverse (default 1, max 3)."),
+                        ]),
+                    ]),
+                    "required": .array([.string("id")]),
+                    "additionalProperties": .bool(false),
+                ])
+            ),
         ]
     }
 
@@ -305,6 +478,12 @@ public actor MemoryTools {
             return try handleStats(params.arguments)
         case "merge":
             return try await handleMerge(params.arguments)
+        case "connect":
+            return try handleConnect(params.arguments)
+        case "disconnect":
+            return try handleDisconnect(params.arguments)
+        case "graph":
+            return try handleGraph(params.arguments)
         default:
             throw MCPError.invalidParams("Unknown tool: \(params.name)")
         }
@@ -333,6 +512,35 @@ public actor MemoryTools {
             embeddingVec = Vector<Float>(floats)
         }
 
+        // Conflict detection: check for near-duplicates before storing
+        // Uses tiered thresholds: 0.12 for same-project, 0.05 for cross-scope (global↔project)
+        if a.force != true && !embeddingVec.isEmpty {
+            let candidates = lattice.objects(Memory.self)
+                .where { $0.expiresAt > Date() }
+                .where { $0.project == project || $0.project == "global" }
+                .nearest(to: embeddingVec, on: \.embedding, limit: 5, distance: .cosine)
+
+            let conflicts = candidates.filter { match in
+                let sameProject = match.object.project == project
+                let threshold = sameProject ? 0.12 : 0.05
+                return match.distance < threshold
+            }
+            if !conflicts.isEmpty {
+                var warning = "⚠️ Near-duplicate memory detected. The new memory was NOT stored.\n\nExisting similar memories:"
+                for match in conflicts {
+                    let m = match.object
+                    let dist = String(format: "%.3f", match.distance)
+                    warning += "\n  [id:\(m.primaryKey!)] (distance: \(dist)) \(m.content)"
+                }
+                warning += "\n\nTo resolve:"
+                warning += "\n  - Use `update(id: N, ...)` to modify the existing memory"
+                warning += "\n  - Use `remember(..., force: true)` to keep both"
+                warning += "\n  - Use `forget(id: N)` to remove the old one, then `remember` the new one"
+                log("Conflict detected for: \(content.prefix(80))")
+                return CallTool.Result(content: [.text(warning)], isError: false)
+            }
+        }
+
         let memory = Memory(content: content, topic: topic, project: project, source: source, embedding: embeddingVec, expiresAt: expiresAt)
         lattice.add(memory)
 
@@ -355,33 +563,59 @@ public actor MemoryTools {
         let projectFilter = a.project
         let topicFilter = a.topic
         let limit = a.limit?.value ?? 10
+        let depth = min(a.depth?.value ?? 0, 3)
 
-        // Build base query — if project specified, include both project-specific AND global memories
-        // Always filter out expired memories
+        // Build base query — always filter out expired memories
         var results = lattice.objects(Memory.self)
             .where { $0.expiresAt > Date() }
-        if let projectFilter {
-            results = results.where { $0.project == projectFilter || $0.project == "global" }
-        }
+
+        // Topic is still a hard filter (it's a narrow constraint)
         if let topicFilter {
             results = results.where { $0.topic == topicFilter }
         }
 
         // Semantic search with vector similarity
         if let queryEmbedding = try await embedder.embed(text: query) {
+            // Soft project boost: fetch wider net, then re-rank
+            let fetchLimit = projectFilter != nil ? limit * 3 : limit
             let nearest = results
-                .nearest(to: Vector<Float>(queryEmbedding), on: \.embedding, limit: limit, distance: .cosine)
+                .nearest(to: Vector<Float>(queryEmbedding), on: \.embedding, limit: fetchLimit, distance: .cosine)
 
             if nearest.isEmpty {
                 return CallTool.Result(content: [.text("No memories found.")], isError: false)
             }
 
+            // Apply soft project boosting on distances
+            let boosted: [(object: Memory, distance: Double)] = nearest.map { match in
+                let m = match.object
+                let boost: Double
+                if let projectFilter {
+                    if m.project == projectFilter {
+                        boost = 0.7   // same-project: strong boost
+                    } else if m.project == "global" {
+                        boost = 0.85  // global: moderate boost
+                    } else {
+                        boost = 1.0   // other-project: no boost
+                    }
+                } else {
+                    boost = 1.0       // no project filter: no boost
+                }
+                return (object: m, distance: match.distance * boost)
+            }
+
+            // Re-sort by boosted distance and take top `limit`
+            let sorted = boosted.sorted { $0.distance < $1.distance }
+            let topResults = Array(sorted.prefix(limit))
+
+            if topResults.isEmpty {
+                return CallTool.Result(content: [.text("No memories found.")], isError: false)
+            }
+
             // Filter out outliers: use adaptive threshold based on the result cluster
-            // Takes the 75th percentile distance and adds 20% margin
-            let distances = nearest.map(\.distance)
+            let distances = topResults.map(\.distance)
             let p75 = distances[distances.count * 3 / 4]
             let threshold = p75 * 1.2
-            let filtered = nearest.filter { $0.distance <= threshold }
+            let filtered = topResults.filter { $0.distance <= threshold }
 
             // Bump lastAccessedAt on recalled memories
             let now = Date()
@@ -393,11 +627,33 @@ public actor MemoryTools {
                 let m = match.object
                 let dist = String(format: "%.3f", match.distance)
                 let expires = m.expiresAt == .distantFuture ? "" : ", expires: \(Self.dateFormatter.string(from: m.expiresAt))"
-                return "[id:\(m.primaryKey!)] [\(m.project)/\(m.topic)] (distance: \(dist)\(expires)) \(m.content)"
+                return "[id:\(m.primaryKey!)] [\(m.project)/\(m.topic)] (relevance: \(dist)\(expires)) \(m.content)"
             }
-            return CallTool.Result(content: [.text(lines.joined(separator: "\n\n"))], isError: false)
+
+            var output = lines.joined(separator: "\n\n")
+
+            // Graph traversal when depth > 0
+            if depth > 0 {
+                let recalledIds = Set(filtered.map { $0.object.primaryKey! })
+                let connected = traverseGraph(from: recalledIds, depth: depth, excludeIds: recalledIds)
+                if !connected.isEmpty {
+                    output += "\n\n--- Connected (graph traversal, depth: \(depth)) ---"
+                    let connNow = Date()
+                    for mem in connected {
+                        mem.lastAccessedAt = connNow
+                        let expires = mem.expiresAt == .distantFuture ? "" : ", expires: \(Self.dateFormatter.string(from: mem.expiresAt))"
+                        output += "\n\n[id:\(mem.primaryKey!)] [\(mem.project)/\(mem.topic)]\(expires) \(mem.content)"
+                    }
+                }
+            }
+
+            return CallTool.Result(content: [.text(output)], isError: false)
         } else {
             // Degraded mode: text search with SQL LIKE (no embedding model loaded)
+            // Still apply project soft boost by sorting
+            if let projectFilter {
+                results = results.where { $0.project == projectFilter || $0.project == "global" }
+            }
             let filtered = results.where { $0.content.contains(query) }
 
             var lines: [String] = []
@@ -425,34 +681,48 @@ public actor MemoryTools {
                 return CallTool.Result(content: [.text("Memory with id \(id) not found.")], isError: true)
             }
             let summary = mem.content.prefix(80)
+
+            // Cascade: delete edges referencing this memory
+            let edgeCount = deleteEdgesForMemories([id64])
+
             lattice.delete(Memory.self, where: { $0.primaryKey == id64 })
+            let edgeNote = edgeCount > 0 ? " Removed \(edgeCount) edge(s)." : ""
             log("Deleted memory [id:\(id)]: \(summary)")
             return CallTool.Result(
-                content: [.text("Deleted memory (id: \(id), project: \(mem.project), topic: \(mem.topic)): \(summary)")],
+                content: [.text("Deleted memory (id: \(id), project: \(mem.project), topic: \(mem.topic)): \(summary)\(edgeNote)")],
                 isError: false
             )
         }
 
         switch (a.topic, a.project) {
         case let (topic?, project?):
-            let count = lattice.count(Memory.self, where: { $0.topic == topic && $0.project == project })
+            let memoryIds = collectMemoryIds { $0.topic == topic && $0.project == project }
+            let edgeCount = deleteEdgesForMemories(memoryIds)
+            let count = memoryIds.count
             lattice.delete(Memory.self, where: { $0.topic == topic && $0.project == project })
+            let edgeNote = edgeCount > 0 ? " Removed \(edgeCount) edge(s)." : ""
             return CallTool.Result(
-                content: [.text("Deleted \(count) memories (project: \(project), topic: \(topic)).")],
+                content: [.text("Deleted \(count) memories (project: \(project), topic: \(topic)).\(edgeNote)")],
                 isError: false
             )
         case let (topic?, nil):
-            let count = lattice.count(Memory.self, where: { $0.topic == topic })
+            let memoryIds = collectMemoryIds { $0.topic == topic }
+            let edgeCount = deleteEdgesForMemories(memoryIds)
+            let count = memoryIds.count
             lattice.delete(Memory.self, where: { $0.topic == topic })
+            let edgeNote = edgeCount > 0 ? " Removed \(edgeCount) edge(s)." : ""
             return CallTool.Result(
-                content: [.text("Deleted \(count) memories with topic '\(topic)'.")],
+                content: [.text("Deleted \(count) memories with topic '\(topic)'.\(edgeNote)")],
                 isError: false
             )
         case let (nil, project?):
-            let count = lattice.count(Memory.self, where: { $0.project == project })
+            let memoryIds = collectMemoryIds { $0.project == project }
+            let edgeCount = deleteEdgesForMemories(memoryIds)
+            let count = memoryIds.count
             lattice.delete(Memory.self, where: { $0.project == project })
+            let edgeNote = edgeCount > 0 ? " Removed \(edgeCount) edge(s)." : ""
             return CallTool.Result(
-                content: [.text("Deleted \(count) memories for project '\(project)'.")],
+                content: [.text("Deleted \(count) memories for project '\(project)'.\(edgeNote)")],
                 isError: false
             )
         case (nil, nil):
@@ -464,45 +734,121 @@ public actor MemoryTools {
 
     private func handleUpdate(_ args: [String: Value]?) async throws -> CallTool.Result {
         let a = try args.decode(UpdateArgs.self)
-        guard !a.query.isEmpty else {
-            throw MCPError.invalidParams("'query' is required")
-        }
-        guard !a.newContent.isEmpty else {
-            throw MCPError.invalidParams("'new_content' is required")
-        }
-        let query = a.query
-        let newContent = a.newContent
-        let projectFilter = a.project
 
-        var results = lattice.objects(Memory.self)
-        if let projectFilter {
-            results = results.where { $0.project == projectFilter }
+        // 1. Validate targeting — at least id or query required
+        guard a.id != nil || (a.query != nil && !a.query!.isEmpty) else {
+            throw MCPError.invalidParams("Provide 'id' or 'query' to target a memory.")
         }
 
-        guard let queryEmbedding = try await embedder.embed(text: query) else {
-            throw MCPError.internalError("Failed to generate embedding for query")
+        // 2. Validate at least one edit field
+        let hasContentEdit = a.content != nil || a.append != nil || a.prepend != nil || a.find != nil
+        let hasMetadataEdit = a.topic != nil || a.source != nil || a.expiresInDays != nil
+        guard hasContentEdit || hasMetadataEdit else {
+            throw MCPError.invalidParams("Provide at least one edit: content, append, prepend, find+replace, topic, source, or expires_in_days.")
         }
 
-        let nearest = results
-            .nearest(to: Vector<Float>(queryEmbedding), on: \.embedding, limit: 1, distance: .cosine)
-
-        guard let match = nearest.first else {
-            return CallTool.Result(content: [.text("No matching memory found to update.")], isError: false)
+        // 3. Validate content edit modes are mutually exclusive
+        let contentModes = [a.content != nil, a.append != nil, a.prepend != nil, a.find != nil]
+        if contentModes.filter({ $0 }).count > 1 {
+            throw MCPError.invalidParams("Content edit modes are mutually exclusive: use only one of content, append, prepend, or find+replace.")
         }
 
-        let mem = match.object
+        // 4. find requires replace (replace can be empty string)
+        if a.find != nil && a.replace == nil {
+            throw MCPError.invalidParams("'find' requires 'replace' (can be empty string to delete matched text).")
+        }
+
+        // 5. Locate memory
+        let mem: Memory
+        if let id = a.id?.value {
+            let id64 = Int64(id)
+            let matches = lattice.objects(Memory.self).where { $0.primaryKey == id64 }
+            guard let found = matches.first else {
+                return CallTool.Result(content: [.text("Memory with id \(id) not found.")], isError: true)
+            }
+            mem = found
+        } else {
+            let query = a.query!
+            var results = lattice.objects(Memory.self)
+            if let projectFilter = a.project {
+                results = results.where { $0.project == projectFilter }
+            }
+            guard let queryEmbedding = try await embedder.embed(text: query) else {
+                throw MCPError.internalError("Failed to generate embedding for query")
+            }
+            let nearest = results
+                .nearest(to: Vector<Float>(queryEmbedding), on: \.embedding, limit: 1, distance: .cosine)
+            guard let match = nearest.first else {
+                return CallTool.Result(content: [.text("No matching memory found to update.")], isError: false)
+            }
+            mem = match.object
+        }
+
+        // 6. Apply content edits
         let oldContent = mem.content
+        var contentChanged = false
 
-        // Re-embed with new content
-        if let newEmbedding = try await embedder.embed(text: newContent) {
-            mem.embedding = Vector<Float>(newEmbedding)
+        if let content = a.content {
+            mem.content = content
+            contentChanged = true
+        } else if let append = a.append {
+            mem.content += "\n" + append
+            contentChanged = true
+        } else if let prepend = a.prepend {
+            mem.content = prepend + "\n" + mem.content
+            contentChanged = true
+        } else if let find = a.find {
+            let replace = a.replace!
+            guard mem.content.contains(find) else {
+                return CallTool.Result(
+                    content: [.text("Find pattern not found in memory content.\nPattern: \(find)\nContent: \(mem.content)")],
+                    isError: true
+                )
+            }
+            mem.content = mem.content.replacingOccurrences(of: find, with: replace)
+            contentChanged = true
         }
-        mem.content = newContent
+
+        // 7. Apply metadata edits
+        var changes: [String] = []
+        if contentChanged {
+            changes.append("content: \(oldContent.prefix(60))... → \(mem.content.prefix(60))...")
+        }
+
+        if let topic = a.topic {
+            let old = mem.topic
+            mem.topic = topic
+            changes.append("topic: \(old) → \(topic)")
+        }
+        if let source = a.source {
+            let old = mem.source
+            mem.source = source
+            changes.append("source: \(old) → \(source)")
+        }
+        if let days = a.expiresInDays?.value {
+            let oldExpires = mem.expiresAt == .distantFuture ? "permanent" : Self.dateFormatter.string(from: mem.expiresAt)
+            if days == 0 {
+                mem.expiresAt = .distantFuture
+                changes.append("expires: \(oldExpires) → permanent")
+            } else {
+                mem.expiresAt = Date().addingTimeInterval(Double(days) * 86400)
+                changes.append("expires: \(oldExpires) → \(Self.dateFormatter.string(from: mem.expiresAt))")
+            }
+        }
+
+        // 8. Re-embed only if content changed
+        if contentChanged {
+            if let newEmbedding = try await embedder.embed(text: mem.content) {
+                mem.embedding = Vector<Float>(newEmbedding)
+            }
+        }
+
+        // 9. Update lastAccessedAt
         mem.lastAccessedAt = Date()
 
-        log("Updated memory [\(mem.project)/\(mem.topic)]: \(newContent.prefix(80))")
+        log("Updated memory [id:\(mem.primaryKey!)] [\(mem.project)/\(mem.topic)]: \(changes.joined(separator: ", "))")
         return CallTool.Result(
-            content: [.text("Updated memory (project: \(mem.project), topic: \(mem.topic)).\nOld: \(oldContent)\nNew: \(newContent)")],
+            content: [.text("Updated memory (id: \(mem.primaryKey!), project: \(mem.project), topic: \(mem.topic)).\nChanges:\n\(changes.joined(separator: "\n"))")],
             isError: false
         )
     }
@@ -547,16 +893,199 @@ public actor MemoryTools {
         // Collect old content summaries before deleting
         let oldSummaries = sources.map { "[id:\($0.primaryKey!)] \($0.content.prefix(60))" }
 
+        // Clean up edges referencing source memories
+        let edgeCount = deleteEdgesForMemories(ids)
+
         // Delete originals
         for id in ids {
             lattice.delete(Memory.self, where: { $0.primaryKey == id })
         }
 
+        let edgeNote = edgeCount > 0 ? " Removed \(edgeCount) edge(s) from source memories." : ""
         log("Merged \(ids.count) memories into [id:\(merged.primaryKey!)]")
         return CallTool.Result(
-            content: [.text("Merged \(ids.count) memories into new memory (id: \(merged.primaryKey!), project: \(project), topic: \(topic)).\n\nDeleted:\n\(oldSummaries.joined(separator: "\n"))\n\nNew:\n\(content)")],
+            content: [.text("Merged \(ids.count) memories into new memory (id: \(merged.primaryKey!), project: \(project), topic: \(topic)).\(edgeNote)\n\nDeleted:\n\(oldSummaries.joined(separator: "\n"))\n\nNew:\n\(content)")],
             isError: false
         )
+    }
+
+    // MARK: - connect
+
+    private func handleConnect(_ args: [String: Value]?) throws -> CallTool.Result {
+        let a = try args.decode(ConnectArgs.self)
+        let fromId = Int64(a.from.value)
+        let toId = Int64(a.to.value)
+        let relation = a.relation
+
+        // Validate relation
+        guard validRelations.contains(relation) else {
+            throw MCPError.invalidParams("Invalid relation '\(relation)'. Must be one of: \(validRelations.sorted().joined(separator: ", "))")
+        }
+
+        // Validate both memories exist
+        guard lattice.objects(Memory.self).where({ $0.primaryKey == fromId }).first != nil else {
+            return CallTool.Result(content: [.text("Memory with id \(fromId) not found.")], isError: true)
+        }
+        guard lattice.objects(Memory.self).where({ $0.primaryKey == toId }).first != nil else {
+            return CallTool.Result(content: [.text("Memory with id \(toId) not found.")], isError: true)
+        }
+
+        // Check for duplicate edge
+        let existing = lattice.objects(Edge.self)
+            .where { $0.sourceId == fromId && $0.targetId == toId && $0.relation == relation }
+        if let edge = existing.first {
+            return CallTool.Result(
+                content: [.text("Edge already exists (edge id: \(edge.primaryKey!), \(fromId) --[\(relation)]--> \(toId)).")],
+                isError: false
+            )
+        }
+
+        // Create edge
+        let edge = Edge(sourceId: fromId, targetId: toId, relation: relation)
+        lattice.add(edge)
+
+        log("Connected [id:\(fromId)] --[\(relation)]--> [id:\(toId)]")
+        return CallTool.Result(
+            content: [.text("Connected (edge id: \(edge.primaryKey!)) [id:\(fromId)] --[\(relation)]--> [id:\(toId)]")],
+            isError: false
+        )
+    }
+
+    // MARK: - disconnect
+
+    private func handleDisconnect(_ args: [String: Value]?) throws -> CallTool.Result {
+        let a = try args.decode(DisconnectArgs.self)
+
+        // By edge ID
+        if let id = a.id?.value {
+            let id64 = Int64(id)
+            let matches = lattice.objects(Edge.self).where { $0.primaryKey == id64 }
+            guard matches.first != nil else {
+                return CallTool.Result(content: [.text("Edge with id \(id) not found.")], isError: true)
+            }
+            lattice.delete(Edge.self, where: { $0.primaryKey == id64 })
+            log("Disconnected edge [id:\(id)]")
+            return CallTool.Result(
+                content: [.text("Deleted edge (id: \(id)).")],
+                isError: false
+            )
+        }
+
+        // By from + to
+        guard let from = a.from?.value, let to = a.to?.value else {
+            throw MCPError.invalidParams("Provide 'id' or both 'from' and 'to' to target edges.")
+        }
+        let fromId = Int64(from)
+        let toId = Int64(to)
+
+        var query = lattice.objects(Edge.self)
+            .where { $0.sourceId == fromId && $0.targetId == toId }
+        if let relation = a.relation {
+            query = query.where { $0.relation == relation }
+        }
+
+        let count = query.count
+        if count == 0 {
+            return CallTool.Result(content: [.text("No edges found from \(fromId) to \(toId).")], isError: false)
+        }
+
+        if let relation = a.relation {
+            lattice.delete(Edge.self, where: { $0.sourceId == fromId && $0.targetId == toId && $0.relation == relation })
+        } else {
+            lattice.delete(Edge.self, where: { $0.sourceId == fromId && $0.targetId == toId })
+        }
+
+        log("Disconnected \(count) edge(s) from [id:\(fromId)] to [id:\(toId)]")
+        return CallTool.Result(
+            content: [.text("Deleted \(count) edge(s) from [id:\(fromId)] to [id:\(toId)].")],
+            isError: false
+        )
+    }
+
+    // MARK: - graph
+
+    private func handleGraph(_ args: [String: Value]?) throws -> CallTool.Result {
+        let a = try args.decode(GraphArgs.self)
+        let memId = Int64(a.id.value)
+        let depth = min(a.depth?.value ?? 1, 3)
+
+        // Validate memory exists
+        guard let rootMem = lattice.objects(Memory.self).where({ $0.primaryKey == memId }).first else {
+            return CallTool.Result(content: [.text("Memory with id \(memId) not found.")], isError: true)
+        }
+
+        // BFS traversal
+        var visited = Set<Int64>([memId])
+        var frontier = Set<Int64>([memId])
+        var allEdges: [(edge: Edge, depth: Int)] = []
+
+        for d in 1...depth {
+            var nextFrontier = Set<Int64>()
+            for nodeId in frontier {
+                // Outgoing edges
+                let outgoing = lattice.objects(Edge.self).where { $0.sourceId == nodeId }
+                for edge in outgoing {
+                    allEdges.append((edge: edge, depth: d))
+                    if !visited.contains(edge.targetId) {
+                        visited.insert(edge.targetId)
+                        nextFrontier.insert(edge.targetId)
+                    }
+                }
+                // Incoming edges
+                let incoming = lattice.objects(Edge.self).where { $0.targetId == nodeId }
+                for edge in incoming {
+                    allEdges.append((edge: edge, depth: d))
+                    if !visited.contains(edge.sourceId) {
+                        visited.insert(edge.sourceId)
+                        nextFrontier.insert(edge.sourceId)
+                    }
+                }
+            }
+            frontier = nextFrontier
+            if frontier.isEmpty { break }
+        }
+
+        // Deduplicate edges by primary key
+        var seenEdgeIds = Set<Int64>()
+        var uniqueEdges: [Edge] = []
+        for (edge, _) in allEdges {
+            let edgeId = edge.primaryKey!
+            if !seenEdgeIds.contains(edgeId) {
+                seenEdgeIds.insert(edgeId)
+                uniqueEdges.append(edge)
+            }
+        }
+
+        // Format output
+        var output = "[id:\(memId)] \(rootMem.content)"
+
+        if uniqueEdges.isEmpty {
+            output += "\n\nNo connections."
+        } else {
+            output += "\n\nConnections:"
+            for edge in uniqueEdges {
+                if edge.sourceId == memId {
+                    // Outgoing
+                    let targetContent = lattice.objects(Memory.self)
+                        .where { $0.primaryKey == edge.targetId }.first?.content ?? "(deleted)"
+                    output += "\n  --[\(edge.relation)]--> [id:\(edge.targetId)] \(targetContent.prefix(80))"
+                } else if edge.targetId == memId {
+                    // Incoming
+                    let sourceContent = lattice.objects(Memory.self)
+                        .where { $0.primaryKey == edge.sourceId }.first?.content ?? "(deleted)"
+                    output += "\n  <--[\(edge.relation)]-- [id:\(edge.sourceId)] \(sourceContent.prefix(80))"
+                } else {
+                    // Edge between two non-root nodes (deeper traversal)
+                    let sourceContent = lattice.objects(Memory.self)
+                        .where { $0.primaryKey == edge.sourceId }.first?.content ?? "(deleted)"
+                    let targetContent = lattice.objects(Memory.self)
+                        .where { $0.primaryKey == edge.targetId }.first?.content ?? "(deleted)"
+                    output += "\n  [id:\(edge.sourceId)] \(sourceContent.prefix(40))... --[\(edge.relation)]--> [id:\(edge.targetId)] \(targetContent.prefix(40))..."
+                }
+            }
+        }
+
+        return CallTool.Result(content: [.text(output)], isError: false)
     }
 
     // MARK: - stats
@@ -640,5 +1169,67 @@ public actor MemoryTools {
             content: [.text(header + "\n" + lines.joined(separator: "\n"))],
             isError: false
         )
+    }
+
+    // MARK: - Graph Helpers
+
+    /// Collect IDs of memories matching a predicate.
+    private func collectMemoryIds(_ predicate: (Memory) -> Bool) -> [Int64] {
+        lattice.objects(Memory.self).filter(predicate).compactMap(\.primaryKey)
+    }
+
+    /// Delete all edges where sourceId or targetId is in the given set. Returns count deleted.
+    @discardableResult
+    private func deleteEdgesForMemories(_ ids: [Int64]) -> Int {
+        var total = 0
+        for id in ids {
+            let count = lattice.count(Edge.self, where: { $0.sourceId == id || $0.targetId == id })
+            if count > 0 {
+                lattice.delete(Edge.self, where: { $0.sourceId == id || $0.targetId == id })
+                total += count
+            }
+        }
+        return total
+    }
+
+    /// BFS graph traversal from a set of starting memory IDs, returning connected memories.
+    private func traverseGraph(from startIds: Set<Int64>, depth: Int, excludeIds: Set<Int64>) -> [Memory] {
+        var visited = excludeIds
+        var frontier = startIds
+        var result: [Memory] = []
+        let now = Date()
+
+        for _ in 1...depth {
+            var nextFrontier = Set<Int64>()
+            for nodeId in frontier {
+                // Outgoing edges
+                for edge in lattice.objects(Edge.self).where({ $0.sourceId == nodeId }) {
+                    if !visited.contains(edge.targetId) {
+                        visited.insert(edge.targetId)
+                        nextFrontier.insert(edge.targetId)
+                    }
+                }
+                // Incoming edges
+                for edge in lattice.objects(Edge.self).where({ $0.targetId == nodeId }) {
+                    if !visited.contains(edge.sourceId) {
+                        visited.insert(edge.sourceId)
+                        nextFrontier.insert(edge.sourceId)
+                    }
+                }
+            }
+            // Fetch the memories for the next frontier
+            for id in nextFrontier {
+                if let mem = lattice.objects(Memory.self).where({ $0.primaryKey == id }).first {
+                    // Skip expired
+                    if mem.expiresAt > now {
+                        result.append(mem)
+                    }
+                }
+            }
+            frontier = nextFrontier
+            if frontier.isEmpty { break }
+        }
+
+        return result
     }
 }

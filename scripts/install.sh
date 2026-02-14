@@ -63,10 +63,19 @@ MEMORY_BLOCK='# Memory
 Use the memory MCP server as your primary memory system — not the built-in auto-memory files.
 
 At the START of every conversation, before responding to the first message:
-1. `recall` with the current project name to load project context + global preferences
+1. `recall` with the current project name and `depth: 1` to load project context + global preferences with graph connections
 2. Use what you learn to inform your responses
 
-When you learn something worth remembering (preferences, patterns, decisions, debugging insights), `remember` it immediately — do not wait to be asked.
+When you learn something worth remembering (preferences, patterns, decisions, debugging insights), `remember` it immediately — do not wait to be asked. Use project scoping: project-specific knowledge gets the project name, cross-project preferences get "global".
+
+After remembering, `recall` related memories and `connect` them with edges (`relates_to`, `part_of`, `supersedes`, `contradicts`, `derived_from`) to build a knowledge graph.
+
+To keep memories clean:
+- `recall` before `remember` to check for duplicates
+- `update` (by id) to refine existing memories — supports `append`, `prepend`, `find`+`replace`, and metadata-only changes
+- `merge` when multiple memories cover the same topic
+- `forget` to remove wrong or outdated memories
+- Set `expires_in_days` for temporary context (current tasks, open PRs)
 
 Do NOT use ~/.claude/projects/*/memory/ files for memory. All persistent knowledge goes through the memory MCP server.'
 
