@@ -10,28 +10,61 @@ Claude Code has built-in memory via `MEMORY.md` files. Here's why ClaudeMemory i
 |---|---|---|
 | **Retrieval** | Dumps entire file into system prompt | Semantic vector search — only relevant memories surfaced |
 | **Capacity** | Truncated at 200 lines | Unlimited — stores thousands, retrieves the best matches |
-| **Search** | Position-based (top of file = seen first) | Similarity-based (most relevant = seen first) |
+| **Search** | Position-based (top of file = seen first) | Hybrid FTS5 + vector similarity (most relevant = seen first) |
 | **Cross-project** | Per-project files, no sharing | Project scoping + global scope — preferences follow you everywhere |
 | **Maintenance** | Append-only text that gets stale | `update`, `merge`, `forget`, auto-expiring memories, conflict detection |
 | **Structure** | Flat text, no relationships | Knowledge graph — connect memories with typed edges, traverse on recall |
+| **Continuity** | No session awareness | Episodic memory, task checkpoints, clustering + consolidation |
 | **Privacy** | Plain text files | Local SQLite + on-device embeddings (MiniLM-L6). Nothing leaves your machine |
 
 **The one-liner:** MEMORY.md is 200 lines of flat text that gets stale. ClaudeMemory is a vector database that scales, searches semantically, and self-maintains.
 
 ## Tools
 
+### Core
+
 | Tool | Description |
 |------|-------------|
 | `remember` | Store a memory with semantic embedding. Conflict detection blocks near-duplicates (`force: true` to override). Optional `importance: 1-5` |
-| `recall` | Semantic search with project boosting, reinforcement scoring (frequency + importance + recency), and optional graph traversal (`depth: 1-3`) |
+| `recall` | Hybrid FTS5 + vector search with project boosting, reinforcement scoring (frequency + importance + recency), temporal filters (`since`/`before`), and optional graph traversal (`depth: 1-3`) |
 | `forget` | Delete by ID, topic, or project. Cascades edge cleanup |
 | `update` | Edit by ID or similarity — full replace, `append`, `prepend`, `find`+`replace`, or metadata-only (`topic`, `source`, `expires_in_days`, `importance`) |
 | `merge` | Consolidate multiple memories into one. Cleans up source edges |
-| `connect` | Create a directed edge between memories (`relates_to`, `contradicts`, `supersedes`, `derived_from`, `part_of`) |
-| `disconnect` | Remove edges by edge ID or by (from, to) pair |
-| `graph` | View a memory's neighborhood — shows connections up to a given depth |
 | `stats` | Database overview with per-project and per-topic breakdowns |
 | `list_topics` | List all topics with counts |
+| `timeline` | Chronological memory view grouped by day/week/month with project, topic, and temporal filters |
+
+### Knowledge Graph
+
+| Tool | Description |
+|------|-------------|
+| `connect` | Create a directed edge between memories (`relates_to`, `contradicts`, `supersedes`, `derived_from`, `part_of`, `summarized_by`) |
+| `disconnect` | Remove edges by edge ID or by (from, to) pair |
+| `graph` | View a memory's neighborhood — shows connections up to a given depth |
+
+### Task Continuity
+
+| Tool | Description |
+|------|-------------|
+| `checkpoint` | Save work-in-progress state (plan, progress, context) for cross-session resume |
+| `resume` | Load a task checkpoint and mark it active |
+| `list_tasks` | List tasks filtered by project and/or status (active, paused, completed) |
+
+### Episodic Memory
+
+| Tool | Description |
+|------|-------------|
+| `begin_episode` | Start a named session episode. Auto-closes any active episode |
+| `end_episode` | End an episode with optional summary |
+| `recall_episode` | Replay an episode's memories in chronological order |
+| `list_episodes` | List episodes filtered by project and/or status |
+
+### Clustering & Consolidation
+
+| Tool | Description |
+|------|-------------|
+| `find_clusters` | Discover groups of semantically similar memories by cosine distance |
+| `consolidate` | Create a summary memory from a cluster, deprioritize originals with `summarized_by` edges |
 
 ## Install
 
@@ -62,13 +95,17 @@ Removes the binary and MCP registration. Database is preserved at `~/.claude/mem
 ## How it works
 
 - **Embedding model**: [paraphrase-MiniLM-L6-v2](https://huggingface.co/sentence-transformers/paraphrase-MiniLM-L6-v2) runs locally via CoreML. 384-dimensional vectors.
-- **Storage**: SQLite via [Lattice](https://github.com/jflasher/Lattice) ORM with [sqlite-vec](https://github.com/asg017/sqlite-vec) for vector search.
+- **Storage**: SQLite via [Lattice](https://github.com/jsflax/lattice) ORM with [sqlite-vec](https://github.com/asg017/sqlite-vec) for vector search and FTS5 for full-text search.
 - **Transport**: stdio MCP — server starts with each Claude Code session, loads embedding model once, stays alive for the session duration.
+- **Hybrid search**: Recall combines FTS5 full-text search (any matching term qualifies) with vector cosine similarity. Falls back to FTS5-only if the embedding model is unavailable.
 - **Scoping**: Memories have `project` and `topic` fields. Project is a soft ranking signal — same-project and global memories rank higher, but cross-project results still surface if semantically relevant.
 - **Knowledge graph**: Connect memories with typed directed edges. Recall with `depth > 0` follows edges via BFS to surface connected knowledge. Edges auto-cleanup on forget/merge.
 - **Reinforcement scoring**: Recall ranking blends cosine similarity with three reinforcement signals — **frequency** (log-scaled access count, up to 15% boost), **importance** (explicit 1-5 rating, up to 20% boost), and **recency** (exponential decay from last access, up to 10% boost). Cosine similarity still dominates; reinforcement fine-tunes ordering among close matches.
 - **Conflict detection**: `remember` checks for near-duplicates (cosine distance < 0.12 same-project, < 0.05 cross-scope). Blocks storage with a warning; use `force: true` to override.
 - **Expiration**: Set `expires_in_days` for temporal context ("currently working on X"). Expired memories are filtered from recall automatically.
+- **Episodic memory**: Memories are automatically grouped into episodes. First `remember` creates an auto-episode; a >30 minute gap or project switch starts a new one. Explicit `begin_episode`/`end_episode` for named sessions.
+- **Task continuity**: `checkpoint` saves plan/progress/context state. `resume` restores it in a new session. Tasks persist across conversations.
+- **Clustering**: `find_clusters` uses greedy cosine-distance clustering to find related memory groups. `consolidate` creates a summary, deprioritizes originals (importance -> 0), and links them with `summarized_by` edges.
 
 ## Configuration
 
@@ -80,5 +117,5 @@ Removes the binary and MCP registration. Database is preserved at `~/.claude/mem
 ## Requirements
 
 - macOS (CoreML for embeddings)
-- Swift 6.0+
+- Swift 6.2+
 - Claude Code CLI
