@@ -56,16 +56,18 @@ public actor MemoryTools {
             Tool(
                 name: "remember",
                 description: """
-                    Store a memory for later recall. Use this to save important context, \
-                    preferences, patterns, decisions, or debugging insights. Memories are \
-                    embedded as vectors for semantic search.
+                    Store a memory for later recall. Keep each memory atomic and focused — \
+                    one concept or fact per memory. For complex topics, create a brief hub \
+                    memory first, then store details as child memories using `parent_id` to \
+                    automatically link them via `part_of` edges. This enables precise recall \
+                    and targeted updates. Memories are embedded as vectors for semantic search.
                     """,
                 inputSchema: .object([
                     "type": .string("object"),
                     "properties": .object([
                         "content": .object([
                             "type": .string("string"),
-                            "description": .string("The memory text to store. Be specific and self-contained — this should make sense without surrounding context."),
+                            "description": .string("The memory text to store. Keep it focused on a single concept — if you have multiple sections or topics, store them as separate memories using parent_id."),
                         ]),
                         "topic": .object([
                             "type": .string("string"),
@@ -78,6 +80,10 @@ public actor MemoryTools {
                         "source": .object([
                             "type": .string("string"),
                             "description": .string("Where this memory came from: 'conversation', 'code-review', 'debugging-session', or a file path."),
+                        ]),
+                        "parent_id": .object([
+                            "type": .string("integer"),
+                            "description": .string("ID of a parent/hub memory. Automatically creates a part_of edge from this memory to the parent. Use to build hierarchies: store a brief hub, then add detail memories as children."),
                         ]),
                         "expires_in_days": .object([
                             "type": .string("integer"),

@@ -124,10 +124,12 @@ struct RememberArgs: Decodable {
     let expiresInDays: FlexibleInt?
     let force: Bool?
     let importance: FlexibleInt?
+    let parentId: FlexibleInt?
 
     enum CodingKeys: String, CodingKey {
         case content, topic, project, source, force, importance
         case expiresInDays = "expires_in_days"
+        case parentId = "parent_id"
     }
 }
 

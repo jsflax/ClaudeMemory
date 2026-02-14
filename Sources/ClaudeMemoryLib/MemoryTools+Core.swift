@@ -89,11 +89,38 @@ extension MemoryTools {
         let memory = Memory(content: content, topic: topic, project: project, source: source, embedding: embeddingVec, expiresAt: expiresAt, importance: importance, episodeId: episodeId)
         lattice.add(memory)
 
+        // Auto-create part_of edge when parent_id is provided
+        var parentNote = ""
+        if let parentId = a.parentId?.value {
+            let pid = Int64(parentId)
+            guard lattice.objects(Memory.self).where({ $0.primaryKey == pid }).first != nil else {
+                throw MCPError.invalidParams("parent_id \(parentId) not found")
+            }
+            let edge = Edge(sourceId: memory.primaryKey!, targetId: pid, relation: "part_of")
+            lattice.add(edge)
+            parentNote = ", parent: \(parentId)"
+            log("Auto-created part_of edge: \(memory.primaryKey!) -> \(parentId)")
+        }
+
         let expiresNote = expiresAt == .distantFuture ? "" : ", expires: \(Self.dateFormatter.string(from: expiresAt))"
         let importanceNote = importance > 0 ? ", importance: \(importance)" : ""
         log("Stored memory [\(project)/\(topic)]: \(content.prefix(80))")
+
+        var response = "Stored memory (id: \(memory.primaryKey!), project: \(project), topic: \(topic)\(parentNote)\(expiresNote)\(importanceNote)): \(content.prefix(100))\(content.count > 100 ? "..." : "")"
+
+        // Nudge toward atomic memories when content is complex
+        let lines = content.components(separatedBy: "\n")
+        let headers = lines.filter { $0.hasPrefix("## ") || $0.hasPrefix("### ") }
+        if content.count > 1000 && headers.count >= 2 {
+            let names = headers.map {
+                $0.drop(while: { $0 == "#" || $0 == " " })
+            }
+            response += "\n\n💡 This memory has \(headers.count) sections (\(names.joined(separator: ", "))). "
+            response += "Consider storing each section as a child memory with `parent_id: \(memory.primaryKey!)` for more precise recall."
+        }
+
         return CallTool.Result(
-            content: [.text("Stored memory (id: \(memory.primaryKey!), project: \(project), topic: \(topic)\(expiresNote)\(importanceNote)): \(content.prefix(100))\(content.count > 100 ? "..." : "")")],
+            content: [.text(response)],
             isError: false
         )
     }
@@ -227,11 +254,35 @@ extension MemoryTools {
                 if !connected.isEmpty {
                     output += "\n\n--- Connected (graph traversal, depth: \(depth)) ---"
                     let connNow = Date()
+                    // Track all known IDs (recalled + connected so far) for edge lookup at depth>1
+                    var knownIds = recalledIds
                     for mem in connected {
                         mem.lastAccessedAt = connNow
                         mem.accessCount += 1
+
                         let expires = mem.expiresAt == .distantFuture ? "" : ", expires: \(Self.dateFormatter.string(from: mem.expiresAt))"
-                        output += "\n\n[id:\(mem.primaryKey!)] [\(mem.project)/\(mem.topic)]\(expires) \(mem.content)"
+                        let memId = mem.primaryKey!
+
+                        // Look up the edge relation connecting this memory to any known memory
+                        var edgeInfo = ""
+                        if let edge = lattice.objects(Edge.self).where({ $0.targetId == memId }).first(where: { knownIds.contains($0.sourceId) }) {
+                            edgeInfo = " <--[\(edge.relation)]-- [id:\(edge.sourceId)]"
+                        } else if let edge = lattice.objects(Edge.self).where({ $0.sourceId == memId }).first(where: { knownIds.contains($0.targetId) }) {
+                            edgeInfo = " --[\(edge.relation)]--> [id:\(edge.targetId)]"
+                        }
+                        knownIds.insert(memId)
+
+                        // Small memories shown in full; large ones get a compact preview
+                        if mem.content.count <= 500 {
+                            output += "\n\n[id:\(memId)] [\(mem.project)/\(mem.topic)]\(expires)\(edgeInfo) \(mem.content)"
+                        } else {
+                            let firstLine = mem.content.split(separator: "\n", maxSplits: 1).first.map(String.init) ?? mem.content
+                            let preview = String(firstLine.prefix(120))
+                            let charCount = mem.content.count
+                            let sectionCount = mem.content.components(separatedBy: "\n").filter { $0.hasPrefix("## ") || $0.hasPrefix("### ") }.count
+                            let sizeInfo = sectionCount > 0 ? "\(sectionCount) sections, \(charCount) chars" : "\(charCount) chars"
+                            output += "\n\n[id:\(memId)] [\(mem.project)/\(mem.topic)] (\(sizeInfo)\(expires))\(edgeInfo) \(preview)\(charCount > 120 ? "..." : "")"
+                        }
                     }
                 }
             }

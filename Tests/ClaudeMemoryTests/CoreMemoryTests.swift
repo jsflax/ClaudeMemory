@@ -1486,3 +1486,249 @@ import Foundation
     let output = text(from: result)
     #expect(output.contains("Lattice ORM"))
 }
+
+// MARK: - parent_id
+
+@Test func remember_withParentId_createsEdge() async throws {
+    let tools = try await makeTools()
+
+    // Create hub memory
+    let hub = try await tools.handle(CallTool.Parameters(
+        name: "remember",
+        arguments: ["content": .string("Project overview hub"), "project": .string("TestProj")]
+    ))
+    let hubId = extractId(from: text(from: hub))!
+
+    // Create child with parent_id
+    let child = try await tools.handle(CallTool.Parameters(
+        name: "remember",
+        arguments: [
+            "content": .string("Storage layer uses SQLite"),
+            "project": .string("TestProj"),
+            "parent_id": .int(hubId),
+        ]
+    ))
+    let childOutput = text(from: child)
+    #expect(childOutput.contains("parent: \(hubId)"))
+    let childId = extractId(from: childOutput)!
+
+    // Verify edge was created
+    let graph = try await tools.handle(CallTool.Parameters(
+        name: "graph",
+        arguments: ["id": .int(childId)]
+    ))
+    let graphOutput = text(from: graph)
+    #expect(graphOutput.contains("part_of"))
+    #expect(graphOutput.contains("[id:\(hubId)]"))
+}
+
+@Test func remember_withParentId_invalidParent_throws() async throws {
+    let tools = try await makeTools()
+    await #expect(throws: (any Error).self) {
+        try await tools.handle(CallTool.Parameters(
+            name: "remember",
+            arguments: [
+                "content": .string("Orphan memory"),
+                "parent_id": .int(99999),
+            ]
+        ))
+    }
+}
+
+@Test func remember_withParentId_recallShowsConnected() async throws {
+    let tools = try await makeTools()
+
+    let hub = try await tools.handle(CallTool.Parameters(
+        name: "remember",
+        arguments: ["content": .string("Architecture overview for recall test project"), "project": .string("RecallTest")]
+    ))
+    let hubId = extractId(from: text(from: hub))!
+
+    _ = try await tools.handle(CallTool.Parameters(
+        name: "remember",
+        arguments: [
+            "content": .string("The database layer uses Lattice ORM with SQLite backend"),
+            "project": .string("RecallTest"),
+            "parent_id": .int(hubId),
+        ]
+    ))
+
+    // Recall the child — hub should appear as connected
+    let result = try await tools.handle(CallTool.Parameters(
+        name: "recall",
+        arguments: ["query": .string("Lattice ORM SQLite database"), "depth": .int(1), "project": .string("RecallTest")]
+    ))
+    let output = text(from: result)
+    #expect(output.contains("Connected (graph traversal"))
+    #expect(output.contains("Architecture overview"))
+}
+
+// MARK: - Atomic memory nudge
+
+@Test func remember_largeMultiSection_showsNudge() async throws {
+    let tools = try await makeTools()
+
+    let longContent = """
+    ## Section One
+    \(String(repeating: "Detail about section one. ", count: 30))
+
+    ## Section Two
+    \(String(repeating: "Detail about section two. ", count: 30))
+
+    ## Section Three
+    \(String(repeating: "Detail about section three. ", count: 30))
+    """
+
+    let result = try await tools.handle(CallTool.Parameters(
+        name: "remember",
+        arguments: ["content": .string(longContent), "force": .bool(true)]
+    ))
+    let output = text(from: result)
+    #expect(output.contains("3 sections"))
+    #expect(output.contains("parent_id"))
+    #expect(output.contains("precise recall"))
+}
+
+@Test func remember_smallContent_noNudge() async throws {
+    let tools = try await makeTools()
+
+    let result = try await tools.handle(CallTool.Parameters(
+        name: "remember",
+        arguments: ["content": .string("Simple atomic fact about testing")]
+    ))
+    let output = text(from: result)
+    #expect(!output.contains("sections"))
+    #expect(!output.contains("parent_id"))
+}
+
+// MARK: - Connected memory display (compact vs full)
+
+@Test func recall_connectedSmallMemory_showsFullContent() async throws {
+    let tools = try await makeTools()
+
+    let hub = try await tools.handle(CallTool.Parameters(
+        name: "remember",
+        arguments: ["content": .string("Hub memory for display test of connected memories"), "project": .string("DisplayTest")]
+    ))
+    let hubId = extractId(from: text(from: hub))!
+
+    // Small child — under 500 chars
+    _ = try await tools.handle(CallTool.Parameters(
+        name: "remember",
+        arguments: [
+            "content": .string("Small detail: uses ARC for memory management"),
+            "project": .string("DisplayTest"),
+            "parent_id": .int(hubId),
+        ]
+    ))
+
+    let result = try await tools.handle(CallTool.Parameters(
+        name: "recall",
+        arguments: ["query": .string("Hub memory display test connected"), "depth": .int(1), "limit": .int(1), "project": .string("DisplayTest")]
+    ))
+    let output = text(from: result)
+    // Small connected memory should show full content (no "chars" size info)
+    #expect(output.contains("Small detail: uses ARC"))
+    #expect(!output.contains("chars)"))
+}
+
+@Test func recall_connectedLargeMemory_showsPreview() async throws {
+    let tools = try await makeTools()
+
+    let hub = try await tools.handle(CallTool.Parameters(
+        name: "remember",
+        arguments: ["content": .string("Hub memory for large display test"), "project": .string("LargeTest")]
+    ))
+    let hubId = extractId(from: text(from: hub))!
+
+    // Large child — over 500 chars
+    let largeContent = "## Detailed Architecture\n" + String(repeating: "This is a detailed explanation of the system architecture. ", count: 20)
+    _ = try await tools.handle(CallTool.Parameters(
+        name: "remember",
+        arguments: [
+            "content": .string(largeContent),
+            "project": .string("LargeTest"),
+            "parent_id": .int(hubId),
+            "force": .bool(true),
+        ]
+    ))
+
+    let result = try await tools.handle(CallTool.Parameters(
+        name: "recall",
+        arguments: ["query": .string("Hub memory large display test"), "depth": .int(1), "limit": .int(1), "project": .string("LargeTest")]
+    ))
+    let output = text(from: result)
+    // Large connected memory should show compact preview with size info
+    #expect(output.contains("chars)"))
+    #expect(output.contains("Detailed Architecture"))
+}
+
+// MARK: - Edge info in connected output
+
+@Test func recall_connectedMemory_showsEdgeRelation() async throws {
+    let tools = try await makeTools()
+
+    let r1 = try await tools.handle(CallTool.Parameters(
+        name: "remember",
+        arguments: ["content": .string("Kubernetes orchestrates containers across cloud clusters"), "force": .bool(true)]
+    ))
+    let r2 = try await tools.handle(CallTool.Parameters(
+        name: "remember",
+        arguments: ["content": .string("Docker images use layered filesystem for efficiency"), "force": .bool(true)]
+    ))
+    let id1 = extractId(from: text(from: r1))!
+    let id2 = extractId(from: text(from: r2))!
+
+    _ = try await tools.handle(CallTool.Parameters(
+        name: "connect",
+        arguments: ["from": .int(id2), "to": .int(id1), "relation": .string("part_of")]
+    ))
+
+    let result = try await tools.handle(CallTool.Parameters(
+        name: "recall",
+        arguments: ["query": .string("Kubernetes containers cloud clusters"), "depth": .int(1), "limit": .int(1)]
+    ))
+    let output = text(from: result)
+    #expect(output.contains("part_of"))
+}
+
+@Test func recall_depth2_showsEdgeForIntermediateNodes() async throws {
+    let tools = try await makeTools()
+
+    // Create a chain: A -> B -> C (distinct topics to avoid conflict detection)
+    let rA = try await tools.handle(CallTool.Parameters(
+        name: "remember",
+        arguments: ["content": .string("Photosynthesis converts sunlight into chemical energy in plants"), "force": .bool(true)]
+    ))
+    let rB = try await tools.handle(CallTool.Parameters(
+        name: "remember",
+        arguments: ["content": .string("Chloroplasts contain thylakoid membranes for light reactions"), "force": .bool(true)]
+    ))
+    let rC = try await tools.handle(CallTool.Parameters(
+        name: "remember",
+        arguments: ["content": .string("ATP synthase enzyme produces adenosine triphosphate molecules"), "force": .bool(true)]
+    ))
+    let idA = extractId(from: text(from: rA))!
+    let idB = extractId(from: text(from: rB))!
+    let idC = extractId(from: text(from: rC))!
+
+    _ = try await tools.handle(CallTool.Parameters(
+        name: "connect",
+        arguments: ["from": .int(idB), "to": .int(idA), "relation": .string("part_of")]
+    ))
+    _ = try await tools.handle(CallTool.Parameters(
+        name: "connect",
+        arguments: ["from": .int(idC), "to": .int(idB), "relation": .string("part_of")]
+    ))
+
+    // Recall A with depth 2 — should find B and C
+    let result = try await tools.handle(CallTool.Parameters(
+        name: "recall",
+        arguments: ["query": .string("photosynthesis sunlight chemical energy plants"), "depth": .int(2), "limit": .int(1)]
+    ))
+    let output = text(from: result)
+    #expect(output.contains("Chloroplasts"))
+    #expect(output.contains("ATP synthase"))
+    // C's edge should reference B (not A), verifying depth>1 edge lookup works
+    #expect(output.contains("part_of"))
+}
