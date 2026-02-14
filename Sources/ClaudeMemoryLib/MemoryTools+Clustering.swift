@@ -126,19 +126,42 @@ extension MemoryTools {
             }
             let avgSim = pairCount > 0 ? totalSim / Double(pairCount) : 0
 
+            // Compute pairwise distance standard deviation
+            var distances: [Double] = []
+            for a in cluster {
+                for b in cluster where a < b {
+                    if let dist = distanceCache[a]?[b] ?? distanceCache[b]?[a] {
+                        distances.append(dist)
+                    }
+                }
+            }
+            let meanDist = distances.isEmpty ? 0.0 : distances.reduce(0, +) / Double(distances.count)
+            let variance = distances.isEmpty ? 0.0 : distances.map { ($0 - meanDist) * ($0 - meanDist) }.reduce(0, +) / Double(distances.count)
+            let stdev = sqrt(variance)
+
             let topics = cluster.compactMap { memoryMap[$0]?.topic }
+            let uniqueTopics = Set(topics)
             let majorityTopic = Dictionary(grouping: topics, by: { $0 })
                 .max(by: { $0.value.count < $1.value.count })?.key ?? "general"
 
-            output += "\n## Cluster \(i + 1): \(majorityTopic) (\(cluster.count) memories)\n"
-            output += "Avg. similarity: \(String(format: "%.2f", avgSim))\n\n"
+            // Redundancy assessment
+            let assessment: String
+            if avgSim >= 0.95 && stdev <= 0.03 {
+                assessment = "⚠️ Likely redundant — good candidates for consolidation"
+            } else {
+                assessment = "ℹ️ Topically similar but may cover distinct aspects — review content carefully before consolidating"
+            }
+
+            output += "\n## Cluster \(i + 1): \(majorityTopic) (\(cluster.count) memories, \(uniqueTopics.count) topic(s))\n"
+            output += "Avg. similarity: \(String(format: "%.2f", avgSim)) | Distance stdev: \(String(format: "%.4f", stdev))\n"
+            output += "\(assessment)\n\n"
             for memId in cluster {
                 let content = memoryMap[memId]?.content ?? ""
                 let preview = String(content.prefix(120))
                 output += "[id:\(memId)] \(preview)\n"
             }
             let idList = cluster.map { String($0) }.joined(separator: ",")
-            output += "\nSuggested action: consolidate --ids \(idList)\n"
+            output += "\nIDs: \(idList)\n"
         }
 
         return CallTool.Result(content: [.text(output)], isError: false)

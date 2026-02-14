@@ -185,6 +185,11 @@ let server = Server(
         - When `recall` returns many similar memories on the same topic
         - During periodic maintenance of a project's memory space
         - When you notice fragmented knowledge that would be better as one coherent memory
+
+        **When NOT to consolidate:**
+        - When memories cover different subsystems/concerns of the same project — even if semantically similar, separate memories give better recall precision
+        - When memories are long, detailed references for distinct topics (e.g., "CI/CD" vs "recall algorithm")
+        - Semantic similarity ≠ redundancy. Two memories about the same project's architecture can be very similar in embedding space while covering completely different things
         """,
     capabilities: .init(tools: .init(listChanged: false))
 )

@@ -628,7 +628,10 @@ public actor MemoryTools {
                 description: """
                     Create a summary memory from a set of related memories. Originals are \
                     deprioritized (importance set to 0) and linked to the summary via \
-                    'summarized_by' edges. The summary gets an embedding for future recall.
+                    'summarized_by' edges. The summary gets an embedding for future recall. \
+                    Only consolidate memories with genuinely overlapping content — not \
+                    memories that are merely topically related. Separate memories for \
+                    distinct concerns give better recall precision.
                     """,
                 inputSchema: .object([
                     "type": .string("object"),

@@ -48,7 +48,10 @@ import Foundation
     let output = text(from: result)
     #expect(output.contains("cluster"))
     #expect(output.contains("Cluster 1"))
-    #expect(output.contains("consolidate"))
+    #expect(output.contains("IDs:"))
+    #expect(!output.contains("Suggested action"))
+    // Redundancy assessment should be present
+    #expect(output.contains("redundant") || output.contains("distinct aspects"))
     // At threshold=30, pasta/quantum should not cluster with Swift concurrency
     #expect(!output.contains("pasta"))
     #expect(!output.contains("quantum"))
@@ -173,6 +176,63 @@ import Foundation
     ))
     let output = text(from: result)
     #expect(output.contains("No clusters found"))
+}
+
+@Test func findClusters_showsRedundancyAssessment() async throws {
+    let tools = try await makeTools()
+
+    // Store nearly identical memories (should trigger "Likely redundant")
+    _ = try await tools.handle(CallTool.Parameters(
+        name: "remember",
+        arguments: ["content": .string("Swift uses ARC for memory management"), "topic": .string("memory"), "force": .bool(true)]
+    ))
+    _ = try await tools.handle(CallTool.Parameters(
+        name: "remember",
+        arguments: ["content": .string("Swift uses ARC for memory management automatically"), "topic": .string("memory"), "force": .bool(true)]
+    ))
+    _ = try await tools.handle(CallTool.Parameters(
+        name: "remember",
+        arguments: ["content": .string("Swift uses ARC for automatic memory management"), "topic": .string("memory"), "force": .bool(true)]
+    ))
+
+    let redundantResult = try await tools.handle(CallTool.Parameters(
+        name: "find_clusters",
+        arguments: ["min_cluster_size": .int(3), "distance_threshold": .int(30)]
+    ))
+    let redundantOutput = text(from: redundantResult)
+    // Nearly identical memories should show high similarity
+    #expect(redundantOutput.contains("Cluster 1"))
+    #expect(redundantOutput.contains("Distance stdev"))
+    #expect(redundantOutput.contains("topic(s)"))
+    #expect(redundantOutput.contains("IDs:"))
+}
+
+@Test func findClusters_showsDistinctAspectsForDiverseCluster() async throws {
+    let tools = try await makeTools()
+
+    // Store topically related but distinct memories (different topics)
+    _ = try await tools.handle(CallTool.Parameters(
+        name: "remember",
+        arguments: ["content": .string("Our app uses React for the frontend UI components"), "topic": .string("frontend"), "force": .bool(true)]
+    ))
+    _ = try await tools.handle(CallTool.Parameters(
+        name: "remember",
+        arguments: ["content": .string("Our app uses Express.js for the backend API server"), "topic": .string("backend"), "force": .bool(true)]
+    ))
+    _ = try await tools.handle(CallTool.Parameters(
+        name: "remember",
+        arguments: ["content": .string("Our app uses PostgreSQL for the database layer"), "topic": .string("database"), "force": .bool(true)]
+    ))
+
+    let diverseResult = try await tools.handle(CallTool.Parameters(
+        name: "find_clusters",
+        arguments: ["min_cluster_size": .int(3), "distance_threshold": .int(50)]
+    ))
+    let diverseOutput = text(from: diverseResult)
+    // If these cluster together, they should show "distinct aspects" due to different topics
+    if diverseOutput.contains("Cluster 1") {
+        #expect(diverseOutput.contains("distinct aspects"))
+    }
 }
 
 // MARK: - Consolidate
