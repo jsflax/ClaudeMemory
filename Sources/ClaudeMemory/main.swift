@@ -14,11 +14,22 @@ let dbPath = ProcessInfo.processInfo.environment["CLAUDE_MEMORY_DB"]
 
 // Ensure parent directory exists
 let dbDir = (dbPath as NSString).deletingLastPathComponent
-try FileManager.default.createDirectory(atPath: dbDir, withIntermediateDirectories: true)
+do {
+    try FileManager.default.createDirectory(atPath: dbDir, withIntermediateDirectories: true)
+} catch {
+    log("Failed to create database directory at \(dbDir): \(error)")
+    exit(1)
+}
 
 // MARK: - Init Lattice
 
-let lattice = try Lattice(Memory.self, Edge.self, Checkpoint.self, Episode.self, configuration: .init(fileURL: URL(fileURLWithPath: dbPath)))
+let lattice: Lattice
+do {
+    lattice = try Lattice(Memory.self, Edge.self, Checkpoint.self, Episode.self, configuration: .init(fileURL: URL(fileURLWithPath: dbPath)))
+} catch {
+    log("Failed to initialize database at \(dbPath): \(error)")
+    exit(1)
+}
 log("Database at \(dbPath)")
 
 // MARK: - Init Embedding Service
@@ -227,12 +238,27 @@ await server.withMethodHandler(ListTools.self) { _ in
 }
 
 await server.withMethodHandler(CallTool.self) { params in
-    try await tools.handle(params)
+    do {
+        return try await tools.handle(params)
+    } catch let error as MCPError {
+        throw error // MCP errors are expected — let the server return them to the client
+    } catch {
+        log("Unexpected error handling tool '\(params.name)': \(error)")
+        return CallTool.Result(
+            content: [.text("Internal error: \(error.localizedDescription)")],
+            isError: true
+        )
+    }
 }
 
 let transport = StdioTransport()
-try await server.start(transport: transport)
-log("Server started")
+do {
+    try await server.start(transport: transport)
+    log("Server started")
+} catch {
+    log("Server transport error: \(error)")
+    exit(1)
+}
 
 // Keep alive
 await server.waitUntilCompleted()

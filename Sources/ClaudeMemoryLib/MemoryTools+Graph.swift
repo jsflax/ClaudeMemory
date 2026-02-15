@@ -31,8 +31,9 @@ extension MemoryTools {
         let existing = lattice.objects(Edge.self)
             .where { $0.sourceId == fromId && $0.targetId == toId && $0.relation == relation }
         if let edge = existing.first {
+            let edgeId = edge.primaryKey.map(String.init) ?? "?"
             return CallTool.Result(
-                content: [.text("Edge already exists (edge id: \(edge.primaryKey!), \(fromId) --[\(relation)]--> \(toId)).")],
+                content: [.text("Edge already exists (edge id: \(edgeId), \(fromId) --[\(relation)]--> \(toId)).")],
                 isError: false
             )
         }
@@ -41,9 +42,13 @@ extension MemoryTools {
         let edge = Edge(sourceId: fromId, targetId: toId, relation: relation)
         lattice.add(edge)
 
+        guard let edgeId = edge.primaryKey else {
+            throw MCPError.internalError("Failed to persist edge — primaryKey is nil after add()")
+        }
+
         log("Connected [id:\(fromId)] --[\(relation)]--> [id:\(toId)]")
         return CallTool.Result(
-            content: [.text("Connected (edge id: \(edge.primaryKey!)) [id:\(fromId)] --[\(relation)]--> [id:\(toId)]")],
+            content: [.text("Connected (edge id: \(edgeId)) [id:\(fromId)] --[\(relation)]--> [id:\(toId)]")],
             isError: false
         )
     }
@@ -146,7 +151,7 @@ extension MemoryTools {
         var seenEdgeIds = Set<Int64>()
         var uniqueEdges: [Edge] = []
         for (edge, _) in allEdges {
-            let edgeId = edge.primaryKey!
+            guard let edgeId = edge.primaryKey else { continue }
             if !seenEdgeIds.contains(edgeId) {
                 seenEdgeIds.insert(edgeId)
                 uniqueEdges.append(edge)

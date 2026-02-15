@@ -57,9 +57,10 @@ extension MemoryTools {
                 var warning = "⚠️ Near-duplicate memory detected. The new memory was NOT stored.\n\nExisting similar memories:"
                 for match in conflicts {
                     let m = match.object
+                    guard let mId = m.primaryKey else { continue }
                     let dist = String(format: "%.3f", match.distance)
                     let jaccard = String(format: "%.0f%%", jaccardSimilarity(content, m.content) * 100)
-                    warning += "\n  [id:\(m.primaryKey!)] (distance: \(dist), term overlap: \(jaccard)) \(m.content)"
+                    warning += "\n  [id:\(mId)] (distance: \(dist), term overlap: \(jaccard)) \(m.content)"
                 }
                 warning += "\n\nTo resolve:"
                 warning += "\n  - Use `update(id: N, ...)` to modify the existing memory"
@@ -92,6 +93,10 @@ extension MemoryTools {
         let memory = Memory(content: content, topic: topic, project: project, source: source, embedding: embeddingVec, expiresAt: expiresAt, importance: importance, episodeId: episodeId)
         lattice.add(memory)
 
+        guard let memoryId = memory.primaryKey else {
+            throw MCPError.internalError("Failed to persist memory — primaryKey is nil after add()")
+        }
+
         // Auto-create part_of edge when parent_id is provided
         var parentNote = ""
         if let parentId = a.parentId?.value {
@@ -99,17 +104,17 @@ extension MemoryTools {
             guard lattice.objects(Memory.self).where({ $0.primaryKey == pid }).first != nil else {
                 throw MCPError.invalidParams("parent_id \(parentId) not found")
             }
-            let edge = Edge(sourceId: memory.primaryKey!, targetId: pid, relation: "part_of")
+            let edge = Edge(sourceId: memoryId, targetId: pid, relation: "part_of")
             lattice.add(edge)
             parentNote = ", parent: \(parentId)"
-            log("Auto-created part_of edge: \(memory.primaryKey!) -> \(parentId)")
+            log("Auto-created part_of edge: \(memoryId) -> \(parentId)")
         }
 
         let expiresNote = expiresAt == .distantFuture ? "" : ", expires: \(Self.dateFormatter.string(from: expiresAt))"
         let importanceNote = importance > 0 ? ", importance: \(importance)" : ""
         log("Stored memory [\(project)/\(topic)]: \(content.prefix(80))")
 
-        var response = "Stored memory (id: \(memory.primaryKey!), project: \(project), topic: \(topic)\(parentNote)\(expiresNote)\(importanceNote)): \(content.prefix(100))\(content.count > 100 ? "..." : "")"
+        var response = "Stored memory (id: \(memoryId), project: \(project), topic: \(topic)\(parentNote)\(expiresNote)\(importanceNote)): \(content.prefix(100))\(content.count > 100 ? "..." : "")"
 
         // Nudge toward atomic memories when content is complex
         let lines = content.components(separatedBy: "\n")
@@ -119,7 +124,7 @@ extension MemoryTools {
                 $0.drop(while: { $0 == "#" || $0 == " " })
             }
             response += "\n\n💡 This memory has \(headers.count) sections (\(names.joined(separator: ", "))). "
-            response += "Consider storing each section as a child memory with `parent_id: \(memory.primaryKey!)` for more precise recall."
+            response += "Consider storing each section as a child memory with `parent_id: \(memoryId)` for more precise recall."
         }
 
         return CallTool.Result(
@@ -238,21 +243,22 @@ extension MemoryTools {
                 match.object.accessCount += 1
             }
 
-            let lines = filtered.map { match in
+            let lines = filtered.compactMap { match -> String? in
                 let m = match.object
+                guard let mId = m.primaryKey else { return nil }
                 let dist = String(format: "%.3f", match.distance)
                 let ftsInfo = match.ftsRank.map { ", fts5: \(String(format: "%.3f", $0))" } ?? ""
                 let impInfo = m.importance > 0 ? ", importance: \(m.importance)" : ""
                 let expires = m.expiresAt == .distantFuture ? "" : ", expires: \(Self.dateFormatter.string(from: m.expiresAt))"
                 let created = hasTemporalFilter ? ", created: \(Self.dateFormatter.string(from: m.createdAt))" : ""
-                return "[id:\(m.primaryKey!)] [\(m.project)/\(m.topic)] (relevance: \(dist)\(ftsInfo)\(impInfo)\(expires)\(created)) \(m.content)"
+                return "[id:\(mId)] [\(m.project)/\(m.topic)] (relevance: \(dist)\(ftsInfo)\(impInfo)\(expires)\(created)) \(m.content)"
             }
 
             var output = lines.joined(separator: "\n\n")
 
             // Graph traversal when depth > 0
             if depth > 0 {
-                let recalledIds = Set(filtered.map { $0.object.primaryKey! })
+                let recalledIds = Set(filtered.compactMap { $0.object.primaryKey })
                 let connected = traverseGraph(from: recalledIds, depth: depth, excludeIds: recalledIds)
                 if !connected.isEmpty {
                     output += "\n\n--- Connected (graph traversal, depth: \(depth)) ---"
@@ -260,11 +266,11 @@ extension MemoryTools {
                     // Track all known IDs (recalled + connected so far) for edge lookup at depth>1
                     var knownIds = recalledIds
                     for mem in connected {
+                        guard let memId = mem.primaryKey else { continue }
                         mem.lastAccessedAt = connNow
                         mem.accessCount += 1
 
                         let expires = mem.expiresAt == .distantFuture ? "" : ", expires: \(Self.dateFormatter.string(from: mem.expiresAt))"
-                        let memId = mem.primaryKey!
 
                         // Look up the edge relation connecting this memory to any known memory
                         var edgeInfo = ""
@@ -304,7 +310,8 @@ extension MemoryTools {
                 let ftsInfo = match.distances["content"].map { " (fts5: \(String(format: "%.3f", $0)))" } ?? ""
                 let expires = m.expiresAt == .distantFuture ? "" : ", expires: \(Self.dateFormatter.string(from: m.expiresAt))"
                 let created = hasTemporalFilter ? ", created: \(Self.dateFormatter.string(from: m.createdAt))" : ""
-                lines.append("[id:\(m.primaryKey!)] [\(m.project)/\(m.topic)]\(ftsInfo)\(expires)\(created) \(m.content)")
+                guard let mId = m.primaryKey else { continue }
+                lines.append("[id:\(mId)] [\(m.project)/\(m.topic)]\(ftsInfo)\(expires)\(created) \(m.content)")
             }
             if lines.isEmpty {
                 return CallTool.Result(content: [.text("No memories found.")], isError: false)
@@ -502,9 +509,10 @@ extension MemoryTools {
         // 9. Update lastAccessedAt
         mem.lastAccessedAt = Date()
 
-        log("Updated memory [id:\(mem.primaryKey!)] [\(mem.project)/\(mem.topic)]: \(changes.joined(separator: ", "))")
+        let memId = mem.primaryKey.map(String.init) ?? "unknown"
+        log("Updated memory [id:\(memId)] [\(mem.project)/\(mem.topic)]: \(changes.joined(separator: ", "))")
         return CallTool.Result(
-            content: [.text("Updated memory (id: \(mem.primaryKey!), project: \(mem.project), topic: \(mem.topic)).\nChanges:\n\(changes.joined(separator: "\n"))")],
+            content: [.text("Updated memory (id: \(memId), project: \(mem.project), topic: \(mem.topic)).\nChanges:\n\(changes.joined(separator: "\n"))")],
             isError: false
         )
     }
@@ -546,8 +554,12 @@ extension MemoryTools {
         let merged = Memory(content: content, topic: topic, project: project, source: "merged", embedding: embeddingVec)
         lattice.add(merged)
 
+        guard let mergedId = merged.primaryKey else {
+            throw MCPError.internalError("Failed to persist merged memory — primaryKey is nil after add()")
+        }
+
         // Collect old content summaries before deleting
-        let oldSummaries = sources.map { "[id:\($0.primaryKey!)] \($0.content.prefix(60))" }
+        let oldSummaries = sources.map { "[id:\($0.primaryKey.map(String.init) ?? "?")] \($0.content.prefix(60))" }
 
         // Clean up edges referencing source memories
         let edgeCount = deleteEdgesForMemories(ids)
@@ -558,9 +570,9 @@ extension MemoryTools {
         }
 
         let edgeNote = edgeCount > 0 ? " Removed \(edgeCount) edge(s) from source memories." : ""
-        log("Merged \(ids.count) memories into [id:\(merged.primaryKey!)]")
+        log("Merged \(ids.count) memories into [id:\(mergedId)]")
         return CallTool.Result(
-            content: [.text("Merged \(ids.count) memories into new memory (id: \(merged.primaryKey!), project: \(project), topic: \(topic)).\(edgeNote)\n\nDeleted:\n\(oldSummaries.joined(separator: "\n"))\n\nNew:\n\(content)")],
+            content: [.text("Merged \(ids.count) memories into new memory (id: \(mergedId), project: \(project), topic: \(topic)).\(edgeNote)\n\nDeleted:\n\(oldSummaries.joined(separator: "\n"))\n\nNew:\n\(content)")],
             isError: false
         )
     }
@@ -740,7 +752,8 @@ extension MemoryTools {
             output += "## \(headerFormatter.string(from: group.key)) (\(countLabel))"
             for mem in group.memories {
                 let impInfo = mem.importance > 0 ? " [importance: \(mem.importance)]" : ""
-                output += "\n[id:\(mem.primaryKey!)] [\(mem.project)/\(mem.topic)]\(impInfo) \(mem.content)"
+                let memId = mem.primaryKey.map(String.init) ?? "?"
+                output += "\n[id:\(memId)] [\(mem.project)/\(mem.topic)]\(impInfo) \(mem.content)"
             }
         }
 

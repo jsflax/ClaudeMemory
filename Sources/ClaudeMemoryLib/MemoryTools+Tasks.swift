@@ -82,9 +82,12 @@ extension MemoryTools {
         )
         lattice.add(task)
 
-        log("Created task [task:\(task.primaryKey!)] \(title)")
+        guard let taskId = task.primaryKey else {
+            throw MCPError.internalError("Failed to persist task — primaryKey is nil after add()")
+        }
+        log("Created task [task:\(taskId)] \(title)")
         return CallTool.Result(
-            content: [.text("Created task (task:\(task.primaryKey!), status: \(task.status), project: \(task.project)): \(title)")],
+            content: [.text("Created task (task:\(taskId), status: \(task.status), project: \(task.project)): \(title)")],
             isError: false
         )
     }
@@ -152,10 +155,11 @@ extension MemoryTools {
             return CallTool.Result(content: [.text("No tasks found.")], isError: false)
         }
 
-        let lines = limited.map { task in
+        let lines = limited.compactMap { task -> String? in
+            guard let taskId = task.primaryKey else { return nil }
             let date = Self.dateFormatter.string(from: task.checkpointedAt)
             let progressPreview = task.progress.isEmpty ? "" : " — \(task.progress.prefix(80))"
-            return "[task:\(task.primaryKey!)] [\(task.status)] \(task.title) (\(task.project), checkpointed: \(date))\(progressPreview)"
+            return "[task:\(taskId)] [\(task.status)] \(task.title) (\(task.project), checkpointed: \(date))\(progressPreview)"
         }
 
         return CallTool.Result(content: [.text(lines.joined(separator: "\n"))], isError: false)

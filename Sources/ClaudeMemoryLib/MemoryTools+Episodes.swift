@@ -18,13 +18,17 @@ extension MemoryTools {
 
         let episode = Episode(title: title, project: project)
         lattice.add(episode)
-        activeEpisodeId = episode.primaryKey!
+
+        guard let episodeId = episode.primaryKey else {
+            throw MCPError.internalError("Failed to persist episode — primaryKey is nil after add()")
+        }
+        activeEpisodeId = episodeId
         isExplicitEpisode = true
         lastMemoryTime = Date()
 
-        log("Created episode [episode:\(episode.primaryKey!)] \(title)")
+        log("Created episode [episode:\(episodeId)] \(title)")
         return CallTool.Result(
-            content: [.text("Created episode (episode:\(episode.primaryKey!), project: \(project)): \(title)")],
+            content: [.text("Created episode (episode:\(episodeId), project: \(project)): \(title)")],
             isError: false
         )
     }
@@ -49,11 +53,15 @@ extension MemoryTools {
             episode = found
         }
 
+        guard let epId = episode.primaryKey else {
+            throw MCPError.internalError("Episode has no primaryKey")
+        }
+
         // Guard against ending an already-ended episode
         if episode.status == "ended" {
-            let memoryCount = lattice.count(Memory.self, where: { $0.episodeId == episode.primaryKey! })
+            let memoryCount = lattice.count(Memory.self, where: { $0.episodeId == epId })
             return CallTool.Result(
-                content: [.text("Episode \(episode.primaryKey!) (\(episode.title)) is already ended. Duration: \(formatDuration(from: episode.startedAt, to: episode.endedAt)), memories: \(memoryCount)")],
+                content: [.text("Episode \(epId) (\(episode.title)) is already ended. Duration: \(formatDuration(from: episode.startedAt, to: episode.endedAt)), memories: \(memoryCount)")],
                 isError: false
             )
         }
@@ -65,17 +73,17 @@ extension MemoryTools {
         }
 
         // Clear activeEpisodeId if it matches
-        if activeEpisodeId == episode.primaryKey {
+        if activeEpisodeId == epId {
             activeEpisodeId = nil
             isExplicitEpisode = false
         }
 
-        let memoryCount = lattice.count(Memory.self, where: { $0.episodeId == episode.primaryKey! })
+        let memoryCount = lattice.count(Memory.self, where: { $0.episodeId == epId })
         let duration = formatDuration(from: episode.startedAt, to: episode.endedAt)
 
-        log("Ended episode [episode:\(episode.primaryKey!)] \(episode.title)")
+        log("Ended episode [episode:\(epId)] \(episode.title)")
         return CallTool.Result(
-            content: [.text("Ended episode (episode:\(episode.primaryKey!), \(episode.title)). Duration: \(duration), memories: \(memoryCount)\(episode.summary.isEmpty ? "" : ", summary: \(episode.summary)")")],
+            content: [.text("Ended episode (episode:\(epId), \(episode.title)). Duration: \(duration), memories: \(memoryCount)\(episode.summary.isEmpty ? "" : ", summary: \(episode.summary)")")],
             isError: false
         )
     }
@@ -106,7 +114,7 @@ extension MemoryTools {
         }
 
         var output = "## Episode: \(episode.title)\n"
-        output += "**ID**: \(episode.primaryKey!) | **Project**: \(episode.project) | **Status**: \(episode.status) | **Duration**: \(duration)"
+        output += "**ID**: \(id64) | **Project**: \(episode.project) | **Status**: \(episode.status) | **Duration**: \(duration)"
         output += "\n**Started**: \(Self.dateFormatter.string(from: episode.startedAt))"
         if episode.status == "ended" {
             output += " | **Ended**: \(Self.dateFormatter.string(from: episode.endedAt))"
@@ -128,7 +136,8 @@ extension MemoryTools {
 
             for mem in memories {
                 let time = timeFormatter.string(from: mem.createdAt)
-                output += "\n[id:\(mem.primaryKey!)] [\(time)] \(mem.content)"
+                let memId = mem.primaryKey.map(String.init) ?? "?"
+                output += "\n[id:\(memId)] [\(time)] \(mem.content)"
             }
 
             if truncated {
@@ -167,11 +176,12 @@ extension MemoryTools {
             return CallTool.Result(content: [.text("No episodes found.")], isError: false)
         }
 
-        let lines = limited.map { ep in
-            let memCount = lattice.count(Memory.self, where: { $0.episodeId == ep.primaryKey! })
+        let lines = limited.compactMap { ep -> String? in
+            guard let epId = ep.primaryKey else { return nil }
+            let memCount = lattice.count(Memory.self, where: { $0.episodeId == epId })
             let startDate = Self.dateFormatter.string(from: ep.startedAt)
             let endDate = ep.status == "ended" ? Self.dateFormatter.string(from: ep.endedAt) : "ongoing"
-            return "[episode:\(ep.primaryKey!)] [\(ep.status)] \(ep.title) (\(ep.project), \(startDate) – \(endDate), \(memCount) memories)"
+            return "[episode:\(epId)] [\(ep.status)] \(ep.title) (\(ep.project), \(startDate) – \(endDate), \(memCount) memories)"
         }
 
         return CallTool.Result(content: [.text(lines.joined(separator: "\n"))], isError: false)
@@ -180,14 +190,19 @@ extension MemoryTools {
     // MARK: - Episode Helpers
 
     /// Create an auto-episode for the current session.
+    /// Returns the episode's primaryKey, or 0 if persistence failed.
     func createAutoEpisode(project: String) -> Int64 {
         let title = "Session: \(Self.isoDateFormatter.string(from: Date()))"
         let episode = Episode(title: title, project: project)
         lattice.add(episode)
-        activeEpisodeId = episode.primaryKey!
+        guard let epId = episode.primaryKey else {
+            log("Warning: auto-episode primaryKey is nil after add()")
+            return 0
+        }
+        activeEpisodeId = epId
         isExplicitEpisode = false
-        log("Auto-created episode [episode:\(episode.primaryKey!)] \(title)")
-        return episode.primaryKey!
+        log("Auto-created episode [episode:\(epId)] \(title)")
+        return epId
     }
 
     /// End the currently active episode (if any).

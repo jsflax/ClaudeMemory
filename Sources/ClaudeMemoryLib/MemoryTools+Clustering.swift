@@ -47,7 +47,7 @@ public func findMemoryClusters(
         var neighbors: [Int64] = []
         var dists: [Int64: Double] = [:]
         for match in matches {
-            let nId = match.object.primaryKey!
+            guard let nId = match.object.primaryKey else { continue }
             guard nId != memId, validIds.contains(nId) else { continue }
             let dist = match.distances["embedding"] ?? 1.0
             if dist <= distanceThreshold {
@@ -229,12 +229,16 @@ extension MemoryTools {
             importance: importance
         )
         lattice.add(summary)
-        let summaryId = summary.primaryKey!
+
+        guard let summaryId = summary.primaryKey else {
+            throw MCPError.internalError("Failed to persist summary — primaryKey is nil after add()")
+        }
 
         // Deprioritize originals (importance → 0) and create summarized_by edges
         for source in sources {
             source.importance = 0
-            let edge = Edge(sourceId: source.primaryKey!, targetId: summaryId, relation: "summarized_by")
+            guard let sourceId = source.primaryKey else { continue }
+            let edge = Edge(sourceId: sourceId, targetId: summaryId, relation: "summarized_by")
             lattice.add(edge)
         }
 
