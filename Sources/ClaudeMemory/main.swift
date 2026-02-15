@@ -58,10 +58,11 @@ let server = Server(
         - When in doubt, use the project scope — it's better to be specific than to pollute global.
 
         ## Conflict detection
-        `remember` automatically checks for near-duplicate memories before storing. \
-        Same-project matches use cosine distance < 0.12; cross-scope matches (global↔project) \
-        use a tighter threshold of 0.05. If a near-duplicate is found, the memory is NOT \
-        stored — instead you'll see the existing memory and suggestions. To resolve:
+        `remember` checks for near-duplicates using both embedding distance AND term overlap \
+        (Jaccard similarity). A memory is only blocked if it's close in embedding space (cosine \
+        distance < 0.12 same-project, < 0.05 cross-scope) AND shares 40%+ of its terms with an \
+        existing memory. This avoids false positives from topically similar but distinct memories. \
+        If blocked, you'll see the existing memory and suggestions. To resolve:
         - Use `update` to modify the existing memory
         - Use `remember` with `force: true` to keep both (e.g., if they're related but distinct)
         - Use `forget` to remove the old one, then `remember` the new one

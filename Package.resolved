@@ -1,5 +1,5 @@
 {
-  "originHash" : "4a30d5d151b9cfa05c30aae26f3dce9573c3968d152fb78f804fc298ef58d42c",
+  "originHash" : "16a11ec49315d9222969969e0d79fd3f2ee08584e1f09d810884d8308c5ef4d2",
   "pins" : [
     {
       "identity" : "async-http-client",
@@ -88,7 +88,7 @@
       "location" : "https://github.com/jsflax/lattice.git",
       "state" : {
         "branch" : "main",
-        "revision" : "a72bc2d925bcc6ab705aefa00f8912e0e07bb9d6"
+        "revision" : "4763c0cd4fcfcd6714c2b56518b714e2fc766554"
       }
     },
     {

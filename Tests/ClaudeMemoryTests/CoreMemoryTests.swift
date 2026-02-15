@@ -555,6 +555,62 @@ import Foundation
     #expect(text(from: stats).contains("Total memories: 2"))
 }
 
+@Test func remember_conflictDetection_lowTermOverlap_allows() async throws {
+    let tools = try await makeTools()
+
+    // Store a memory about Swift concurrency actors
+    _ = try await tools.handle(CallTool.Parameters(
+        name: "remember",
+        arguments: [
+            "content": .string("Swift concurrency uses actors for thread safety and data isolation"),
+            "project": .string("SwiftNotes"),
+        ]
+    ))
+
+    // Store a topically similar but informationally distinct memory
+    // Embeddings will be close (both about Swift concurrency) but term overlap is low
+    let result = try await tools.handle(CallTool.Parameters(
+        name: "remember",
+        arguments: [
+            "content": .string("Swift concurrency provides structured tasks with automatic cancellation propagation"),
+            "project": .string("SwiftNotes"),
+        ]
+    ))
+    let output = text(from: result)
+    #expect(output.contains("Stored memory"))
+
+    let stats = try await tools.handle(CallTool.Parameters(
+        name: "stats",
+        arguments: ["project": .string("SwiftNotes")]
+    ))
+    #expect(text(from: stats).contains("Total memories: 2"))
+}
+
+@Test func jaccardSimilarity_basic() {
+    // Identical strings
+    #expect(jaccardSimilarity("hello world test", "hello world test") == 1.0)
+
+    // Complete overlap (subset)
+    let j1 = jaccardSimilarity("Lattice uses SQLite", "Lattice uses SQLite as its database")
+    #expect(j1 >= 0.4) // 3 shared out of 5 unique terms (3+ chars)
+
+    // Low overlap — different content, same domain
+    let j2 = jaccardSimilarity(
+        "Lattice uses actors for thread safety and data isolation",
+        "Lattice provides structured tasks with automatic cancellation propagation"
+    )
+    #expect(j2 < 0.4)
+
+    // No overlap
+    #expect(jaccardSimilarity("apple banana cherry", "dog elephant fox") == 0.0)
+
+    // Empty strings
+    #expect(jaccardSimilarity("", "") == 0.0)
+
+    // Short tokens filtered out (< 3 chars)
+    #expect(jaccardSimilarity("a is to", "a is to") == 0.0)
+}
+
 // MARK: - Update
 
 @Test func update_existingMemory() async throws {

@@ -2,6 +2,8 @@
 
 A local MCP server that gives Claude Code persistent, semantic memory across sessions.
 
+![Demo](claude_memory_graph.gif)
+
 ## Why not MEMORY.md?
 
 Claude Code has built-in memory via `MEMORY.md` files. Here's why ClaudeMemory is better:

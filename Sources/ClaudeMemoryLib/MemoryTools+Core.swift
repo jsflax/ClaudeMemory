@@ -39,7 +39,8 @@ extension MemoryTools {
         }
 
         // Conflict detection: check for near-duplicates before storing
-        // Uses tiered thresholds: 0.12 for same-project, 0.05 for cross-scope (global↔project)
+        // Requires BOTH close embedding distance AND high term overlap (Jaccard >= 0.4)
+        // to avoid false positives from topically similar but informationally distinct memories
         if a.force != true && !embeddingVec.isEmpty {
             let candidates = lattice.objects(Memory.self)
                 .where { $0.expiresAt > Date() }
@@ -49,14 +50,16 @@ extension MemoryTools {
             let conflicts = candidates.filter { match in
                 let sameProject = match.object.project == project
                 let threshold = sameProject ? 0.12 : 0.05
-                return match.distance < threshold
+                guard match.distance < threshold else { return false }
+                return jaccardSimilarity(content, match.object.content) >= 0.4
             }
             if !conflicts.isEmpty {
                 var warning = "⚠️ Near-duplicate memory detected. The new memory was NOT stored.\n\nExisting similar memories:"
                 for match in conflicts {
                     let m = match.object
                     let dist = String(format: "%.3f", match.distance)
-                    warning += "\n  [id:\(m.primaryKey!)] (distance: \(dist)) \(m.content)"
+                    let jaccard = String(format: "%.0f%%", jaccardSimilarity(content, m.content) * 100)
+                    warning += "\n  [id:\(m.primaryKey!)] (distance: \(dist), term overlap: \(jaccard)) \(m.content)"
                 }
                 warning += "\n\nTo resolve:"
                 warning += "\n  - Use `update(id: N, ...)` to modify the existing memory"

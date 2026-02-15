@@ -40,6 +40,16 @@ let package = Package(
                 .interoperabilityMode(.Cxx),
             ]
         ),
+        .executableTarget(
+            name: "MemoryVisualizer",
+            dependencies: [
+                "ClaudeMemoryLib",
+                .product(name: "Lattice", package: "Lattice"),
+            ],
+            swiftSettings: [
+                .interoperabilityMode(.Cxx),
+            ]
+        ),
         .testTarget(
             name: "ClaudeMemoryTests",
             dependencies: [

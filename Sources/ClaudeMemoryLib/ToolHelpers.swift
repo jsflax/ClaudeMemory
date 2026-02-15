@@ -221,6 +221,22 @@ struct TimelineArgs: Decodable {
     }
 }
 
+/// Compute Jaccard similarity between two strings based on unique lowercased terms (3+ chars).
+/// Returns a value between 0.0 (no overlap) and 1.0 (identical term sets).
+public func jaccardSimilarity(_ a: String, _ b: String) -> Double {
+    func tokenize(_ s: String) -> Set<String> {
+        Set(
+            s.lowercased()
+                .components(separatedBy: .alphanumerics.inverted)
+                .filter { $0.count >= 3 }
+        )
+    }
+    let setA = tokenize(a)
+    let setB = tokenize(b)
+    guard !setA.isEmpty || !setB.isEmpty else { return 0.0 }
+    return Double(setA.intersection(setB).count) / Double(setA.union(setB).count)
+}
+
 /// Valid relation types for knowledge graph edges.
 let validRelations: Set<String> = [
     "relates_to", "contradicts", "supersedes", "derived_from", "part_of", "summarized_by",

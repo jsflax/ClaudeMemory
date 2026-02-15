@@ -13,18 +13,18 @@ import Foundation
 @Model
 public final class Edge {
     /// The primary key of the source memory.
-    var sourceId: Int64
+    public var sourceId: Int64
 
     /// The primary key of the target memory.
-    var targetId: Int64
+    public var targetId: Int64
 
     /// The relationship type (e.g., "relates_to", "contradicts", "supersedes").
-    var relation: String
+    public var relation: String
 
     /// When this edge was created.
-    var createdAt: Date
+    public var createdAt: Date
 
-    init(
+    public init(
         sourceId: Int64,
         targetId: Int64,
         relation: String,
