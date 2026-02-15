@@ -2,6 +2,63 @@ import Lattice
 import MCP
 import Foundation
 
+// MARK: - Direct Access (for hooks)
+
+extension MemoryTools {
+    /// Perform a recall and return the text result directly, without MCP framing.
+    /// Used by the hooks binary to inject recalled memories as context.
+    public func directRecall(query: String, project: String?, depth: Int = 1, limit: Int = 5) async throws -> String? {
+        var args: [String: Value] = ["query": .string(query)]
+        if let project {
+            args["project"] = .string(project)
+        }
+        args["depth"] = .int(depth)
+        args["limit"] = .int(limit)
+        let result = try await handleRecall(args)
+        // Extract text from the CallTool.Result
+        guard let textContent = result.content.first else { return nil }
+        switch textContent {
+        case .text(let text):
+            return text == "No memories found." ? nil : text
+        default:
+            return nil
+        }
+    }
+}
+
+// MARK: - CRUD Operation Tracking
+
+extension MemoryTools {
+    /// Increment the CRUD operation counter in HookState.
+    /// Called after successful remember, forget, update, merge, consolidate.
+    func incrementCrudCounter() {
+        let current = Int(lattice.objects(HookState.self)
+            .where { $0.key == .crudOperationCount }
+            .first?.value ?? "0") ?? 0
+        let newCount = current + 1
+        if let existing = lattice.objects(HookState.self).where({ $0.key == .crudOperationCount }).first {
+            existing.value = String(newCount)
+            existing.updatedAt = Date()
+        } else {
+            lattice.add(HookState(key: .crudOperationCount, value: String(newCount)))
+        }
+    }
+
+    /// Reset the maintenance baseline to the current CRUD op count.
+    /// Called after organize/consolidate — the actual maintenance actions.
+    func resetMaintenanceBaseline() {
+        let opCount = lattice.objects(HookState.self)
+            .where { $0.key == .crudOperationCount }
+            .first?.value ?? "0"
+        if let existing = lattice.objects(HookState.self).where({ $0.key == .maintenanceLastOpCount }).first {
+            existing.value = opCount
+            existing.updatedAt = Date()
+        } else {
+            lattice.add(HookState(key: .maintenanceLastOpCount, value: opCount))
+        }
+    }
+}
+
 // MARK: - CRUD + Search + Timeline
 
 extension MemoryTools {
@@ -38,59 +95,61 @@ extension MemoryTools {
             embeddingVec = Vector<Float>(floats)
         }
 
-        // Conflict detection: check for near-duplicates before storing
-        // Requires BOTH close embedding distance AND high term overlap (Jaccard >= 0.4)
-        // to avoid false positives from topically similar but informationally distinct memories
-        if a.force != true && !embeddingVec.isEmpty {
-            let candidates = lattice.objects(Memory.self)
-                .where { $0.expiresAt > Date() }
-                .where { $0.project == project || $0.project == "global" }
-                .nearest(to: embeddingVec, on: \.embedding, limit: 5, distance: .cosine)
+        // Conflict detection + auto-connect candidate gathering
+        // Search is done outside the force guard so auto-connect candidates survive force=true
+        var autoConnectCandidates: [(object: Memory, distance: Double)] = []
 
-            let conflicts = candidates.filter { match in
-                let sameProject = match.object.project == project
-                let threshold = sameProject ? 0.12 : 0.05
-                guard match.distance < threshold else { return false }
-                return jaccardSimilarity(content, match.object.content) >= 0.4
-            }
-            if !conflicts.isEmpty {
-                var warning = "⚠️ Near-duplicate memory detected. The new memory was NOT stored.\n\nExisting similar memories:"
-                for match in conflicts {
-                    let m = match.object
-                    guard let mId = m.primaryKey else { continue }
-                    let dist = String(format: "%.3f", match.distance)
-                    let jaccard = String(format: "%.0f%%", jaccardSimilarity(content, m.content) * 100)
-                    warning += "\n  [id:\(mId)] (distance: \(dist), term overlap: \(jaccard)) \(m.content)"
+        if !embeddingVec.isEmpty && topic != "episode" {
+            let candidates = lattice.objects(Memory.self)
+                .where { $0.expiresAt > Date() && $0.topic != "episode" }
+                .where { $0.project == project || $0.project == "global" }
+                .nearest(to: embeddingVec, on: \.embedding, limit: 8, distance: .cosine)
+
+            // Conflict detection (unchanged behavior, just nested under force guard)
+            if a.force != true {
+                let conflicts = candidates.filter { match in
+                    let sameProject = match.object.project == project
+                    let threshold = sameProject ? 0.12 : 0.05
+                    guard match.distance < threshold else { return false }
+                    return jaccardSimilarity(content, match.object.content) >= 0.4
                 }
-                warning += "\n\nTo resolve:"
-                warning += "\n  - Use `update(id: N, ...)` to modify the existing memory"
-                warning += "\n  - Use `remember(..., force: true)` to keep both"
-                warning += "\n  - Use `forget(id: N)` to remove the old one, then `remember` the new one"
-                log("Conflict detected for: \(content.prefix(80))")
-                return CallTool.Result(content: [.text(warning)], isError: false)
+                if !conflicts.isEmpty {
+                    var warning = "⚠️ Near-duplicate memory detected. The new memory was NOT stored.\n\nExisting similar memories:"
+                    for match in conflicts {
+                        let m = match.object
+                        guard let mId = m.primaryKey else { continue }
+                        let dist = String(format: "%.3f", match.distance)
+                        let jaccard = String(format: "%.0f%%", jaccardSimilarity(content, m.content) * 100)
+                        warning += "\n  [id:\(mId)] (distance: \(dist), term overlap: \(jaccard)) \(m.content)"
+                    }
+                    warning += "\n\nTo resolve:"
+                    warning += "\n  - Use `update(id: N, ...)` to modify the existing memory"
+                    warning += "\n  - Use `remember(..., force: true)` to keep both"
+                    warning += "\n  - Use `forget(id: N)` to remove the old one, then `remember` the new one"
+                    log("Conflict detected for: \(content.prefix(80))")
+                    return CallTool.Result(content: [.text(warning)], isError: false)
+                }
             }
+
+            // Gather auto-connect candidates (beyond conflict zone, within relatedness threshold)
+            autoConnectCandidates = candidates.compactMap { match in
+                let sameProject = match.object.project == project
+                let conflictThreshold = sameProject ? 0.12 : 0.05
+                guard match.distance >= conflictThreshold && match.distance < 0.20 else { return nil }
+                return (object: match.object, distance: match.distance)
+            }
+            autoConnectCandidates.sort { $0.distance < $1.distance }
+            autoConnectCandidates = Array(autoConnectCandidates.prefix(3))
         }
 
-        // Auto-episode: create or reuse episode for this session
-        let episodeId: Int64
-        if let active = activeEpisodeId {
+        // Episode: end stale episodes on 30-min gap
+        if activeEpisodeId != nil {
             let gap = Date().timeIntervalSince(lastMemoryTime)
-            if gap > 1800 { // 30 minutes
-                endActiveEpisode()
-                episodeId = createAutoEpisode(project: project)
-            } else if !isExplicitEpisode, let ep = lattice.objects(Episode.self).where({ $0.primaryKey == active }).first, ep.project != project {
-                // Auto-episode project mismatch — start a new one for this project
-                endActiveEpisode()
-                episodeId = createAutoEpisode(project: project)
-            } else {
-                episodeId = active
-            }
-        } else {
-            episodeId = createAutoEpisode(project: project)
+            if gap > 1800 { endActiveEpisode() }
         }
         lastMemoryTime = Date()
 
-        let memory = Memory(content: content, topic: topic, project: project, source: source, embedding: embeddingVec, expiresAt: expiresAt, importance: importance, episodeId: episodeId)
+        let memory = Memory(content: content, topic: topic, project: project, source: source, embedding: embeddingVec, expiresAt: expiresAt, importance: importance)
         lattice.add(memory)
 
         guard let memoryId = memory.primaryKey else {
@@ -110,11 +169,142 @@ extension MemoryTools {
             log("Auto-created part_of edge: \(memoryId) -> \(parentId)")
         }
 
+        // Link to active episode via part_of edge
+        if let epId = activeEpisodeId {
+            let edge = Edge(sourceId: memoryId, targetId: epId, relation: "part_of")
+            lattice.add(edge)
+            log("Linked memory \(memoryId) to episode \(epId)")
+        }
+
+        // Auto-connect: create relates_to edges to semantically similar memories
+        var autoLinkedIds: [Int64] = []
+        let parentIdValue: Int64? = a.parentId.map { Int64($0.value) }
+
+        for candidate in autoConnectCandidates {
+            guard let targetId = candidate.object.primaryKey else { continue }
+            // Skip if already linked as parent or episode
+            if let pid = parentIdValue, targetId == pid { continue }
+            if let epId = activeEpisodeId, targetId == epId { continue }
+            // Dedup: check both directions
+            let hasEdge = lattice.objects(Edge.self)
+                .where { ($0.sourceId == memoryId && $0.targetId == targetId && $0.relation == "relates_to")
+                      || ($0.sourceId == targetId && $0.targetId == memoryId && $0.relation == "relates_to") }
+                .first != nil
+            guard !hasEdge else { continue }
+
+            let edge = Edge(sourceId: memoryId, targetId: targetId, relation: "relates_to")
+            lattice.add(edge)
+            autoLinkedIds.append(targetId)
+            log("Auto-connected [\(memoryId)] --[relates_to]--> [\(targetId)] (distance: \(String(format: "%.3f", candidate.distance)))")
+        }
+
+        // Cross-project hub linking: if content mentions another project by name, link to its hub
+        if topic != "episode" {
+            let allProjects = Set(
+                lattice.objects(Memory.self)
+                    .snapshot()
+                    .map(\.project)
+            ).subtracting([project, "global"])
+
+            for otherProject in allProjects {
+                guard otherProject.count >= 3 else { continue }
+
+                let pattern = "\\b\(NSRegularExpression.escapedPattern(for: otherProject))\\b"
+                guard let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive),
+                      regex.firstMatch(in: content, range: NSRange(content.startIndex..., in: content)) != nil
+                else { continue }
+
+                // Find hub: the memory with the most incoming part_of edges
+                let projectMemories = lattice.objects(Memory.self)
+                    .where { $0.project == otherProject && $0.topic != "episode" }
+                    .snapshot()
+
+                var bestHub: (id: Int64, count: Int)? = nil
+                for mem in projectMemories {
+                    guard let memId = mem.primaryKey else { continue }
+                    let incomingCount = lattice.objects(Edge.self)
+                        .where { $0.targetId == memId && $0.relation == "part_of" }
+                        .count
+                    if incomingCount > 0 && (bestHub == nil || incomingCount > bestHub!.count) {
+                        bestHub = (id: memId, count: incomingCount)
+                    }
+                }
+
+                guard let hub = bestHub else { continue }
+
+                let alreadyLinked = lattice.objects(Edge.self)
+                    .where { ($0.sourceId == memoryId && $0.targetId == hub.id && $0.relation == "relates_to")
+                          || ($0.sourceId == hub.id && $0.targetId == memoryId && $0.relation == "relates_to") }
+                    .first != nil
+                guard !alreadyLinked else { continue }
+
+                let edge = Edge(sourceId: memoryId, targetId: hub.id, relation: "relates_to")
+                lattice.add(edge)
+                autoLinkedIds.append(hub.id)
+                log("Cross-project link [\(memoryId)] --[relates_to]--> [\(hub.id)] (project '\(otherProject)' mentioned in content)")
+            }
+        }
+
+        // Incremental topic/hub inference from auto-connect neighbors
+        if !autoConnectCandidates.isEmpty {
+            var hubCounts: [Int64: Int] = [:]
+            var topicCounts: [String: Int] = [:]
+
+            for candidate in autoConnectCandidates {
+                guard let candidateId = candidate.object.primaryKey else { continue }
+                // Find hubs this neighbor belongs to (outgoing part_of to non-episode memory)
+                for edge in lattice.objects(Edge.self)
+                    .where({ $0.sourceId == candidateId && $0.relation == "part_of" }) {
+                    if lattice.objects(Memory.self)
+                        .where({ $0.primaryKey == edge.targetId && $0.topic != "episode" }).first != nil {
+                        hubCounts[edge.targetId, default: 0] += 1
+                    }
+                }
+                // Check if this neighbor IS a hub (has incoming part_of edges)
+                if candidate.object.topic != "episode" {
+                    let hasIncoming = lattice.objects(Edge.self)
+                        .where { $0.targetId == candidateId && $0.relation == "part_of" }
+                        .first != nil
+                    if hasIncoming {
+                        hubCounts[candidateId, default: 0] += 1
+                    }
+                }
+                // Count non-generic topics
+                let t = candidate.object.topic
+                if t != "general" && t != "episode" {
+                    topicCounts[t, default: 0] += 1
+                }
+            }
+
+            // Auto-link to hub if >= 2 neighbors share one
+            if let (hubId, count) = hubCounts.max(by: { $0.value < $1.value }),
+               count >= 2,
+               parentIdValue.map({ $0 != hubId }) ?? true {
+                let alreadyLinked = lattice.objects(Edge.self)
+                    .where { $0.sourceId == memoryId && $0.targetId == hubId && $0.relation == "part_of" }
+                    .first != nil
+                if !alreadyLinked {
+                    let edge = Edge(sourceId: memoryId, targetId: hubId, relation: "part_of")
+                    lattice.add(edge)
+                    log("Auto-organized [\(memoryId)] into hub [\(hubId)]")
+                }
+            }
+
+            // Inherit topic if neighbors agree and Claude used "general"
+            if topic == "general",
+               let (consensusTopic, count) = topicCounts.max(by: { $0.value < $1.value }),
+               count >= 2 {
+                memory.topic = consensusTopic
+                log("Auto-inferred topic '\(consensusTopic)' for [\(memoryId)]")
+            }
+        }
+
         let expiresNote = expiresAt == .distantFuture ? "" : ", expires: \(Self.dateFormatter.string(from: expiresAt))"
         let importanceNote = importance > 0 ? ", importance: \(importance)" : ""
+        let autoLinkNote = autoLinkedIds.isEmpty ? "" : ", auto-linked to \(autoLinkedIds.map { "[id:\($0)]" }.joined(separator: ", "))"
         log("Stored memory [\(project)/\(topic)]: \(content.prefix(80))")
 
-        var response = "Stored memory (id: \(memoryId), project: \(project), topic: \(topic)\(parentNote)\(expiresNote)\(importanceNote)): \(content.prefix(100))\(content.count > 100 ? "..." : "")"
+        var response = "Stored memory (id: \(memoryId), project: \(project), topic: \(topic)\(parentNote)\(expiresNote)\(importanceNote)\(autoLinkNote)): \(content.prefix(100))\(content.count > 100 ? "..." : "")"
 
         // Nudge toward atomic memories when content is complex
         let lines = content.components(separatedBy: "\n")
@@ -127,6 +317,7 @@ extension MemoryTools {
             response += "Consider storing each section as a child memory with `parent_id: \(memoryId)` for more precise recall."
         }
 
+        incrementCrudCounter()
         return CallTool.Result(
             content: [.text(response)],
             isError: false
@@ -340,6 +531,7 @@ extension MemoryTools {
             lattice.delete(Memory.self, where: { $0.primaryKey == id64 })
             let edgeNote = edgeCount > 0 ? " Removed \(edgeCount) edge(s)." : ""
             log("Deleted memory [id:\(id)]: \(summary)")
+            incrementCrudCounter()
             return CallTool.Result(
                 content: [.text("Deleted memory (id: \(id), project: \(mem.project), topic: \(mem.topic)): \(summary)\(edgeNote)")],
                 isError: false
@@ -354,6 +546,7 @@ extension MemoryTools {
             let count = memoryIds.count
             lattice.delete(Memory.self, where: { $0.topic == topic && $0.project == project })
             let edgeNote = edgeCount > 0 ? " Removed \(edgeCount) edge(s)." : ""
+            incrementCrudCounter()
             return CallTool.Result(
                 content: [.text("Deleted \(count) memories (project: \(project), topic: \(topic)).\(edgeNote)")],
                 isError: false
@@ -365,6 +558,7 @@ extension MemoryTools {
             let count = memoryIds.count
             lattice.delete(Memory.self, where: { $0.topic == topic })
             let edgeNote = edgeCount > 0 ? " Removed \(edgeCount) edge(s)." : ""
+            incrementCrudCounter()
             return CallTool.Result(
                 content: [.text("Deleted \(count) memories with topic '\(topic)'.\(edgeNote)")],
                 isError: false
@@ -376,6 +570,7 @@ extension MemoryTools {
             let count = memoryIds.count
             lattice.delete(Memory.self, where: { $0.project == project })
             let edgeNote = edgeCount > 0 ? " Removed \(edgeCount) edge(s)." : ""
+            incrementCrudCounter()
             return CallTool.Result(
                 content: [.text("Deleted \(count) memories for project '\(project)'.\(edgeNote)")],
                 isError: false
@@ -511,6 +706,11 @@ extension MemoryTools {
 
         let memId = mem.primaryKey.map(String.init) ?? "unknown"
         log("Updated memory [id:\(memId)] [\(mem.project)/\(mem.topic)]: \(changes.joined(separator: ", "))")
+        // Count as CRUD op unless only the topic changed
+        let hasNonTopicChange = contentChanged || a.source != nil || a.expiresInDays != nil || a.importance != nil
+        if hasNonTopicChange {
+            incrementCrudCounter()
+        }
         return CallTool.Result(
             content: [.text("Updated memory (id: \(memId), project: \(mem.project), topic: \(mem.topic)).\nChanges:\n\(changes.joined(separator: "\n"))")],
             isError: false
@@ -571,6 +771,7 @@ extension MemoryTools {
 
         let edgeNote = edgeCount > 0 ? " Removed \(edgeCount) edge(s) from source memories." : ""
         log("Merged \(ids.count) memories into [id:\(mergedId)]")
+        incrementCrudCounter()
         return CallTool.Result(
             content: [.text("Merged \(ids.count) memories into new memory (id: \(mergedId), project: \(project), topic: \(topic)).\(edgeNote)\n\nDeleted:\n\(oldSummaries.joined(separator: "\n"))\n\nNew:\n\(content)")],
             isError: false

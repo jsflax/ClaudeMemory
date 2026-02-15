@@ -245,8 +245,6 @@ let validRelations: Set<String> = [
 /// Valid statuses for task checkpoints.
 let validStatuses: Set<String> = ["active", "paused", "completed"]
 
-/// Valid statuses for episodes.
-let validEpisodeStatuses: Set<String> = ["active", "ended"]
 
 struct CheckpointArgs: Decodable {
     let taskId: FlexibleInt?
@@ -298,7 +296,6 @@ struct RecallEpisodeArgs: Decodable {
 
 struct ListEpisodesArgs: Decodable {
     let project: String?
-    let status: String?
     let limit: FlexibleInt?
 }
 
@@ -315,6 +312,21 @@ struct FindClustersArgs: Decodable {
         case distanceThreshold = "distance_threshold"
         case maxClusters = "max_clusters"
     }
+}
+
+struct DetectCommunitiesArgs: Decodable {
+    let project: String
+    let minSize: FlexibleInt?
+    enum CodingKeys: String, CodingKey {
+        case project
+        case minSize = "min_size"
+    }
+}
+
+struct OrganizeArgs: Decodable {
+    let ids: FlexibleIntArray
+    let label: String
+    let project: String?
 }
 
 struct ConsolidateArgs: Decodable {

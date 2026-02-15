@@ -51,9 +51,6 @@ public final class Memory {
     /// Explicit importance rating (1-5). 0 means unset. Higher values boost recall ranking.
     public var importance: Int
 
-    /// Episode this memory belongs to. 0 = no episode.
-    public var episodeId: Int64
-
     public init(
         content: String,
         topic: String = "general",
@@ -64,8 +61,7 @@ public final class Memory {
         lastAccessedAt: Date = Date(),
         expiresAt: Date = Date.distantFuture,
         accessCount: Int = 0,
-        importance: Int = 0,
-        episodeId: Int64 = 0
+        importance: Int = 0
     ) {
         self.content = content
         self.topic = topic
@@ -77,6 +73,5 @@ public final class Memory {
         self.expiresAt = expiresAt
         self.accessCount = accessCount
         self.importance = importance
-        self.episodeId = episodeId
     }
 }

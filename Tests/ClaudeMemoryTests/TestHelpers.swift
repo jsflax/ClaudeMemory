@@ -22,7 +22,7 @@ let sharedEmbedder: EmbeddingService = {
 func makeTools() async throws -> MemoryTools {
     let path = FileManager.default.temporaryDirectory
         .appending(path: "claude-memory-test-\(UUID().uuidString).sqlite")
-    let lattice = try Lattice(Memory.self, Edge.self, Checkpoint.self, Episode.self, configuration: .init(fileURL: path))
+    let lattice = try Lattice(Memory.self, Edge.self, Checkpoint.self, HookState.self, configuration: .init(fileURL: path))
     let embedder = sharedEmbedder
     if await !embedder.isLoaded {
         await embedder.load()
@@ -60,12 +60,12 @@ func extractTaskId(from text: String) -> Int? {
     return Int(digits)
 }
 
-/// Helper to extract an episode ID from text like "episode:42"
+/// Episodes are now memories — extract ID using the same "id:" format.
 func extractEpisodeId(from text: String) -> Int? {
-    guard let range = text.range(of: "episode:", options: .literal) else {
-        return nil
-    }
-    let after = text[range.upperBound...]
-    let digits = after.prefix(while: { $0.isNumber })
-    return Int(digits)
+    extractId(from: text)
+}
+
+/// Extract memory ID from "Stored memory (id: N, ..."
+func extractMemoryId(from text: String) -> Int? {
+    extractId(from: text)
 }

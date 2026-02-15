@@ -244,6 +244,8 @@ extension MemoryTools {
 
         let preview = String(a.content.prefix(120))
         log("Consolidated \(ids.count) memories into [id:\(summaryId)]")
+        incrementCrudCounter()
+        resetMaintenanceBaseline()
         return CallTool.Result(
             content: [.text("""
                 Created summary [id:\(summaryId)] (project: \(project), topic: \(topic), importance: \(importance))

@@ -19,11 +19,13 @@ jobs:
 
       - name: Package artifacts
         run: |
-          mkdir -p staging
+          mkdir -p staging/agents
           cp .build/release/ClaudeMemory staging/memory
+          cp .build/release/ClaudeMemoryHooks staging/memory-hooks
           cp -R .build/release/ClaudeMemory_ClaudeMemoryLib.bundle staging/
           cp -R .build/release/swift-transformers_Hub.bundle staging/
           cp -R .build/release/SwiftLM_SwiftLM.bundle staging/
+          cp agents/*.md staging/agents/
           cd staging && tar czf ../claude-memory-macos-arm64.tar.gz *
 
       - name: Create release

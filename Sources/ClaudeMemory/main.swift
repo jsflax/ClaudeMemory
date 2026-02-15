@@ -25,7 +25,7 @@ do {
 
 let lattice: Lattice
 do {
-    lattice = try Lattice(Memory.self, Edge.self, Checkpoint.self, Episode.self, configuration: .init(fileURL: URL(fileURLWithPath: dbPath)))
+    lattice = try Lattice(Memory.self, Edge.self, Checkpoint.self, HookState.self, configuration: .init(fileURL: URL(fileURLWithPath: dbPath)))
 } catch {
     log("Failed to initialize database at \(dbPath): \(error)")
     exit(1)
@@ -75,6 +75,7 @@ let server = Server(
         ## When to recall
         - At the START of every conversation: recall with the current project name to load context
         - Before making architectural decisions: check if prior decisions exist
+        - Before exploring or researching any codebase or topic: check what you already know first
         - When the user references something from a past session
         - When you're unsure about a convention or preference
 
@@ -100,6 +101,10 @@ let server = Server(
         creating duplicates. Prefer targeting by `id` from recall output. Supports partial \
         edits: `append`, `prepend`, `find`+`replace`, and metadata-only updates (`topic`, \
         `source`, `importance`, `expires_in_days`) without rewriting full content
+        - Use **organize** to re-topic multiple memories at once. Pass `ids` and a `label` \
+        — updates all their topics, creates a hub memory, and links members via part_of edges. \
+        **Always use organize instead of calling update in a loop to change topics.** \
+        Pick descriptive labels (e.g., "editor-rendering", "AI-pipeline", "characters").
         - Use **merge** when you notice multiple memories about the same topic — consolidate \
         fragments into one well-written memory
         - Set **expires_in_days** for temporal context: "currently working on X", \
@@ -109,7 +114,8 @@ let server = Server(
         ## Topics
         Use consistent topic names: "preferences", "architecture", "debugging", "patterns", \
         "conventions", "workflow", "dependencies". Custom topics are fine for project-specific \
-        categories.
+        categories. When a generic topic grows large enough to benefit from subtopics, \
+        break it up using **organize**.
 
         ## Recall output
         Each recalled memory includes an `[id:N]` prefix. Use these IDs for precise update, \
@@ -181,29 +187,28 @@ let server = Server(
         ## Episodic Memory
         Use **begin_episode**, **end_episode**, **recall_episode**, and **list_episodes** to group \
         memories into narrative sessions. Episodes answer "what happened during X?" rather than \
-        individual facts.
+        individual facts. Episodes are **opt-in** — memories are not automatically grouped.
 
-        **Auto-episode**: You don't have to explicitly begin episodes. The first `remember` in a \
-        session auto-creates an episode. If there's a >30 minute gap between remembers, a new \
-        episode starts automatically. Explicit `begin_episode` overrides auto-episodes.
-
-        **When to begin an episode explicitly:**
-        - Starting a focused work session (debugging, feature implementation, code review)
-        - When you want a descriptive title instead of "Session: {date}"
+        **When to begin an episode:**
+        - Debugging sessions — chasing a bug across multiple files/hypotheses
+        - Multi-step feature implementations — where context builds over many remembers
+        - Code reviews or refactors with a clear narrative arc
+        - Any focused work where the user might later ask "what happened when we did X?"
+        - Do NOT begin episodes for routine Q&A, single-memory interactions, or trivial tasks
 
         **When to end an episode:**
-        - At the end of a focused work session
-        - Provide a summary of what was accomplished for future recall
-        - Episodes auto-end when a new one starts (explicitly or via time gap)
+        - When the focused work session wraps up (fix found, feature done, review complete)
+        - Always provide a **summary** — this is the main value for future recall
+        - Episodes auto-end after a 30-minute gap between remembers
 
         **When to recall an episode:**
-        - When the user references a past session ("what happened when we debugged X?")
+        - When the user references a past session ("what happened when we debugged X?", \
+        "continue where we left off")
         - Use `list_episodes` to find the right episode ID, then `recall_episode` for details
 
         **Best practices:**
-        - Let auto-episodes handle casual sessions
-        - Use explicit episodes for important work sessions
-        - Provide summaries at end_episode for quick future reference
+        - Give episodes descriptive titles ("Debugging auth token expiry", not "Session")
+        - Summaries should capture: what was attempted, what worked, what was decided
         - Episodes use `[episode:N]` IDs (distinct from `[id:N]` and `[task:N]`)
 
         ## Memory Consolidation
@@ -229,6 +234,16 @@ let server = Server(
         - When memories cover different subsystems/concerns of the same project — even if semantically similar, separate memories give better recall precision
         - When memories are long, detailed references for distinct topics (e.g., "CI/CD" vs "recall algorithm")
         - Semantic similarity ≠ redundancy. Two memories about the same project's architecture can be very similar in embedding space while covering completely different things
+
+        ## Auto-Organization
+        Memories are automatically organized when possible:
+        - **At remember-time**: if your new memory auto-connects to neighbors that share a hub, \
+        it's automatically linked to that hub. If neighbors agree on a topic and you used the \
+        default, their topic is inherited.
+        - **detect_communities**: Discover natural groups in the knowledge graph via label \
+        propagation. Read-only — shows which memories cluster together based on edge connections.
+        - **organize**(ids, label): Batch re-topic memories. Use this instead of calling update \
+        in a loop. Also creates a hub memory and part_of edges for graph structure.
         """,
     capabilities: .init(tools: .init(listChanged: false))
 )

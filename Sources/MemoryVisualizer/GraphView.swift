@@ -11,6 +11,7 @@ struct NodeInfo: Equatable {
     let id: Int64
     let label: String
     let project: String
+    let topic: String
     let importance: Int
     let isHub: Bool
     let createdAt: Date
@@ -20,6 +21,12 @@ struct EdgeInfo: Equatable {
     let sourceId: Int64
     let targetId: Int64
     let relation: String
+}
+
+struct TopicGroupInfo: Equatable {
+    let topic: String
+    let project: String
+    let ids: [Int64]
 }
 
 // MARK: - Viewport state (isolated from query data to avoid expensive recomputation on pan/zoom)
@@ -113,6 +120,7 @@ struct GraphView: View {
                 id: pk,
                 label: Self.extractLabel(content: memory.content, topic: memory.topic),
                 project: memory.project,
+                topic: memory.topic,
                 importance: memory.importance,
                 isHub: hubIds.contains(pk),
                 createdAt: memory.createdAt
@@ -136,6 +144,22 @@ struct GraphView: View {
     /// Edges filtered by visible nodes and hidden relations.
     private var edgeInfos: [EdgeInfo] {
         allVisibleEdgeInfos.filter { !hiddenRelations.contains($0.relation) }
+    }
+
+    /// Topic groups: nodes grouped by (project, topic) for sub-hull rendering and force clustering.
+    /// Only includes groups with 2+ members. Episode and "general" topics are excluded.
+    private var topicGroups: [TopicGroupInfo] {
+        var groups: [String: (topic: String, project: String, ids: [Int64])] = [:]
+        for node in nodeInfos {
+            guard node.topic != "general", node.topic != "episode" else { continue }
+            let key = "\(node.project)|\(node.topic)"
+            var entry = groups[key] ?? (topic: node.topic, project: node.project, ids: [])
+            entry.ids.append(node.id)
+            groups[key] = entry
+        }
+        return groups.values
+            .filter { $0.ids.count >= 2 }
+            .map { TopicGroupInfo(topic: $0.topic, project: $0.project, ids: $0.ids) }
     }
 
     /// Semantic clusters within each project (embedding similarity + Jaccard term overlap).
@@ -241,6 +265,7 @@ struct GraphView: View {
             viewport: viewport,
             selectedNode: $selectedMemoryId,
             clusters: clusterGroups,
+            topicGroups: topicGroups,
             colorMap: colorMap
         )
     }

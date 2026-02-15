@@ -15,6 +15,25 @@ struct StatsOverlay: View {
     let toggleRelation: (String) -> Void
     let colorMap: [String: Color]
 
+    private var dbFileSize: String {
+        let dbPath = ProcessInfo.processInfo.environment["CLAUDE_MEMORY_DB"]
+            ?? NSHomeDirectory() + "/.claude/memory.sqlite"
+        let fm = FileManager.default
+        var total: Int64 = 0
+        for path in [dbPath, dbPath + "-wal", dbPath + "-shm"] {
+            if let attrs = try? fm.attributesOfItem(atPath: path),
+               let size = attrs[.size] as? Int64 {
+                total += size
+            }
+        }
+        guard total > 0 else { return "—" }
+        if total < 1024 { return "\(total) B" }
+        let kb = Double(total) / 1024
+        if kb < 1024 { return String(format: "%.1f KB", kb) }
+        let mb = kb / 1024
+        return String(format: "%.1f MB", mb)
+    }
+
     var body: some View {
         VStack {
             HStack {
@@ -30,6 +49,8 @@ struct StatsOverlay: View {
                     }
                     Text("\(edgeData.count) edges")
                         .font(.system(size: 13, weight: .medium, design: .monospaced))
+                    Text("db: \(dbFileSize)")
+                        .font(.system(size: 11, design: .monospaced))
 
                     Divider().frame(width: 100).overlay(Color.white.opacity(0.2))
 

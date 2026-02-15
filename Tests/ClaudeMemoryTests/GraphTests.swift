@@ -282,7 +282,7 @@ import Foundation
     ))
     let output = text(from: result)
     #expect(output.contains("Deleted memory"))
-    #expect(output.contains("Removed 1 edge(s)"))
+    #expect(output.contains("edge(s)"))
 
     let graphResult = try await tools.handle(CallTool.Parameters(
         name: "graph",

@@ -19,11 +19,9 @@ public actor MemoryTools {
     let lattice: Lattice
     let embedder: EmbeddingService
 
-    /// Tracks the currently active episode for this session (auto or explicit).
+    /// Tracks the currently active episode memory ID for this session.
     var activeEpisodeId: Int64? = nil
-    /// Whether the active episode was explicitly created via begin_episode (vs auto-created).
-    var isExplicitEpisode: Bool = false
-    /// Tracks when the last memory was stored, for auto-episode gap detection.
+    /// Tracks when the last memory was stored, for episode gap detection.
     var lastMemoryTime: Date = .distantPast
 
     static let dateFormatter: DateFormatter = {
@@ -45,7 +43,7 @@ public actor MemoryTools {
     }
 
     #if DEBUG
-    /// Test-only: set lastMemoryTime to simulate time gaps for auto-episode.
+    /// Test-only: set lastMemoryTime to simulate time gaps for episode expiry.
     package func setLastMemoryTime(_ date: Date) { lastMemoryTime = date }
     #endif
 
@@ -508,8 +506,8 @@ public actor MemoryTools {
                 name: "begin_episode",
                 description: """
                     Start a new episode to group related memories into a narrative session. \
-                    Memories created after this call are automatically associated with the episode \
-                    until it is ended. If an auto-created episode is active, it will be closed first.
+                    Memories created after this call are linked to the episode via part_of edges \
+                    until it is ended. If another episode is active, it will be closed first.
                     """,
                 inputSchema: .object([
                     "type": .string("object"),
@@ -529,8 +527,9 @@ public actor MemoryTools {
             Tool(
                 name: "end_episode",
                 description: """
-                    End an active episode. Optionally provide a summary of what happened. \
-                    If no episode_id is given, ends the currently active episode.
+                    End an active episode. Optionally provide a summary of what happened \
+                    (appended to the episode memory). If no episode_id is given, ends the \
+                    currently active episode. To delete an episode, use forget(id:).
                     """,
                 inputSchema: .object([
                     "type": .string("object"),
@@ -550,8 +549,8 @@ public actor MemoryTools {
             Tool(
                 name: "recall_episode",
                 description: """
-                    Retrieve an episode and its memories in chronological order. \
-                    Use this to replay what happened during a session.
+                    Retrieve an episode and its linked memories in chronological order. \
+                    Use this to replay what happened during a focused work session.
                     """,
                 inputSchema: .object([
                     "type": .string("object"),
@@ -572,8 +571,9 @@ public actor MemoryTools {
             Tool(
                 name: "list_episodes",
                 description: """
-                    List episodes, optionally filtered by project and/or status. \
-                    Shows episodes sorted by most recent first.
+                    List episodes, optionally filtered by project. \
+                    Shows episodes sorted by most recent first. \
+                    Episodes are memories with topic 'episode' — use forget(id:) to delete them.
                     """,
                 inputSchema: .object([
                     "type": .string("object"),
@@ -581,11 +581,6 @@ public actor MemoryTools {
                         "project": .object([
                             "type": .string("string"),
                             "description": .string("Filter to episodes in this project."),
-                        ]),
-                        "status": .object([
-                            "type": .string("string"),
-                            "enum": .array([.string("active"), .string("ended")]),
-                            "description": .string("Filter by status: 'active' or 'ended'. If omitted, shows all."),
                         ]),
                         "limit": .object([
                             "type": .string("integer"),
@@ -626,6 +621,59 @@ public actor MemoryTools {
                             "description": .string("Maximum clusters to return (default 10)."),
                         ]),
                     ]),
+                    "additionalProperties": .bool(false),
+                ])
+            ),
+            Tool(
+                name: "detect_communities",
+                description: """
+                    Detect natural communities in a project's knowledge graph using label \
+                    propagation. Read-only — shows which memories cluster together based on \
+                    their edge connections. Useful for understanding memory structure before \
+                    organizing. Memories need edges (from auto-connect or manual connect) to \
+                    form communities.
+                    """,
+                inputSchema: .object([
+                    "type": .string("object"),
+                    "properties": .object([
+                        "project": .object([
+                            "type": .string("string"),
+                            "description": .string("Project to analyze."),
+                        ]),
+                        "min_size": .object([
+                            "type": .string("integer"),
+                            "description": .string("Minimum community size to report (default 2)."),
+                        ]),
+                    ]),
+                    "required": .array([.string("project")]),
+                    "additionalProperties": .bool(false),
+                ])
+            ),
+            Tool(
+                name: "organize",
+                description: """
+                    Label a group of memories with a topic and create a hub. Takes memory IDs \
+                    and a label — updates each memory's topic to the label, creates a hub memory, \
+                    and links all members to the hub via part_of edges.
+                    """,
+                inputSchema: .object([
+                    "type": .string("object"),
+                    "properties": .object([
+                        "ids": .object([
+                            "type": .string("array"),
+                            "items": .object(["type": .string("integer")]),
+                            "description": .string("Memory IDs to organize under this label."),
+                        ]),
+                        "label": .object([
+                            "type": .string("string"),
+                            "description": .string("Topic label for the group (e.g., 'editor-rendering', 'AI-pipeline')."),
+                        ]),
+                        "project": .object([
+                            "type": .string("string"),
+                            "description": .string("Project for the hub memory. If omitted, inferred from the first memory."),
+                        ]),
+                    ]),
+                    "required": .array([.string("ids"), .string("label")]),
                     "additionalProperties": .bool(false),
                 ])
             ),
@@ -704,7 +752,7 @@ public actor MemoryTools {
         case "list_tasks":
             return try handleListTasks(params.arguments)
         case "begin_episode":
-            return try handleBeginEpisode(params.arguments)
+            return try await handleBeginEpisode(params.arguments)
         case "end_episode":
             return try handleEndEpisode(params.arguments)
         case "recall_episode":
@@ -713,6 +761,10 @@ public actor MemoryTools {
             return try handleListEpisodes(params.arguments)
         case "find_clusters":
             return try await handleFindClusters(params.arguments)
+        case "detect_communities":
+            return try await handleDetectCommunities(params.arguments)
+        case "organize":
+            return try await handleOrganize(params.arguments)
         case "consolidate":
             return try await handleConsolidate(params.arguments)
         default:

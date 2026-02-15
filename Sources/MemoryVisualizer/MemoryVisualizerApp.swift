@@ -22,7 +22,7 @@ struct MemoryVisualizerApp: App {
         let dbPath = ProcessInfo.processInfo.environment["CLAUDE_MEMORY_DB"]
             ?? NSHomeDirectory() + "/.claude/memory.sqlite"
         lattice = try! Lattice(
-            Memory.self, Edge.self, Checkpoint.self, Episode.self,
+            Memory.self, Edge.self, Checkpoint.self,
             configuration: .init(
                 fileURL: URL(fileURLWithPath: dbPath)
             )

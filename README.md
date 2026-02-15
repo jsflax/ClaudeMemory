@@ -61,10 +61,12 @@ Claude Code has built-in memory via `MEMORY.md` files. Here's why ClaudeMemory i
 | `recall_episode` | Replay an episode's memories in chronological order |
 | `list_episodes` | List episodes filtered by project and/or status |
 
-### Clustering & Consolidation
+### Organization & Clustering
 
 | Tool | Description |
 |------|-------------|
+| `organize` | Batch re-topic memories, create a hub memory, and link members via `part_of` edges |
+| `detect_communities` | Label propagation on the knowledge graph to discover natural memory groups |
 | `find_clusters` | Discover groups of semantically similar memories by cosine distance |
 | `consolidate` | Create a summary memory from a cluster, deprioritize originals with `summarized_by` edges |
 
@@ -131,9 +133,11 @@ Removes the binary and MCP registration. Database is preserved at `~/.claude/mem
 - **Reinforcement scoring**: Recall ranking blends cosine similarity with three reinforcement signals — **frequency** (log-scaled access count, up to 15% boost), **importance** (explicit 1-5 rating, up to 20% boost), and **recency** (exponential decay from last access, up to 10% boost). Cosine similarity still dominates; reinforcement fine-tunes ordering among close matches.
 - **Conflict detection**: `remember` checks for near-duplicates (cosine distance < 0.12 same-project, < 0.05 cross-scope). Blocks storage with a warning; use `force: true` to override.
 - **Expiration**: Set `expires_in_days` for temporal context ("currently working on X"). Expired memories are filtered from recall automatically.
-- **Episodic memory**: Memories are automatically grouped into episodes. First `remember` creates an auto-episode; a >30 minute gap or project switch starts a new one. Explicit `begin_episode`/`end_episode` for named sessions.
+- **Episodic memory**: Opt-in session grouping via `begin_episode`/`end_episode`. Episodes are hub memories (topic: "episode") linked to member memories via `part_of` edges. Stale episodes auto-end after a 30-minute gap.
 - **Task continuity**: `checkpoint` saves plan/progress/context state. `resume` restores it in a new session. Tasks persist across conversations.
-- **Clustering**: `find_clusters` uses greedy cosine-distance clustering to find related memory groups. `consolidate` creates a summary, deprioritizes originals (importance -> 0), and links them with `summarized_by` edges.
+- **Clustering**: `find_clusters` uses greedy cosine-distance clustering to find related memory groups. `consolidate` creates a summary, deprioritizes originals (importance -> 0), and links them with `summarized_by` edges. `organize` batch re-topics memories with automatic hub creation.
+- **Cross-project linking**: `remember` auto-detects mentions of other project names in content and creates `relates_to` edges to those projects' hub memories.
+- **Hooks**: Optional `memory-hooks` binary for Claude Code hooks integration — auto-injects recalled context before each message (`advise`) and nudges session learning after interactions (`analyze`).
 
 ## Configuration
 

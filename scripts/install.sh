@@ -9,6 +9,7 @@ echo "======================"
 
 # Clean old install
 rm -f "$INSTALL_DIR/memory"
+rm -f "$INSTALL_DIR/memory-hooks"
 rm -rf "$INSTALL_DIR/ClaudeMemory_ClaudeMemoryLib.bundle"
 rm -rf "$INSTALL_DIR/swift-transformers_Hub.bundle"
 rm -rf "$INSTALL_DIR/SwiftLM_SwiftLM.bundle"
@@ -20,6 +21,7 @@ if [ "$1" = "--from-source" ]; then
     echo "Building from source: $REPO_DIR"
     cd "$REPO_DIR" && swift build -c release
     cp .build/release/ClaudeMemory "$INSTALL_DIR/memory"
+    cp .build/release/ClaudeMemoryHooks "$INSTALL_DIR/memory-hooks"
     cp -R .build/release/ClaudeMemory_ClaudeMemoryLib.bundle "$INSTALL_DIR/"
     cp -R .build/release/swift-transformers_Hub.bundle "$INSTALL_DIR/"
     cp -R .build/release/SwiftLM_SwiftLM.bundle "$INSTALL_DIR/"
@@ -56,15 +58,99 @@ fi
 env -u CLAUDECODE claude mcp remove memory 2>/dev/null || true
 env -u CLAUDECODE claude mcp add --scope user --transport stdio memory -- "$INSTALL_DIR/memory"
 
+# Install custom agent definitions
+echo "Installing agent definitions..."
+AGENTS_DIR="$HOME/.claude/agents"
+mkdir -p "$AGENTS_DIR"
+if [ "$1" = "--from-source" ]; then
+    cp "$REPO_DIR/agents/"*.md "$AGENTS_DIR/" 2>/dev/null
+else
+    # Agent files are included in the release tarball
+    cp "$INSTALL_DIR/agents/"*.md "$AGENTS_DIR/" 2>/dev/null && rm -rf "$INSTALL_DIR/agents"
+fi
+echo "Installed agent definitions to $AGENTS_DIR"
+
+# Register hooks with Claude Code
+echo "Registering hooks..."
+SETTINGS_FILE="$HOME/.claude/settings.json"
+HOOKS_CONFIG='{
+  "hooks": {
+    "SessionStart": [{
+      "hooks": [{
+        "type": "command",
+        "command": "'"$INSTALL_DIR"'/memory-hooks on-start 2>/dev/null",
+        "timeout": 5
+      }]
+    }],
+    "UserPromptSubmit": [{
+      "hooks": [{
+        "type": "command",
+        "command": "'"$INSTALL_DIR"'/memory-hooks advise 2>/dev/null",
+        "timeout": 5
+      }]
+    }],
+    "PreToolUse": [{
+      "matcher": "mcp__",
+      "hooks": [{
+        "type": "command",
+        "command": "'"$INSTALL_DIR"'/memory-hooks pre-tool 2>/dev/null",
+        "timeout": 5
+      }]
+    }],
+    "PostToolUseFailure": [{
+      "hooks": [{
+        "type": "command",
+        "command": "'"$INSTALL_DIR"'/memory-hooks on-failure 2>/dev/null",
+        "timeout": 5
+      }]
+    }],
+    "PreCompact": [{
+      "matcher": "auto",
+      "hooks": [{
+        "type": "command",
+        "command": "'"$INSTALL_DIR"'/memory-hooks pre-compact 2>/dev/null",
+        "timeout": 3
+      }]
+    }],
+    "Stop": [{
+      "hooks": [{
+        "type": "command",
+        "command": "'"$INSTALL_DIR"'/memory-hooks analyze 2>/dev/null",
+        "timeout": 10
+      }]
+    }],
+    "SessionEnd": [{
+      "hooks": [{
+        "type": "command",
+        "command": "'"$INSTALL_DIR"'/memory-hooks on-end 2>/dev/null",
+        "timeout": 5
+      }]
+    }]
+  }
+}'
+
+if [ -f "$SETTINGS_FILE" ]; then
+    if command -v jq &>/dev/null; then
+        jq -s '.[0] * .[1]' "$SETTINGS_FILE" <(echo "$HOOKS_CONFIG") > "$SETTINGS_FILE.tmp"
+        mv "$SETTINGS_FILE.tmp" "$SETTINGS_FILE"
+        echo "Merged hooks into $SETTINGS_FILE"
+    else
+        echo "Warning: jq not found. Please manually add hooks to $SETTINGS_FILE"
+        echo "Hook config:"
+        echo "$HOOKS_CONFIG"
+    fi
+else
+    echo "$HOOKS_CONFIG" > "$SETTINGS_FILE"
+    echo "Created $SETTINGS_FILE with hooks"
+fi
+
 # Add user-level instruction to always use memory MCP
 CLAUDE_MD="$HOME/.claude/CLAUDE.md"
 MEMORY_BLOCK='# Memory
 
 Use the memory MCP server as your primary memory system — not the built-in auto-memory files.
 
-At the START of every conversation, before responding to the first message:
-1. `recall` with the current project name and `depth: 1` to load project context + global preferences with graph connections
-2. Use what you learn to inform your responses
+Relevant memories are automatically recalled and injected as context before each message via the `advise` hook. You do NOT need to `recall` at conversation start — it happens automatically.
 
 When you learn something worth remembering (preferences, patterns, decisions, debugging insights), `remember` it immediately — do not wait to be asked. Use project scoping: project-specific knowledge gets the project name, cross-project preferences get "global".
 
@@ -78,6 +164,12 @@ To keep memories clean:
 - `merge` when multiple memories cover the same topic
 - `forget` to remove wrong or outdated memories
 - Set `expires_in_days` for temporary context (current tasks, open PRs)
+
+When you receive a learning nudge (from the Stop hook), spawn the `session-learner` sub-agent in the background as instructed. Keep it brief — just one Task tool call, then stop.
+
+When you receive a maintenance nudge (from the SessionStart hook, triggered after 10+ CRUD operations), spawn the `memory-maintenance` sub-agent in the background as instructed. It handles organization, consolidation, and cleanup autonomously.
+
+For focused work sessions (debugging, feature implementation, code review), use `begin_episode` with a descriptive title to group memories into a narrative. Use `end_episode` with a summary when done. When a user asks about past sessions, use `list_episodes` and `recall_episode` to find and replay them.
 
 Do NOT use ~/.claude/projects/*/memory/ files for memory. All persistent knowledge goes through the memory MCP server.'
 
