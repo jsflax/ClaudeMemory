@@ -172,6 +172,7 @@ struct GraphCanvas: View {
             path.closeSubpath()
             context.fill(path, with: .color(color.opacity(0.04)))
             context.stroke(path, with: .color(color.opacity(0.08)), lineWidth: 1)
+
         }
 
         // Per-cluster hulls (semantic clusters — more prominent, dashed)
@@ -312,7 +313,11 @@ struct GraphCanvas: View {
             return ids
         }()
 
-        for node in nodes {
+        // Two passes: regular nodes first, then hubs on top
+        let regular = nodes.filter { !$0.isHub }
+        let hubs = nodes.filter { $0.isHub }
+
+        for node in regular + hubs {
             guard let pos = positions[node.id] else { continue }
 
             let radius = nodeRadius(for: node)
@@ -366,6 +371,7 @@ struct GraphCanvas: View {
             )
 
             // Label with deconfliction
+            let labelWeight: Font.Weight = isSelected ? .bold : (node.isHub ? .bold : .medium)
             let labelSize = CGSize(width: CGFloat(node.label.count) * 5.5 + 8, height: 14)
             let labelRect = bestLabelPlacement(nodePos: pos, nodeRadius: radius,
                                                 labelSize: labelSize, placed: &placedLabels)
@@ -374,7 +380,7 @@ struct GraphCanvas: View {
 
             context.draw(
                 Text(node.label)
-                    .font(.system(size: isSelected ? 11 : 9, weight: isSelected ? .bold : .medium))
+                    .font(.system(size: isSelected ? 11 : 9, weight: labelWeight))
                     .foregroundStyle(.white.opacity((dimmed || searchDimmed) ? 0.15 : 0.85)),
                 in: labelRect
             )

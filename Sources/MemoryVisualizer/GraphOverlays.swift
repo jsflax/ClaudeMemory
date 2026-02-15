@@ -75,6 +75,8 @@ struct StatsOverlay: View {
                 }
                 .foregroundStyle(.white.opacity(0.7))
                 .padding(12)
+                .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 10))
+                .padding(12)
             }
             Spacer()
         }
