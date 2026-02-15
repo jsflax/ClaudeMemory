@@ -82,11 +82,22 @@ To keep memories clean:
 Do NOT use ~/.claude/projects/*/memory/ files for memory. All persistent knowledge goes through the memory MCP server.'
 
 if [ -f "$CLAUDE_MD" ]; then
-    if ! grep -q "memory MCP server" "$CLAUDE_MD"; then
+    if grep -q "^# Memory" "$CLAUDE_MD"; then
+        # Remove existing Memory section (from "# Memory" to next "# " heading or EOF)
+        # Uses awk: skip lines from "# Memory" until the next top-level heading, print everything else
+        awk '
+            /^# Memory$/ { skip=1; next }
+            /^# / && skip { skip=0 }
+            !skip { print }
+        ' "$CLAUDE_MD" > "$CLAUDE_MD.tmp"
+        # Remove trailing blank lines left from removal
+        sed -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$CLAUDE_MD.tmp" > "$CLAUDE_MD"
+        rm -f "$CLAUDE_MD.tmp"
+        printf '\n%s\n' "$MEMORY_BLOCK" >> "$CLAUDE_MD"
+        echo "Updated memory instructions in $CLAUDE_MD"
+    else
         printf '\n%s\n' "$MEMORY_BLOCK" >> "$CLAUDE_MD"
         echo "Added memory instructions to $CLAUDE_MD"
-    else
-        echo "Memory instructions already in $CLAUDE_MD"
     fi
 else
     printf '%s\n' "$MEMORY_BLOCK" > "$CLAUDE_MD"
