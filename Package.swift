@@ -7,7 +7,7 @@ let package = Package(
     platforms: [.macOS(.v15)],
     dependencies: [
         .package(url: "https://github.com/modelcontextprotocol/swift-sdk.git", from: "0.10.0"),
-        .package(url: "https://github.com/jsflax/lattice.git", branch: "main"),
+        .package(url: "https://github.com/jsflax/lattice.git", from: "0.1.0"),
         .package(url: "https://github.com/jsflax/SwiftLM.git", branch: "main"),
     ],
     targets: [
