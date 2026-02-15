@@ -2,170 +2,83 @@
 
 Evolving ClaudeMemory from a memory store into a fully-fledged brain for Claude persistence.
 
-## Tier 1: High-Impact, Builds on Current Architecture
+## Completed
 
-### 1. Fine-Grained Memory Editing
+### Fine-Grained Memory Editing
+- Edit by ID with `update` — direct targeting, no similarity guessing
+- Partial content edits: `append`, `prepend`, `find`+`replace` modes
+- Field-level updates: change `topic`, `project`, `source`, `importance`, `expires_in_days` without touching content
+- Re-embed on content change, skip for metadata-only changes
 
-`update` currently only works by similarity match and replaces the entire content. Claude needs precise, surgical control over memories.
+### Knowledge Graph
+- `edges` table with `(source_id, target_id, relation)` — six relation types: `relates_to`, `contradicts`, `supersedes`, `derived_from`, `part_of`, `summarized_by`
+- `connect` / `disconnect` tools for creating and removing edges
+- `graph` tool to view a memory's neighborhood at configurable depth
+- `recall` with `depth: 1-3` follows edges via BFS to surface connected knowledge
+- Hierarchical memories via `parent_id` (auto-creates `part_of` edges)
+- Edges auto-cleanup on forget/merge
 
-- **Edit by ID**: `update` accepts an `id` parameter for direct targeting (no similarity guessing)
-- **Partial content edits**: `append`, `prepend`, and `find_replace` modes alongside full replacement
-- **Field-level updates**: change `topic`, `project`, `source`, or `expires_in_days` without touching content
-- **Batch operations**: update multiple memories at once (e.g., re-topic a set of memories, move memories between projects)
-- **Re-embed on content change**: automatically recompute embedding when content is modified, skip re-embedding for metadata-only changes
-- Existing similarity-based update preserved as a convenience, but ID-based is the primary path
+### Reinforcement / Importance Scoring
+- `accessCount` and `importance` fields on Memory model
+- Scoring: cosine similarity blended with frequency (log-scaled, 15% boost), importance (1-5, 20% boost), recency (exponential decay, 10% boost)
+- Recall ranking uses reinforcement signals to fine-tune ordering among close matches
 
-### 2. Memory Relationships / Knowledge Graph
+### Conflict Detection
+- `remember` checks for near-duplicates using both cosine distance (< 0.12 same-project, < 0.05 cross-scope) AND Jaccard term overlap (40%+ shared terms)
+- Blocks storage with a warning showing the existing memory; `force: true` to override
 
-Memories currently exist in isolation. A brain connects ideas.
+### Hybrid Search (Semantic + Full-Text)
+- FTS5 full-text index on `content` field
+- Recall combines FTS5 (any matching term) with vector cosine similarity
+- Falls back to FTS5-only if embedding model is unavailable
 
-- Add an `edges` table with `(source_id, target_id, relation_type)` columns
-- Relation types: `relates_to`, `contradicts`, `supersedes`, `derived_from`, `part_of`
-- New `connect` tool to create edges between memories
-- Enhance `recall` to optionally traverse edges (depth-limited graph walk)
-- Query patterns: "recall everything connected to the auth refactor" follows edges, not just similarity
-- Visualization via `graph` tool: show a memory's neighborhood
+### Episodic Memory
+- `Episode` model with title, summary, project, timestamps
+- `begin_episode` / `end_episode` / `recall_episode` / `list_episodes` tools
+- Auto-episodes: first `remember` creates one; >30 minute gap or project switch starts a new one
 
-### 3. Reinforcement / Importance Scoring
+### Task Continuity
+- `Checkpoint` model with plan, progress, context, status
+- `checkpoint` / `resume` / `list_tasks` tools
+- Tasks persist across conversations with active/paused/completed status
 
-`lastAccessedAt` exists but isn't used for ranking. Memories that keep proving useful should float to the top.
+### Temporal Queries
+- `timeline` tool with chronological view grouped by day/week/month
+- `since` / `before` temporal filters on recall
+- Calendar-style grouping with project and topic filters
 
-- Add `accessCount` and `importance` fields to Memory model
-- Scoring formula: `score = similarity * (recency_weight + frequency_weight + explicit_importance)`
-- Recency: exponential decay from `lastAccessedAt`
-- Frequency: logarithmic scale on `accessCount`
-- Explicit importance: optional 1-5 rating set on `remember` or `update`
-- Blend scoring into recall ranking alongside cosine similarity
-- Memories that haven't been recalled in months naturally decay
+### Clustering & Consolidation
+- `find_clusters` uses greedy cosine-distance + Jaccard term overlap clustering
+- `consolidate` creates a summary memory, deprioritizes originals (importance -> 0), links with `summarized_by` edges
 
-### 4. Automatic Conflict Detection
+### Memory Visualizer
+- Interactive force-directed graph (SwiftUI Canvas, 60fps)
+- Project-colored nodes with inter-project repulsion for visual separation
+- FTS5-backed search with prefix matching, highlight mode
+- Edge type filtering with color-coded relations
+- Time slider with play button to animate graph growth
+- Semantic cluster hulls, minimap, detail panel, keyboard shortcuts
+- PNG export
 
-`remember` currently always creates new entries, even if they contradict existing knowledge.
+## Not Yet Implemented
 
-- On `remember`, check for semantic near-duplicates (cosine > 0.85 threshold)
-- If near-duplicate found, return a warning with the existing memory and ask to `update` or keep both
-- Detect contradictions: high similarity but opposing sentiment/content
-- New `contradicts` edge type automatically created when both are kept
-- Configurable: `auto_dedup: true` to silently update, or `prompt` mode (default) to surface conflicts
+### Confidence Levels and Provenance Tracking
+- `confidence` field (0.0-1.0) that increases with confirmation across sessions, decreases with conflicting evidence
+- Provenance chain tracking which conversations/files/events created or reinforced a memory
+- Low-confidence memories flagged for verification
 
-### 5. Hybrid Search (Semantic + Full-Text + Metadata)
+### Proactive Surfacing / Triggers
+- Register trigger patterns that auto-surface memories when context matches
+- Safety triggers ("never force-push to main"), convention triggers ("this project uses tabs")
+- `add_trigger` / `remove_trigger` tools
 
-Pure vector search misses exact keyword matches. Pure keyword search misses meaning.
+### Multi-Type Memory
+- Typed memories: `fact`, `code_pattern`, `error_resolution`, `decision`, `preference`, `procedure`
+- Structured fields per type (e.g., error_resolution has symptom, root_cause, fix, prevention)
+- Type-aware retrieval and display formatting
 
-- Add FTS5 full-text index on `content` field
-- Recall scoring: weighted combination of cosine similarity + FTS5 rank + metadata match
-- Exact identifiers (function names, file paths, error codes) matched precisely via FTS5
-- Semantic meaning matched via existing vector search
-- Metadata filters (project, topic, date range) applied as pre-filters before scoring
-- Configurable weights per query or globally
-
-## Tier 2: Makes It Feel Like Cognition
-
-### 6. Episodic Memory / Session Chains
-
-Group related memories from a single work session into coherent episodes.
-
-- New `Episode` model: `(id, title, summary, project, startedAt, endedAt)`
-- `Memory` gets optional `episodeId` foreign key
-- New `begin_episode` / `end_episode` tools to bracket a work session
-- Auto-episode: if no explicit episode, group memories by time proximity (e.g., within 30 min)
-- `recall_episode` tool: retrieve a full episode as a linked narrative
-- Episode summaries auto-generated from member memories
-- Enables "recall the debugging session where we found the race condition"
-
-### 7. Automatic Summarization / Consolidation
-
-As memories accumulate, consolidate clusters into higher-level abstractions.
-
-- Periodic maintenance: cluster memories by semantic similarity
-- Clusters above a size threshold (e.g., 5+ memories on same topic) trigger consolidation
-- Generate a summary memory that captures the gist of the cluster
-- Original memories marked with `summarized_by` edge to the summary
-- Originals optionally archived (kept but excluded from default recall)
-- New `consolidate` tool to manually trigger for a topic/project
-- Mimics human memory consolidation: details fade, patterns persist
-
-### 8. Temporal Queries
-
-Time as a first-class query dimension, not just metadata.
-
-- New query syntax for time ranges: `recall --since "last week"` / `--before "2024-01-01"`
-- Timeline view: `timeline` tool shows memories chronologically for a project
-- Change tracking: "how has the API design evolved?" returns memories sorted by time with diffs
-- Recency-weighted recall mode: prioritize recent memories when explicitly requested
-- Calendar-style grouping: memories by day/week/month
-
-### 9. Task Continuity / Work-in-Progress State
-
-Checkpoint ongoing tasks so Claude can pick up where it left off.
-
-- New `Task` model: `(id, title, status, plan, progress, project, checkpointedAt)`
-- `checkpoint` tool: save current task state (what's done, what's left, current approach)
-- `resume` tool: load the most recent checkpoint for a project/task
-- Auto-checkpoint: before session ends, prompt to save WIP state
-- Task memories linked to relevant episodic and semantic memories
-- Enables genuine continuity: "I was halfway through migrating the database layer"
-
-## Tier 3: Advanced
-
-### 10. Confidence Levels and Provenance Tracking
-
-Not all memories are equally trustworthy.
-
-- Add `confidence` field (0.0-1.0) to Memory model
-- Confidence increases when a memory is confirmed across multiple sessions
-- Confidence decreases when conflicting evidence appears
-- Provenance chain: track which conversations/files/events created or reinforced a memory
-- Display confidence in recall results: `[id:5 confidence:high]`
-- Low-confidence memories can be flagged for verification
-
-### 11. Proactive Surfacing / Triggers
-
-Shift from passive recall to active cognitive assistance.
-
-- Register trigger patterns: `trigger("force push", memory_id)`
-- When Claude's context matches a trigger pattern, automatically surface the memory
-- Safety triggers: "user prefers to never force-push to main" fires before `git push --force`
-- Convention triggers: "this project uses tabs" fires when writing new files
-- Implemented as a `triggers` table with pattern + memory_id + priority
-- New `add_trigger` / `remove_trigger` tools
-
-### 12. Multi-Type Memory
-
-Typed memories with schema-appropriate handling.
-
-- Memory subtypes: `fact`, `code_pattern`, `error_resolution`, `decision`, `preference`, `procedure`
-- Each type has structured fields:
-  - `code_pattern`: snippet, language, context, when_to_use
-  - `error_resolution`: symptom, root_cause, fix, prevention
-  - `decision`: options_considered, chosen, rationale, outcome
-  - `procedure`: steps, preconditions, postconditions
-- Type-aware retrieval: searching for errors prioritizes `error_resolution` memories
-- Type-specific display formatting in recall results
-
-### 13. Memory Validation / Truth Maintenance
-
-Stored memories can become stale. Verify against current reality.
-
-- Verifiable memory types: file paths, function signatures, dependency versions, config values
-- `validate` tool: checks verifiable memories against current codebase state
-- Auto-validation: on project recall, spot-check a sample of verifiable memories
-- Stale memories flagged with `[stale]` in recall or auto-expired
-- Validation log: track what was checked and when
-- Integrates with git: detect when referenced files have changed significantly
-
-## Implementation Priority
-
-1. **Fine-Grained Editing** — low complexity, immediately useful, unblocks precise memory management
-2. **Relationships / Knowledge Graph** — most transformative, builds on existing SQLite
-3. **Conflict Detection** — prevents bad data from accumulating
-4. **Hybrid Search** — immediate recall quality improvement via FTS5
-5. **Reinforcement Scoring** — makes recall smarter over time
-6. **Episodic Memory** — enables session continuity
-7. **Task Continuity** — enables genuine pick-up-where-you-left-off
-8. **Temporal Queries** — natural extension of existing timestamp fields
-9. **Summarization** — important for long-term scaling
-10. **Multi-Type Memory** — richer data model
-11. **Confidence Tracking** — quality improvement
-12. **Proactive Triggers** — paradigm shift from pull to push
-13. **Validation** — long-term maintenance
+### Memory Validation / Truth Maintenance
+- Verify stored memories against current codebase state (file paths, function signatures, dependency versions)
+- Auto-validation on project recall, spot-checking verifiable memories
+- Stale memories flagged or auto-expired
+- Git integration for detecting significant file changes

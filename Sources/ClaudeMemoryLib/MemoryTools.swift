@@ -619,7 +619,7 @@ public actor MemoryTools {
                         ]),
                         "distance_threshold": .object([
                             "type": .string("integer"),
-                            "description": .string("Max cosine distance × 100 for cluster membership (default 30, i.e. 0.30). Lower = tighter clusters."),
+                            "description": .string("Max cosine distance × 100 for cluster membership (default 15, i.e. 0.15). Lower = tighter clusters."),
                         ]),
                         "max_clusters": .object([
                             "type": .string("integer"),

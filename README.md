@@ -86,6 +86,32 @@ cd ClaudeMemory
 
 Start a new Claude Code session — memory tools are immediately available.
 
+## Memory Visualizer
+
+An interactive force-directed graph visualization of your memory database, built with SwiftUI.
+
+```bash
+swift run MemoryVisualizer
+```
+
+Or point it at a specific database:
+
+```bash
+CLAUDE_MEMORY_DB=~/path/to/memory.sqlite swift run MemoryVisualizer
+```
+
+**Features:**
+- Force-directed graph layout with project-colored nodes and inter-project repulsion
+- FTS5-backed search with prefix matching — highlights matches, dims the rest
+- Edge type filtering with color-coded relations (part_of, contradicts, supersedes, etc.)
+- Time slider with play button to animate graph growth over time
+- Project filtering toggles in the stats overlay
+- Semantic cluster hulls drawn as translucent project-colored regions
+- Minimap with click-to-navigate
+- Detail panel with typewriter effect for selected memories
+- Drag nodes, pan, zoom-to-cursor (scroll wheel + pinch)
+- Keyboard shortcuts: Esc (deselect), Tab (cycle connections), Cmd+F (search), +/- (zoom), Cmd+Shift+E (export PNG)
+
 ## Uninstall
 
 ```bash

@@ -1,6 +1,7 @@
 import SwiftUI
 import Lattice
 import ClaudeMemoryLib
+import UniformTypeIdentifiers
 
 @main
 struct MemoryVisualizerApp: App {
@@ -33,6 +34,27 @@ struct MemoryVisualizerApp: App {
             GraphView()
                 .environment(\.lattice, lattice)
                 .frame(minWidth: 800, minHeight: 600)
+        }
+        .commands {
+            CommandGroup(after: .saveItem) {
+                Button("Export as PNG…") {
+                    guard let window = NSApp.keyWindow,
+                          let contentView = window.contentView else { return }
+                    let rep = contentView.bitmapImageRepForCachingDisplay(in: contentView.bounds)
+                    guard let rep else { return }
+                    contentView.cacheDisplay(in: contentView.bounds, to: rep)
+                    guard let pngData = rep.representation(using: .png, properties: [:]) else { return }
+                    let panel = NSSavePanel()
+                    panel.allowedContentTypes = [.png]
+                    panel.nameFieldStringValue = "memory-graph.png"
+                    panel.begin { response in
+                        if response == .OK, let url = panel.url {
+                            try? pngData.write(to: url)
+                        }
+                    }
+                }
+                .keyboardShortcut("e", modifiers: [.command, .shift])
+            }
         }
     }
 }

@@ -44,6 +44,23 @@ let server = Server(
         - Key file paths, project structure, or integration details that took effort to find
         - Do NOT store trivial or easily re-discoverable facts (standard library APIs, etc.)
 
+        ## Structuring memories
+        Keep each memory **atomic** — one concept per memory. If you write content with multiple \
+        sections or topics, the server will nudge you to decompose it into separate memories.
+
+        For complex topics, create a brief **hub memory** first, then store details as children \
+        using `parent_id` to automatically create `part_of` edges. This enables precise recall \
+        and targeted updates.
+
+        Key `remember` parameters:
+        - **parent_id**: ID of a parent memory. Creates a `part_of` edge automatically. Use to \
+        build hierarchies (hub + detail children).
+        - **importance** (1-5): Boosts recall ranking by up to 20%. Use for critical knowledge \
+        that should surface consistently. Omit for default priority.
+        - **source**: Where the memory came from — `conversation`, `code-review`, \
+        `debugging-session`, or a file path. Helps with provenance tracking.
+        - **expires_in_days**: Auto-expire temporal context (see "Keeping memories clean").
+
         ## When to recall
         - At the START of every conversation: recall with the current project name to load context
         - Before making architectural decisions: check if prior decisions exist
@@ -71,7 +88,7 @@ let server = Server(
         - Use **update** (by id or similarity) to refine existing memories instead of \
         creating duplicates. Prefer targeting by `id` from recall output. Supports partial \
         edits: `append`, `prepend`, `find`+`replace`, and metadata-only updates (`topic`, \
-        `source`, `expires_in_days`) without rewriting full content
+        `source`, `importance`, `expires_in_days`) without rewriting full content
         - Use **merge** when you notice multiple memories about the same topic — consolidate \
         fragments into one well-written memory
         - Set **expires_in_days** for temporal context: "currently working on X", \
@@ -87,17 +104,27 @@ let server = Server(
         Each recalled memory includes an `[id:N]` prefix. Use these IDs for precise update, \
         merge, and forget operations. Expiring memories also show their expiration date.
 
+        ## Discovery & analytics
+        - **stats**: Memory counts grouped by project and topic. Use to understand memory \
+        distribution.
+        - **list_topics**: All topics with their memory counts. Use to check topic consistency.
+        - **timeline**: Chronological view of memories grouped by day, week, or month. Pure \
+        chronological — no semantic search. Use to review what was stored over a time period.
+
         ## Knowledge Graph
         Memories can be connected with directed edges to form a knowledge graph. Use this to \
         represent relationships between ideas, track contradictions, and enable graph-based discovery.
 
         **Tools:**
-        - **connect**: Create an edge between two memories. Relation types: `relates_to`, \
-        `contradicts`, `supersedes`, `derived_from`, `part_of`, `summarized_by`. Duplicate edges \
-        are idempotent.
-        - **disconnect**: Remove edges by edge ID or by (from, to) memory pair.
-        - **graph**: View a memory's neighborhood — shows connected memories up to a given depth.
-        - **recall with depth**: Set `depth: 1` (or up to 3) to follow edges from recalled \
+        - **connect**(from, to, relation): Create a directed edge between two memories. \
+        `from` and `to` are memory IDs (integers, NOT `from_id`/`to_id`). \
+        Relation types: `relates_to`, `contradicts`, `supersedes`, `derived_from`, `part_of`, \
+        `summarized_by`. Duplicate edges are idempotent.
+        - **disconnect**(id | from+to): Remove an edge by edge `id`, or by `from` and `to` \
+        memory IDs. Optional `relation` filter.
+        - **graph**(id, depth?): View a memory's neighborhood — shows connected memories up to \
+        a given depth (default 1, max 3).
+        - **recall** with `depth`: Set `depth: 1` (or up to 3) to follow edges from recalled \
         memories and surface connected knowledge. Default is 0 (no traversal).
 
         **When to connect — do this proactively:**

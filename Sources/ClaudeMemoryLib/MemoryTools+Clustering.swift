@@ -2,7 +2,105 @@ import Lattice
 import MCP
 import Foundation
 
-// MARK: - Consolidation
+// MARK: - Clustering Algorithm
+
+/// Compute semantic clusters from memories using embedding similarity + Jaccard term overlap.
+/// Uses Lattice `.nearest()` for vector search and greedy seed-based clustering.
+/// Returns clusters (arrays of memory primary keys) and pairwise distance cache.
+public func findMemoryClusters(
+    in lattice: Lattice,
+    project: String? = nil,
+    topic: String? = nil,
+    distanceThreshold: Double = 0.15,
+    jaccardThreshold: Double = 0.2,
+    minClusterSize: Int = 2,
+    maxClusters: Int = 10
+) -> (clusters: [[Int64]], distances: [Int64: [Int64: Double]]) {
+    let now = Date()
+    var baseQuery = lattice.objects(Memory.self).where { $0.expiresAt > now }
+    if let project { baseQuery = baseQuery.where { $0.project == project } }
+    if let topic { baseQuery = baseQuery.where { $0.topic == topic } }
+    let memories = baseQuery.snapshot()
+
+    guard memories.count >= minClusterSize else { return ([], [:]) }
+
+    let memoryMap: [Int64: Memory] = Dictionary(
+        uniqueKeysWithValues: memories.compactMap { m in
+            guard let pk = m.primaryKey, !m.embedding.isEmpty else { return nil }
+            return (pk, m)
+        }
+    )
+    let validIds = Set(memoryMap.keys)
+    guard validIds.count >= minClusterSize else { return ([], [:]) }
+
+    // Build neighbor map using Lattice vector search per memory.
+    // For each memory, run .nearest() to find neighbors within the distance threshold
+    // AND Jaccard term overlap >= threshold. This prevents same-project memories about different
+    // subsystems from clustering together just because they share project vocabulary.
+    var neighborMap: [Int64: [Int64]] = [:]
+    var distanceCache: [Int64: [Int64: Double]] = [:]
+
+    for (memId, mem) in memoryMap {
+        let matches = baseQuery
+            .nearest(to: mem.embedding, on: \.embedding, limit: memories.count, distance: .cosine)
+
+        var neighbors: [Int64] = []
+        var dists: [Int64: Double] = [:]
+        for match in matches {
+            let nId = match.object.primaryKey!
+            guard nId != memId, validIds.contains(nId) else { continue }
+            let dist = match.distances["embedding"] ?? 1.0
+            if dist <= distanceThreshold {
+                let jaccard = jaccardSimilarity(mem.content, match.object.content)
+                guard jaccard >= jaccardThreshold else { continue }
+                neighbors.append(nId)
+                dists[nId] = dist
+            }
+        }
+        neighborMap[memId] = neighbors
+        distanceCache[memId] = dists
+    }
+
+    // Greedy clustering: pick memory with most unassigned neighbors as seed
+    var assigned = Set<Int64>()
+    var clusters: [[Int64]] = []
+
+    while clusters.count < maxClusters {
+        var bestSeed: Int64? = nil
+        var bestCount = 0
+        for memId in validIds where !assigned.contains(memId) {
+            let unassigned = (neighborMap[memId] ?? []).filter { !assigned.contains($0) }.count
+            if unassigned > bestCount {
+                bestCount = unassigned
+                bestSeed = memId
+            }
+        }
+        guard let seed = bestSeed else { break }
+
+        var cluster = [seed]
+        assigned.insert(seed)
+        let neighbors = (neighborMap[seed] ?? []).filter { !assigned.contains($0) }
+        let sorted = neighbors.sorted { a, b in
+            (distanceCache[seed]?[a] ?? 1.0) < (distanceCache[seed]?[b] ?? 1.0)
+        }
+        for n in sorted where !assigned.contains(n) {
+            cluster.append(n)
+            assigned.insert(n)
+        }
+
+        if cluster.count >= minClusterSize {
+            clusters.append(cluster)
+        } else {
+            for id in cluster where id != seed {
+                assigned.remove(id)
+            }
+        }
+    }
+
+    return (clusters, distanceCache)
+}
+
+// MARK: - MCP Tool Handlers
 
 extension MemoryTools {
 
@@ -11,130 +109,49 @@ extension MemoryTools {
     func handleFindClusters(_ args: [String: Value]?) async throws -> CallTool.Result {
         let a = try args.decode(FindClustersArgs.self)
         let minSize = a.minClusterSize?.value ?? 3
-        let threshold = Double(a.distanceThreshold?.value ?? 30) / 100.0
+        let threshold = Double(a.distanceThreshold?.value ?? 15) / 100.0
         let maxClusters = a.maxClusters?.value ?? 10
 
-        // Load all non-expired memories matching filters
-        let now = Date()
-        var baseQuery = lattice.objects(Memory.self).where { $0.expiresAt > now }
-        if let project = a.project {
-            baseQuery = baseQuery.where { $0.project == project }
-        }
-        if let topic = a.topic {
-            baseQuery = baseQuery.where { $0.topic == topic }
-        }
-        let memories = baseQuery.snapshot()
-
-        guard memories.count >= minSize else {
-            return CallTool.Result(content: [.text("No clusters found. Only \(memories.count) memories match the filters (minimum cluster size: \(minSize)).")], isError: false)
-        }
-
-        // Index memories by ID for lookup
-        let memoryMap: [Int64: Memory] = Dictionary(
-            uniqueKeysWithValues: memories.compactMap { m in
-                guard let pk = m.primaryKey, !m.embedding.isEmpty else { return nil }
-                return (pk, m)
-            }
+        let result = findMemoryClusters(
+            in: lattice,
+            project: a.project,
+            topic: a.topic,
+            distanceThreshold: threshold,
+            jaccardThreshold: 0.2,
+            minClusterSize: minSize,
+            maxClusters: maxClusters
         )
-        let validIds = Set(memoryMap.keys)
 
-        guard validIds.count >= minSize else {
-            return CallTool.Result(content: [.text("No clusters found. Only \(validIds.count) memories have embeddings (minimum cluster size: \(minSize)).")], isError: false)
-        }
-
-        // Build neighbor map using Lattice vector search per memory.
-        // For each memory, run .nearest() to find neighbors within the distance threshold.
-        // This delegates distance computation to sqlite-vec instead of pulling embeddings into memory.
-        var neighborMap: [Int64: [Int64]] = [:]
-        var distanceCache: [Int64: [Int64: Double]] = [:]
-
-        for (memId, mem) in memoryMap {
-            let matches = baseQuery
-                .nearest(to: mem.embedding, on: \.embedding, limit: memories.count, distance: .cosine)
-
-            var neighbors: [Int64] = []
-            var dists: [Int64: Double] = [:]
-            for match in matches {
-                let nId = match.object.primaryKey!
-                guard nId != memId, validIds.contains(nId) else { continue }
-                let dist = match.distances["embedding"] ?? 1.0
-                if dist <= threshold {
-                    neighbors.append(nId)
-                    dists[nId] = dist
-                }
-            }
-            neighborMap[memId] = neighbors
-            distanceCache[memId] = dists
-        }
-
-        // Greedy clustering: pick memory with most unassigned neighbors as seed
-        var assigned = Set<Int64>()
-        var clusters: [[Int64]] = []
-
-        while clusters.count < maxClusters {
-            var bestSeed: Int64? = nil
-            var bestCount = 0
-            for memId in validIds where !assigned.contains(memId) {
-                let unassigned = (neighborMap[memId] ?? []).filter { !assigned.contains($0) }.count
-                if unassigned > bestCount {
-                    bestCount = unassigned
-                    bestSeed = memId
-                }
-            }
-
-            guard let seed = bestSeed else { break }
-
-            // Build cluster: seed + unassigned neighbors sorted by distance to seed
-            var cluster = [seed]
-            assigned.insert(seed)
-            let neighbors = (neighborMap[seed] ?? []).filter { !assigned.contains($0) }
-            let sorted = neighbors.sorted { a, b in
-                (distanceCache[seed]?[a] ?? 1.0) < (distanceCache[seed]?[b] ?? 1.0)
-            }
-            for n in sorted where !assigned.contains(n) {
-                cluster.append(n)
-                assigned.insert(n)
-            }
-
-            if cluster.count >= minSize {
-                clusters.append(cluster)
-            } else {
-                // Not enough for a cluster — unassign all except seed to avoid infinite loop
-                for id in cluster where id != seed {
-                    assigned.remove(id)
-                }
-            }
-        }
-
-        guard !clusters.isEmpty else {
+        guard !result.clusters.isEmpty else {
             return CallTool.Result(content: [.text("No clusters found. Memories are too dissimilar at distance threshold \(Int(threshold * 100)) (try increasing distance_threshold).")], isError: false)
         }
 
+        // Fetch memory data for formatting
+        var memoryMap: [Int64: Memory] = [:]
+        for id in Set(result.clusters.flatMap({ $0 })) {
+            if let mem = lattice.objects(Memory.self).where({ $0.primaryKey == id }).first {
+                memoryMap[id] = mem
+            }
+        }
+
         // Format output
-        var output = "Found \(clusters.count) cluster(s):\n"
-        for (i, cluster) in clusters.enumerated() {
+        var output = "Found \(result.clusters.count) cluster(s):\n"
+        for (i, cluster) in result.clusters.enumerated() {
             // Compute average pairwise similarity from cached distances
             var totalSim: Double = 0
             var pairCount = 0
+            var distances: [Double] = []
             for a in cluster {
                 for b in cluster where a < b {
-                    if let dist = distanceCache[a]?[b] ?? distanceCache[b]?[a] {
+                    if let dist = result.distances[a]?[b] ?? result.distances[b]?[a] {
                         totalSim += 1.0 - dist
                         pairCount += 1
+                        distances.append(dist)
                     }
                 }
             }
             let avgSim = pairCount > 0 ? totalSim / Double(pairCount) : 0
 
-            // Compute pairwise distance standard deviation
-            var distances: [Double] = []
-            for a in cluster {
-                for b in cluster where a < b {
-                    if let dist = distanceCache[a]?[b] ?? distanceCache[b]?[a] {
-                        distances.append(dist)
-                    }
-                }
-            }
             let meanDist = distances.isEmpty ? 0.0 : distances.reduce(0, +) / Double(distances.count)
             let variance = distances.isEmpty ? 0.0 : distances.map { ($0 - meanDist) * ($0 - meanDist) }.reduce(0, +) / Double(distances.count)
             let stdev = sqrt(variance)

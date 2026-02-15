@@ -52,7 +52,7 @@ import Foundation
     #expect(!output.contains("Suggested action"))
     // Redundancy assessment should be present
     #expect(output.contains("redundant") || output.contains("distinct aspects"))
-    // At threshold=30, pasta/quantum should not cluster with Swift concurrency
+    // At threshold=15, pasta/quantum should not cluster with Swift concurrency
     #expect(!output.contains("pasta"))
     #expect(!output.contains("quantum"))
 }

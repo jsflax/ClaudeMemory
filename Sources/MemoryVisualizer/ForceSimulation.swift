@@ -17,6 +17,8 @@ final class ForceSimulation {
     private var hasTarget: [Bool] = []
     private var idToIndex: [Int64: Int] = [:]
     private var edgeIndices: [(Int, Int)] = []
+    private var projectGroup: [Int] = []  // group index per node (same project = same group)
+    private var sameProject: [[Bool]] = []  // n×n flattened would be expensive; use group comparison
 
     private(set) var positions: [Int64: CGPoint] = [:]
 
@@ -69,7 +71,7 @@ final class ForceSimulation {
 
     // MARK: - Graph updates
 
-    func updateGraph(nodeIds: Set<Int64>, edges: [(Int64, Int64)]) {
+    func updateGraph(nodeIds: Set<Int64>, edges: [(Int64, Int64)], projectForNode: [Int64: String] = [:]) {
         // Remove nodes no longer in the graph
         var keep = [Bool](repeating: false, count: ids.count)
         for (i, id) in ids.enumerated() {
@@ -144,6 +146,16 @@ final class ForceSimulation {
             idToIndex[id] = i
         }
 
+        // Build project group indices for inter-project repulsion
+        var projectToGroup: [String: Int] = [:]
+        projectGroup = ids.map { id in
+            let proj = projectForNode[id] ?? ""
+            if let g = projectToGroup[proj] { return g }
+            let g = projectToGroup.count
+            projectToGroup[proj] = g
+            return g
+        }
+
         // Convert edges to index pairs
         edgeIndices = edges.compactMap { (src, tgt) in
             guard let si = idToIndex[src], let ti = idToIndex[tgt] else { return nil }
@@ -165,7 +177,8 @@ final class ForceSimulation {
             return
         }
 
-        // Charge repulsion (all pairs) — direct array access, no dict lookups
+        // Charge repulsion (all pairs) — extra repulsion between different projects
+        let hasProjects = !projectGroup.isEmpty
         for i in 0..<n {
             for j in (i + 1)..<n {
                 var dx = x[i] - x[j]
@@ -173,7 +186,9 @@ final class ForceSimulation {
                 var dist = sqrt(dx * dx + dy * dy)
                 if dist < 1 { dist = 1; dx = .random(in: -1...1); dy = .random(in: -1...1) }
 
-                let force = alpha * chargeStrength / (dist * dist)
+                let crossProject = hasProjects && projectGroup[i] != projectGroup[j]
+                let charge = crossProject ? chargeStrength * 3.0 : chargeStrength
+                let force = alpha * charge / (dist * dist)
                 let fx = (dx / dist) * force, fy = (dy / dist) * force
 
                 if !pinned[i] { vx[i] += fx; vy[i] += fy }
