@@ -12,20 +12,19 @@ final class ForceSimulation {
     private var vx: [CGFloat] = []
     private var vy: [CGFloat] = []
     private var pinned: [Bool] = []
-    private var targetX: [CGFloat] = []
-    private var targetY: [CGFloat] = []
-    private var hasTarget: [Bool] = []
     private var idToIndex: [Int64: Int] = [:]
     private var edgeIndices: [(Int, Int)] = []
     private var projectGroup: [Int] = []  // group index per node (same project = same group)
-    private var sameProject: [[Bool]] = []  // n×n flattened would be expensive; use group comparison
 
     private(set) var positions: [Int64: CGPoint] = [:]
 
     private let springLength: CGFloat = 200
+    private let crossProjectSpringLength: CGFloat = 350
     private let springStrength: CGFloat = 0.003
     private let chargeStrength: CGFloat = 3000
     private let centerStrength: CGFloat = 0.008
+    private let cohesionStrength: CGFloat = 0.015
+    private let centroidRepulsion: CGFloat = 8000
     private let damping: CGFloat = 0.85
     private let minAlpha: CGFloat = 0.001
 
@@ -53,22 +52,6 @@ final class ForceSimulation {
         pinned[i] = false
     }
 
-    // MARK: - Target animation (smooth pull toward position)
-
-    func setTarget(_ id: Int64, position: CGPoint) {
-        guard let i = idToIndex[id] else { return }
-        targetX[i] = position.x
-        targetY[i] = position.y
-        hasTarget[i] = true
-        alpha = max(alpha, 0.5)
-    }
-
-    func clearTarget(_ id: Int64) {
-        guard let i = idToIndex[id] else { return }
-        hasTarget[i] = false
-        alpha = max(alpha, 0.5)
-    }
-
     // MARK: - Graph updates
 
     func updateGraph(nodeIds: Set<Int64>, edges: [(Int64, Int64)], projectForNode: [Int64: String] = [:]) {
@@ -85,9 +68,6 @@ final class ForceSimulation {
         var newVx: [CGFloat] = []
         var newVy: [CGFloat] = []
         var newPinned: [Bool] = []
-        var newTargetX: [CGFloat] = []
-        var newTargetY: [CGFloat] = []
-        var newHasTarget: [Bool] = []
         let cap = nodeIds.count
         newIds.reserveCapacity(cap)
         newX.reserveCapacity(cap)
@@ -95,9 +75,6 @@ final class ForceSimulation {
         newVx.reserveCapacity(cap)
         newVy.reserveCapacity(cap)
         newPinned.reserveCapacity(cap)
-        newTargetX.reserveCapacity(cap)
-        newTargetY.reserveCapacity(cap)
-        newHasTarget.reserveCapacity(cap)
 
         for i in 0..<ids.count where keep[i] {
             newIds.append(ids[i])
@@ -106,9 +83,6 @@ final class ForceSimulation {
             newVx.append(vx[i])
             newVy.append(vy[i])
             newPinned.append(pinned[i])
-            newTargetX.append(targetX[i])
-            newTargetY.append(targetY[i])
-            newHasTarget.append(hasTarget[i])
         }
 
         // Add new nodes
@@ -122,9 +96,6 @@ final class ForceSimulation {
             newVx.append(0)
             newVy.append(0)
             newPinned.append(false)
-            newTargetX.append(0)
-            newTargetY.append(0)
-            newHasTarget.append(false)
             topologyChanged = true
         }
 
@@ -136,9 +107,6 @@ final class ForceSimulation {
         vx = newVx
         vy = newVy
         pinned = newPinned
-        targetX = newTargetX
-        targetY = newTargetY
-        hasTarget = newHasTarget
 
         // Rebuild index
         idToIndex.removeAll(keepingCapacity: true)
@@ -196,28 +164,79 @@ final class ForceSimulation {
             }
         }
 
-        // Spring attraction (edges) — index-based
+        // Spring attraction (edges) — longer rest length for cross-project edges
         for (si, ti) in edgeIndices {
             let dx = x[ti] - x[si], dy = y[ti] - y[si]
             var dist = sqrt(dx * dx + dy * dy)
             if dist < 1 { dist = 1 }
-            let force = alpha * springStrength * (dist - springLength)
+            let crossProject = hasProjects && projectGroup[si] != projectGroup[ti]
+            let rest = crossProject ? crossProjectSpringLength : springLength
+            let force = alpha * springStrength * (dist - rest)
             let fx = (dx / dist) * force, fy = (dy / dist) * force
             if !pinned[si] { vx[si] += fx; vy[si] += fy }
             if !pinned[ti] { vx[ti] -= fx; vy[ti] -= fy }
         }
 
-        // Target pull (selected nodes animate toward target)
-        for i in 0..<n where hasTarget[i] && !pinned[i] {
-            vx[i] += (targetX[i] - x[i]) * 0.1
-            vy[i] += (targetY[i] - y[i]) * 0.1
+        // Project centroid forces: cohesion (pull toward own centroid) + centroid repulsion (push clusters apart)
+        if hasProjects {
+            // Compute centroids per project group
+            var groupSumX: [CGFloat] = []
+            var groupSumY: [CGFloat] = []
+            var groupCount: [Int] = []
+            let groupN = (projectGroup.max() ?? -1) + 1
+            if groupN > 0 {
+                groupSumX = [CGFloat](repeating: 0, count: groupN)
+                groupSumY = [CGFloat](repeating: 0, count: groupN)
+                groupCount = [Int](repeating: 0, count: groupN)
+                for i in 0..<n {
+                    let g = projectGroup[i]
+                    groupSumX[g] += x[i]
+                    groupSumY[g] += y[i]
+                    groupCount[g] += 1
+                }
+
+                // Cohesion: pull each node gently toward its project centroid
+                for i in 0..<n where !pinned[i] {
+                    let g = projectGroup[i]
+                    let cnt = CGFloat(groupCount[g])
+                    if cnt < 2 { continue }
+                    let cx = groupSumX[g] / cnt, cy = groupSumY[g] / cnt
+                    vx[i] += (cx - x[i]) * alpha * cohesionStrength
+                    vy[i] += (cy - y[i]) * alpha * cohesionStrength
+                }
+
+                // Centroid repulsion: push project centroids apart
+                for g1 in 0..<groupN {
+                    guard groupCount[g1] > 0 else { continue }
+                    let c1x = groupSumX[g1] / CGFloat(groupCount[g1])
+                    let c1y = groupSumY[g1] / CGFloat(groupCount[g1])
+                    for g2 in (g1 + 1)..<groupN {
+                        guard groupCount[g2] > 0 else { continue }
+                        let c2x = groupSumX[g2] / CGFloat(groupCount[g2])
+                        let c2y = groupSumY[g2] / CGFloat(groupCount[g2])
+                        var dx = c1x - c2x, dy = c1y - c2y
+                        var dist = sqrt(dx * dx + dy * dy)
+                        if dist < 1 { dist = 1; dx = .random(in: -1...1); dy = .random(in: -1...1) }
+                        let force = alpha * centroidRepulsion / (dist * dist)
+                        let fx = (dx / dist) * force, fy = (dy / dist) * force
+                        // Distribute force to all nodes in each group
+                        let f1 = 1.0 / CGFloat(groupCount[g1])
+                        let f2 = 1.0 / CGFloat(groupCount[g2])
+                        for i in 0..<n where projectGroup[i] == g1 && !pinned[i] {
+                            vx[i] += fx * f1; vy[i] += fy * f1
+                        }
+                        for i in 0..<n where projectGroup[i] == g2 && !pinned[i] {
+                            vx[i] -= fx * f2; vy[i] -= fy * f2
+                        }
+                    }
+                }
+            }
         }
 
         // Center gravity + integrate
         for i in 0..<n where !pinned[i] {
-            let cStr = hasTarget[i] ? centerStrength * 0.2 : centerStrength
-            vx[i] += (center.x - x[i]) * alpha * cStr
-            vy[i] += (center.y - y[i]) * alpha * cStr
+            vx[i] += (center.x - x[i]) * alpha * centerStrength
+            vy[i] += (center.y - y[i]) * alpha * centerStrength
             vx[i] *= damping; vy[i] *= damping
             x[i] += vx[i]; y[i] += vy[i]
         }

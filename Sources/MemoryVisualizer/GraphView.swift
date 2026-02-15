@@ -30,10 +30,33 @@ final class ViewportState {
     var scale: CGFloat = 1.0
     var offset: CGPoint = .zero
     var draggedNode: Int64?
-    var isPanningBackground = false
-    var panStart: CGPoint = .zero
-    var offsetStart: CGPoint = .zero
     var hoveredNode: Int64?
+
+    // Animated pan target — lerped each frame by the Canvas timer
+    private var targetOffset: CGPoint?
+    private let panSpeed: CGFloat = 0.12
+
+    func animateTo(offset target: CGPoint) {
+        targetOffset = target
+    }
+
+    /// Call each frame to interpolate toward the target. Returns true while animating.
+    @discardableResult
+    func tickPan() -> Bool {
+        guard let target = targetOffset else { return false }
+        let dx = target.x - offset.x
+        let dy = target.y - offset.y
+        if abs(dx) < 0.5 && abs(dy) < 0.5 {
+            offset = target
+            targetOffset = nil
+            return false
+        }
+        offset = CGPoint(
+            x: offset.x + dx * panSpeed,
+            y: offset.y + dy * panSpeed
+        )
+        return true
+    }
 }
 
 // MARK: - Root view (owns queries, computes display data, manages state)
@@ -60,9 +83,20 @@ struct GraphView: View {
     @State private var debouncedTimeSliderDate: Date?
     @State private var isTimelinePlaying: Bool = false
 
-    static let projectColors: [Color] = [
-        .blue, .green, .orange, .purple, .cyan, .pink, .mint, .teal, .indigo, .yellow
-    ]
+    /// Builds a color map assigning maximally-separated hues to each project using the golden angle.
+    /// Sequential indices guarantee minimum ~137.5° hue separation between adjacent projects.
+    private var projectColorMap: [String: Color] {
+        let goldenAngle = 0.381966011250105 // (√5 - 1) / 2, conjugate of golden ratio
+        let projects = uniqueProjects()
+        var map: [String: Color] = ["global": .gray]
+        for (i, project) in projects.enumerated() {
+            if project == "global" { continue }
+            let hue = Double(i) * goldenAngle
+            let h = hue - hue.rounded(.down)
+            map[project] = Color(hue: h, saturation: 0.65, brightness: 0.9)
+        }
+        return map
+    }
 
     // MARK: - Filtering Pipeline
 
@@ -187,16 +221,17 @@ struct GraphView: View {
         let edgeData = edgeInfos
         let matchIds = searchMatchIds
         let isSearching = !searchText.isEmpty
+        let colorMap = projectColorMap
         ZStack {
             Color(red: 0.051, green: 0.067, blue: 0.09).ignoresSafeArea()
 
-            graphCanvas(nodes: nodes, edges: edgeData, matchIds: matchIds, isSearching: isSearching)
-            graphOverlays(nodes: nodes, edges: edgeData, size: size)
-            detailPanel(size: size)
+            graphCanvas(nodes: nodes, edges: edgeData, matchIds: matchIds, isSearching: isSearching, colorMap: colorMap)
+            graphOverlays(nodes: nodes, edges: edgeData, size: size, colorMap: colorMap)
+            detailPanel(size: size, colorMap: colorMap)
         }
     }
 
-    private func graphCanvas(nodes: [NodeInfo], edges: [EdgeInfo], matchIds: Set<Int64>, isSearching: Bool) -> some View {
+    private func graphCanvas(nodes: [NodeInfo], edges: [EdgeInfo], matchIds: Set<Int64>, isSearching: Bool, colorMap: [String: Color]) -> some View {
         GraphCanvas(
             simulation: simulation,
             nodes: nodes,
@@ -205,12 +240,13 @@ struct GraphView: View {
             isSearchActive: isSearching,
             viewport: viewport,
             selectedNode: $selectedMemoryId,
-            clusters: clusterGroups
+            clusters: clusterGroups,
+            colorMap: colorMap
         )
     }
 
     @ViewBuilder
-    private func graphOverlays(nodes: [NodeInfo], edges: [EdgeInfo], size: CGSize) -> some View {
+    private func graphOverlays(nodes: [NodeInfo], edges: [EdgeInfo], size: CGSize, colorMap: [String: Color]) -> some View {
         StatsOverlay(
             nodes: nodes,
             edgeData: edges,
@@ -222,7 +258,8 @@ struct GraphView: View {
                 .mapValues(\.count)
                 .sorted(by: { $0.key < $1.key }),
             toggleProject: toggleProject,
-            toggleRelation: toggleRelation
+            toggleRelation: toggleRelation,
+            colorMap: colorMap
         )
 
         VStack {
@@ -241,7 +278,8 @@ struct GraphView: View {
                     simulation: simulation,
                     nodes: nodes,
                     viewport: viewport,
-                    viewportSize: size
+                    viewportSize: size,
+                    colorMap: colorMap
                 )
                 .padding(12)
                 Spacer()
@@ -262,14 +300,15 @@ struct GraphView: View {
     }
 
     @ViewBuilder
-    private func detailPanel(size: CGSize) -> some View {
+    private func detailPanel(size: CGSize, colorMap: [String: Color]) -> some View {
         if let memory = selectedMemory {
             let sid = selectedMemoryId!
             let count = edges.filter { $0.sourceId == sid || $0.targetId == sid }.count
             MemoryDetailPanel(
                 memory: memory,
                 connectedCount: count,
-                onClose: { selectedMemoryId = nil }
+                onClose: { selectedMemoryId = nil },
+                colorMap: colorMap
             )
             .id(memory.primaryKey)
             .frame(maxWidth: min(400, size.width * 0.35), maxHeight: min(500, size.height * 0.7))
@@ -282,28 +321,16 @@ struct GraphView: View {
 
     private func installScrollMonitor() {
         scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { event in
+            // Let the detail panel scroll normally
             if let window = event.window, selectedMemoryId != nil {
                 let loc = event.locationInWindow
                 if loc.x > window.frame.width * 0.6 { return event }
             }
-            guard let window = event.window else {
-                let zoomFactor: CGFloat = event.scrollingDeltaY > 0 ? 1.03 : 0.97
-                viewport.scale = max(0.2, min(3.0, viewport.scale * zoomFactor))
-                return event
-            }
-            let loc = event.locationInWindow
-            let cursor = CGPoint(x: loc.x, y: window.frame.height - loc.y)
-            let worldPoint = CGPoint(
-                x: (cursor.x - viewport.offset.x) / viewport.scale,
-                y: (cursor.y - viewport.offset.y) / viewport.scale
-            )
-            let zoomFactor: CGFloat = event.scrollingDeltaY > 0 ? 1.03 : 0.97
-            let newScale = max(0.2, min(3.0, viewport.scale * zoomFactor))
+            // Two-finger scroll / trackpad → pan
             viewport.offset = CGPoint(
-                x: cursor.x - worldPoint.x * newScale,
-                y: cursor.y - worldPoint.y * newScale
+                x: viewport.offset.x + event.scrollingDeltaX,
+                y: viewport.offset.y + event.scrollingDeltaY
             )
-            viewport.scale = newScale
             return event
         }
     }
@@ -316,14 +343,32 @@ struct GraphView: View {
     }
 
     private func handleSelectionChange(oldId: Int64?, newId: Int64?, viewSize: CGSize) {
-        if let old = oldId { simulation.clearTarget(old) }
-        if let new = newId {
-            let targetScreen = CGPoint(x: viewSize.width * 0.25, y: viewSize.height * 0.5)
-            let worldPt = CGPoint(
-                x: (targetScreen.x - viewport.offset.x) / viewport.scale,
-                y: (targetScreen.y - viewport.offset.y) / viewport.scale
-            )
-            simulation.setTarget(new, position: worldPt)
+        guard let new = newId,
+              let worldPos = simulation.positions[new] else { return }
+
+        // Where the node currently sits on screen
+        let screenX = worldPos.x * viewport.scale + viewport.offset.x
+        let screenY = worldPos.y * viewport.scale + viewport.offset.y
+
+        // Visible region is the left ~60% (right 40% is the detail panel)
+        let safeRight = viewSize.width * 0.58
+        let margin: CGFloat = 60
+        let safeLeft = margin
+        let safeTop = margin
+        let safeBottom = viewSize.height - margin
+
+        // Only pan if the node is outside the safe region
+        var dx: CGFloat = 0, dy: CGFloat = 0
+        if screenX > safeRight { dx = safeRight - screenX - margin }
+        else if screenX < safeLeft { dx = safeLeft - screenX + margin }
+        if screenY > safeBottom { dy = safeBottom - screenY - margin }
+        else if screenY < safeTop { dy = safeTop - screenY + margin }
+
+        if dx != 0 || dy != 0 {
+            viewport.animateTo(offset: CGPoint(
+                x: viewport.offset.x + dx,
+                y: viewport.offset.y + dy
+            ))
         }
     }
 
@@ -448,10 +493,9 @@ struct GraphView: View {
         }
     }
 
-    static func projectColor(for project: String) -> Color {
-        if project == "global" { return .gray }
-        let hash = abs(project.hashValue)
-        return projectColors[hash % projectColors.count]
+    /// Look up a project's color from a pre-built map. Falls back to gray for unknown projects.
+    static func projectColor(for project: String, in colorMap: [String: Color]) -> Color {
+        colorMap[project] ?? .gray
     }
 
     static func extractLabel(content: String, topic: String) -> String {

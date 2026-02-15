@@ -13,6 +13,7 @@ struct StatsOverlay: View {
     let allRelationCounts: [(key: String, value: Int)]
     let toggleProject: (String) -> Void
     let toggleRelation: (String) -> Void
+    let colorMap: [String: Color]
 
     var body: some View {
         VStack {
@@ -39,7 +40,7 @@ struct StatsOverlay: View {
                         } label: {
                             HStack(spacing: 6) {
                                 Circle()
-                                    .fill(GraphView.projectColor(for: project))
+                                    .fill(GraphView.projectColor(for: project, in: colorMap))
                                     .frame(width: 8, height: 8)
                                     .opacity(hiddenProjects.contains(project) ? 0.3 : 1.0)
                                 Text(project)
@@ -87,6 +88,7 @@ struct MinimapView: View {
     let nodes: [NodeInfo]
     let viewport: ViewportState
     let viewportSize: CGSize
+    let colorMap: [String: Color]
 
     @State private var frameCount: UInt64 = 0
     private let timer = Timer.publish(every: 1.0 / 60.0, on: .main, in: .common).autoconnect()
@@ -106,7 +108,7 @@ struct MinimapView: View {
                 guard let pos = positions[node.id] else { continue }
                 let mx = (pos.x - bounds.minX) * mapScale
                 let my = (pos.y - bounds.minY) * mapScale
-                let color = GraphView.projectColor(for: node.project)
+                let color = GraphView.projectColor(for: node.project, in: colorMap)
                 let dotSize: CGFloat = node.isHub ? 4 : 2.5
                 let rect = CGRect(x: mx - dotSize / 2, y: my - dotSize / 2, width: dotSize, height: dotSize)
                 context.fill(Circle().path(in: rect), with: .color(color.opacity(0.8)))

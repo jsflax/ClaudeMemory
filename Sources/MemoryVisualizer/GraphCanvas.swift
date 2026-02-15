@@ -12,6 +12,7 @@ struct GraphCanvas: View {
     let viewport: ViewportState
     @Binding var selectedNode: Int64?
     let clusters: [[Int64]]
+    let colorMap: [String: Color]
     @GestureState private var lastMagnification: CGFloat = 1.0
     @State private var frameCount: UInt64 = 0
 
@@ -41,6 +42,7 @@ struct GraphCanvas: View {
                 simulation.updateGraph(nodeIds: currentIds, edges: edgePairs, projectForNode: projectMap)
             }
             simulation.tick()
+            viewport.tickPan()
             var ctx = context
             ctx.translateBy(x: viewport.offset.x, y: viewport.offset.y)
             ctx.scaleBy(x: viewport.scale, y: viewport.scale)
@@ -52,7 +54,7 @@ struct GraphCanvas: View {
         .onReceive(timer) { _ in
             frameCount &+= 1
         }
-        .gesture(dragGesture)
+        .gesture(nodeDragGesture)
         .gesture(magnificationGesture)
         .simultaneousGesture(
             SpatialTapGesture()
@@ -74,31 +76,21 @@ struct GraphCanvas: View {
 
     // MARK: - Gestures
 
-    private var dragGesture: some Gesture {
+    private var nodeDragGesture: some Gesture {
         DragGesture(minimumDistance: 2)
             .onChanged { value in
-                if viewport.draggedNode == nil && !viewport.isPanningBackground {
+                if viewport.draggedNode == nil {
                     if let nodeId = hitTest(value.startLocation) {
                         viewport.draggedNode = nodeId
-                    } else {
-                        viewport.isPanningBackground = true
-                        viewport.panStart = value.startLocation
-                        viewport.offsetStart = viewport.offset
                     }
                 }
                 if let nodeId = viewport.draggedNode {
                     simulation.pinNode(nodeId, at: screenToWorld(value.location))
-                } else if viewport.isPanningBackground {
-                    viewport.offset = CGPoint(
-                        x: viewport.offsetStart.x + (value.location.x - viewport.panStart.x),
-                        y: viewport.offsetStart.y + (value.location.y - viewport.panStart.y)
-                    )
                 }
             }
             .onEnded { _ in
                 if let nodeId = viewport.draggedNode { simulation.unpinNode(nodeId) }
                 viewport.draggedNode = nil
-                viewport.isPanningBackground = false
             }
     }
 
@@ -107,7 +99,23 @@ struct GraphCanvas: View {
             .updating($lastMagnification) { value, state, _ in
                 let delta = value.magnification / state
                 state = value.magnification
-                viewport.scale = max(0.2, min(3.0, viewport.scale * delta))
+                // Zoom anchored to cursor: keep the world point under the cursor fixed
+                guard let window = NSApp.keyWindow else {
+                    viewport.scale = max(0.2, min(3.0, viewport.scale * delta))
+                    return
+                }
+                let mouseLoc = window.mouseLocationOutsideOfEventStream
+                let cursor = CGPoint(x: mouseLoc.x, y: window.frame.height - mouseLoc.y)
+                let worldPoint = CGPoint(
+                    x: (cursor.x - viewport.offset.x) / viewport.scale,
+                    y: (cursor.y - viewport.offset.y) / viewport.scale
+                )
+                let newScale = max(0.2, min(3.0, viewport.scale * delta))
+                viewport.offset = CGPoint(
+                    x: cursor.x - worldPoint.x * newScale,
+                    y: cursor.y - worldPoint.y * newScale
+                )
+                viewport.scale = newScale
             }
     }
 
@@ -157,7 +165,7 @@ struct GraphCanvas: View {
             let hull = ConvexHull.compute(points: points)
             guard hull.count >= 3 else { continue }
             let expanded = ConvexHull.expand(hull, by: 30)
-            let color = GraphView.projectColor(for: project)
+            let color = GraphView.projectColor(for: project, in: colorMap)
             var path = Path()
             path.move(to: expanded[0])
             for i in 1..<expanded.count { path.addLine(to: expanded[i]) }
@@ -173,7 +181,7 @@ struct GraphCanvas: View {
             guard visiblePoints.count >= 2 else { continue }
 
             let project = cluster.first.flatMap { nodeProjectMap[$0] } ?? "global"
-            let color = GraphView.projectColor(for: project)
+            let color = GraphView.projectColor(for: project, in: colorMap)
 
             // For 2-point clusters, add perpendicular offsets to form a capsule shape
             let hullInput: [CGPoint]
@@ -234,7 +242,7 @@ struct GraphCanvas: View {
 
             if isConnected {
                 let color = GraphView.projectColor(for:
-                    nodes.first(where: { $0.id == selectedNode })?.project ?? "global")
+                    nodes.first(where: { $0.id == selectedNode })?.project ?? "global", in: colorMap)
                 context.stroke(path, with: .color(color.opacity(0.6)), lineWidth: 2)
             } else {
                 let baseOpacity: CGFloat = (dimmed || searchDimmed) ? 0.05 : 0.15
@@ -244,7 +252,7 @@ struct GraphCanvas: View {
             // Arrow head
             let arrowOpacity: CGFloat = isConnected ? 0.6 : ((dimmed || searchDimmed) ? 0.05 : 0.15)
             let arrowColor = isConnected
-                ? GraphView.projectColor(for: nodes.first(where: { $0.id == selectedNode })?.project ?? "global")
+                ? GraphView.projectColor(for: nodes.first(where: { $0.id == selectedNode })?.project ?? "global", in: colorMap)
                 : relationColor
             drawArrowHead(context: &context, from: mid, to: shortenedTo, color: arrowColor, opacity: arrowOpacity)
 
@@ -308,7 +316,7 @@ struct GraphCanvas: View {
             guard let pos = positions[node.id] else { continue }
 
             let radius = nodeRadius(for: node)
-            let color = GraphView.projectColor(for: node.project)
+            let color = GraphView.projectColor(for: node.project, in: colorMap)
             let isSelected = node.id == selectedNode
             let isConnected = connectedToSelected.contains(node.id)
             let dimmed = hasSelection && !isSelected && !isConnected

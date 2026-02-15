@@ -8,6 +8,7 @@ struct MemoryDetailPanel: View {
     @Bindable var memory: Memory
     let connectedCount: Int
     let onClose: () -> Void
+    let colorMap: [String: Color]
 
     @State private var typingProgress: Int = 0
     private var content: String { memory.content }
@@ -17,11 +18,11 @@ struct MemoryDetailPanel: View {
             // Header
             HStack {
                 Circle()
-                    .fill(GraphView.projectColor(for: memory.project))
+                    .fill(GraphView.projectColor(for: memory.project, in: colorMap))
                     .frame(width: 10, height: 10)
                 Text(memory.project)
                     .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                    .foregroundStyle(GraphView.projectColor(for: memory.project))
+                    .foregroundStyle(GraphView.projectColor(for: memory.project, in: colorMap))
                 Text("·")
                     .foregroundStyle(.white.opacity(0.3))
                 Text(memory.topic)
@@ -77,7 +78,7 @@ struct MemoryDetailPanel: View {
                 .overlay {
                     RoundedRectangle(cornerRadius: 16)
                         .strokeBorder(
-                            GraphView.projectColor(for: memory.project).opacity(0.3),
+                            GraphView.projectColor(for: memory.project, in: colorMap).opacity(0.3),
                             lineWidth: 1
                         )
                 }
