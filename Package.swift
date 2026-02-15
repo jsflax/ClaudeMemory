@@ -19,7 +19,7 @@ let package = Package(
                 .product(name: "SwiftLM", package: "SwiftLM"),
             ],
             resources: [
-                .copy("Resources/paraphrase-MiniLM-L6-v2_Embedding.mlpackage"),
+                .copy("Resources/paraphrase-MiniLM-L6-v2_Embedding.mlmodelc"),
                 .copy("Resources/paraphrase-MiniLM-L6-v2_tokenizer"),
             ],
             swiftSettings: [

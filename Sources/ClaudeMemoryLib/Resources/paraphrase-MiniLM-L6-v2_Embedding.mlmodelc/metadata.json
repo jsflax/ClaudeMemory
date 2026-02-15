@@ -1,0 +1,105 @@
+[
+  {
+    "metadataOutputVersion" : "3.0",
+    "storagePrecision" : "Float16",
+    "outputSchema" : [
+      {
+        "hasShapeFlexibility" : "0",
+        "isOptional" : "0",
+        "dataType" : "Float16",
+        "formattedType" : "MultiArray (Float16)",
+        "shortDescription" : "",
+        "shape" : "[]",
+        "name" : "embeddings",
+        "type" : "MultiArray"
+      }
+    ],
+    "modelParameters" : [
+
+    ],
+    "specificationVersion" : 8,
+    "mlProgramOperationTypeHistogram" : {
+      "Ios16.reduceL2Norm" : 1,
+      "Ios17.reshape" : 24,
+      "Ios16.softmax" : 6,
+      "Ios17.matmul" : 12,
+      "Ios17.transpose" : 24,
+      "Ios17.maximum" : 1,
+      "Select" : 1,
+      "Ios17.expandDims" : 2,
+      "Ios17.add" : 20,
+      "Tile" : 3,
+      "Ios17.sliceByIndex" : 3,
+      "Shape" : 28,
+      "Ios17.gather" : 53,
+      "Ios17.layerNorm" : 13,
+      "Ios16.gelu" : 6,
+      "Ios17.sub" : 1,
+      "Ios17.cast" : 81,
+      "Ios17.realDiv" : 3,
+      "Ios17.linear" : 36,
+      "Ios17.concat" : 26,
+      "Ios17.mul" : 6
+    },
+    "computePrecision" : "Mixed (Float16, Int16, Int32, UInt16)",
+    "isUpdatable" : "0",
+    "stateSchema" : [
+
+    ],
+    "availability" : {
+      "macOS" : "14.0",
+      "tvOS" : "17.0",
+      "visionOS" : "1.0",
+      "watchOS" : "10.0",
+      "iOS" : "17.0",
+      "macCatalyst" : "17.0"
+    },
+    "modelType" : {
+      "name" : "MLModelType_mlProgram"
+    },
+    "userDefinedMetadata" : {
+      "co.swiftlm.output_type" : "embeddings",
+      "co.swiftlm.normalize_embeddings" : "true",
+      "co.huggingface.exporters.name" : "sentence-transformers\/paraphrase-MiniLM-L6-v2",
+      "co.swiftlm.hidden_size" : "384",
+      "co.swiftlm.num_attention_heads" : "12",
+      "com.github.apple.coremltools.version" : "8.1",
+      "co.swiftlm.vocab_size" : "30522",
+      "co.swiftlm.num_hidden_layers" : "6",
+      "co.swiftlm.max_position_embeddings" : "512",
+      "co.swiftlm.embedding_dim" : "384",
+      "com.github.apple.coremltools.source_dialect" : "TorchScript",
+      "com.github.apple.coremltools.source" : "torch==2.5.1",
+      "co.swiftlm.pooling_strategy" : "cls",
+      "co.swiftlm.model_type" : "bert"
+    },
+    "inputSchema" : [
+      {
+        "dataType" : "Int32",
+        "hasShapeFlexibility" : "1",
+        "isOptional" : "0",
+        "shapeFlexibility" : "1 × 1...512",
+        "shapeRange" : "[[1, 1], [1, 512]]",
+        "formattedType" : "MultiArray (Int32 1 × 32)",
+        "type" : "MultiArray",
+        "shape" : "[1, 32]",
+        "name" : "inputIds",
+        "shortDescription" : ""
+      },
+      {
+        "dataType" : "Float32",
+        "hasShapeFlexibility" : "1",
+        "isOptional" : "0",
+        "shapeFlexibility" : "1 × 1...512",
+        "shapeRange" : "[[1, 1], [1, 512]]",
+        "formattedType" : "MultiArray (Float32 1 × 32)",
+        "type" : "MultiArray",
+        "shape" : "[1, 32]",
+        "name" : "attentionMask",
+        "shortDescription" : ""
+      }
+    ],
+    "generatedClassName" : "paraphrase_MiniLM_L6_v2_Embedding",
+    "method" : "predict"
+  }
+]

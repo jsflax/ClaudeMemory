@@ -24,7 +24,7 @@ log("Database at \(dbPath)")
 // MARK: - Init Embedding Service
 
 let embedder = EmbeddingService(modelPath: modelPath)
-await embedder.load()
+await embedder.startLoading()
 
 // MARK: - MCP Server
 
