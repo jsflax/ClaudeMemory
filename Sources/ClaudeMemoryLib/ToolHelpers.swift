@@ -41,7 +41,12 @@ struct FlexibleIntArray: Decodable {
         if let array = try? container.decode([FlexibleInt].self) {
             values = array.map(\.value)
         } else if let string = try? container.decode(String.self) {
-            let parsed = string.split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+            // Strip surrounding brackets for clients that JSON-stringify arrays: "[155, 156]"
+            var trimmed = string.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("[") && trimmed.hasSuffix("]") {
+                trimmed = String(trimmed.dropFirst().dropLast())
+            }
+            let parsed = trimmed.split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
             guard !parsed.isEmpty else {
                 throw DecodingError.typeMismatch(
                     [Int].self,
