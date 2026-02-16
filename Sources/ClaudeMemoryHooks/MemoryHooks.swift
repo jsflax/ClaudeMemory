@@ -7,7 +7,6 @@ struct MemoryHooks: AsyncParsableCommand {
         abstract: "Claude Code hooks for automatic memory recall and learning",
         subcommands: [
             Advise.self,
-            Analyze.self,
             OnStart.self,
             OnEnd.self,
             OnFailure.self,

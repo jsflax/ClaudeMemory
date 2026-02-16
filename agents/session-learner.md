@@ -1,6 +1,6 @@
 ---
 name: session-learner
-description: Learns from coding sessions by analyzing what happened and storing key insights as memories. Spawned automatically by the Stop hook after substantive interactions.
+description: Learns from coding sessions by analyzing what happened and storing key insights as memories. Spawned automatically by the advise hook after substantive interactions.
 model: sonnet
 maxTurns: 15
 ---

@@ -4,6 +4,21 @@ All notable changes to ClaudeMemory are documented in this file.
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-02-15
+
+### Added
+- MemoryVisualizer: activity log panel — persistent scrollable list of recent memories with animated slide-in, cyan glow on new entries, and click-to-navigate
+
+### Changed
+- MemoryVisualizer: replace transient toast notifications with the persistent activity log
+- MemoryVisualizer: raise normal label zoom threshold from 1.4x to 1.8x for cleaner overview
+- README: use `swift run -c release` for MemoryVisualizer launch commands
+
+### Improved
+- MemoryVisualizer: extract search bar into isolated view to prevent expensive recomputation on each keystroke
+- MemoryVisualizer: move cluster computation to reactive state for snappier search typing
+- Hooks: simplified hook handlers, removed unused Analyze/TranscriptParser modules
+
 ## [0.7.0] - 2026-02-15
 
 ### Added

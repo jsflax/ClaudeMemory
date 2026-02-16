@@ -93,13 +93,13 @@ Start a new Claude Code session — memory tools are immediately available.
 An interactive force-directed graph visualization of your memory database, built with SwiftUI.
 
 ```bash
-swift run MemoryVisualizer
+swift run -c release MemoryVisualizer
 ```
 
 Or point it at a specific database:
 
 ```bash
-CLAUDE_MEMORY_DB=~/path/to/memory.sqlite swift run MemoryVisualizer
+CLAUDE_MEMORY_DB=~/path/to/memory.sqlite swift run -c release MemoryVisualizer
 ```
 
 **Features:**

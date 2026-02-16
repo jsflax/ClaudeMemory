@@ -66,3 +66,40 @@ func setHookState(key: HookState.Key, value: String) {
         lattice.add(HookState(key: key, value: value))
     }
 }
+
+// MARK: - Shared Nudges
+
+/// Returns a maintenance nudge if the CRUD operation delta exceeds the threshold.
+func maintenanceNudge(project: String) -> String? {
+    let opCount = Int(getHookState(key: .crudOperationCount) ?? "0") ?? 0
+    let lastOpCount = Int(getHookState(key: .maintenanceLastOpCount) ?? "0") ?? 0
+    let delta = opCount - lastOpCount
+
+    guard delta >= maintenanceThreshold else { return nil }
+
+    hookLog("Maintenance nudge injected (ops delta: \(delta))")
+
+    return """
+    ## Memory maintenance due
+
+    \(delta) memory operations since last maintenance (\(opCount) total ops).
+
+    If you haven't already, use the memory-maintenance agent to run maintenance in the background. \
+    Focus on project "\(project)" and any other projects with significant memory counts.
+
+    Keep it brief — just one Task tool call, then move on to the user's request.
+    """
+}
+
+/// Returns the learning nudge for the given project.
+func learningNudge(project: String) -> String {
+    """
+    ## Session learning
+
+    If you haven't already, use the session-learner agent in the background to capture insights from this session.
+
+    Project: \(project)
+
+    Keep it brief — just one Task tool call, then move on to the user's request.
+    """
+}

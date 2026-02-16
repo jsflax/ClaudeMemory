@@ -17,21 +17,6 @@ struct UserPromptSubmitInput: Decodable {
     }
 }
 
-/// Input for the Stop hook.
-struct StopInput: Decodable {
-    let sessionId: String?
-    let transcriptPath: String?
-    let cwd: String?
-    let stopHookActive: Bool?
-
-    enum CodingKeys: String, CodingKey {
-        case sessionId = "session_id"
-        case transcriptPath = "transcript_path"
-        case cwd
-        case stopHookActive = "stop_hook_active"
-    }
-}
-
 /// Input for the SessionStart hook.
 struct SessionStartInput: Decodable {
     let sessionId: String?

@@ -3,11 +3,11 @@ import ClaudeMemoryLib
 import Lattice
 import Foundation
 
-/// PreCompact hook: saves important context before compaction erases it.
+/// PreCompact hook: saves important context before compaction, nudges learning and maintenance.
 struct PreCompact: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "pre-compact",
-        abstract: "Save context before compaction (PreCompact hook)"
+        abstract: "Save context before compaction, nudge learning and maintenance (PreCompact hook)"
     )
 
     func run() async throws {
@@ -25,7 +25,12 @@ struct PreCompact: AsyncParsableCommand {
         // Only nudge on auto-compaction — manual compaction is intentional
         guard input.trigger == "auto" else { return }
 
-        let context = """
+        let project = projectName(from: input.cwd)
+        let proj = project ?? "unknown"
+
+        var sections: [String] = []
+
+        sections.append("""
         ## IMPORTANT: Context compaction starting
 
         Your conversation context is about to be compacted — earlier messages will be \
@@ -37,12 +42,20 @@ struct PreCompact: AsyncParsableCommand {
         3. Any corrections or mistakes → `remember` the correct approach
 
         Do this immediately — after compaction, you will not be able to recall these details.
-        """
+        """)
+
+        // Maintenance nudge (if threshold crossed)
+        if let nudge = maintenanceNudge(project: proj) {
+            sections.append(nudge)
+        }
+
+        // Learning nudge
+        sections.append(learningNudge(project: proj))
 
         let output = HookOutput(
             hookSpecificOutput: HookSpecificOutput(
                 hookEventName: "PreCompact",
-                additionalContext: context
+                additionalContext: sections.joined(separator: "\n\n")
             )
         )
         try writeOutput(output)

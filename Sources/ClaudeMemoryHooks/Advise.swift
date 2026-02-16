@@ -3,10 +3,10 @@ import ClaudeMemoryLib
 import Lattice
 import Foundation
 
-/// UserPromptSubmit hook: recalls relevant memories and injects them as context.
+/// UserPromptSubmit hook: recalls relevant memories, nudges learning and maintenance.
 struct Advise: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
-        abstract: "Recall relevant memories for the user's prompt (UserPromptSubmit hook)"
+        abstract: "Recall relevant memories, nudge learning and maintenance (UserPromptSubmit hook)"
     )
 
     func run() async throws {
@@ -24,22 +24,34 @@ struct Advise: AsyncParsableCommand {
         guard let prompt = input.prompt, !prompt.isEmpty else { return }
 
         let project = projectName(from: input.cwd)
+        let proj = project ?? "unknown"
 
-        guard let tools = await initMemoryTools() else { return }
+        var sections: [String] = []
 
-        guard let result = try await tools.directRecall(
-            query: prompt,
-            project: project,
-            depth: 1,
-            limit: 5
-        ) else {
-            return
+        // Recall relevant memories
+        if let tools = await initMemoryTools() {
+            if let result = try await tools.directRecall(
+                query: prompt,
+                project: project,
+                depth: 1,
+                limit: 5
+            ) {
+                sections.append("## Relevant memories\n\n\(result)")
+            }
         }
+
+        // Maintenance nudge (if threshold crossed)
+        if let nudge = maintenanceNudge(project: proj) {
+            sections.append(nudge)
+        }
+
+        // Learning nudge
+        sections.append(learningNudge(project: proj))
 
         let output = HookOutput(
             hookSpecificOutput: HookSpecificOutput(
                 hookEventName: "UserPromptSubmit",
-                additionalContext: "## Relevant memories\n\n\(result)"
+                additionalContext: sections.joined(separator: "\n\n")
             )
         )
         try writeOutput(output)

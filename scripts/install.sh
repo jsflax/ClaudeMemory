@@ -90,7 +90,6 @@ HOOKS_CONFIG='{
       }]
     }],
     "PreToolUse": [{
-      "matcher": "mcp__",
       "hooks": [{
         "type": "command",
         "command": "'"$INSTALL_DIR"'/memory-hooks pre-tool 2>/dev/null",
@@ -112,13 +111,6 @@ HOOKS_CONFIG='{
         "timeout": 3
       }]
     }],
-    "Stop": [{
-      "hooks": [{
-        "type": "command",
-        "command": "'"$INSTALL_DIR"'/memory-hooks analyze 2>/dev/null",
-        "timeout": 10
-      }]
-    }],
     "SessionEnd": [{
       "hooks": [{
         "type": "command",
@@ -131,7 +123,7 @@ HOOKS_CONFIG='{
 
 if [ -f "$SETTINGS_FILE" ]; then
     if command -v jq &>/dev/null; then
-        jq -s '.[0] * .[1]' "$SETTINGS_FILE" <(echo "$HOOKS_CONFIG") > "$SETTINGS_FILE.tmp"
+        jq -s '.[0] * .[1] | .hooks |= del(.Stop)' "$SETTINGS_FILE" <(echo "$HOOKS_CONFIG") > "$SETTINGS_FILE.tmp"
         mv "$SETTINGS_FILE.tmp" "$SETTINGS_FILE"
         echo "Merged hooks into $SETTINGS_FILE"
     else
@@ -165,9 +157,9 @@ To keep memories clean:
 - `forget` to remove wrong or outdated memories
 - Set `expires_in_days` for temporary context (current tasks, open PRs)
 
-When you receive a learning nudge (from the Stop hook), spawn the `session-learner` sub-agent in the background as instructed. Keep it brief — just one Task tool call, then stop.
+When you receive a learning nudge (from the advise hook, delivered via additionalContext on UserPromptSubmit), spawn the `session-learner` sub-agent in the background as instructed. Keep it brief — just one Task tool call, then move on to the user'"'"'s request.
 
-When you receive a maintenance nudge (from the SessionStart hook, triggered after 10+ CRUD operations), spawn the `memory-maintenance` sub-agent in the background as instructed. It handles organization, consolidation, and cleanup autonomously.
+When you receive a maintenance nudge (from the advise hook, triggered after 10+ CRUD operations), spawn the `memory-maintenance` sub-agent in the background as instructed. It handles organization, consolidation, and cleanup autonomously.
 
 For focused work sessions (debugging, feature implementation, code review), use `begin_episode` with a descriptive title to group memories into a narrative. Use `end_episode` with a summary when done. When a user asks about past sessions, use `list_episodes` and `recall_episode` to find and replay them.
 

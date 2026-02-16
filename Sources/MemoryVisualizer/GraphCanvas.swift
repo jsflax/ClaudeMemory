@@ -361,7 +361,7 @@ struct GraphCanvas: View {
         case .hub:       return scale >= 0.3
         case .topic:     return scale >= 0.4
         case .prominent: return scale >= 0.7
-        case .normal:    return scale >= 1.4
+        case .normal:    return scale >= 1.8
         }
     }
 

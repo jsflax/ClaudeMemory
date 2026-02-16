@@ -3,11 +3,11 @@ import ClaudeMemoryLib
 import Lattice
 import Foundation
 
-/// SessionStart hook: checks if memory maintenance is due and nudges Claude to spawn a maintenance agent.
+/// SessionStart hook: recalls project context and checks maintenance.
 struct OnStart: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "on-start",
-        abstract: "Check maintenance needs on session start (SessionStart hook)"
+        abstract: "Recall project context and check maintenance (SessionStart hook)"
     )
 
     func run() async throws {
@@ -22,36 +22,38 @@ struct OnStart: AsyncParsableCommand {
             return
         }
 
-        // Check if maintenance is due based on CRUD operation count
-        let opCount = Int(getHookState(key: .crudOperationCount) ?? "0") ?? 0
-        let lastOpCount = Int(getHookState(key: .maintenanceLastOpCount) ?? "0") ?? 0
-        let delta = opCount - lastOpCount
+        let project = projectName(from: input.cwd)
+        let proj = project ?? "unknown"
 
-        guard delta >= maintenanceThreshold else {
-            hookLog("No maintenance needed (ops delta: \(delta), threshold: \(maintenanceThreshold))")
-            return
+        var sections: [String] = []
+
+        // Recall project context
+        if let tools = await initMemoryTools() {
+            if let result = try await tools.directRecall(
+                query: "project overview \(proj)",
+                project: project,
+                depth: 1,
+                limit: 5
+            ) {
+                sections.append("## Project context\n\n\(result)")
+            }
         }
 
-        let proj = projectName(from: input.cwd) ?? "global"
+        // Maintenance nudge (if threshold crossed)
+        if let nudge = maintenanceNudge(project: proj) {
+            sections.append(nudge)
+        }
 
-        let context = """
-        ## Memory maintenance due
+        // No learning nudge at session start — nothing to learn from yet
 
-        \(delta) memory operations since last maintenance (\(opCount) total ops).
-
-        Before doing anything else, use the memory-maintenance agent to run maintenance in the background. \
-        Focus on project "\(proj)" and any other projects with significant memory counts.
-
-        Keep it brief — just one Task tool call, then move on to the user's request.
-        """
+        guard !sections.isEmpty else { return }
 
         let output = HookOutput(
             hookSpecificOutput: HookSpecificOutput(
                 hookEventName: "SessionStart",
-                additionalContext: context
+                additionalContext: sections.joined(separator: "\n\n")
             )
         )
         try writeOutput(output)
-        hookLog("Maintenance reminder injected (ops delta: \(delta))")
     }
 }

@@ -2,6 +2,7 @@ import SwiftUI
 import Lattice
 import ClaudeMemoryLib
 import UniformTypeIdentifiers
+import AppKit
 
 typealias MemoryEdge = ClaudeMemoryLib.Edge
 
@@ -80,10 +81,12 @@ struct GraphView: View {
     @State private var selectedMemoryId: Int64?
     @State private var scrollMonitor: Any?
 
-    // Search (debounced, FTS5-backed)
-    @State private var searchText: String = ""
+    // Search results (owned by SearchBarView, written via bindings)
     @State private var searchMatchIds: Set<Int64> = []
-    @FocusState private var isSearchFocused: Bool
+    @State private var isSearchActive: Bool = false
+
+    // Cluster groups (expensive — recomputed only when data or filters change)
+    @State private var clusterGroups: [[Int64]] = []
 
     // Time slider (debounced like search)
     @State private var timeSliderDate: Date?
@@ -162,8 +165,7 @@ struct GraphView: View {
             .map { TopicGroupInfo(topic: $0.topic, project: $0.project, ids: $0.ids) }
     }
 
-    /// Semantic clusters within each project (embedding similarity + Jaccard term overlap).
-    private var clusterGroups: [[Int64]] {
+    private func recomputeClusters() {
         let visibleProjects = Set(memories.compactMap { m -> String? in
             guard !hiddenProjects.contains(m.project) else { return nil }
             return m.project
@@ -172,7 +174,7 @@ struct GraphView: View {
         for project in visibleProjects {
             all.append(contentsOf: findMemoryClusters(in: lattice, project: project, minClusterSize: 2).clusters)
         }
-        return all
+        clusterGroups = all
     }
 
     // MARK: - Date range for time slider (filtered by visible projects)
@@ -201,36 +203,27 @@ struct GraphView: View {
                     handleSelectionChange(oldId: oldId, newId: newId, viewSize: geo.size)
                 }
                 .modifier(keyboardShortcuts)
-                .task(id: searchText) {
-                    let query = searchText
-                    guard !query.isEmpty else {
-                        searchMatchIds = []
-                        return
-                    }
-                    try? await Task.sleep(for: .milliseconds(150))
-                    guard !Task.isCancelled else { return }
-                    let terms = query.split(separator: " ").map(String.init)
-                    guard !terms.isEmpty else { searchMatchIds = []; return }
-                    // Use prefix matching so "edito" matches "editor"
-                    let ftsQuery: TextQuery = .raw(terms.map { "\($0)*" }.joined(separator: " OR "))
-                    var ids = Set<Int64>()
-                    for match in lattice.objects(Memory.self).matching(ftsQuery, on: \.content, limit: 500) {
-                        if let pk = match.object.primaryKey { ids.insert(pk) }
-                    }
-                    searchMatchIds = ids
-                }
                 .task(id: timeSliderDate) {
                     try? await Task.sleep(for: .milliseconds(80))
                     debouncedTimeSliderDate = timeSliderDate
                 }
+                .onChange(of: memories.count) { oldCount, newCount in
+                    guard newCount != oldCount else { return }
+                    recomputeClusters()
+                    guard UserDefaults.standard.bool(forKey: "soundEnabled") else { return }
+                    let sound = newCount > oldCount
+                        ? "/System/Library/Sounds/Funk.aiff"
+                        : "/System/Library/Sounds/Bottle.aiff"
+                    NSSound(contentsOf: URL(fileURLWithPath: sound), byReference: true)?.play()
+                }
+                .onChange(of: hiddenProjects) { _, _ in recomputeClusters() }
+                .onAppear { recomputeClusters() }
         }
     }
 
     private var keyboardShortcuts: some ViewModifier {
         GraphKeyboardShortcuts(
             selectedMemoryId: $selectedMemoryId,
-            searchText: $searchText,
-            isSearchFocused: $isSearchFocused,
             viewport: viewport,
             cycleConnectedNode: cycleConnectedNode,
             exportToPNG: exportToPNG
@@ -244,7 +237,7 @@ struct GraphView: View {
         let nodes = nodeInfos
         let edgeData = edgeInfos
         let matchIds = searchMatchIds
-        let isSearching = !searchText.isEmpty
+        let isSearching = isSearchActive
         let colorMap = projectColorMap
         ZStack {
             Color(red: 0.051, green: 0.067, blue: 0.09).ignoresSafeArea()
@@ -272,24 +265,46 @@ struct GraphView: View {
 
     @ViewBuilder
     private func graphOverlays(nodes: [NodeInfo], edges: [EdgeInfo], size: CGSize, colorMap: [String: Color]) -> some View {
-        StatsOverlay(
-            nodes: nodes,
-            edgeData: edges,
-            totalMemories: memories.count,
-            hiddenProjects: hiddenProjects,
-            hiddenRelations: hiddenRelations,
-            projects: uniqueProjects(),
-            allRelationCounts: Dictionary(grouping: allVisibleEdgeInfos, by: \.relation)
-                .mapValues(\.count)
-                .sorted(by: { $0.key < $1.key }),
-            toggleProject: toggleProject,
-            toggleRelation: toggleRelation,
-            colorMap: colorMap
-        )
+        // Right column: stats + activity log
+        VStack(alignment: .trailing, spacing: 8) {
+            StatsOverlay(
+                nodes: nodes,
+                edgeData: edges,
+                totalMemories: memories.count,
+                hiddenProjects: hiddenProjects,
+                hiddenRelations: hiddenRelations,
+                projects: uniqueProjects(),
+                allRelationCounts: Dictionary(grouping: allVisibleEdgeInfos, by: \.relation)
+                    .mapValues(\.count)
+                    .sorted(by: { $0.key < $1.key }),
+                toggleProject: toggleProject,
+                toggleRelation: toggleRelation,
+                colorMap: colorMap
+            )
+
+            if selectedMemoryId == nil {
+                ActivityLogPanel(
+                    memories: Array(memories),
+                    colorMap: colorMap,
+                    onSelect: { id in selectedMemoryId = id }
+                )
+                .transition(.opacity)
+            }
+
+            Spacer()
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .trailing)
+        .animation(.easeInOut(duration: 0.25), value: selectedMemoryId == nil)
 
         VStack {
             HStack {
-                searchBar
+                SearchBarView(
+                    matchIds: $searchMatchIds,
+                    isActive: $isSearchActive,
+                    lattice: lattice
+                )
+                SoundToggleButton()
                 Spacer()
             }
             .padding(12)
@@ -346,10 +361,12 @@ struct GraphView: View {
 
     private func installScrollMonitor() {
         scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { event in
-            // Let the detail panel scroll normally
-            if let window = event.window, selectedMemoryId != nil {
+            if let window = event.window {
                 let loc = event.locationInWindow
-                if loc.x > window.frame.width * 0.6 { return event }
+                let rightEdge = window.frame.width
+                // Let the activity log or detail panel scroll normally
+                if loc.x > rightEdge - 240 { return event }
+                if selectedMemoryId != nil && loc.x > rightEdge * 0.6 { return event }
             }
             // Two-finger scroll / trackpad → pan
             viewport.offset = CGPoint(
@@ -395,48 +412,6 @@ struct GraphView: View {
                 y: viewport.offset.y + dy
             ))
         }
-    }
-
-    // MARK: - Search Bar
-
-    private var searchBar: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "magnifyingglass")
-                .foregroundStyle(.white.opacity(0.4))
-                .font(.system(size: 12))
-            TextField("Search memories…", text: $searchText)
-                .textFieldStyle(.plain)
-                .font(.system(size: 12, design: .monospaced))
-                .foregroundStyle(.white.opacity(0.9))
-                .focused($isSearchFocused)
-                .frame(width: 180)
-            if !searchText.isEmpty {
-                Button {
-                    searchText = ""
-                    searchMatchIds = []
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .foregroundStyle(.white.opacity(0.4))
-                        .font(.system(size: 11))
-                }
-                .buttonStyle(.plain)
-
-                let matchCount = searchMatchIds.count
-                Text("\(matchCount) match\(matchCount == 1 ? "" : "es")")
-                    .font(.system(size: 10, design: .monospaced))
-                    .foregroundStyle(.white.opacity(0.4))
-            }
-        }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
-        .background(
-            RoundedRectangle(cornerRadius: 8)
-                .fill(Color(red: 0.08, green: 0.1, blue: 0.14))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 8)
-                        .strokeBorder(.white.opacity(isSearchFocused ? 0.3 : 0.1), lineWidth: 1)
-                )
-        )
     }
 
     // MARK: - Selected Memory (live)
@@ -548,12 +523,28 @@ struct GraphView: View {
     }
 }
 
+// MARK: - Sound Toggle (isolated to avoid re-rendering GraphView)
+
+struct SoundToggleButton: View {
+    @AppStorage("soundEnabled") private var soundEnabled = false
+
+    var body: some View {
+        Button {
+            soundEnabled.toggle()
+        } label: {
+            Image(systemName: soundEnabled ? "speaker.wave.2.fill" : "speaker.slash.fill")
+                .font(.system(size: 12))
+                .foregroundStyle(.white.opacity(soundEnabled ? 0.7 : 0.3))
+        }
+        .buttonStyle(.plain)
+        .help(soundEnabled ? "Mute notifications" : "Unmute notifications")
+    }
+}
+
 // MARK: - Keyboard Shortcuts Modifier
 
 struct GraphKeyboardShortcuts: ViewModifier {
     @Binding var selectedMemoryId: Int64?
-    @Binding var searchText: String
-    var isSearchFocused: FocusState<Bool>.Binding
     let viewport: ViewportState
     let cycleConnectedNode: () -> Void
     let exportToPNG: () -> Void
@@ -562,8 +553,6 @@ struct GraphKeyboardShortcuts: ViewModifier {
         content
             .onKeyPress(.escape) {
                 selectedMemoryId = nil
-                searchText = ""
-                isSearchFocused.wrappedValue = false
                 return .handled
             }
             .onKeyPress(.tab) {
@@ -583,15 +572,89 @@ struct GraphKeyboardShortcuts: ViewModifier {
                 return .handled
             }
             .onKeyPress(characters: .alphanumerics, phases: .down) { keyPress in
-                if keyPress.characters == "f" && keyPress.modifiers == .command {
-                    isSearchFocused.wrappedValue = true
-                    return .handled
-                }
                 if keyPress.characters == "E" && keyPress.modifiers == [.command, .shift] {
                     exportToPNG()
                     return .handled
                 }
                 return .ignored
             }
+    }
+}
+
+// MARK: - Search Bar (isolated view — owns its own text state to avoid invalidating GraphView on each keystroke)
+
+struct SearchBarView: View {
+    @Binding var matchIds: Set<Int64>
+    @Binding var isActive: Bool
+    let lattice: Lattice
+
+    @State private var text: String = ""
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(.white.opacity(0.4))
+                .font(.system(size: 12))
+            TextField("Search memories…", text: $text)
+                .textFieldStyle(.plain)
+                .font(.system(size: 12, design: .monospaced))
+                .foregroundStyle(.white.opacity(0.9))
+                .focused($isFocused)
+                .frame(width: 180)
+                .onKeyPress(.escape) {
+                    text = ""
+                    matchIds = []
+                    isActive = false
+                    isFocused = false
+                    return .handled
+                }
+            if !text.isEmpty {
+                Button {
+                    text = ""
+                    matchIds = []
+                    isActive = false
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.white.opacity(0.4))
+                        .font(.system(size: 11))
+                }
+                .buttonStyle(.plain)
+
+                let matchCount = matchIds.count
+                Text("\(matchCount) match\(matchCount == 1 ? "" : "es")")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.4))
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(Color(red: 0.08, green: 0.1, blue: 0.14))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .strokeBorder(.white.opacity(isFocused ? 0.3 : 0.1), lineWidth: 1)
+                )
+        )
+        .task(id: text) {
+            let query = text
+            guard !query.isEmpty else {
+                matchIds = []
+                isActive = false
+                return
+            }
+            isActive = true
+            try? await Task.sleep(for: .milliseconds(150))
+            guard !Task.isCancelled else { return }
+            let terms = query.split(separator: " ").map(String.init)
+            guard !terms.isEmpty else { matchIds = []; return }
+            let ftsQuery: TextQuery = .raw(terms.map { "\($0)*" }.joined(separator: " OR "))
+            var ids = Set<Int64>()
+            for match in lattice.objects(Memory.self).matching(ftsQuery, on: \.content, limit: 500) {
+                if let pk = match.object.primaryKey { ids.insert(pk) }
+            }
+            matchIds = ids
+        }
     }
 }

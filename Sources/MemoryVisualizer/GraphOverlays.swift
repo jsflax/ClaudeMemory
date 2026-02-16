@@ -35,72 +35,65 @@ struct StatsOverlay: View {
     }
 
     var body: some View {
-        VStack {
-            HStack {
-                Spacer()
-                VStack(alignment: .trailing, spacing: 6) {
-                    let visible = nodes.count
-                    if visible < totalMemories {
-                        Text("\(visible)/\(totalMemories) memories")
-                            .font(.system(size: 13, weight: .medium, design: .monospaced))
-                    } else {
-                        Text("\(totalMemories) memories")
-                            .font(.system(size: 13, weight: .medium, design: .monospaced))
-                    }
-                    Text("\(edgeData.count) edges")
-                        .font(.system(size: 13, weight: .medium, design: .monospaced))
-                    Text("db: \(dbFileSize)")
-                        .font(.system(size: 11, design: .monospaced))
+        VStack(alignment: .trailing, spacing: 6) {
+            let visible = nodes.count
+            if visible < totalMemories {
+                Text("\(visible)/\(totalMemories) memories")
+                    .font(.system(size: 13, weight: .medium, design: .monospaced))
+            } else {
+                Text("\(totalMemories) memories")
+                    .font(.system(size: 13, weight: .medium, design: .monospaced))
+            }
+            Text("\(edgeData.count) edges")
+                .font(.system(size: 13, weight: .medium, design: .monospaced))
+            Text("db: \(dbFileSize)")
+                .font(.system(size: 11, design: .monospaced))
 
-                    Divider().frame(width: 100).overlay(Color.white.opacity(0.2))
+            Divider().frame(width: 100).overlay(Color.white.opacity(0.2))
 
-                    // Project filters
-                    ForEach(projects, id: \.self) { project in
-                        Button {
-                            toggleProject(project)
-                        } label: {
-                            HStack(spacing: 6) {
-                                Circle()
-                                    .fill(GraphView.projectColor(for: project, in: colorMap))
-                                    .frame(width: 8, height: 8)
-                                    .opacity(hiddenProjects.contains(project) ? 0.3 : 1.0)
-                                Text(project)
-                                    .font(.system(size: 11, design: .monospaced))
-                                    .strikethrough(hiddenProjects.contains(project))
-                            }
-                        }
-                        .buttonStyle(.plain)
-                    }
-
-                    // Edge type filters (use unfiltered counts so hidden types remain visible)
-                    if !allRelationCounts.isEmpty {
-                        Divider().frame(width: 100).overlay(Color.white.opacity(0.2))
-
-                        ForEach(allRelationCounts, id: \.key) { relation, count in
-                            Button {
-                                toggleRelation(relation)
-                            } label: {
-                                HStack(spacing: 6) {
-                                    Circle()
-                                        .fill(GraphCanvas.relationColors[relation] ?? .white)
-                                        .frame(width: 8, height: 8)
-                                        .opacity(hiddenRelations.contains(relation) ? 0.3 : 1.0)
-                                    Text("\(relation.replacingOccurrences(of: "_", with: " ")) (\(count))")
-                                        .font(.system(size: 11, design: .monospaced))
-                                        .strikethrough(hiddenRelations.contains(relation))
-                                }
-                            }
-                            .buttonStyle(.plain)
-                        }
+            // Project filters
+            ForEach(projects, id: \.self) { project in
+                Button {
+                    toggleProject(project)
+                } label: {
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(GraphView.projectColor(for: project, in: colorMap))
+                            .frame(width: 8, height: 8)
+                            .opacity(hiddenProjects.contains(project) ? 0.3 : 1.0)
+                        Text(project)
+                            .font(.system(size: 11, design: .monospaced))
+                            .strikethrough(hiddenProjects.contains(project))
                     }
                 }
-                .foregroundStyle(.white.opacity(0.7))
-                .padding(12)
-                .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 10))
-                .padding(12)
+                .buttonStyle(.plain)
             }
-            Spacer()
+
+            // Edge type filters (use unfiltered counts so hidden types remain visible)
+            if !allRelationCounts.isEmpty {
+                Divider().frame(width: 100).overlay(Color.white.opacity(0.2))
+
+                ForEach(allRelationCounts, id: \.key) { relation, count in
+                    Button {
+                        toggleRelation(relation)
+                    } label: {
+                        HStack(spacing: 6) {
+                            Circle()
+                                .fill(GraphCanvas.relationColors[relation] ?? .white)
+                                .frame(width: 8, height: 8)
+                                .opacity(hiddenRelations.contains(relation) ? 0.3 : 1.0)
+                            Text("\(relation.replacingOccurrences(of: "_", with: " ")) (\(count))")
+                                .font(.system(size: 11, design: .monospaced))
+                                .strikethrough(hiddenRelations.contains(relation))
+                        }
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
         }
+        .foregroundStyle(.white.opacity(0.7))
+        .padding(12)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 10))
     }
 }
 

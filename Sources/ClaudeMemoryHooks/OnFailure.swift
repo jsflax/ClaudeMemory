@@ -3,11 +3,11 @@ import ClaudeMemoryLib
 import Lattice
 import Foundation
 
-/// PostToolUseFailure hook: recalls relevant memories about the failed tool.
+/// PostToolUseFailure hook: nudges learning and maintenance. Skips expensive recall to stay within timeout.
 struct OnFailure: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "on-failure",
-        abstract: "Recall relevant tool usage memories after a failure (PostToolUseFailure hook)"
+        abstract: "Nudge learning and maintenance (PostToolUseFailure hook)"
     )
 
     func run() async throws {
@@ -22,40 +22,25 @@ struct OnFailure: AsyncParsableCommand {
             return
         }
 
-        guard let toolName = input.toolName else { return }
+        guard input.toolName != nil else { return }
 
         let project = projectName(from: input.cwd)
-        let errorText = input.error ?? "unknown error"
+        let proj = project ?? "unknown"
 
-        // Build a query from the tool name + error context
-        let query = "\(toolName) usage error: \(String(errorText.prefix(200)))"
+        var sections: [String] = []
 
-        guard let tools = await initMemoryTools() else { return }
-
-        guard let result = try await tools.directRecall(
-            query: query,
-            project: project,
-            depth: 0,
-            limit: 3
-        ) else {
-            return
+        // Maintenance nudge (if threshold crossed)
+        if let nudge = maintenanceNudge(project: proj) {
+            sections.append(nudge)
         }
 
-        let context = """
-        ## Tool failure: \(toolName)
-
-        Error: \(String(errorText.prefix(300)))
-
-        Relevant memories about this tool:
-        \(result)
-
-        Use these memories to avoid repeating this mistake.
-        """
+        // Learning nudge
+        sections.append(learningNudge(project: proj))
 
         let output = HookOutput(
             hookSpecificOutput: HookSpecificOutput(
                 hookEventName: "PostToolUseFailure",
-                additionalContext: context
+                additionalContext: sections.joined(separator: "\n\n")
             )
         )
         try writeOutput(output)

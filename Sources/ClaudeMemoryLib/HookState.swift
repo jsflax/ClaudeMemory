@@ -8,7 +8,6 @@ public final class HookState {
     public enum Key: String, Codable, Sendable {
         case crudOperationCount = "crud.operationCount"
         case maintenanceLastOpCount = "maintenance.lastOpCount"
-        case lastNudgedSession = "nudge.lastSessionId"
     }
 
     /// The state key.
