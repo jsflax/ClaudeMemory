@@ -74,6 +74,11 @@ echo "Installed agent definitions to $AGENTS_DIR"
 echo "Registering hooks..."
 SETTINGS_FILE="$HOME/.claude/settings.json"
 HOOKS_CONFIG='{
+  "permissions": {
+    "allow": [
+      "mcp__memory__*"
+    ]
+  },
   "hooks": {
     "SessionStart": [{
       "hooks": [{
