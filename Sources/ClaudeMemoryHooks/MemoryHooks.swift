@@ -9,6 +9,7 @@ struct MemoryHooks: AsyncParsableCommand {
             Advise.self,
             OnStart.self,
             OnEnd.self,
+            OnStop.self,
             OnFailure.self,
             PreTool.self,
             PreCompact.self,

@@ -98,6 +98,12 @@ public actor EmbeddingService {
         return try await model.embed(text: text)
     }
 
+    public func similarity(_ text1: String, _ text2: String) async throws -> Float? {
+        await ensureLoaded()
+        guard let model else { return nil }
+        return try await model.similarity(text1, text2)
+    }
+
     private func log(_ message: String) {
         FileHandle.standardError.write(Data("[claude-memory] \(message)\n".utf8))
     }

@@ -1257,7 +1257,7 @@ import Foundation
     ))
     let output = text(from: result)
     #expect(output.contains("fts5:"))
-    #expect(output.contains("relevance:"))
+    #expect(output.contains("distance:"))
 }
 
 // MARK: - Reinforcement / Importance Scoring
@@ -1398,7 +1398,7 @@ import Foundation
     ))
     let output = text(from: result)
     #expect(output.contains("microservices"))
-    #expect(output.contains("relevance:"))
+    #expect(output.contains("distance:"))
 }
 
 // MARK: - Temporal Queries (recall since/before)

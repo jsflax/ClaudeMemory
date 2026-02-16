@@ -2,29 +2,20 @@ import ClaudeMemoryLib
 import Lattice
 import Foundation
 
-/// The full Lattice schema — must match everywhere Lattice is initialized.
-func openLattice(at dbPath: String) throws -> Lattice {
-    try Lattice(
-        Memory.self, Edge.self, Checkpoint.self, HookState.self,
+/// Open Lattice with the full schema at the default database path.
+func openLattice() -> Lattice? {
+    let dbPath = defaultDbPath
+    guard FileManager.default.fileExists(atPath: dbPath) else { return nil }
+    return try? Lattice(
+        Memory.self, Edge.self, Checkpoint.self, HookState.self, SessionState.self,
         configuration: .init(fileURL: URL(fileURLWithPath: dbPath))
     )
 }
 
-/// Initialize MemoryTools from the default database path.
-/// Returns nil if the database doesn't exist or can't be opened.
+/// Initialize MemoryTools (Lattice + embedding model).
 func initMemoryTools() async -> MemoryTools? {
-    let dbPath = defaultDbPath
-
-    guard FileManager.default.fileExists(atPath: dbPath) else {
-        hookLog("No memory database at \(dbPath)")
-        return nil
-    }
-
-    let lattice: Lattice
-    do {
-        lattice = try openLattice(at: dbPath)
-    } catch {
-        hookLog("Failed to open database: \(error)")
+    guard let lattice = openLattice() else {
+        hookLog("No memory database at \(defaultDbPath)")
         return nil
     }
 
@@ -35,36 +26,41 @@ func initMemoryTools() async -> MemoryTools? {
     return MemoryTools(lattice: lattice, embedder: embedder)
 }
 
-/// Open Lattice read-only (no embedding model needed) for count/state queries.
-func openLatticeReadOnly() -> Lattice? {
-    let dbPath = defaultDbPath
-    guard FileManager.default.fileExists(atPath: dbPath) else { return nil }
-    return try? openLattice(at: dbPath)
-}
-
 /// Get the current total memory count from the database.
 func currentMemoryCount() -> Int? {
-    guard let lattice = openLatticeReadOnly() else { return nil }
+    guard let lattice = openLattice() else { return nil }
     return lattice.count(Memory.self)
 }
 
-/// Read a HookState value by key.
+/// Read a global HookState value by key.
 func getHookState(key: HookState.Key) -> String? {
-    guard let lattice = openLatticeReadOnly() else { return nil }
+    guard let lattice = openLattice() else { return nil }
     return lattice.objects(HookState.self)
         .where { $0.key == key }
         .first?.value
 }
 
-/// Write a HookState value by key (upsert).
+/// Write a global HookState value by key (upsert).
 func setHookState(key: HookState.Key, value: String) {
-    guard let lattice = openLatticeReadOnly() else { return }
+    guard let lattice = openLattice() else { return }
     if let existing = lattice.objects(HookState.self).where({ $0.key == key }).first {
         existing.value = value
         existing.updatedAt = Date()
     } else {
         lattice.add(HookState(key: key, value: value))
     }
+}
+
+/// Get or create the SessionState row for a given session ID.
+func getSessionState(sessionId: String?) -> SessionState? {
+    guard let sessionId, !sessionId.isEmpty else { return nil }
+    guard let lattice = openLattice() else { return nil }
+    if let existing = lattice.objects(SessionState.self).where({ $0.sessionId == sessionId }).first {
+        return existing
+    }
+    let state = SessionState(sessionId: sessionId)
+    lattice.add(state)
+    return state
 }
 
 // MARK: - Shared Nudges
@@ -107,19 +103,21 @@ private let learningNudgeInitialThreshold = 15
 private let learningNudgeInterval = 30
 
 /// Increments the tool call counter and returns a learning nudge only when threshold is crossed.
-/// Use this for high-frequency hooks (PreToolUse, PostToolUseFailure) to avoid habituation.
-func throttledLearningNudge(project: String) -> String? {
-    let count = (Int(getHookState(key: .toolCallCount) ?? "0") ?? 0) + 1
-    setHookState(key: .toolCallCount, value: String(count))
+/// Use this for high-frequency hooks (PostToolUseFailure) to avoid habituation.
+func throttledLearningNudge(project: String, sessionId: String?) -> String? {
+    guard let state = getSessionState(sessionId: sessionId) else { return nil }
 
-    let lastNudgeAt = Int(getHookState(key: .learningNudgeLastToolCount) ?? "0") ?? 0
+    state.toolCallCount += 1
+    state.updatedAt = Date()
+
+    let lastNudgeAt = state.learningNudgeLastToolCount
     let threshold = lastNudgeAt == 0 ? learningNudgeInitialThreshold : learningNudgeInterval
-    let delta = count - lastNudgeAt
+    let delta = state.toolCallCount - lastNudgeAt
 
     guard delta >= threshold else { return nil }
 
-    setHookState(key: .learningNudgeLastToolCount, value: String(count))
-    hookLog("Learning nudge injected (tool call \(count), last nudge at \(lastNudgeAt))")
+    state.learningNudgeLastToolCount = state.toolCallCount
+    hookLog("Learning nudge injected (tool call \(state.toolCallCount), last nudge at \(lastNudgeAt))")
 
     return """
     ## Action required: capture session insights

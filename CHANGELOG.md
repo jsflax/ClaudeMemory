@@ -2,7 +2,29 @@
 
 All notable changes to ClaudeMemory are documented in this file.
 
-## [Unreleased]
+## [0.8.0] - 2026-02-16
+
+### Added
+- **Stop hook** (`on-stop`) — blocks session end when significant code changes detected, nudges session-learner to capture insights
+- **Per-session state model** (`SessionState`) — replaces global HookState keys for tool call tracking and learning nudge throttling; cleaned up on session end
+- `EmbeddingService.similarity()` method for direct text-to-text similarity comparison
+- MemoryVisualizer: floating PiP panel with drag, resize, and corner-snapping
+- MemoryVisualizer: `@globalActor`-based force simulation for off-MainActor O(n²) computation
+- MemoryVisualizer: synchronous local repulsion on drag for immediate visual feedback
+
+### Changed
+- Recall output label changed from "relevance:" to "distance:" for clarity
+- Lattice dependency updated from local path to remote `0.3.1`
+- Hooks: learning nudge skipped when stop hook already fired (prevents double-nudge)
+- Hooks: `openLattice()` simplified — single function replaces `openLattice(at:)` and `openLatticeReadOnly()`
+- MemoryVisualizer: ActivityLogPanel refactored to use `NodeData` instead of `Memory` directly
+- install.sh: auto-approve memory MCP tools
+
+### Fixed
+- Graph traversal crash when depth=0 (now uses `stride` instead of range)
+- `FlexibleIntArray` parsing of bracket-wrapped string arrays
+- ForceSimulation `tickInFlight` starvation — `isActive` now also checks `maxSpeed`
+- Throttled learning nudge counter reset properly scoped to session instead of global state
 
 ## [0.7.1] - 2026-02-15
 
@@ -113,7 +135,8 @@ All notable changes to ClaudeMemory are documented in this file.
 - CI/CD with GitHub Actions on macOS 26 / Swift 6.2
 - Homebrew tap workflow
 
-[Unreleased]: https://github.com/jsflax/ClaudeMemory/compare/v0.7.0...HEAD
+[0.8.0]: https://github.com/jsflax/ClaudeMemory/compare/v0.7.3...v0.8.0
+[0.7.1]: https://github.com/jsflax/ClaudeMemory/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/jsflax/ClaudeMemory/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/jsflax/ClaudeMemory/compare/v0.5.2...v0.6.0
 [0.5.2]: https://github.com/jsflax/ClaudeMemory/compare/v0.5.1...v0.5.2

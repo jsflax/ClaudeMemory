@@ -35,7 +35,7 @@ struct OnFailure: AsyncParsableCommand {
         }
 
         // Learning nudge
-        if let nudge = throttledLearningNudge(project: proj) {
+        if let nudge = throttledLearningNudge(project: proj, sessionId: input.sessionId) {
             sections.append(nudge)
         }
 

@@ -1,8 +1,7 @@
 import SwiftUI
-import ClaudeMemoryLib
 
 struct ActivityLogPanel: View {
-    let memories: [Memory]
+    let nodes: [NodeData]
     let colorMap: [String: Color]
     let onSelect: (Int64) -> Void
 
@@ -16,46 +15,49 @@ struct ActivityLogPanel: View {
     }()
 
     var body: some View {
-        VStack(alignment: .trailing, spacing: 0) {
-            HStack(spacing: 6) {
-                Image(systemName: "clock.arrow.circlepath")
-                    .font(.system(size: 10))
-                Text("Activity")
-                    .font(.system(size: 11, weight: .medium, design: .monospaced))
-            }
-            .foregroundStyle(.white.opacity(0.5))
-            .padding(.horizontal, 10)
-            .padding(.vertical, 6)
-
-            Divider().overlay(Color.white.opacity(0.15))
-
-            ScrollView(.vertical, showsIndicators: true) {
-                LazyVStack(alignment: .trailing, spacing: 2) {
-                    let recent = memories.suffix(50).reversed()
-                    ForEach(Array(recent), id: \.primaryKey) { memory in
-                        let isGlowing = memory.primaryKey.map { glowingIds.contains($0) } ?? false
-                        ActivityRow(
-                            memory: memory,
-                            colorMap: colorMap,
-                            isGlowing: isGlowing,
-                            onSelect: onSelect
-                        )
-                        .transition(.move(edge: .top).combined(with: .opacity))
-                    }
+        TimelineView(.periodic(from: .now, by: 1)) { context in
+            VStack(alignment: .trailing, spacing: 0) {
+                HStack(spacing: 6) {
+                    Image(systemName: "clock.arrow.circlepath")
+                        .font(.system(size: 10))
+                    Text("Activity")
+                        .font(.system(size: 11, weight: .medium, design: .monospaced))
                 }
-                .padding(.vertical, 4)
-                .animation(.easeInOut(duration: 0.3), value: memories.count)
+                .foregroundStyle(.white.opacity(0.5))
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+
+                Divider().overlay(Color.white.opacity(0.15))
+
+                ScrollView(.vertical, showsIndicators: true) {
+                    LazyVStack(alignment: .trailing, spacing: 2) {
+                        let recent = Array(nodes.sorted(by: { $0.createdAt > $1.createdAt }).prefix(50))
+                        ForEach(recent, id: \.id) { node in
+                            let isGlowing = glowingIds.contains(node.id)
+                            ActivityRow(
+                                node: node,
+                                colorMap: colorMap,
+                                isGlowing: isGlowing,
+                                now: context.date,
+                                onSelect: onSelect
+                            )
+                            .transition(.move(edge: .top).combined(with: .opacity))
+                        }
+                    }
+                    .padding(.vertical, 4)
+                    .animation(.easeInOut(duration: 0.3), value: nodes.count)
+                }
             }
+            .frame(width: 220)
+            .frame(maxHeight: 300)
+            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 10))
+            .foregroundStyle(.white.opacity(0.7))
         }
-        .frame(width: 220)
-        .frame(maxHeight: 300)
-        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 10))
-        .foregroundStyle(.white.opacity(0.7))
         .onAppear {
-            knownIds = Set(memories.compactMap(\.primaryKey))
+            knownIds = Set(nodes.map(\.id))
         }
-        .onChange(of: memories.count) { _, _ in
-            let currentIds = Set(memories.compactMap(\.primaryKey))
+        .onChange(of: nodes.count) { _, _ in
+            let currentIds = Set(nodes.map(\.id))
             let newIds = currentIds.subtracting(knownIds)
             knownIds = currentIds
             guard !newIds.isEmpty else { return }
@@ -73,16 +75,15 @@ struct ActivityLogPanel: View {
 }
 
 private struct ActivityRow: View {
-    let memory: Memory
+    let node: NodeData
     let colorMap: [String: Color]
     let isGlowing: Bool
+    let now: Date
     let onSelect: (Int64) -> Void
 
     var body: some View {
         Button {
-            if let pk = memory.primaryKey {
-                onSelect(pk)
-            }
+            onSelect(node.id)
         } label: {
             HStack(spacing: 6) {
                 Spacer(minLength: 0)
@@ -90,13 +91,13 @@ private struct ActivityRow: View {
                     .font(.system(size: 9, design: .monospaced))
                     .foregroundStyle(.white.opacity(0.35))
                     .frame(minWidth: 32, alignment: .trailing)
-                Text(label)
+                Text(node.label)
                     .font(.system(size: 10, design: .monospaced))
                     .lineLimit(1)
                     .truncationMode(.tail)
                     .foregroundStyle(isGlowing ? .cyan : .white.opacity(0.7))
                 Circle()
-                    .fill(GraphView.projectColor(for: memory.project, in: colorMap))
+                    .fill(GraphView.projectColor(for: node.project, in: colorMap))
                     .frame(width: 6, height: 6)
                     .shadow(color: isGlowing ? .cyan.opacity(0.8) : .clear, radius: 4)
             }
@@ -112,11 +113,7 @@ private struct ActivityRow: View {
         .animation(.easeOut(duration: 0.6), value: isGlowing)
     }
 
-    private var label: String {
-        GraphView.extractLabel(content: memory.content, topic: memory.topic)
-    }
-
     private var relativeTime: String {
-        ActivityLogPanel.relativeFormatter.localizedString(for: memory.createdAt, relativeTo: Date())
+        ActivityLogPanel.relativeFormatter.localizedString(for: node.createdAt, relativeTo: now)
     }
 }

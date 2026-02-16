@@ -45,8 +45,13 @@ struct Advise: AsyncParsableCommand {
             sections.append(nudge)
         }
 
-        // Learning nudge
-        sections.append(learningNudge(project: proj))
+        // Learning nudge — skip if stop hook just fired (session-learner already spawned)
+        if let state = getSessionState(sessionId: input.sessionId), state.stopNudgeSent {
+            state.stopNudgeSent = false
+            state.updatedAt = Date()
+        } else {
+            sections.append(learningNudge(project: proj))
+        }
 
         let output = HookOutput(
             hookSpecificOutput: HookSpecificOutput(

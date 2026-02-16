@@ -442,7 +442,7 @@ extension MemoryTools {
                 let impInfo = m.importance > 0 ? ", importance: \(m.importance)" : ""
                 let expires = m.expiresAt == .distantFuture ? "" : ", expires: \(Self.dateFormatter.string(from: m.expiresAt))"
                 let created = hasTemporalFilter ? ", created: \(Self.dateFormatter.string(from: m.createdAt))" : ""
-                return "[id:\(mId)] [\(m.project)/\(m.topic)] (relevance: \(dist)\(ftsInfo)\(impInfo)\(expires)\(created)) \(m.content)"
+                return "[id:\(mId)] [\(m.project)/\(m.topic)] (distance: \(dist)\(ftsInfo)\(impInfo)\(expires)\(created)) \(m.content)"
             }
 
             var output = lines.joined(separator: "\n\n")

@@ -75,6 +75,19 @@ struct PreToolUseInput: Decodable {
     }
 }
 
+/// Input for the Stop hook.
+struct StopInput: Decodable {
+    let sessionId: String?
+    let transcriptPath: String?
+    let cwd: String?
+
+    enum CodingKeys: String, CodingKey {
+        case sessionId = "session_id"
+        case transcriptPath = "transcript_path"
+        case cwd
+    }
+}
+
 /// Input for the PreCompact hook.
 struct PreCompactInput: Decodable {
     let sessionId: String?

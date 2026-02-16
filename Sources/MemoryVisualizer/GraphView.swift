@@ -1,28 +1,13 @@
 import SwiftUI
 import Lattice
+import Combine
 import ClaudeMemoryLib
 import UniformTypeIdentifiers
 import AppKit
 
 typealias MemoryEdge = ClaudeMemoryLib.Edge
 
-// MARK: - Pre-computed display data
-
-struct NodeInfo: Equatable {
-    let id: Int64
-    let label: String
-    let project: String
-    let topic: String
-    let importance: Int
-    let isHub: Bool
-    let createdAt: Date
-}
-
-struct EdgeInfo: Equatable {
-    let sourceId: Int64
-    let targetId: Int64
-    let relation: String
-}
+// MARK: - Display data
 
 struct TopicGroupInfo: Equatable {
     let topic: String
@@ -43,6 +28,7 @@ final class ViewportState {
     // Animated pan target — lerped each frame by the Canvas timer
     private var targetOffset: CGPoint?
     private let panSpeed: CGFloat = 0.12
+    var isAnimatingPan: Bool { targetOffset != nil }
 
     func animateTo(offset target: CGPoint) {
         targetOffset = target
@@ -67,12 +53,29 @@ final class ViewportState {
     }
 }
 
-// MARK: - Root view (owns queries, computes display data, manages state)
+// MARK: - Root view (owns data store, simulation, and state)
 
 struct GraphView: View {
-    @LatticeQuery<Memory>(sort: \Memory.createdAt) var memories: TableResults<Memory>
-    @LatticeQuery<MemoryEdge>(sort: \MemoryEdge.createdAt) var edges: TableResults<MemoryEdge>
     @Environment(\.lattice) private var lattice
+
+    // Lightweight data store — replaces @LatticeQuery with manual observation
+    @State private var allNodes: [Int64: NodeData] = [:]
+    @State private var allEdges: [Int64: EdgeData] = [:]
+    @State private var nodeObserver: AnyCancellable?
+    @State private var edgeObserver: AnyCancellable?
+    @State private var glowingNodes: [Int64: Date] = [:]
+
+    // Cached filtered views — recomputed on structural changes or filter changes
+    @State private var cachedFilteredNodes: [NodeData] = []
+    @State private var cachedHubs: Set<Int64> = []
+    @State private var cachedFilteredEdges: [EdgeData] = []
+
+    // Cached derived data — recomputed only when filtered data changes (not every body eval)
+    @State private var cachedProjectColorMap: [String: Color] = [:]
+    @State private var cachedTopicGroups: [TopicGroupInfo] = []
+    @State private var cachedVisibleNodeIds: Set<Int64> = []
+    @State private var cachedRelationCounts: [(key: String, value: Int)] = []
+    @State private var cachedEdgeCountByNode: [Int64: Int] = [:]
 
     @State private var simulation = ForceSimulation()
     @State private var viewport = ViewportState()
@@ -93,10 +96,19 @@ struct GraphView: View {
     @State private var debouncedTimeSliderDate: Date?
     @State private var isTimelinePlaying: Bool = false
 
-    /// Builds a color map assigning maximally-separated hues to each project using the golden angle.
-    /// Sequential indices guarantee minimum ~137.5° hue separation between adjacent projects.
-    private var projectColorMap: [String: Color] {
-        let goldenAngle = 0.381966011250105 // (√5 - 1) / 2, conjugate of golden ratio
+    // Minimap PiP
+    @State private var minimapDetached: Bool = false
+    @State private var minimapPanel = MinimapPanelController()
+
+    // Glow cleanup timer (1s interval — removes entries older than 4.3s)
+    private let glowTimer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+
+    // MARK: - Derived Data (cached, recomputed on structural changes)
+
+    /// Recompute all derived data from current filtered nodes/edges. Call after any structural change.
+    private func recomputeDerivedData() {
+        // Color map
+        let goldenAngle = 0.381966011250105
         let projects = uniqueProjects()
         var map: [String: Color] = ["global": .gray]
         for (i, project) in projects.enumerated() {
@@ -105,71 +117,44 @@ struct GraphView: View {
             let h = hue - hue.rounded(.down)
             map[project] = Color(hue: h, saturation: 0.65, brightness: 0.9)
         }
-        return map
-    }
+        cachedProjectColorMap = map
 
-    // MARK: - Filtering Pipeline
+        // Visible node IDs
+        cachedVisibleNodeIds = Set(cachedFilteredNodes.map(\.id))
 
-    /// Base nodes: filtered by hidden projects and time slider date.
-    private var baseNodeInfos: [NodeInfo] {
-        let hubIds = computeHubIds()
-        return memories.compactMap { memory -> NodeInfo? in
-            guard !hiddenProjects.contains(memory.project),
-                  let pk = memory.primaryKey else { return nil }
-            if let cutoff = debouncedTimeSliderDate, memory.createdAt > cutoff {
-                return nil
-            }
-            return NodeInfo(
-                id: pk,
-                label: Self.extractLabel(content: memory.content, topic: memory.topic),
-                project: memory.project,
-                topic: memory.topic,
-                importance: memory.importance,
-                isHub: hubIds.contains(pk),
-                createdAt: memory.createdAt
-            )
+        // Relation counts (uses all edges, not filtered — so hidden relations still show in UI)
+        let nodeIds = cachedVisibleNodeIds
+        var counts: [String: Int] = [:]
+        for edge in allEdges.values {
+            guard nodeIds.contains(edge.sourceId), nodeIds.contains(edge.targetId) else { continue }
+            counts[edge.relation, default: 0] += 1
         }
-    }
+        cachedRelationCounts = counts.sorted(by: { $0.key < $1.key })
 
-    /// Final node list (same as baseNodeInfos — search doesn't hide).
-    private var nodeInfos: [NodeInfo] { baseNodeInfos }
-
-    /// All edges between visible nodes (before relation filtering).
-    private var allVisibleEdgeInfos: [EdgeInfo] {
-        let nodeIds = Set(nodeInfos.map(\.id))
-        return edges.compactMap { edge -> EdgeInfo? in
-            guard nodeIds.contains(edge.sourceId),
-                  nodeIds.contains(edge.targetId) else { return nil }
-            return EdgeInfo(sourceId: edge.sourceId, targetId: edge.targetId, relation: edge.relation)
-        }
-    }
-
-    /// Edges filtered by visible nodes and hidden relations.
-    private var edgeInfos: [EdgeInfo] {
-        allVisibleEdgeInfos.filter { !hiddenRelations.contains($0.relation) }
-    }
-
-    /// Topic groups: nodes grouped by (project, topic) for sub-hull rendering and force clustering.
-    /// Only includes groups with 2+ members. Episode and "general" topics are excluded.
-    private var topicGroups: [TopicGroupInfo] {
+        // Topic groups
         var groups: [String: (topic: String, project: String, ids: [Int64])] = [:]
-        for node in nodeInfos {
+        for node in cachedFilteredNodes {
             guard node.topic != "general", node.topic != "episode" else { continue }
             let key = "\(node.project)|\(node.topic)"
             var entry = groups[key] ?? (topic: node.topic, project: node.project, ids: [])
             entry.ids.append(node.id)
             groups[key] = entry
         }
-        return groups.values
+        cachedTopicGroups = groups.values
             .filter { $0.ids.count >= 2 }
             .map { TopicGroupInfo(topic: $0.topic, project: $0.project, ids: $0.ids) }
+
+        // Per-node edge counts (for detail panel)
+        var edgeCounts: [Int64: Int] = [:]
+        for edge in allEdges.values {
+            edgeCounts[edge.sourceId, default: 0] += 1
+            edgeCounts[edge.targetId, default: 0] += 1
+        }
+        cachedEdgeCountByNode = edgeCounts
     }
 
     private func recomputeClusters() {
-        let visibleProjects = Set(memories.compactMap { m -> String? in
-            guard !hiddenProjects.contains(m.project) else { return nil }
-            return m.project
-        })
+        let visibleProjects = Set(cachedFilteredNodes.map(\.project))
         var all: [[Int64]] = []
         for project in visibleProjects {
             all.append(contentsOf: findMemoryClusters(in: lattice, project: project, minClusterSize: 2).clusters)
@@ -182,14 +167,211 @@ struct GraphView: View {
     private var dateRange: (earliest: Date, latest: Date) {
         var earliest = Date.distantFuture
         var latest = Date.distantPast
-        for memory in memories {
-            guard !hiddenProjects.contains(memory.project) else { continue }
-            if memory.createdAt < earliest { earliest = memory.createdAt }
-            if memory.createdAt > latest { latest = memory.createdAt }
+        for node in cachedFilteredNodes {
+            if node.createdAt < earliest { earliest = node.createdAt }
+            if node.createdAt > latest { latest = node.createdAt }
         }
         if earliest > latest { earliest = Date(); latest = Date() }
         return (earliest, latest)
     }
+
+    // MARK: - Data Loading & Observation
+
+    private func loadData() {
+        // One-shot population — extract lightweight primitives from Lattice models
+        for m in lattice.objects(Memory.self) {
+            guard let pk = m.primaryKey else { continue }
+            allNodes[pk] = NodeData(
+                id: pk, project: m.project, topic: m.topic,
+                label: extractLabel(content: m.content, topic: m.topic),
+                createdAt: m.createdAt, lastAccessedAt: m.lastAccessedAt,
+                importance: m.importance
+            )
+        }
+        for e in lattice.objects(MemoryEdge.self) {
+            guard let pk = e.primaryKey else { continue }
+            allEdges[pk] = EdgeData(id: pk, sourceId: e.sourceId, targetId: e.targetId, relation: e.relation)
+        }
+
+        recomputeFilteredData()
+        rebuildSimulationGraph()
+        recomputeClusters()
+
+        // Fine-grained collection observers for cross-process changes
+        edgeObserver = lattice.objects(MemoryEdge.self).observe { change in
+            Task { @MainActor in handleEdgeChange(change) }
+        }
+        nodeObserver = lattice.objects(Memory.self).observe { change in
+            Task { @MainActor in handleNodeChange(change) }
+        }
+    }
+
+    private func handleNodeChange(_ change: CollectionChange) {
+        switch change {
+        case .insert(let pk):
+            guard let memory = lattice.object(Memory.self, primaryKey: pk) else { return }
+            let node = NodeData(
+                id: pk, project: memory.project, topic: memory.topic,
+                label: extractLabel(content: memory.content, topic: memory.topic),
+                createdAt: memory.createdAt, lastAccessedAt: memory.lastAccessedAt,
+                importance: memory.importance
+            )
+            allNodes[pk] = node
+            let visible = !hiddenProjects.contains(node.project) &&
+                (debouncedTimeSliderDate == nil || node.createdAt <= debouncedTimeSliderDate!)
+            if visible {
+                cachedFilteredNodes.append(node)
+                cachedVisibleNodeIds.insert(pk)
+                simulation.addNode(pk, project: node.project, topic: node.topic)
+                // Add edges for this node from existing edge data
+                let nodeIds = cachedVisibleNodeIds
+                for edge in allEdges.values {
+                    if (edge.sourceId == pk || edge.targetId == pk) &&
+                       nodeIds.contains(edge.sourceId) && nodeIds.contains(edge.targetId) &&
+                       !hiddenRelations.contains(edge.relation) {
+                        simulation.addEdge(from: edge.sourceId, to: edge.targetId)
+                        if !cachedFilteredEdges.contains(where: { $0.id == edge.id }) {
+                            cachedFilteredEdges.append(edge)
+                        }
+                    }
+                }
+                // Check if this new node is a hub target (any part_of edges point to it)
+                for edge in allEdges.values where edge.relation == "part_of" && edge.targetId == pk {
+                    cachedHubs.insert(pk)
+                    break
+                }
+            }
+
+        case .update(let pk):
+            guard let memory = lattice.object(Memory.self, primaryKey: pk) else { return }
+            let old = allNodes[pk]
+            // Detect recall: lastAccessedAt changed → trigger glow
+            if let old, memory.lastAccessedAt > old.lastAccessedAt {
+                glowingNodes[pk] = Date()
+            }
+            // Only update dict if structural properties changed (avoids unnecessary body re-eval)
+            let newLabel = extractLabel(content: memory.content, topic: memory.topic)
+            let structuralChange = old == nil ||
+                old!.project != memory.project ||
+                old!.topic != memory.topic ||
+                old!.importance != memory.importance ||
+                old!.label != newLabel
+            if !structuralChange {
+                // Still update lastAccessedAt for recency visualization (no recompute needed)
+                allNodes[pk]?.lastAccessedAt = memory.lastAccessedAt
+                if let idx = cachedFilteredNodes.firstIndex(where: { $0.id == pk }) {
+                    cachedFilteredNodes[idx].lastAccessedAt = memory.lastAccessedAt
+                }
+                return
+            }
+            let node = NodeData(
+                id: pk, project: memory.project, topic: memory.topic,
+                label: newLabel,
+                createdAt: memory.createdAt, lastAccessedAt: memory.lastAccessedAt,
+                importance: memory.importance
+            )
+            allNodes[pk] = node
+            if let idx = cachedFilteredNodes.firstIndex(where: { $0.id == pk }) {
+                cachedFilteredNodes[idx] = node
+            }
+            if old!.project != node.project || old!.topic != node.topic {
+                recomputeFilteredData()
+                rebuildSimulationGraph()
+            }
+
+        case .delete(let pk):
+            allNodes.removeValue(forKey: pk)
+            glowingNodes.removeValue(forKey: pk)
+            cachedFilteredNodes.removeAll { $0.id == pk }
+            cachedFilteredEdges.removeAll { $0.sourceId == pk || $0.targetId == pk }
+            cachedVisibleNodeIds.remove(pk)
+            simulation.removeNode(pk)
+            cachedHubs.remove(pk)
+            // Remove from cluster groups surgically
+            clusterGroups = clusterGroups.compactMap { cluster in
+                let filtered = cluster.filter { $0 != pk }
+                return filtered.count >= 2 ? filtered : nil
+            }
+        }
+    }
+
+    private func handleEdgeChange(_ change: CollectionChange) {
+        switch change {
+        case .insert(let pk):
+            guard let edge = lattice.object(MemoryEdge.self, primaryKey: pk) else { return }
+            let data = EdgeData(id: pk, sourceId: edge.sourceId, targetId: edge.targetId, relation: edge.relation)
+            allEdges[pk] = data
+            cachedEdgeCountByNode[data.sourceId, default: 0] += 1
+            cachedEdgeCountByNode[data.targetId, default: 0] += 1
+            let nodeIds = cachedVisibleNodeIds
+            if nodeIds.contains(data.sourceId) && nodeIds.contains(data.targetId) &&
+               !hiddenRelations.contains(data.relation) {
+                cachedFilteredEdges.append(data)
+                simulation.addEdge(from: data.sourceId, to: data.targetId)
+            }
+            if data.relation == "part_of" { cachedHubs.insert(data.targetId) }
+
+        case .update(let pk):
+            guard let edge = lattice.object(MemoryEdge.self, primaryKey: pk) else { return }
+            let data = EdgeData(id: pk, sourceId: edge.sourceId, targetId: edge.targetId, relation: edge.relation)
+            allEdges[pk] = data
+            if let idx = cachedFilteredEdges.firstIndex(where: { $0.id == pk }) {
+                cachedFilteredEdges[idx] = data
+            }
+
+        case .delete(let pk):
+            if let old = allEdges[pk] {
+                simulation.removeEdge(from: old.sourceId, to: old.targetId)
+                cachedFilteredEdges.removeAll { $0.id == pk }
+                cachedEdgeCountByNode[old.sourceId, default: 1] -= 1
+                cachedEdgeCountByNode[old.targetId, default: 1] -= 1
+                if old.relation == "part_of" {
+                    let stillHub = allEdges.values.contains { $0.id != pk && $0.relation == "part_of" && $0.targetId == old.targetId }
+                    if !stillHub { cachedHubs.remove(old.targetId) }
+                }
+            }
+            allEdges.removeValue(forKey: pk)
+        }
+    }
+
+    private func recomputeFilteredData() {
+        cachedFilteredNodes = allNodes.values.filter { node in
+            !hiddenProjects.contains(node.project) &&
+            (debouncedTimeSliderDate == nil || node.createdAt <= debouncedTimeSliderDate!)
+        }
+        recomputeHubs()
+        let nodeIds = Set(cachedFilteredNodes.map(\.id))
+        cachedFilteredEdges = allEdges.values.filter { edge in
+            nodeIds.contains(edge.sourceId) && nodeIds.contains(edge.targetId) &&
+            !hiddenRelations.contains(edge.relation)
+        }
+        recomputeDerivedData()
+    }
+
+    private func recomputeHubs() {
+        var hubs = Set<Int64>()
+        for edge in allEdges.values where edge.relation == "part_of" {
+            hubs.insert(edge.targetId)
+        }
+        cachedHubs = hubs
+    }
+
+    private func rebuildSimulationGraph() {
+        let filtered = cachedFilteredNodes
+        let currentIds = Set(filtered.map(\.id))
+        let edgePairs = cachedFilteredEdges.map { ($0.sourceId, $0.targetId) }
+        var projectMap: [Int64: String] = [:]
+        var topicMap: [Int64: String] = [:]
+        for node in filtered {
+            projectMap[node.id] = node.project
+            topicMap[node.id] = node.topic
+        }
+//        Task {
+            simulation.updateGraph(nodeIds: currentIds, edges: edgePairs, projectForNode: projectMap, topicForNode: topicMap)
+//        }
+    }
+
+    // MARK: - Body
 
     var body: some View {
         GeometryReader { geo in
@@ -197,8 +379,17 @@ struct GraphView: View {
                 .onChange(of: geo.size, initial: true) { _, newSize in
                     simulation.center = CGPoint(x: newSize.width / 2, y: newSize.height / 2)
                 }
-                .onAppear { installScrollMonitor() }
-                .onDisappear { removeScrollMonitor() }
+                .onAppear {
+                    loadData()
+                    installScrollMonitor()
+                }
+                .onDisappear {
+                    removeScrollMonitor()
+                    minimapPanel.dismiss()
+                }
+                .onPreferenceChange(InlineMinimapFrameKey.self) { frame in
+                    if frame.width > 0 { minimapPanel.inlineFrame = frame }
+                }
                 .onChange(of: selectedMemoryId) { oldId, newId in
                     handleSelectionChange(oldId: oldId, newId: newId, viewSize: geo.size)
                 }
@@ -207,17 +398,35 @@ struct GraphView: View {
                     try? await Task.sleep(for: .milliseconds(80))
                     debouncedTimeSliderDate = timeSliderDate
                 }
-                .onChange(of: memories.count) { oldCount, newCount in
+                .onChange(of: allNodes.count) { oldCount, newCount in
                     guard newCount != oldCount else { return }
-                    recomputeClusters()
                     guard UserDefaults.standard.bool(forKey: "soundEnabled") else { return }
                     let sound = newCount > oldCount
                         ? "/System/Library/Sounds/Funk.aiff"
                         : "/System/Library/Sounds/Bottle.aiff"
                     NSSound(contentsOf: URL(fileURLWithPath: sound), byReference: true)?.play()
                 }
-                .onChange(of: hiddenProjects) { _, _ in recomputeClusters() }
-                .onAppear { recomputeClusters() }
+                .onChange(of: hiddenProjects) { _, _ in
+                    recomputeFilteredData()
+                    rebuildSimulationGraph()
+                    recomputeClusters()
+                }
+                .onChange(of: hiddenRelations) { _, _ in
+                    recomputeFilteredData()
+                    rebuildSimulationGraph()
+                }
+                .onChange(of: debouncedTimeSliderDate) { _, _ in
+                    recomputeFilteredData()
+                    rebuildSimulationGraph()
+                }
+                .onReceive(glowTimer) { _ in
+                    guard !glowingNodes.isEmpty else { return }
+                    let now = Date()
+                    let filtered = glowingNodes.filter { now.timeIntervalSince($0.value) < 4.3 }
+                    if filtered.count != glowingNodes.count {
+                        glowingNodes = filtered
+                    }
+                }
         }
     }
 
@@ -234,49 +443,45 @@ struct GraphView: View {
 
     @ViewBuilder
     private func graphContent(size: CGSize) -> some View {
-        let nodes = nodeInfos
-        let edgeData = edgeInfos
-        let matchIds = searchMatchIds
-        let isSearching = isSearchActive
-        let colorMap = projectColorMap
+        let colorMap = cachedProjectColorMap
         ZStack {
             Color(red: 0.051, green: 0.067, blue: 0.09).ignoresSafeArea()
 
-            graphCanvas(nodes: nodes, edges: edgeData, matchIds: matchIds, isSearching: isSearching, colorMap: colorMap)
-            graphOverlays(nodes: nodes, edges: edgeData, size: size, colorMap: colorMap)
+            graphCanvas(colorMap: colorMap)
+            graphOverlays(size: size, colorMap: colorMap)
             detailPanel(size: size, colorMap: colorMap)
         }
     }
 
-    private func graphCanvas(nodes: [NodeInfo], edges: [EdgeInfo], matchIds: Set<Int64>, isSearching: Bool, colorMap: [String: Color]) -> some View {
+    private func graphCanvas(colorMap: [String: Color]) -> some View {
         GraphCanvas(
             simulation: simulation,
-            nodes: nodes,
-            edges: edges,
-            searchMatchIds: matchIds,
-            isSearchActive: isSearching,
+            nodes: cachedFilteredNodes,
+            edges: cachedFilteredEdges,
+            hubs: cachedHubs,
+            glowingNodes: glowingNodes,
+            searchMatchIds: searchMatchIds,
+            isSearchActive: isSearchActive,
             viewport: viewport,
             selectedNode: $selectedMemoryId,
             clusters: clusterGroups,
-            topicGroups: topicGroups,
+            topicGroups: cachedTopicGroups,
             colorMap: colorMap
         )
     }
 
     @ViewBuilder
-    private func graphOverlays(nodes: [NodeInfo], edges: [EdgeInfo], size: CGSize, colorMap: [String: Color]) -> some View {
+    private func graphOverlays(size: CGSize, colorMap: [String: Color]) -> some View {
         // Right column: stats + activity log
         VStack(alignment: .trailing, spacing: 8) {
             StatsOverlay(
-                nodes: nodes,
-                edgeData: edges,
-                totalMemories: memories.count,
+                visibleMemoryCount: cachedVisibleNodeIds.count,
+                visibleEdgeCount: cachedFilteredEdges.count,
+                totalMemories: allNodes.count,
                 hiddenProjects: hiddenProjects,
                 hiddenRelations: hiddenRelations,
                 projects: uniqueProjects(),
-                allRelationCounts: Dictionary(grouping: allVisibleEdgeInfos, by: \.relation)
-                    .mapValues(\.count)
-                    .sorted(by: { $0.key < $1.key }),
+                allRelationCounts: cachedRelationCounts,
                 toggleProject: toggleProject,
                 toggleRelation: toggleRelation,
                 colorMap: colorMap
@@ -284,7 +489,7 @@ struct GraphView: View {
 
             if selectedMemoryId == nil {
                 ActivityLogPanel(
-                    memories: Array(memories),
+                    nodes: cachedFilteredNodes,
                     colorMap: colorMap,
                     onSelect: { id in selectedMemoryId = id }
                 )
@@ -311,21 +516,40 @@ struct GraphView: View {
             Spacer()
         }
 
-        VStack {
-            Spacer()
-            HStack {
-                MinimapView(
-                    simulation: simulation,
-                    nodes: nodes,
-                    viewport: viewport,
-                    viewportSize: size,
-                    colorMap: colorMap
-                )
-                .padding(12)
+        // Minimap — inline when docked, floating NSPanel when detached
+        if !minimapDetached {
+            VStack {
                 Spacer()
+                HStack {
+                    MinimapView(
+                        filteredNodes: cachedFilteredNodes,
+                        hubs: cachedHubs,
+                        glowingNodes: glowingNodes,
+                        simulation: simulation,
+                        viewport: viewport,
+                        viewportSize: size,
+                        colorMap: colorMap,
+                        pipAction: { minimapDetached = true }
+                    )
+                    .background(GeometryReader { geo in
+                        Color.clear.preference(
+                            key: InlineMinimapFrameKey.self,
+                            value: geo.frame(in: .global)
+                        )
+                    })
+                    .padding(12)
+                    Spacer()
+                }
+                .padding(.bottom, 44)
             }
-            .padding(.bottom, 44)
         }
+        MinimapPanelBridge(
+            isDetached: minimapDetached,
+            panel: minimapPanel,
+            content: floatingMinimap(size: size, colorMap: colorMap),
+            onDismiss: { minimapDetached = false }
+        )
+        .frame(width: 0, height: 0)
 
         VStack {
             Spacer()
@@ -343,7 +567,7 @@ struct GraphView: View {
     private func detailPanel(size: CGSize, colorMap: [String: Color]) -> some View {
         if let memory = selectedMemory {
             let sid = selectedMemoryId!
-            let count = edges.filter { $0.sourceId == sid || $0.targetId == sid }.count
+            let count = cachedEdgeCountByNode[sid] ?? 0
             MemoryDetailPanel(
                 memory: memory,
                 connectedCount: count,
@@ -354,9 +578,24 @@ struct GraphView: View {
             .frame(maxWidth: min(400, size.width * 0.35), maxHeight: min(500, size.height * 0.7))
             .frame(maxWidth: .infinity, alignment: .trailing)
             .padding(24)
+            .compositingGroup()
             .transition(.move(edge: .trailing).combined(with: .opacity))
             .animation(.spring(duration: 0.4, bounce: 0.2), value: selectedMemoryId)
         }
+    }
+
+    private func floatingMinimap(size: CGSize, colorMap: [String: Color]) -> some View {
+        MinimapView(
+            filteredNodes: cachedFilteredNodes,
+            hubs: cachedHubs,
+            glowingNodes: glowingNodes,
+            simulation: simulation,
+            viewport: viewport,
+            viewportSize: size,
+            colorMap: colorMap,
+            pipAction: { minimapPanel.animatedDismiss { minimapDetached = false } },
+            isFloating: true
+        )
     }
 
     private func installScrollMonitor() {
@@ -368,12 +607,12 @@ struct GraphView: View {
                 if loc.x > rightEdge - 240 { return event }
                 if selectedMemoryId != nil && loc.x > rightEdge * 0.6 { return event }
             }
-            // Two-finger scroll / trackpad → pan
+            // Two-finger scroll / trackpad → pan (consume event to prevent ScrollView conflicts)
             viewport.offset = CGPoint(
                 x: viewport.offset.x + event.scrollingDeltaX,
                 y: viewport.offset.y + event.scrollingDeltaY
             )
-            return event
+            return nil
         }
     }
 
@@ -414,11 +653,11 @@ struct GraphView: View {
         }
     }
 
-    // MARK: - Selected Memory (live)
+    // MARK: - Selected Memory (single Lattice lookup for detail panel)
 
     private var selectedMemory: Memory? {
         guard let id = selectedMemoryId else { return nil }
-        return memories.first(where: { $0.primaryKey == id })
+        return lattice.object(Memory.self, primaryKey: id)
     }
 
     // MARK: - Helpers
@@ -439,20 +678,12 @@ struct GraphView: View {
         }
     }
 
-    private func computeHubIds() -> Set<Int64> {
-        var hubs = Set<Int64>()
-        for edge in edges where edge.relation == "part_of" {
-            hubs.insert(edge.targetId)
-        }
-        return hubs
-    }
-
     private func uniqueProjects() -> [String] {
         var seen = Set<String>()
         var result: [String] = []
-        for memory in memories {
-            if seen.insert(memory.project).inserted {
-                result.append(memory.project)
+        for node in allNodes.values {
+            if seen.insert(node.project).inserted {
+                result.append(node.project)
             }
         }
         return result.sorted()
@@ -461,7 +692,7 @@ struct GraphView: View {
     private func cycleConnectedNode() {
         guard let sel = selectedMemoryId else { return }
         var connected: [Int64] = []
-        for edge in edges {
+        for edge in allEdges.values {
             if edge.sourceId == sel { connected.append(edge.targetId) }
             if edge.targetId == sel { connected.append(edge.sourceId) }
         }
@@ -498,29 +729,6 @@ struct GraphView: View {
         colorMap[project] ?? .gray
     }
 
-    static func extractLabel(content: String, topic: String) -> String {
-        if let headerRange = content.range(of: #"^#{1,3}\s+"#, options: .regularExpression) {
-            let title = content[headerRange.upperBound...].prefix(while: { $0 != "\n" })
-            return truncate(String(title), to: 30)
-        }
-        if content.hasPrefix("**"), let end = content.dropFirst(2).range(of: "**") {
-            let title = content[content.index(content.startIndex, offsetBy: 2)..<end.lowerBound]
-            return truncate(String(title), to: 30)
-        }
-        if let colon = content.firstIndex(of: ":"),
-           content.distance(from: content.startIndex, to: colon) < 30 {
-            return String(content[..<colon])
-        }
-        let firstLine = String(content.prefix(while: { $0 != "\n" }))
-        if firstLine.count <= 30 { return firstLine }
-        if topic != "general" { return "\(topic): \(truncate(firstLine, to: 22))" }
-        return truncate(firstLine, to: 30)
-    }
-
-    private static func truncate(_ text: String, to maxLen: Int) -> String {
-        if text.count <= maxLen { return text }
-        return String(text.prefix(maxLen - 1)) + "…"
-    }
 }
 
 // MARK: - Sound Toggle (isolated to avoid re-rendering GraphView)

@@ -25,6 +25,9 @@ if [ "$1" = "--from-source" ]; then
     cp -R .build/release/ClaudeMemory_ClaudeMemoryLib.bundle "$INSTALL_DIR/"
     cp -R .build/release/swift-transformers_Hub.bundle "$INSTALL_DIR/"
     cp -R .build/release/SwiftLM_SwiftLM.bundle "$INSTALL_DIR/"
+    # Re-sign binaries — linker-signed ad-hoc binaries can be rejected by macOS Taskgated
+    codesign --force --sign - "$INSTALL_DIR/memory"
+    codesign --force --sign - "$INSTALL_DIR/memory-hooks"
 else
     echo "Downloading latest release..."
     DOWNLOAD_URL=$(curl -sL "https://api.github.com/repos/$REPO/releases/latest" \
@@ -40,6 +43,9 @@ else
 
     echo "From: $DOWNLOAD_URL"
     curl -sL "$DOWNLOAD_URL" | tar xz -C "$INSTALL_DIR"
+    # Re-sign binaries — linker-signed ad-hoc binaries can be rejected by macOS Taskgated
+    codesign --force --sign - "$INSTALL_DIR/memory"
+    codesign --force --sign - "$INSTALL_DIR/memory-hooks"
 fi
 
 echo "Installed to $INSTALL_DIR"
@@ -94,10 +100,10 @@ HOOKS_CONFIG='{
         "timeout": 5
       }]
     }],
-    "PreToolUse": [{
+    "Stop": [{
       "hooks": [{
         "type": "command",
-        "command": "'"$INSTALL_DIR"'/memory-hooks pre-tool 2>/dev/null",
+        "command": "'"$INSTALL_DIR"'/memory-hooks on-stop 2>/dev/null",
         "timeout": 5
       }]
     }],
@@ -128,7 +134,7 @@ HOOKS_CONFIG='{
 
 if [ -f "$SETTINGS_FILE" ]; then
     if command -v jq &>/dev/null; then
-        jq -s '.[0] * .[1] | .hooks |= del(.Stop)' "$SETTINGS_FILE" <(echo "$HOOKS_CONFIG") > "$SETTINGS_FILE.tmp"
+        jq -s '.[0] * .[1] | .hooks |= del(.PreToolUse)' "$SETTINGS_FILE" <(echo "$HOOKS_CONFIG") > "$SETTINGS_FILE.tmp"
         mv "$SETTINGS_FILE.tmp" "$SETTINGS_FILE"
         echo "Merged hooks into $SETTINGS_FILE"
     else

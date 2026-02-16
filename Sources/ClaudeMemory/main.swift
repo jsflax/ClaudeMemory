@@ -25,7 +25,7 @@ do {
 
 let lattice: Lattice
 do {
-    lattice = try Lattice(Memory.self, Edge.self, Checkpoint.self, HookState.self, configuration: .init(fileURL: URL(fileURLWithPath: dbPath)))
+    lattice = try Lattice(Memory.self, Edge.self, Checkpoint.self, HookState.self, SessionState.self, configuration: .init(fileURL: URL(fileURLWithPath: dbPath)))
 } catch {
     log("Failed to initialize database at \(dbPath): \(error)")
     exit(1)

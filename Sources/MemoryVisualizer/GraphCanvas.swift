@@ -1,12 +1,61 @@
 import SwiftUI
 import ClaudeMemoryLib
 
-/// Canvas rendering + gesture handling for the force-directed graph.
-/// Uses ViewportState (Observable) so pan/zoom changes don't trigger GraphView body re-evaluation.
+// MARK: - File-level helpers
+
+func extractLabel(content: String, topic: String) -> String {
+    if let headerRange = content.range(of: #"^#{1,3}\s+"#, options: .regularExpression) {
+        let title = content[headerRange.upperBound...].prefix(while: { $0 != "\n" })
+        return truncateLabel(String(title), to: 30)
+    }
+    if content.hasPrefix("**"), let end = content.dropFirst(2).range(of: "**") {
+        let title = content[content.index(content.startIndex, offsetBy: 2)..<end.lowerBound]
+        return truncateLabel(String(title), to: 30)
+    }
+    if let colon = content.firstIndex(of: ":"),
+       content.distance(from: content.startIndex, to: colon) < 30 {
+        return String(content[..<colon])
+    }
+    let firstLine = String(content.prefix(while: { $0 != "\n" }))
+    if firstLine.count <= 30 { return firstLine }
+    if topic != "general" { return "\(topic): \(truncateLabel(firstLine, to: 22))" }
+    return truncateLabel(firstLine, to: 30)
+}
+
+func truncateLabel(_ text: String, to maxLen: Int) -> String {
+    if text.count <= maxLen { return text }
+    return String(text.prefix(maxLen - 1)) + "…"
+}
+
+// MARK: - Lightweight data structs (replaces heavy Lattice model objects)
+
+struct NodeData {
+    let id: Int64
+    let project: String
+    let topic: String
+    let label: String
+    let createdAt: Date
+    var lastAccessedAt: Date
+    let importance: Int
+}
+
+struct EdgeData {
+    let id: Int64
+    let sourceId: Int64
+    let targetId: Int64
+    let relation: String
+}
+
+// MARK: - GraphCanvas
+
+/// Pure rendering component for the force-directed graph.
+/// Receives all data from GraphView — no Lattice queries or observers.
 struct GraphCanvas: View {
     let simulation: ForceSimulation
-    let nodes: [NodeInfo]
-    let edges: [EdgeInfo]
+    let nodes: [NodeData]
+    let edges: [EdgeData]
+    let hubs: Set<Int64>
+    let glowingNodes: [Int64: Date]
     let searchMatchIds: Set<Int64>
     let isSearchActive: Bool
     let viewport: ViewportState
@@ -14,9 +63,9 @@ struct GraphCanvas: View {
     let clusters: [[Int64]]
     let topicGroups: [TopicGroupInfo]
     let colorMap: [String: Color]
+
     @GestureState private var lastMagnification: CGFloat = 1.0
     @State private var frameCount: UInt64 = 0
-
     private let baseRadius: CGFloat = 12
     private let hubScale: CGFloat = 1.6
     private let bgColor = Color(red: 0.051, green: 0.067, blue: 0.09)
@@ -33,23 +82,42 @@ struct GraphCanvas: View {
     ]
 
     var body: some View {
-        Canvas { context, size in
+        let mems = nodes
+        let hubSet = hubs
+        let vEdges = edges
+        let glows = glowingNodes
+        // Precompute connected set once per body eval (not per Canvas frame)
+        let connected: Set<Int64> = {
+            guard let sel = selectedNode else { return [] }
+            var ids = Set<Int64>()
+            for edge in edges {
+                if edge.sourceId == sel { ids.insert(edge.targetId) }
+                if edge.targetId == sel { ids.insert(edge.sourceId) }
+            }
+            return ids
+        }()
+        Canvas(rendersAsynchronously: true) { context, size in
             let _ = frameCount
-            simulation.tick()
             viewport.tickPan()
             var ctx = context
             ctx.translateBy(x: viewport.offset.x, y: viewport.offset.y)
             ctx.scaleBy(x: viewport.scale, y: viewport.scale)
             let positions = simulation.positions
-            drawClusterHulls(context: &ctx, positions: positions)
-            drawEdges(context: &ctx, positions: positions)
-            drawNodes(context: &ctx, positions: positions)
+            drawClusterHulls(context: &ctx, positions: positions, nodes: mems, hubs: hubSet, edges: vEdges)
+            drawEdges(context: &ctx, positions: positions, nodes: mems, hubs: hubSet, edges: vEdges, connectedToSelected: connected)
+            drawNodes(context: &ctx, positions: positions, nodes: mems, hubs: hubSet, edges: vEdges, glowingNodes: glows, connectedToSelected: connected)
         }
         .onReceive(timer) { _ in
-            frameCount &+= 1
+            Task {
+                await simulation.tick()
+                let needsRedraw = simulation.isActive
+                || !glowingNodes.isEmpty
+                || viewport.draggedNode != nil
+                || viewport.isAnimatingPan
+                || (isSearchActive && !searchMatchIds.isEmpty)
+                if needsRedraw { frameCount &+= 1 }
+            }
         }
-        .onChange(of: nodes, initial: true) { _, _ in rebuildSimulationGraph() }
-        .onChange(of: edges) { _, _ in rebuildSimulationGraph() }
         .gesture(nodeDragGesture)
         .gesture(magnificationGesture)
         .simultaneousGesture(
@@ -72,16 +140,24 @@ struct GraphCanvas: View {
 
     // MARK: - Gestures
 
+    @GestureState private var dragStartOffset: CGPoint?
+
     private var nodeDragGesture: some Gesture {
         DragGesture(minimumDistance: 2)
-            .onChanged { value in
-                if viewport.draggedNode == nil {
+            .updating($dragStartOffset) { value, state, _ in
+                if state == nil {
                     if let nodeId = hitTest(value.startLocation) {
                         viewport.draggedNode = nodeId
                     }
+                    state = viewport.offset
                 }
                 if let nodeId = viewport.draggedNode {
                     simulation.pinNode(nodeId, at: screenToWorld(value.location))
+                } else if let start = state {
+                    viewport.offset = CGPoint(
+                        x: start.x + value.translation.width,
+                        y: start.y + value.translation.height
+                    )
                 }
             }
             .onEnded { _ in
@@ -95,7 +171,6 @@ struct GraphCanvas: View {
             .updating($lastMagnification) { value, state, _ in
                 let delta = value.magnification / state
                 state = value.magnification
-                // Zoom anchored to cursor: keep the world point under the cursor fixed
                 guard let window = NSApp.keyWindow else {
                     viewport.scale = max(0.2, min(3.0, viewport.scale * delta))
                     return
@@ -113,20 +188,6 @@ struct GraphCanvas: View {
                 )
                 viewport.scale = newScale
             }
-    }
-
-    // MARK: - Graph rebuild (called from onChange, not from Canvas render closure)
-
-    private func rebuildSimulationGraph() {
-        let currentIds = Set(nodes.map(\.id))
-        let edgePairs = edges.map { ($0.sourceId, $0.targetId) }
-        var projectMap: [Int64: String] = [:]
-        var topicMap: [Int64: String] = [:]
-        for node in nodes {
-            projectMap[node.id] = node.project
-            topicMap[node.id] = node.topic
-        }
-        simulation.updateGraph(nodeIds: currentIds, edges: edgePairs, projectForNode: projectMap, topicForNode: topicMap)
     }
 
     // MARK: - Hit testing
@@ -156,14 +217,16 @@ struct GraphCanvas: View {
         )
     }
 
-    private func nodeRadius(for node: NodeInfo) -> CGFloat {
+    private func nodeRadius(for node: NodeData) -> CGFloat {
         let importance = max(1, node.importance)
-        return baseRadius * (node.isHub ? hubScale : 1.0) * (1.0 + CGFloat(importance - 1) * 0.08)
+        let isHub = hubs.contains(node.id)
+        return baseRadius * (isHub ? hubScale : 1.0) * (1.0 + CGFloat(importance - 1) * 0.08)
     }
 
     // MARK: - Cluster Hulls
 
-    private func drawClusterHulls(context: inout GraphicsContext, positions: [Int64: CGPoint]) {
+    private func drawClusterHulls(context: inout GraphicsContext, positions: [Int64: CGPoint],
+                                  nodes: [NodeData], hubs: Set<Int64>, edges: [EdgeData]) {
         // Per-project hulls (faint background)
         var projectPoints: [String: [CGPoint]] = [:]
         for node in nodes {
@@ -182,11 +245,10 @@ struct GraphCanvas: View {
             path.closeSubpath()
             context.fill(path, with: .color(color.opacity(0.04)))
             context.stroke(path, with: .color(color.opacity(0.08)), lineWidth: 1)
-
         }
 
-        // Per-topic sub-hulls (organized topic groups within projects)
-        let nodeProjectMap = Dictionary(uniqueKeysWithValues: nodes.map { ($0.id, $0.project) })
+        // Per-topic sub-hulls
+        let nodeProjectMap = Dictionary(nodes.map { ($0.id, $0.project) }, uniquingKeysWith: { _, last in last })
         for group in topicGroups {
             let visiblePoints = group.ids.compactMap { positions[$0] }
             guard visiblePoints.count >= 2 else { continue }
@@ -220,7 +282,7 @@ struct GraphCanvas: View {
             context.stroke(path, with: .color(color.opacity(0.2)), lineWidth: 1.5)
         }
 
-        // Per-cluster hulls (semantic clusters — more prominent, dashed)
+        // Per-cluster hulls (semantic clusters — dashed)
         for cluster in clusters {
             let visiblePoints = cluster.compactMap { positions[$0] }
             guard visiblePoints.count >= 2 else { continue }
@@ -228,7 +290,6 @@ struct GraphCanvas: View {
             let project = cluster.first.flatMap { nodeProjectMap[$0] } ?? "global"
             let color = GraphView.projectColor(for: project, in: colorMap)
 
-            // For 2-point clusters, add perpendicular offsets to form a capsule shape
             let hullInput: [CGPoint]
             if visiblePoints.count == 2 {
                 let p1 = visiblePoints[0], p2 = visiblePoints[1]
@@ -259,8 +320,13 @@ struct GraphCanvas: View {
 
     // MARK: - Drawing Edges
 
-    private func drawEdges(context: inout GraphicsContext, positions: [Int64: CGPoint]) {
+    private func drawEdges(context: inout GraphicsContext, positions: [Int64: CGPoint],
+                           nodes: [NodeData], hubs: Set<Int64>, edges: [EdgeData],
+                           connectedToSelected: Set<Int64> = []) {
+        let nodeByPk = Dictionary(nodes.map { ($0.id, $0) }, uniquingKeysWith: { _, last in last })
         let hasSelection = selectedNode != nil
+        let selectedProject = selectedNode.flatMap { nodeByPk[$0]?.project } ?? "global"
+
         for edge in edges {
             guard let from = positions[edge.sourceId],
                   let to = positions[edge.targetId] else { continue }
@@ -269,7 +335,7 @@ struct GraphCanvas: View {
             let dimmed = hasSelection && !isConnected
             let searchDimmed = isSearchActive && !searchMatchIds.contains(edge.sourceId) && !searchMatchIds.contains(edge.targetId)
 
-            let targetNode = nodes.first(where: { $0.id == edge.targetId })
+            let targetNode = nodeByPk[edge.targetId]
             let targetRadius = targetNode.map { nodeRadius(for: $0) } ?? baseRadius
 
             let mid = CGPoint(
@@ -286,8 +352,7 @@ struct GraphCanvas: View {
             let relationColor = Self.relationColors[edge.relation] ?? .white
 
             if isConnected {
-                let color = GraphView.projectColor(for:
-                    nodes.first(where: { $0.id == selectedNode })?.project ?? "global", in: colorMap)
+                let color = GraphView.projectColor(for: selectedProject, in: colorMap)
                 context.stroke(path, with: .color(color.opacity(0.6)), lineWidth: 2)
             } else {
                 let baseOpacity: CGFloat = (dimmed || searchDimmed) ? 0.05 : 0.15
@@ -297,17 +362,19 @@ struct GraphCanvas: View {
             // Arrow head
             let arrowOpacity: CGFloat = isConnected ? 0.6 : ((dimmed || searchDimmed) ? 0.05 : 0.15)
             let arrowColor = isConnected
-                ? GraphView.projectColor(for: nodes.first(where: { $0.id == selectedNode })?.project ?? "global", in: colorMap)
+                ? GraphView.projectColor(for: selectedProject, in: colorMap)
                 : relationColor
             drawArrowHead(context: &context, from: mid, to: shortenedTo, color: arrowColor, opacity: arrowOpacity)
 
-            // Edge label
-            context.draw(
-                Text(edge.relation.replacingOccurrences(of: "_", with: " "))
-                    .font(.system(size: isConnected ? 9 : 7, weight: isConnected ? .bold : .medium))
-                    .foregroundStyle(relationColor.opacity(isConnected ? 0.7 : ((dimmed || searchDimmed) ? 0.1 : 0.3))),
-                at: CGPoint(x: mid.x, y: mid.y - 6)
-            )
+            // Edge label (only at higher zoom — text rendering is expensive)
+            if isConnected || viewport.scale >= 0.7 {
+                context.draw(
+                    Text(edge.relation.replacingOccurrences(of: "_", with: " "))
+                        .font(.system(size: isConnected ? 9 : 7, weight: isConnected ? .bold : .medium))
+                        .foregroundStyle(relationColor.opacity(isConnected ? 0.7 : ((dimmed || searchDimmed) ? 0.1 : 0.3))),
+                    at: CGPoint(x: mid.x, y: mid.y - 6)
+                )
+            }
         }
     }
 
@@ -345,12 +412,12 @@ struct GraphCanvas: View {
     // MARK: - Label Tiers (zoom-based visibility)
 
     private enum LabelTier: Int, Comparable {
-        case always    = 0  // selected, hovered, dragged
-        case project   = 1  // project cluster headers
-        case hub       = 2  // hub nodes (category headers)
-        case topic     = 3  // topic group centroid labels
-        case prominent = 4  // connected-to-selected, search matches
-        case normal    = 5  // everything else
+        case always    = 0
+        case project   = 1
+        case hub       = 2
+        case topic     = 3
+        case prominent = 4
+        case normal    = 5
         static func < (lhs: LabelTier, rhs: LabelTier) -> Bool { lhs.rawValue < rhs.rawValue }
     }
 
@@ -378,47 +445,66 @@ struct GraphCanvas: View {
 
     // MARK: - Drawing Nodes
 
-    /// Collected label info for deconflicted drawing after all circles are rendered.
     private struct LabelCmd {
         let text: String
-        let pos: CGPoint       // anchor point (node center or group centroid)
-        let radius: CGFloat    // node radius (or 0 for centroid labels)
+        let pos: CGPoint
+        let radius: CGFloat
         let tier: LabelTier
         let project: String
         let isHub: Bool
         let dimmed: Bool
     }
 
-    private func drawNodes(context: inout GraphicsContext, positions: [Int64: CGPoint]) {
+    private func drawNodes(context: inout GraphicsContext, positions: [Int64: CGPoint],
+                           nodes: [NodeData], hubs: Set<Int64>, edges: [EdgeData],
+                           glowingNodes: [Int64: Date],
+                           connectedToSelected: Set<Int64> = []) {
         let hasSelection = selectedNode != nil
-        let connectedToSelected: Set<Int64> = {
-            guard let sel = selectedNode else { return [] }
-            var ids = Set<Int64>()
-            for edge in edges {
-                if edge.sourceId == sel { ids.insert(edge.targetId) }
-                if edge.targetId == sel { ids.insert(edge.sourceId) }
-            }
-            return ids
-        }()
 
         var labelCmds: [LabelCmd] = []
 
         // --- Pass 1: Draw all node circles (regular first, then hubs on top) ---
-        let regular = nodes.filter { !$0.isHub }
-        let hubs = nodes.filter { $0.isHub }
+        let regular = nodes.filter { !hubs.contains($0.id) }
+        let hubNodes = nodes.filter { hubs.contains($0.id) }
+        let allOrdered = regular + hubNodes
+        let now = Date()
 
-        for node in regular + hubs {
+        // Precompute recall intensities
+        var recallIntensities: [Int64: CGFloat] = [:]
+        for node in allOrdered {
+            guard let glowStart = glowingNodes[node.id], node.id != selectedNode else { continue }
+            let elapsed = now.timeIntervalSince(glowStart)
+            let fadeIn: CGFloat = 0.3, hold: CGFloat = 1.5, fadeOut: CGFloat = 2.0
+            let total = fadeIn + hold + fadeOut
+            let ri: CGFloat
+            if elapsed < Double(fadeIn) {
+                let t = CGFloat(elapsed) / fadeIn; ri = t * t
+            } else if elapsed < Double(fadeIn + hold) {
+                ri = 1.0
+            } else if elapsed < Double(total) {
+                let t = 1.0 - (CGFloat(elapsed) - fadeIn - hold) / fadeOut; ri = t * t
+            } else { ri = 0 }
+            if ri > 0 { recallIntensities[node.id] = ri }
+        }
+
+        // Pass 0: Bloom halos behind all nodes
+        for node in allOrdered {
             guard let pos = positions[node.id] else { continue }
-
+            let pk = node.id
             let radius = nodeRadius(for: node)
             let color = GraphView.projectColor(for: node.project, in: colorMap)
-            let isSelected = node.id == selectedNode
-            let isConnected = connectedToSelected.contains(node.id)
-            let dimmed = hasSelection && !isSelected && !isConnected
-            let searchDimmed = isSearchActive && !searchMatchIds.contains(node.id)
-            let searchMatched = isSearchActive && searchMatchIds.contains(node.id)
+            let isSelected = pk == selectedNode
+            let searchMatched = isSearchActive && searchMatchIds.contains(pk)
 
-            // Glow for search matches
+            if let ri = recallIntensities[pk] {
+                let pulse = 1.0 + sin(Double(frameCount) * 0.08) * 0.15 * ri
+                let bloomRadius = (radius + 20) * pulse
+                let bloomRect = CGRect(
+                    x: pos.x - bloomRadius, y: pos.y - bloomRadius,
+                    width: bloomRadius * 2, height: bloomRadius * 2
+                )
+                context.fill(Circle().path(in: bloomRect), with: .color(Color(red: 0.6, green: 0.85, blue: 1.0).opacity(0.4 * ri)))
+            }
             if searchMatched && !isSelected {
                 let pulse = 1.0 + sin(Double(frameCount) * 0.08) * 0.1
                 let glowRadius = (radius + 8) * pulse
@@ -428,10 +514,8 @@ struct GraphCanvas: View {
                 )
                 context.fill(Circle().path(in: glowRect), with: .color(.white.opacity(0.15)))
             }
-
-            // Glow for selected node
             if isSelected {
-                let pulse = 1.0 + sin(Double(frameCount) * 0.05) * 0.15
+                let pulse = 1.0 + sin(now.timeIntervalSinceReferenceDate * 3.0) * 0.15
                 let glowRadius = (radius + 12) * pulse
                 let glowRect = CGRect(
                     x: pos.x - glowRadius, y: pos.y - glowRadius,
@@ -443,28 +527,53 @@ struct GraphCanvas: View {
                     width: (radius + 6) * 2, height: (radius + 6) * 2
                 )
                 context.fill(Circle().path(in: innerGlow), with: .color(color.opacity(0.35)))
-            } else if viewport.hoveredNode == node.id || viewport.draggedNode == node.id {
+            } else if viewport.hoveredNode == pk || viewport.draggedNode == pk {
                 let glowRect = CGRect(
                     x: pos.x - radius - 4, y: pos.y - radius - 4,
                     width: (radius + 4) * 2, height: (radius + 4) * 2
                 )
                 context.fill(Circle().path(in: glowRect), with: .color(color.opacity(0.25)))
             }
+        }
 
-            let nodeOpacity: CGFloat = (dimmed || searchDimmed) ? 0.15 : 0.8
+        // Pass 1: Node fills + strokes + overlays
+        for node in allOrdered {
+            guard let pos = positions[node.id] else { continue }
+            let pk = node.id
+
+            let isHub = hubs.contains(pk)
+            let radius = nodeRadius(for: node)
+            let color = GraphView.projectColor(for: node.project, in: colorMap)
+            let isSelected = pk == selectedNode
+            let isConnected = connectedToSelected.contains(pk)
+            let dimmed = hasSelection && !isSelected && !isConnected
+            let searchDimmed = isSearchActive && !searchMatchIds.contains(pk)
+            let searchMatched = isSearchActive && searchMatchIds.contains(pk)
+
+            // Recency fade: stretched exponential (plateau then drop), 30-day scale
+            let daysSinceAccess = now.timeIntervalSince(node.lastAccessedAt) / 86400.0
+            let freshness = exp(-pow(daysSinceAccess / 30.0, 1.5))
+            let nodeOpacity: CGFloat = (dimmed || searchDimmed) ? 0.15 : (0.12 + freshness * 0.68)
             let rect = CGRect(x: pos.x - radius, y: pos.y - radius, width: radius * 2, height: radius * 2)
+            let ri = recallIntensities[pk] ?? 0
+            // Draw base node at project color
+            let baseStroke = isSelected ? Color.white : (isHub ? Color.white : color)
+            let baseStrokeOpacity: CGFloat = (dimmed || searchDimmed) ? 0.1 : (0.08 + freshness * 0.52)
+            let baseLineWidth: CGFloat = isSelected ? 3 : (isHub ? 2.5 : 1)
             context.fill(Circle().path(in: rect), with: .color(color.opacity(nodeOpacity)))
-            context.stroke(
-                Circle().path(in: rect),
-                with: .color(isSelected ? .white : (node.isHub ? .white : color).opacity((dimmed || searchDimmed) ? 0.1 : 0.6)),
-                lineWidth: isSelected ? 3 : (node.isHub ? 2.5 : 1)
-            )
+            context.stroke(Circle().path(in: rect), with: .color(baseStroke.opacity(baseStrokeOpacity)), lineWidth: baseLineWidth)
+            // Overlay hot white-blue blended by recallIntensity (fades smoothly)
+            if ri > 0 {
+                let hotWhite = Color(red: 0.9, green: 0.95, blue: 1.0)
+                context.fill(Circle().path(in: rect), with: .color(hotWhite.opacity(0.85 * ri)))
+                context.stroke(Circle().path(in: rect), with: .color(Color(red: 0.8, green: 0.9, blue: 1.0).opacity(0.9 * ri)), lineWidth: 2.5)
+            }
 
             // Determine label tier
             let tier: LabelTier
-            if isSelected || node.id == viewport.hoveredNode || node.id == viewport.draggedNode {
+            if isSelected || pk == viewport.hoveredNode || pk == viewport.draggedNode {
                 tier = .always
-            } else if node.isHub {
+            } else if isHub {
                 tier = .hub
             } else if isConnected || searchMatched {
                 tier = .prominent
@@ -474,9 +583,10 @@ struct GraphCanvas: View {
 
             if labelVisible(tier: tier, scale: viewport.scale) {
                 labelCmds.append(LabelCmd(
-                    text: node.label, pos: pos, radius: radius,
+                    text: node.label,
+                    pos: pos, radius: radius,
                     tier: tier, project: node.project,
-                    isHub: node.isHub, dimmed: dimmed || searchDimmed
+                    isHub: isHub, dimmed: dimmed || searchDimmed
                 ))
             }
         }
@@ -496,18 +606,17 @@ struct GraphCanvas: View {
             }
         }
 
-        // --- Pass 1c: Project cluster labels (positioned at top-center of each project's bounding box) ---
+        // --- Pass 1c: Project cluster labels ---
         if labelVisible(tier: .project, scale: viewport.scale) {
-            var projectPoints: [String: [CGPoint]] = [:]
+            var projectPts: [String: [CGPoint]] = [:]
             for node in nodes {
                 guard let pos = positions[node.id] else { continue }
-                projectPoints[node.project, default: []].append(pos)
+                projectPts[node.project, default: []].append(pos)
             }
-            for (project, points) in projectPoints {
+            for (project, points) in projectPts {
                 guard points.count >= 2 else { continue }
                 let minY = points.map(\.y).min()!
                 let cx = points.map(\.x).reduce(0, +) / CGFloat(points.count)
-                // Position above the top of the cluster
                 labelCmds.append(LabelCmd(
                     text: project, pos: CGPoint(x: cx, y: minY - 20), radius: 0,
                     tier: .project, project: project,
@@ -516,7 +625,7 @@ struct GraphCanvas: View {
             }
         }
 
-        // --- Pass 2: Draw all labels sorted by priority (highest priority placed first) ---
+        // --- Pass 2: Draw all labels sorted by priority ---
         labelCmds.sort { $0.tier < $1.tier }
         var placedLabels: [CGRect] = []
 
@@ -540,7 +649,6 @@ struct GraphCanvas: View {
             let pillPath = RoundedRectangle(cornerRadius: cmd.tier == .project ? 6 : 4).path(in: pillRect)
             context.fill(pillPath, with: .color(bgColor.opacity(pillOpacity)))
 
-            // Colored border for project, hub, and topic labels
             if isHeader {
                 let color = GraphView.projectColor(for: cmd.project, in: colorMap)
                 let borderOpacity: CGFloat = cmd.tier == .project ? 0.5 : (cmd.tier == .topic ? 0.3 : 0.4)
@@ -558,22 +666,20 @@ struct GraphCanvas: View {
         }
     }
 
-    /// Find the best label placement near an anchor point, avoiding overlap with already-placed labels.
-    /// Tries 8 candidate positions (cardinal + diagonal).
     private func bestLabelPlacement(anchorPos: CGPoint, clearRadius: CGFloat,
                                      labelSize: CGSize, placed: inout [CGRect]) -> CGRect {
         let gap: CGFloat = 5
         let r = clearRadius
         let w = labelSize.width, h = labelSize.height
         let candidates = [
-            CGRect(x: anchorPos.x - w / 2, y: anchorPos.y + r + gap, width: w, height: h),                         // below
-            CGRect(x: anchorPos.x - w / 2, y: anchorPos.y - r - gap - h, width: w, height: h),                     // above
-            CGRect(x: anchorPos.x + r + gap, y: anchorPos.y - h / 2, width: w, height: h),                         // right
-            CGRect(x: anchorPos.x - r - gap - w, y: anchorPos.y - h / 2, width: w, height: h),                     // left
-            CGRect(x: anchorPos.x + r * 0.7 + gap, y: anchorPos.y + r * 0.7 + gap, width: w, height: h),          // bottom-right
-            CGRect(x: anchorPos.x - r * 0.7 - gap - w, y: anchorPos.y + r * 0.7 + gap, width: w, height: h),      // bottom-left
-            CGRect(x: anchorPos.x + r * 0.7 + gap, y: anchorPos.y - r * 0.7 - gap - h, width: w, height: h),      // top-right
-            CGRect(x: anchorPos.x - r * 0.7 - gap - w, y: anchorPos.y - r * 0.7 - gap - h, width: w, height: h),  // top-left
+            CGRect(x: anchorPos.x - w / 2, y: anchorPos.y + r + gap, width: w, height: h),
+            CGRect(x: anchorPos.x - w / 2, y: anchorPos.y - r - gap - h, width: w, height: h),
+            CGRect(x: anchorPos.x + r + gap, y: anchorPos.y - h / 2, width: w, height: h),
+            CGRect(x: anchorPos.x - r - gap - w, y: anchorPos.y - h / 2, width: w, height: h),
+            CGRect(x: anchorPos.x + r * 0.7 + gap, y: anchorPos.y + r * 0.7 + gap, width: w, height: h),
+            CGRect(x: anchorPos.x - r * 0.7 - gap - w, y: anchorPos.y + r * 0.7 + gap, width: w, height: h),
+            CGRect(x: anchorPos.x + r * 0.7 + gap, y: anchorPos.y - r * 0.7 - gap - h, width: w, height: h),
+            CGRect(x: anchorPos.x - r * 0.7 - gap - w, y: anchorPos.y - r * 0.7 - gap - h, width: w, height: h),
         ]
 
         var bestRect = candidates[0]

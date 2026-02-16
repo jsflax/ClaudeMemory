@@ -1,5 +1,11 @@
 import Foundation
 
+@globalActor struct ForceSimulatorActor {
+    static let shared: ActorType = .init()
+    
+    actor ActorType {}
+}
+
 /// Force-directed graph layout engine with drag support.
 /// No internal timer — driven externally by TimelineView calling `tick()` each frame.
 /// Uses contiguous arrays for cache-friendly O(n²) force computation.
@@ -36,9 +42,13 @@ final class ForceSimulation {
 
     private var alpha: CGFloat = 1.0
     private var alphaDecay: CGFloat = 0.997
+    private var maxSpeed: CGFloat = 0
+    private var tickInFlight = false
+    private var topologyVersion: UInt64 = 0
 
     var center: CGPoint = CGPoint(x: 400, y: 300)
-    var isActive: Bool { alpha > minAlpha }
+    /// Settled when alpha is negligible OR nodes have stopped moving perceptibly
+    var isActive: Bool { alpha > minAlpha && maxSpeed > 0.5 }
 
     // MARK: - Dragging
 
@@ -50,6 +60,36 @@ final class ForceSimulation {
         vy[i] = 0
         pinned[i] = true
         alpha = max(alpha, 0.3)
+
+        // Synchronous local repulsion — immediately push nearby nodes so drag feels reactive.
+        // Without this, nearby nodes only move when the next async tick completes (~50ms).
+        let n = ids.count
+        let hasProjects = !projectGroup.isEmpty
+        let hasTopics = !topicGroup.isEmpty
+        for j in 0..<n where j != i && !pinned[j] {
+            var dx = x[j] - position.x
+            var dy = y[j] - position.y
+            let distSq = dx * dx + dy * dy
+            guard distSq < 300 * 300 else { continue }
+            var dist = sqrt(distSq)
+            if dist < 1 { dist = 1; dx = .random(in: -1...1); dy = .random(in: -1...1) }
+
+            let crossProject = hasProjects && projectGroup[i] != projectGroup[j]
+            let sameTopic = hasTopics && topicGroup[i] == topicGroup[j]
+            let charge: CGFloat
+            if crossProject { charge = chargeStrength * 3.0 }
+            else if sameTopic { charge = chargeStrength * sameTopicChargeScale }
+            else { charge = chargeStrength }
+
+            let force = 0.3 * charge / (dist * dist)
+            let fx = (dx / dist) * force
+            let fy = (dy / dist) * force
+            // Apply to velocity (sustained effect picked up by next tick)
+            vx[j] += fx; vy[j] += fy
+            // Direct position nudge for instant visual feedback
+            x[j] += fx * 0.4; y[j] += fy * 0.4
+        }
+
         syncPositions()
     }
 
@@ -58,7 +98,126 @@ final class ForceSimulation {
         pinned[i] = false
     }
 
-    // MARK: - Graph updates
+    // Per-node metadata for surgical operations
+    private var nodeProject: [Int64: String] = [:]
+    private var nodeTopic: [Int64: String] = [:]
+    private var projectToGroupIdx: [String: Int] = [:]
+    private var topicKeyToGroupIdx: [String: Int] = [:]
+
+    // MARK: - Surgical node/edge operations
+
+    func addNode(_ id: Int64, project: String, topic: String) {
+        guard idToIndex[id] == nil else { return }
+
+        let idx = ids.count
+        ids.append(id)
+        idToIndex[id] = idx
+
+        // Spawn near project centroid
+        var spawnX = center.x
+        var spawnY = center.y
+        if let projGroupIdx = projectToGroupIdx[project] {
+            var sumX: CGFloat = 0, sumY: CGFloat = 0, count: CGFloat = 0
+            for i in 0..<projectGroup.count where projectGroup[i] == projGroupIdx {
+                sumX += x[i]; sumY += y[i]; count += 1
+            }
+            if count > 0 {
+                let angle = CGFloat.random(in: 0...(2 * .pi))
+                let r = CGFloat.random(in: 20...60)
+                spawnX = sumX / count + cos(angle) * r
+                spawnY = sumY / count + sin(angle) * r
+            }
+        } else {
+            let angle = CGFloat.random(in: 0...(2 * .pi))
+            let r = CGFloat.random(in: 50...250)
+            spawnX = center.x + cos(angle) * r
+            spawnY = center.y + sin(angle) * r
+        }
+
+        x.append(spawnX); y.append(spawnY)
+        vx.append(0); vy.append(0)
+        pinned.append(false)
+
+        // Project group
+        let projGroup: Int
+        if let g = projectToGroupIdx[project] { projGroup = g }
+        else { projGroup = projectToGroupIdx.count; projectToGroupIdx[project] = projGroup }
+        projectGroup.append(projGroup)
+
+        // Topic group
+        let topicKey = "\(project)|\(topic)"
+        let topGroup: Int
+        if let g = topicKeyToGroupIdx[topicKey] { topGroup = g }
+        else {
+            topGroup = topicKeyToGroupIdx.count
+            topicKeyToGroupIdx[topicKey] = topGroup
+            topicProjectGroup.append(projGroup)
+        }
+        topicGroup.append(topGroup)
+
+        nodeProject[id] = project
+        nodeTopic[id] = topic
+        prevTopicGroup = topicGroup
+
+        alpha = max(alpha, 0.4)
+        topologyVersion &+= 1
+        rebuildPositions()
+    }
+
+    func removeNode(_ id: Int64) {
+        guard let idx = idToIndex[id] else { return }
+        let lastIdx = ids.count - 1
+
+        // Remove edges involving this node
+        edgeIndices.removeAll { $0.0 == idx || $0.1 == idx }
+
+        if idx != lastIdx {
+            let lastId = ids[lastIdx]
+            ids[idx] = lastId
+            x[idx] = x[lastIdx]; y[idx] = y[lastIdx]
+            vx[idx] = vx[lastIdx]; vy[idx] = vy[lastIdx]
+            pinned[idx] = pinned[lastIdx]
+            projectGroup[idx] = projectGroup[lastIdx]
+            topicGroup[idx] = topicGroup[lastIdx]
+            idToIndex[lastId] = idx
+
+            // Patch edge indices: lastIdx → idx
+            for i in 0..<edgeIndices.count {
+                if edgeIndices[i].0 == lastIdx { edgeIndices[i].0 = idx }
+                if edgeIndices[i].1 == lastIdx { edgeIndices[i].1 = idx }
+            }
+        }
+
+        ids.removeLast(); x.removeLast(); y.removeLast()
+        vx.removeLast(); vy.removeLast(); pinned.removeLast()
+        projectGroup.removeLast(); topicGroup.removeLast()
+        idToIndex.removeValue(forKey: id)
+        positions.removeValue(forKey: id)
+        nodeProject.removeValue(forKey: id)
+        nodeTopic.removeValue(forKey: id)
+        prevTopicGroup = topicGroup
+
+        alpha = max(alpha, 0.4)
+        topologyVersion &+= 1
+        rebuildPositions()
+    }
+
+    func addEdge(from sourceId: Int64, to targetId: Int64) {
+        guard let si = idToIndex[sourceId], let ti = idToIndex[targetId] else { return }
+        if edgeIndices.contains(where: { $0 == (si, ti) }) { return }
+        edgeIndices.append((si, ti))
+        alpha = max(alpha, 0.3)
+        topologyVersion &+= 1
+    }
+
+    func removeEdge(from sourceId: Int64, to targetId: Int64) {
+        guard let si = idToIndex[sourceId], let ti = idToIndex[targetId] else { return }
+        edgeIndices.removeAll { $0 == (si, ti) }
+        alpha = max(alpha, 0.2)
+        topologyVersion &+= 1
+    }
+
+    // MARK: - Full graph reconciliation
 
     func updateGraph(nodeIds: Set<Int64>, edges: [(Int64, Int64)], projectForNode: [Int64: String] = [:], topicForNode: [Int64: String] = [:]) {
         // Remove nodes no longer in the graph
@@ -190,13 +349,40 @@ final class ForceSimulation {
             return (si, ti)
         }
 
-        syncPositions()
+        // Sync per-node metadata for surgical operations
+        nodeProject = projectForNode
+        nodeTopic = topicForNode
+        projectToGroupIdx = projectToGroup
+        topicKeyToGroupIdx = topicKeyToGroup
+
+        topologyVersion &+= 1
+        rebuildPositions()
     }
 
-    // MARK: - Simulation tick (called by TimelineView each frame)
+    // MARK: - Simulation tick (O(n²) computation offloaded to background thread)
+
+    private struct SimState: Sendable {
+        let n: Int
+        let x: [CGFloat], y: [CGFloat], vx: [CGFloat], vy: [CGFloat]
+        let pinned: [Bool]
+        let projectGroup: [Int], topicGroup: [Int]
+        let edgeIndices: [(Int, Int)]
+        let topicProjectGroup: [Int]
+        let alpha: CGFloat, center: CGPoint
+        let chargeStrength: CGFloat, sameTopicChargeScale: CGFloat
+        let springLength: CGFloat, crossProjectSpringLength: CGFloat, springStrength: CGFloat
+        let centerStrength: CGFloat, cohesionStrength: CGFloat, centroidRepulsion: CGFloat
+        let topicCohesionStrength: CGFloat, topicCentroidRepulsion: CGFloat
+        let damping: CGFloat, alphaDecay: CGFloat
+    }
+
+    private struct SimResult: Sendable {
+        let x: [CGFloat], y: [CGFloat], vx: [CGFloat], vy: [CGFloat]
+        let alpha: CGFloat, maxSpeed: CGFloat
+    }
 
     func tick() {
-        guard alpha > minAlpha else { return }
+        guard alpha > minAlpha, !tickInFlight else { return }
 
         let n = ids.count
         guard n > 1 else {
@@ -205,16 +391,79 @@ final class ForceSimulation {
             return
         }
 
+        tickInFlight = true
+        let version = topologyVersion
+
+        let state = SimState(
+            n: n, x: x, y: y, vx: vx, vy: vy,
+            pinned: pinned, projectGroup: projectGroup,
+            topicGroup: topicGroup, edgeIndices: edgeIndices,
+            topicProjectGroup: topicProjectGroup,
+            alpha: alpha, center: center,
+            chargeStrength: chargeStrength, sameTopicChargeScale: sameTopicChargeScale,
+            springLength: springLength, crossProjectSpringLength: crossProjectSpringLength,
+            springStrength: springStrength, centerStrength: centerStrength,
+            cohesionStrength: cohesionStrength, centroidRepulsion: centroidRepulsion,
+            topicCohesionStrength: topicCohesionStrength, topicCentroidRepulsion: topicCentroidRepulsion,
+            damping: damping, alphaDecay: alphaDecay
+        )
+
+        Task {
+            let result = await Task.detached(priority: .userInitiated) { @ForceSimulatorActor in
+                Self.computeForces(state)
+            }.value
+            guard self.topologyVersion == version else {
+                self.tickInFlight = false
+                return
+            }
+            // Preserve pinned positions (may have been updated via pinNode during computation)
+            var pinnedState: [(Int, CGFloat, CGFloat)] = []
+            for i in 0..<self.ids.count where self.pinned[i] {
+                pinnedState.append((i, self.x[i], self.y[i]))
+            }
+            self.x = result.x; self.y = result.y
+            self.vx = result.vx; self.vy = result.vy
+            self.alpha = result.alpha; self.maxSpeed = result.maxSpeed
+            for (i, px, py) in pinnedState {
+                self.x[i] = px; self.y[i] = py
+                self.vx[i] = 0; self.vy[i] = 0
+            }
+            self.syncPositions()
+            self.tickInFlight = false
+            // Eagerly dispatch next tick to keep pipeline full (don't wait for next timer fire)
+            self.tick()
+        }
+    }
+
+    /// Pure force computation — runs on background thread, no actor isolation.
+    nonisolated private static func computeForces(_ s: SimState) -> SimResult {
+        let n = s.n
+        actor SendableArray<T> {
+            let array: [T]
+            init(array: [T]) {
+                self.array = array
+            }
+            subscript(_ idx: Int) -> T {
+                get {
+                    array[idx]
+                }
+            }
+        }
+        
+        var x = s.x, y = s.y, vx = s.vx, vy = s.vy
+        let pinned = s.pinned
+        let projectGroup = s.projectGroup, topicGroup = s.topicGroup
+        let alpha = s.alpha
+
         // Charge repulsion (all pairs)
-        // Same topic: reduced charge → nodes sit closer
-        // Same project, different topic: normal charge
-        // Different project: 3x charge → projects spread far apart
         let hasProjects = !projectGroup.isEmpty
         let hasTopics = !topicGroup.isEmpty
+        
         for i in 0..<n {
+            let xi = x[i], yi = y[i]
             for j in (i + 1)..<n {
-                var dx = x[i] - x[j]
-                var dy = y[i] - y[j]
+                var dx = xi - x[j]
+                var dy = yi - y[j]
                 var dist = sqrt(dx * dx + dy * dy)
                 if dist < 1 { dist = 1; dx = .random(in: -1...1); dy = .random(in: -1...1) }
 
@@ -222,11 +471,11 @@ final class ForceSimulation {
                 let sameTopic = hasTopics && topicGroup[i] == topicGroup[j]
                 let charge: CGFloat
                 if crossProject {
-                    charge = chargeStrength * 3.0
+                    charge = s.chargeStrength * 3.0
                 } else if sameTopic {
-                    charge = chargeStrength * sameTopicChargeScale
+                    charge = s.chargeStrength * s.sameTopicChargeScale
                 } else {
-                    charge = chargeStrength
+                    charge = s.chargeStrength
                 }
                 let force = alpha * charge / (dist * dist)
                 let fx = (dx / dist) * force, fy = (dy / dist) * force
@@ -236,20 +485,20 @@ final class ForceSimulation {
             }
         }
 
-        // Spring attraction (edges) — longer rest length for cross-project edges
-        for (si, ti) in edgeIndices {
+        // Spring attraction (edges)
+        for (si, ti) in s.edgeIndices {
             let dx = x[ti] - x[si], dy = y[ti] - y[si]
             var dist = sqrt(dx * dx + dy * dy)
             if dist < 1 { dist = 1 }
             let crossProject = hasProjects && projectGroup[si] != projectGroup[ti]
-            let rest = crossProject ? crossProjectSpringLength : springLength
-            let force = alpha * springStrength * (dist - rest)
+            let rest = crossProject ? s.crossProjectSpringLength : s.springLength
+            let force = alpha * s.springStrength * (dist - rest)
             let fx = (dx / dist) * force, fy = (dy / dist) * force
             if !pinned[si] { vx[si] += fx; vy[si] += fy }
             if !pinned[ti] { vx[ti] -= fx; vy[ti] -= fy }
         }
 
-        // Topic centroid forces: cohesion within topic + repulsion between topics in same project
+        // Topic centroid forces
         let topicN = (topicGroup.max() ?? -1) + 1
         if topicN > 1 {
             var tSumX = [CGFloat](repeating: 0, count: topicN)
@@ -259,33 +508,28 @@ final class ForceSimulation {
                 let g = topicGroup[i]
                 tSumX[g] += x[i]; tSumY[g] += y[i]; tCount[g] += 1
             }
-
-            // Topic cohesion: pull toward topic centroid (stronger than project cohesion)
             for i in 0..<n where !pinned[i] {
                 let g = topicGroup[i]
                 let cnt = CGFloat(tCount[g])
                 if cnt < 2 { continue }
                 let cx = tSumX[g] / cnt, cy = tSumY[g] / cnt
-                vx[i] += (cx - x[i]) * alpha * topicCohesionStrength
-                vy[i] += (cy - y[i]) * alpha * topicCohesionStrength
+                vx[i] += (cx - x[i]) * alpha * s.topicCohesionStrength
+                vy[i] += (cy - y[i]) * alpha * s.topicCohesionStrength
             }
-
-            // Topic centroid repulsion: push apart topics within the same project
+            let tpg = s.topicProjectGroup
             for g1 in 0..<topicN {
                 guard tCount[g1] > 0 else { continue }
                 let c1x = tSumX[g1] / CGFloat(tCount[g1])
                 let c1y = tSumY[g1] / CGFloat(tCount[g1])
                 for g2 in (g1 + 1)..<topicN {
                     guard tCount[g2] > 0 else { continue }
-                    // Only repel topics in the same project
-                    guard g1 < topicProjectGroup.count && g2 < topicProjectGroup.count,
-                          topicProjectGroup[g1] == topicProjectGroup[g2] else { continue }
+                    guard g1 < tpg.count && g2 < tpg.count, tpg[g1] == tpg[g2] else { continue }
                     let c2x = tSumX[g2] / CGFloat(tCount[g2])
                     let c2y = tSumY[g2] / CGFloat(tCount[g2])
                     var dx = c1x - c2x, dy = c1y - c2y
                     var dist = sqrt(dx * dx + dy * dy)
                     if dist < 1 { dist = 1; dx = .random(in: -1...1); dy = .random(in: -1...1) }
-                    let force = alpha * topicCentroidRepulsion / (dist * dist)
+                    let force = alpha * s.topicCentroidRepulsion / (dist * dist)
                     let fx = (dx / dist) * force, fy = (dy / dist) * force
                     let f1 = 1.0 / CGFloat(tCount[g1])
                     let f2 = 1.0 / CGFloat(tCount[g2])
@@ -299,35 +543,25 @@ final class ForceSimulation {
             }
         }
 
-        // Project centroid forces: cohesion (pull toward own centroid) + centroid repulsion (push clusters apart)
+        // Project centroid forces
         if hasProjects {
-            // Compute centroids per project group
-            var groupSumX: [CGFloat] = []
-            var groupSumY: [CGFloat] = []
-            var groupCount: [Int] = []
             let groupN = (projectGroup.max() ?? -1) + 1
             if groupN > 0 {
-                groupSumX = [CGFloat](repeating: 0, count: groupN)
-                groupSumY = [CGFloat](repeating: 0, count: groupN)
-                groupCount = [Int](repeating: 0, count: groupN)
+                var groupSumX = [CGFloat](repeating: 0, count: groupN)
+                var groupSumY = [CGFloat](repeating: 0, count: groupN)
+                var groupCount = [Int](repeating: 0, count: groupN)
                 for i in 0..<n {
                     let g = projectGroup[i]
-                    groupSumX[g] += x[i]
-                    groupSumY[g] += y[i]
-                    groupCount[g] += 1
+                    groupSumX[g] += x[i]; groupSumY[g] += y[i]; groupCount[g] += 1
                 }
-
-                // Cohesion: pull each node gently toward its project centroid
                 for i in 0..<n where !pinned[i] {
                     let g = projectGroup[i]
                     let cnt = CGFloat(groupCount[g])
                     if cnt < 2 { continue }
                     let cx = groupSumX[g] / cnt, cy = groupSumY[g] / cnt
-                    vx[i] += (cx - x[i]) * alpha * cohesionStrength
-                    vy[i] += (cy - y[i]) * alpha * cohesionStrength
+                    vx[i] += (cx - x[i]) * alpha * s.cohesionStrength
+                    vy[i] += (cy - y[i]) * alpha * s.cohesionStrength
                 }
-
-                // Centroid repulsion: push project centroids apart
                 for g1 in 0..<groupN {
                     guard groupCount[g1] > 0 else { continue }
                     let c1x = groupSumX[g1] / CGFloat(groupCount[g1])
@@ -339,9 +573,8 @@ final class ForceSimulation {
                         var dx = c1x - c2x, dy = c1y - c2y
                         var dist = sqrt(dx * dx + dy * dy)
                         if dist < 1 { dist = 1; dx = .random(in: -1...1); dy = .random(in: -1...1) }
-                        let force = alpha * centroidRepulsion / (dist * dist)
+                        let force = alpha * s.centroidRepulsion / (dist * dist)
                         let fx = (dx / dist) * force, fy = (dy / dist) * force
-                        // Distribute force to all nodes in each group
                         let f1 = 1.0 / CGFloat(groupCount[g1])
                         let f2 = 1.0 / CGFloat(groupCount[g2])
                         for i in 0..<n where projectGroup[i] == g1 && !pinned[i] {
@@ -356,20 +589,30 @@ final class ForceSimulation {
         }
 
         // Center gravity + integrate
+        var ms: CGFloat = 0
         for i in 0..<n where !pinned[i] {
-            vx[i] += (center.x - x[i]) * alpha * centerStrength
-            vy[i] += (center.y - y[i]) * alpha * centerStrength
-            vx[i] *= damping; vy[i] *= damping
+            vx[i] += (s.center.x - x[i]) * alpha * s.centerStrength
+            vy[i] += (s.center.y - y[i]) * alpha * s.centerStrength
+            vx[i] *= s.damping; vy[i] *= s.damping
             x[i] += vx[i]; y[i] += vy[i]
+            let speed = vx[i] * vx[i] + vy[i] * vy[i]
+            if speed > ms { ms = speed }
         }
 
-        alpha *= alphaDecay
-        syncPositions()
+        return SimResult(x: x, y: y, vx: vx, vy: vy,
+                         alpha: alpha * s.alphaDecay, maxSpeed: sqrt(ms))
     }
 
-    private func syncPositions() {
-        // Reuse existing dictionary capacity
+    /// Full rebuild — only needed after topology changes (add/remove node, updateGraph)
+    private func rebuildPositions() {
         positions.removeAll(keepingCapacity: true)
+        for i in 0..<ids.count {
+            positions[ids[i]] = CGPoint(x: x[i], y: y[i])
+        }
+    }
+
+    /// In-place update — same key set, just overwrite values. No hashing overhead.
+    private func syncPositions() {
         for i in 0..<ids.count {
             positions[ids[i]] = CGPoint(x: x[i], y: y[i])
         }

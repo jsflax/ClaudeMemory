@@ -109,7 +109,7 @@ extension MemoryTools {
     func handleGraph(_ args: [String: Value]?) throws -> CallTool.Result {
         let a = try args.decode(GraphArgs.self)
         let memId = Int64(a.id.value)
-        let depth = min(a.depth?.value ?? 1, 3)
+        let depth = max(min(a.depth?.value ?? 1, 3), 0)
 
         // Validate memory exists
         guard let rootMem = lattice.objects(Memory.self).where({ $0.primaryKey == memId }).first else {
@@ -121,7 +121,7 @@ extension MemoryTools {
         var frontier = Set<Int64>([memId])
         var allEdges: [(edge: Edge, depth: Int)] = []
 
-        for d in 1...depth {
+        for d in stride(from: 1, through: depth, by: 1) {
             var nextFrontier = Set<Int64>()
             for nodeId in frontier {
                 // Outgoing edges
@@ -213,7 +213,7 @@ extension MemoryTools {
         var result: [Memory] = []
         let now = Date()
 
-        for _ in 1...depth {
+        for _ in stride(from: 1, through: depth, by: 1) {
             var nextFrontier = Set<Int64>()
             for nodeId in frontier {
                 // Outgoing edges

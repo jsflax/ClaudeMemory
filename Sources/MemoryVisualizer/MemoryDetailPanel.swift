@@ -12,6 +12,7 @@ struct MemoryDetailPanel: View {
 
     @State private var typingProgress: Int = 0
     private var content: String { memory.content }
+    private var typingDone: Bool { typingProgress >= content.count }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -38,14 +39,23 @@ struct MemoryDetailPanel: View {
             }
             .padding(.bottom, 12)
 
-            // Content (typewriter effect)
+            // Content (typewriter effect — text selection deferred until animation completes)
             ScrollView {
-                Text(String(content.prefix(typingProgress)))
-                    .font(.system(size: 13, design: .monospaced))
-                    .foregroundStyle(.white.opacity(0.9))
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .contentShape(Rectangle())
+                let displayText = typingDone ? content : String(content.prefix(typingProgress))
+                if typingDone {
+                    Text(displayText)
+                        .font(.system(size: 13, design: .monospaced))
+                        .foregroundStyle(.white.opacity(0.9))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                } else {
+                    Text(displayText)
+                        .font(.system(size: 13, design: .monospaced))
+                        .foregroundStyle(.white.opacity(0.9))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                }
             }
 
             Spacer(minLength: 12)
@@ -86,11 +96,13 @@ struct MemoryDetailPanel: View {
         }
         .task(id: memory.primaryKey) {
             typingProgress = 0
-            while !Task.isCancelled && typingProgress < content.count {
-                try? await Task.sleep(for: .milliseconds(10))
-                typingProgress += 2
+            let total = content.count
+            // Adaptive batch size: complete in ~1s at 60fps (~60 ticks)
+            let batch = max(2, total / 60)
+            while !Task.isCancelled && typingProgress < total {
+                try? await Task.sleep(for: .milliseconds(16))
+                typingProgress = min(typingProgress + batch, total)
             }
-            typingProgress = content.count
         }
     }
 }

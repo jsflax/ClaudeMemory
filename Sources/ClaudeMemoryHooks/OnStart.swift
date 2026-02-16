@@ -44,10 +44,6 @@ struct OnStart: AsyncParsableCommand {
             sections.append(nudge)
         }
 
-        // Reset tool call counter for throttled learning nudge
-        setHookState(key: .toolCallCount, value: "0")
-        setHookState(key: .learningNudgeLastToolCount, value: "0")
-
         guard !sections.isEmpty else { return }
 
         let output = HookOutput(
