@@ -35,7 +35,11 @@ struct PreTool: AsyncParsableCommand {
         }
 
         // Learning nudge
-        sections.append(learningNudge(project: proj))
+        if let nudge = throttledLearningNudge(project: proj) {
+            sections.append(nudge)
+        }
+
+        guard !sections.isEmpty else { return }
 
         let output = HookOutput(
             hookSpecificOutput: HookSpecificOutput(

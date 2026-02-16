@@ -80,18 +80,15 @@ func maintenanceNudge(project: String) -> String? {
     hookLog("Maintenance nudge injected (ops delta: \(delta))")
 
     return """
-    ## Memory maintenance due
+    ## Memory maintenance required
 
-    \(delta) memory operations since last maintenance (\(opCount) total ops).
-
-    If you haven't already, use the memory-maintenance agent to run maintenance in the background. \
-    Focus on project "\(project)" and any other projects with significant memory counts.
-
-    Keep it brief — just one Task tool call, then move on to the user's request.
+    \(delta) memory operations since last maintenance (\(opCount) total ops). \
+    Spawn the memory-maintenance agent in the background now. \
+    Focus on project "\(project)".
     """
 }
 
-/// Returns the learning nudge for the given project.
+/// Returns the learning nudge for the given project (always fires).
 func learningNudge(project: String) -> String {
     """
     ## Session learning
@@ -101,5 +98,33 @@ func learningNudge(project: String) -> String {
     Project: \(project)
 
     Keep it brief — just one Task tool call, then move on to the user's request.
+    """
+}
+
+/// Threshold for first throttled learning nudge (tool calls into the session).
+private let learningNudgeInitialThreshold = 15
+/// Interval between subsequent throttled learning nudges (tool calls).
+private let learningNudgeInterval = 30
+
+/// Increments the tool call counter and returns a learning nudge only when threshold is crossed.
+/// Use this for high-frequency hooks (PreToolUse, PostToolUseFailure) to avoid habituation.
+func throttledLearningNudge(project: String) -> String? {
+    let count = (Int(getHookState(key: .toolCallCount) ?? "0") ?? 0) + 1
+    setHookState(key: .toolCallCount, value: String(count))
+
+    let lastNudgeAt = Int(getHookState(key: .learningNudgeLastToolCount) ?? "0") ?? 0
+    let threshold = lastNudgeAt == 0 ? learningNudgeInitialThreshold : learningNudgeInterval
+    let delta = count - lastNudgeAt
+
+    guard delta >= threshold else { return nil }
+
+    setHookState(key: .learningNudgeLastToolCount, value: String(count))
+    hookLog("Learning nudge injected (tool call \(count), last nudge at \(lastNudgeAt))")
+
+    return """
+    ## Action required: capture session insights
+
+    Spawn the session-learner agent in the background now to record what you've learned this session. \
+    Project: \(project). One Task tool call, then continue working.
     """
 }
