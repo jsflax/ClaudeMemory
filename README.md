@@ -104,14 +104,16 @@ CLAUDE_MEMORY_DB=~/path/to/memory.sqlite swift run -c release MemoryVisualizer
 
 **Features:**
 - Force-directed graph layout with project-colored nodes and inter-project repulsion
+- Floating PiP panel — drag to detach, resize from corners, snaps to screen edges
 - FTS5-backed search with prefix matching — highlights matches, dims the rest
 - Edge type filtering with color-coded relations (part_of, contradicts, supersedes, etc.)
 - Time slider with play button to animate graph growth over time
 - Project filtering toggles in the stats overlay
 - Semantic cluster hulls drawn as translucent project-colored regions
+- Activity log with real-time memory updates and click-to-navigate
 - Minimap with click-to-navigate
 - Detail panel with typewriter effect for selected memories
-- Drag nodes, pan, zoom-to-cursor (scroll wheel + pinch)
+- Drag nodes with instant local repulsion, pan, zoom-to-cursor (scroll wheel + pinch)
 - Keyboard shortcuts: Esc (deselect), Tab (cycle connections), Cmd+F (search), +/- (zoom), Cmd+Shift+E (export PNG)
 
 ## Uninstall
@@ -137,7 +139,7 @@ Removes the binary and MCP registration. Database is preserved at `~/.claude/mem
 - **Task continuity**: `checkpoint` saves plan/progress/context state. `resume` restores it in a new session. Tasks persist across conversations.
 - **Clustering**: `find_clusters` uses greedy cosine-distance clustering to find related memory groups. `consolidate` creates a summary, deprioritizes originals (importance -> 0), and links them with `summarized_by` edges. `organize` batch re-topics memories with automatic hub creation.
 - **Cross-project linking**: `remember` auto-detects mentions of other project names in content and creates `relates_to` edges to those projects' hub memories.
-- **Hooks**: Optional `memory-hooks` binary for Claude Code hooks integration — auto-injects recalled context before each message (`advise`) and nudges session learning after interactions (`analyze`).
+- **Hooks**: Optional `memory-hooks` binary for Claude Code hooks integration — auto-injects recalled context before each message (`advise`), blocks session end to capture insights when significant work is detected (`stop`), and triggers maintenance when memory operations accumulate.
 
 ## Configuration
 
