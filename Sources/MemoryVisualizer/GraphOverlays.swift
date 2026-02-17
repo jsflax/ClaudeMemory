@@ -607,6 +607,8 @@ struct MinimapView: View {
     let filteredNodes: [NodeData]
     let hubs: Set<Int64>
     let glowingNodes: [Int64: Date]
+    let newNodes: [Int64: Date]
+    let dyingNodes: [Int64: DyingNode]
     let simulation: ForceSimulation
     let viewport: ViewportState
     let viewportSize: CGSize
@@ -659,7 +661,7 @@ struct MinimapView: View {
         .shadow(color: .black.opacity(isFloating ? 0.5 : 0), radius: 12)
         .onHover { isHovered = $0 }
         .onReceive(timer) { _ in
-            if simulation.isActive || !glowingNodes.isEmpty {
+            if simulation.isActive || !glowingNodes.isEmpty || !newNodes.isEmpty || !dyingNodes.isEmpty {
                 frameCount &+= 1
             }
         }
@@ -676,10 +678,11 @@ struct MinimapView: View {
             let mapScale = min(size.width / bounds.width, size.height / bounds.height)
 
             let glows = glowingNodes
+            let arrivals = newNodes
             let now = Date()
             struct MiniDot {
                 let mx: CGFloat; let my: CGFloat; let dotSize: CGFloat
-                let color: Color; let ri: CGFloat
+                let color: Color; let ri: CGFloat; let ai: CGFloat
             }
             var dots: [MiniDot] = []
             let dotScale: CGFloat = min(size.width, size.height) / 120 // scale dots proportionally
@@ -703,9 +706,29 @@ struct MinimapView: View {
                         let t = 1.0 - (CGFloat(elapsed) - fadeIn - hold) / fadeOut; ri = t * t
                     } else { ri = 0 }
                 } else { ri = 0 }
-                dots.append(MiniDot(mx: mx, my: my, dotSize: dotSize, color: color, ri: ri))
+                let ai: CGFloat
+                if let arrivalTime = arrivals[node.id] {
+                    let elapsed = now.timeIntervalSince(arrivalTime)
+                    let fadeIn: CGFloat = 0.5, hold: CGFloat = 2.0, fadeOut: CGFloat = 3.0
+                    let total = fadeIn + hold + fadeOut
+                    if elapsed < Double(fadeIn) {
+                        let t = CGFloat(elapsed) / fadeIn; ai = t * t
+                    } else if elapsed < Double(fadeIn + hold) {
+                        ai = 1.0
+                    } else if elapsed < Double(total) {
+                        let t = 1.0 - (CGFloat(elapsed) - fadeIn - hold) / fadeOut; ai = t * t
+                    } else { ai = 0 }
+                } else { ai = 0 }
+                dots.append(MiniDot(mx: mx, my: my, dotSize: dotSize, color: color, ri: ri, ai: ai))
             }
 
+            // Arrival bloom (golden-orange)
+            for d in dots where d.ai > 0 {
+                let bloomSize = d.dotSize + 8
+                let bloomRect = CGRect(x: d.mx - bloomSize / 2, y: d.my - bloomSize / 2, width: bloomSize, height: bloomSize)
+                context.fill(Circle().path(in: bloomRect), with: .color(Color(red: 1.0, green: 0.7, blue: 0.2).opacity(0.45 * d.ai)))
+            }
+            // Recall bloom (white-blue)
             for d in dots where d.ri > 0 {
                 let bloomSize = d.dotSize + 6
                 let bloomRect = CGRect(x: d.mx - bloomSize / 2, y: d.my - bloomSize / 2, width: bloomSize, height: bloomSize)
@@ -715,10 +738,44 @@ struct MinimapView: View {
             for d in dots {
                 let rect = CGRect(x: d.mx - d.dotSize / 2, y: d.my - d.dotSize / 2, width: d.dotSize, height: d.dotSize)
                 context.fill(Circle().path(in: rect), with: .color(d.color.opacity(0.8)))
+                if d.ai > 0 {
+                    let golden = Color(red: 1.0, green: 0.7, blue: 0.2)
+                    context.fill(Circle().path(in: rect), with: .color(golden.opacity(0.8 * d.ai)))
+                }
                 if d.ri > 0 {
                     let hotWhite = Color(red: 0.9, green: 0.95, blue: 1.0)
                     context.fill(Circle().path(in: rect), with: .color(hotWhite.opacity(0.85 * d.ri)))
                 }
+            }
+
+            // Dying node ghosts (red to black fade-out)
+            let dying = dyingNodes
+            for (_, ghost) in dying {
+                let elapsed = now.timeIntervalSince(ghost.startTime)
+                let flashIn: CGFloat = 0.3, hold: CGFloat = 1.2, fadeOutD: CGFloat = 1.5
+                let total = flashIn + hold + fadeOutD
+                guard elapsed < Double(total) else { continue }
+                let di: CGFloat
+                if elapsed < Double(flashIn) {
+                    let t = CGFloat(elapsed) / flashIn; di = t * t
+                } else if elapsed < Double(flashIn + hold) {
+                    di = 1.0
+                } else {
+                    let t = 1.0 - (CGFloat(elapsed) - flashIn - hold) / fadeOutD; di = t * t
+                }
+                let mx = (ghost.position.x - bounds.minX) * mapScale
+                let my = (ghost.position.y - bounds.minY) * mapScale
+                let dotSize: CGFloat = (ghost.isHub ? 4 : 2.5) * dotScale
+                // Red bloom
+                let bloomSize = dotSize + 8
+                let bloomRect = CGRect(x: mx - bloomSize / 2, y: my - bloomSize / 2, width: bloomSize, height: bloomSize)
+                context.fill(Circle().path(in: bloomRect), with: .color(Color(red: 0.9, green: 0.15, blue: 0.1).opacity(0.5 * di)))
+                // Red-to-dark dot
+                let darkening = elapsed > Double(flashIn) ? min(1.0, (CGFloat(elapsed) - flashIn) / (hold + fadeOutD)) : 0.0
+                let r = dotSize * (elapsed > Double(flashIn + hold) ? 1.0 - (1.0 - di) * 0.5 : 1.0)
+                let rect = CGRect(x: mx - r / 2, y: my - r / 2, width: r, height: r)
+                let red = Color(red: 0.9 * (1.0 - darkening * 0.8), green: 0.15 * (1.0 - darkening), blue: 0.1 * (1.0 - darkening))
+                context.fill(Circle().path(in: rect), with: .color(red.opacity(di)))
             }
 
             let vpWorldX = -viewport.offset.x / viewport.scale

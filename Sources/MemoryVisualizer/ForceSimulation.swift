@@ -71,9 +71,28 @@ final class ForceSimulation: ObservableObject {
     func unpinNode(_ id: Int64) {
         guard let i = idToIndex[id] else { return }
         pinned[i] = false
-        forceAge = 0  // apply stored forces at full strength for immediate snap-back
+
+        // Rubber-band snap: compute velocity impulse toward connected-neighbor centroid
+        var homeX: CGFloat = 0, homeY: CGFloat = 0, count: CGFloat = 0
+        for (si, ti) in edgeIndices {
+            if si == i { homeX += x[ti]; homeY += y[ti]; count += 1 }
+            else if ti == i { homeX += x[si]; homeY += y[si]; count += 1 }
+        }
+        if count > 0 {
+            homeX /= count; homeY /= count
+            let dx = homeX - x[i], dy = homeY - y[i]
+            let dist = sqrt(dx * dx + dy * dy)
+            if dist > 1 {
+                // Target ~80% of distance in initial impulse: v₀ / (1-damping) ≈ 0.8*dist
+                let snapSpeed = min(dist * 0.2, 50)
+                vx[i] = (dx / dist) * snapSpeed
+                vy[i] = (dy / dist) * snapSpeed
+            }
+        }
+
+        forceAge = 0
         if !tickInFlight {
-            dispatchForceComputation()  // get fresh forces for the new unpinned state
+            dispatchForceComputation()
         }
     }
 
@@ -139,7 +158,7 @@ final class ForceSimulation: ObservableObject {
         nodeTopic[id] = topic
         prevTopicGroup = topicGroup
 
-        alpha = max(alpha, 0.4)
+        alpha = max(alpha, 0.05)
         topologyVersion &+= 1
         rebuildPositions()
     }
@@ -179,7 +198,7 @@ final class ForceSimulation: ObservableObject {
         nodeTopic.removeValue(forKey: id)
         prevTopicGroup = topicGroup
 
-        alpha = max(alpha, 0.4)
+        alpha = max(alpha, 0.05)
         topologyVersion &+= 1
         rebuildPositions()
     }
@@ -188,14 +207,14 @@ final class ForceSimulation: ObservableObject {
         guard let si = idToIndex[sourceId], let ti = idToIndex[targetId] else { return }
         if edgeIndices.contains(where: { $0 == (si, ti) }) { return }
         edgeIndices.append((si, ti))
-        alpha = max(alpha, 0.3)
+        alpha = max(alpha, 0.03)
         topologyVersion &+= 1
     }
 
     func removeEdge(from sourceId: Int64, to targetId: Int64) {
         guard let si = idToIndex[sourceId], let ti = idToIndex[targetId] else { return }
         edgeIndices.removeAll { $0 == (si, ti) }
-        alpha = max(alpha, 0.2)
+        alpha = max(alpha, 0.03)
         topologyVersion &+= 1
     }
 
@@ -321,7 +340,7 @@ final class ForceSimulation: ObservableObject {
         // Reheat simulation if topology or topic groupings changed
         let topicGroupsChanged = topicGroup != prevTopicGroup
         if topologyChanged || topicGroupsChanged {
-            alpha = max(alpha, topologyChanged ? 0.4 : 0.3)
+            alpha = max(alpha, topologyChanged ? 0.05 : 0.03)
             prevTopicGroup = topicGroup
         }
 
@@ -391,7 +410,6 @@ final class ForceSimulation: ObservableObject {
     private struct SimState: Sendable {
         let n: Int
         let x: [CGFloat], y: [CGFloat]
-        let pinned: [Bool]
         let projectGroup: [Int], topicGroup: [Int]
         let edgeIndices: [(Int, Int)]
         let topicProjectGroup: [Int]
@@ -417,7 +435,7 @@ final class ForceSimulation: ObservableObject {
 
         let state = SimState(
             n: n, x: x, y: y,
-            pinned: pinned, projectGroup: projectGroup,
+            projectGroup: projectGroup,
             topicGroup: topicGroup, edgeIndices: edgeIndices,
             topicProjectGroup: topicProjectGroup,
             alpha: alpha, center: center,
@@ -452,7 +470,6 @@ final class ForceSimulation: ObservableObject {
         let n = s.n
         let x = s.x.map(Double.init)
         let y = s.y.map(Double.init)
-        let pinned = s.pinned
         let projectGroup = s.projectGroup, topicGroup = s.topicGroup
         let alpha = Double(s.alpha)
 

@@ -46,6 +46,15 @@ struct EdgeData {
     let relation: String
 }
 
+struct DyingNode {
+    let id: Int64
+    let position: CGPoint
+    let project: String
+    let isHub: Bool
+    let importance: Int
+    let startTime: Date
+}
+
 // MARK: - Perf tracking (writable from Canvas closure)
 
 private final class PerfStats: @unchecked Sendable {
@@ -67,6 +76,8 @@ struct GraphCanvas: View {
     let edges: [EdgeData]
     let hubs: Set<Int64>
     let glowingNodes: [Int64: Date]
+    let newNodes: [Int64: Date]
+    let dyingNodes: [Int64: DyingNode]
     let searchMatchIds: Set<Int64>
     let isSearchActive: Bool
     let viewport: ViewportState
@@ -157,6 +168,8 @@ struct GraphCanvas: View {
             simulation.tick()
             let needsRedraw = simulation.isActive
             || !glowingNodes.isEmpty
+            || !newNodes.isEmpty
+            || !dyingNodes.isEmpty
             || viewport.draggedNode != nil
             || viewport.isAnimatingPan
             || (isSearchActive && !searchMatchIds.isEmpty)
@@ -531,6 +544,24 @@ struct GraphCanvas: View {
             if ri > 0 { recallIntensities[node.id] = ri }
         }
 
+        // Precompute arrival (new node) intensities — golden-orange glow
+        var arrivalIntensities: [Int64: CGFloat] = [:]
+        for node in allOrdered {
+            guard let arrivalTime = newNodes[node.id] else { continue }
+            let elapsed = now.timeIntervalSince(arrivalTime)
+            let fadeIn: CGFloat = 0.5, hold: CGFloat = 2.0, fadeOut: CGFloat = 3.0
+            let total = fadeIn + hold + fadeOut
+            let ai: CGFloat
+            if elapsed < Double(fadeIn) {
+                let t = CGFloat(elapsed) / fadeIn; ai = t * t
+            } else if elapsed < Double(fadeIn + hold) {
+                ai = 1.0
+            } else if elapsed < Double(total) {
+                let t = 1.0 - (CGFloat(elapsed) - fadeIn - hold) / fadeOut; ai = t * t
+            } else { ai = 0 }
+            if ai > 0 { arrivalIntensities[node.id] = ai }
+        }
+
         // Pass 0: Bloom halos behind all nodes
         for node in allOrdered {
             guard let pos = positions[node.id] else { continue }
@@ -540,6 +571,15 @@ struct GraphCanvas: View {
             let isSelected = pk == selectedNode
             let searchMatched = isSearchActive && searchMatchIds.contains(pk)
 
+            if let ai = arrivalIntensities[pk] {
+                let pulse = 1.0 + sin(Double(frameCount) * 0.06) * 0.2 * ai
+                let bloomRadius = (radius + 24) * pulse
+                let bloomRect = CGRect(
+                    x: pos.x - bloomRadius, y: pos.y - bloomRadius,
+                    width: bloomRadius * 2, height: bloomRadius * 2
+                )
+                context.fill(Circle().path(in: bloomRect), with: .color(Color(red: 1.0, green: 0.7, blue: 0.2).opacity(0.35 * ai)))
+            }
             if let ri = recallIntensities[pk] {
                 let pulse = 1.0 + sin(Double(frameCount) * 0.08) * 0.15 * ri
                 let bloomRadius = (radius + 20) * pulse
@@ -606,7 +646,14 @@ struct GraphCanvas: View {
             let baseLineWidth: CGFloat = isSelected ? 3 : (isHub ? 2.5 : 1)
             context.fill(Circle().path(in: rect), with: .color(color.opacity(nodeOpacity)))
             context.stroke(Circle().path(in: rect), with: .color(baseStroke.opacity(baseStrokeOpacity)), lineWidth: baseLineWidth)
-            // Overlay hot white-blue blended by recallIntensity (fades smoothly)
+            // Overlay golden-orange for newly arrived nodes (fades to project color)
+            let ai = arrivalIntensities[pk] ?? 0
+            if ai > 0 {
+                let golden = Color(red: 1.0, green: 0.7, blue: 0.2)
+                context.fill(Circle().path(in: rect), with: .color(golden.opacity(0.8 * ai)))
+                context.stroke(Circle().path(in: rect), with: .color(Color(red: 1.0, green: 0.8, blue: 0.3).opacity(0.9 * ai)), lineWidth: 2)
+            }
+            // Overlay hot white-blue blended by recallIntensity (fades smoothly, takes priority over arrival)
             if ri > 0 {
                 let hotWhite = Color(red: 0.9, green: 0.95, blue: 1.0)
                 context.fill(Circle().path(in: rect), with: .color(hotWhite.opacity(0.85 * ri)))
@@ -633,6 +680,48 @@ struct GraphCanvas: View {
                     isHub: isHub, dimmed: dimmed || searchDimmed
                 ))
             }
+        }
+
+        // --- Pass 1a: Dying nodes (ghost rendering — red to black fade-out) ---
+        for (_, dying) in dyingNodes {
+            let pos = dying.position
+            let importance = max(1, dying.importance)
+            let radius = baseRadius * (dying.isHub ? hubScale : 1.0) * (1.0 + CGFloat(importance - 1) * 0.08)
+            let elapsed = now.timeIntervalSince(dying.startTime)
+            let flashIn: CGFloat = 0.3, hold: CGFloat = 1.2, fadeOut: CGFloat = 1.5
+            let total = flashIn + hold + fadeOut
+            guard elapsed < Double(total) else { continue }
+
+            let di: CGFloat // death intensity
+            if elapsed < Double(flashIn) {
+                let t = CGFloat(elapsed) / flashIn; di = t * t
+            } else if elapsed < Double(flashIn + hold) {
+                di = 1.0
+            } else {
+                let t = 1.0 - (CGFloat(elapsed) - flashIn - hold) / fadeOut; di = t * t
+            }
+
+            // Shrink during fade-out phase
+            let shrink: CGFloat = elapsed > Double(flashIn + hold)
+                ? 1.0 - (1.0 - di) * 0.5
+                : 1.0
+            let r = radius * shrink
+
+            // Red bloom halo
+            let pulse = 1.0 + sin(Double(frameCount) * 0.1) * 0.2 * di
+            let bloomRadius = (r + 20) * pulse
+            let bloomRect = CGRect(
+                x: pos.x - bloomRadius, y: pos.y - bloomRadius,
+                width: bloomRadius * 2, height: bloomRadius * 2
+            )
+            context.fill(Circle().path(in: bloomRect), with: .color(Color(red: 0.9, green: 0.15, blue: 0.1).opacity(0.4 * di)))
+
+            // Node fill: blend from red → dark/black
+            let rect = CGRect(x: pos.x - r, y: pos.y - r, width: r * 2, height: r * 2)
+            let darkening = elapsed > Double(flashIn) ? min(1.0, (CGFloat(elapsed) - flashIn) / (hold + fadeOut)) : 0.0
+            let red = Color(red: 0.9 * (1.0 - darkening * 0.8), green: 0.15 * (1.0 - darkening), blue: 0.1 * (1.0 - darkening))
+            context.fill(Circle().path(in: rect), with: .color(red.opacity(di)))
+            context.stroke(Circle().path(in: rect), with: .color(Color(red: 1.0, green: 0.2, blue: 0.1).opacity(0.7 * di)), lineWidth: 2)
         }
 
         // --- Pass 1b: Topic centroid labels ---

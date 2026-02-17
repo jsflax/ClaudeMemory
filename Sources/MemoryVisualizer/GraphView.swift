@@ -64,6 +64,8 @@ struct GraphView: View {
     @State private var nodeObserver: AnyCancellable?
     @State private var edgeObserver: AnyCancellable?
     @State private var glowingNodes: [Int64: Date] = [:]
+    @State private var newNodes: [Int64: Date] = [:]
+    @State private var dyingNodes: [Int64: DyingNode] = [:]
 
     // Cached filtered views — recomputed on structural changes or filter changes
     @State private var cachedFilteredNodes: [NodeData] = []
@@ -217,6 +219,7 @@ struct GraphView: View {
                 importance: memory.importance
             )
             allNodes[pk] = node
+            newNodes[pk] = Date()
             let visible = !hiddenProjects.contains(node.project) &&
                 (debouncedTimeSliderDate == nil || node.createdAt <= debouncedTimeSliderDate!)
             if visible {
@@ -280,8 +283,17 @@ struct GraphView: View {
             }
 
         case .delete(let pk):
+            // Snapshot dying node for fade-out animation before removal
+            if let node = allNodes[pk], let pos = simulation.positions[pk] {
+                dyingNodes[pk] = DyingNode(
+                    id: pk, position: pos, project: node.project,
+                    isHub: cachedHubs.contains(pk), importance: node.importance,
+                    startTime: Date()
+                )
+            }
             allNodes.removeValue(forKey: pk)
             glowingNodes.removeValue(forKey: pk)
+            newNodes.removeValue(forKey: pk)
             cachedFilteredNodes.removeAll { $0.id == pk }
             cachedFilteredEdges.removeAll { $0.sourceId == pk || $0.targetId == pk }
             cachedVisibleNodeIds.remove(pk)
@@ -416,11 +428,24 @@ struct GraphView: View {
                     rebuildSimulationGraph()
                 }
                 .onReceive(glowTimer) { _ in
-                    guard !glowingNodes.isEmpty else { return }
                     let now = Date()
-                    let filtered = glowingNodes.filter { now.timeIntervalSince($0.value) < 4.3 }
-                    if filtered.count != glowingNodes.count {
-                        glowingNodes = filtered
+                    if !glowingNodes.isEmpty {
+                        let filtered = glowingNodes.filter { now.timeIntervalSince($0.value) < 4.3 }
+                        if filtered.count != glowingNodes.count {
+                            glowingNodes = filtered
+                        }
+                    }
+                    if !newNodes.isEmpty {
+                        let filtered = newNodes.filter { now.timeIntervalSince($0.value) < 5.5 }
+                        if filtered.count != newNodes.count {
+                            newNodes = filtered
+                        }
+                    }
+                    if !dyingNodes.isEmpty {
+                        let filtered = dyingNodes.filter { now.timeIntervalSince($0.value.startTime) < 3.0 }
+                        if filtered.count != dyingNodes.count {
+                            dyingNodes = filtered
+                        }
                     }
                 }
         }
@@ -456,6 +481,8 @@ struct GraphView: View {
             edges: cachedFilteredEdges,
             hubs: cachedHubs,
             glowingNodes: glowingNodes,
+            newNodes: newNodes,
+            dyingNodes: dyingNodes,
             searchMatchIds: searchMatchIds,
             isSearchActive: isSearchActive,
             viewport: viewport,
@@ -521,6 +548,8 @@ struct GraphView: View {
                         filteredNodes: cachedFilteredNodes,
                         hubs: cachedHubs,
                         glowingNodes: glowingNodes,
+                        newNodes: newNodes,
+                        dyingNodes: dyingNodes,
                         simulation: simulation,
                         viewport: viewport,
                         viewportSize: size,
@@ -585,6 +614,8 @@ struct GraphView: View {
             filteredNodes: cachedFilteredNodes,
             hubs: cachedHubs,
             glowingNodes: glowingNodes,
+            newNodes: newNodes,
+            dyingNodes: dyingNodes,
             simulation: simulation,
             viewport: viewport,
             viewportSize: size,
