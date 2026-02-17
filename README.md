@@ -4,6 +4,24 @@ A local MCP server that gives Claude Code persistent, semantic memory across ses
 
 ![Demo](claude_memory_graph.gif)
 
+## Install
+
+```bash
+curl -sL https://raw.githubusercontent.com/jsflax/ClaudeMemory/main/scripts/install.sh | bash
+```
+
+This downloads the pre-built binary, registers the MCP server, and configures Claude Code — takes a few seconds.
+
+To build from source instead:
+
+```bash
+git clone https://github.com/jsflax/ClaudeMemory.git
+cd ClaudeMemory
+./scripts/install.sh --from-source
+```
+
+Start a new Claude Code session — memory tools are immediately available.
+
 ## Why not MEMORY.md?
 
 Claude Code has built-in memory via `MEMORY.md` files. Here's why ClaudeMemory is better:
@@ -69,24 +87,6 @@ Claude Code has built-in memory via `MEMORY.md` files. Here's why ClaudeMemory i
 | `detect_communities` | Label propagation on the knowledge graph to discover natural memory groups |
 | `find_clusters` | Discover groups of semantically similar memories by cosine distance |
 | `consolidate` | Create a summary memory from a cluster, deprioritize originals with `summarized_by` edges |
-
-## Install
-
-```bash
-curl -sL https://raw.githubusercontent.com/jsflax/ClaudeMemory/main/scripts/install.sh | bash
-```
-
-This downloads the pre-built binary, registers the MCP server, and configures Claude Code — takes a few seconds.
-
-To build from source instead:
-
-```bash
-git clone https://github.com/jsflax/ClaudeMemory.git
-cd ClaudeMemory
-./scripts/install.sh --from-source
-```
-
-Start a new Claude Code session — memory tools are immediately available.
 
 ## Memory Visualizer
 
