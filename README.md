@@ -22,6 +22,12 @@ cd ClaudeMemory
 
 Start a new Claude Code session — memory tools are immediately available.
 
+### Memory Visualizer
+
+```bash
+swift run -c release MemoryVisualizer
+```
+
 ## Why not MEMORY.md?
 
 Claude Code has built-in memory via `MEMORY.md` files. Here's why ClaudeMemory is better:
@@ -90,17 +96,7 @@ Claude Code has built-in memory via `MEMORY.md` files. Here's why ClaudeMemory i
 
 ## Memory Visualizer
 
-An interactive force-directed graph visualization of your memory database, built with SwiftUI.
-
-```bash
-swift run -c release MemoryVisualizer
-```
-
-Or point it at a specific database:
-
-```bash
-CLAUDE_MEMORY_DB=~/path/to/memory.sqlite swift run -c release MemoryVisualizer
-```
+An interactive force-directed graph visualization of your memory database, built with SwiftUI. Point it at a specific database with `CLAUDE_MEMORY_DB=~/path/to/memory.sqlite swift run -c release MemoryVisualizer`.
 
 **Features:**
 - Force-directed graph layout with project-colored nodes and inter-project repulsion
