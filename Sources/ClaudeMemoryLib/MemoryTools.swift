@@ -672,6 +672,10 @@ public actor MemoryTools {
                             "type": .string("string"),
                             "description": .string("Project for the hub memory. If omitted, inferred from the first memory."),
                         ]),
+                        "summary": .object([
+                            "type": .string("string"),
+                            "description": .string("Brief summary for the hub memory content. A short natural-language description of what the group covers improves recall. If omitted, defaults to 'Hub: {label}'."),
+                        ]),
                     ]),
                     "required": .array([.string("ids"), .string("label")]),
                     "additionalProperties": .bool(false),

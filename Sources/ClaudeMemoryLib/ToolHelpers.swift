@@ -332,6 +332,7 @@ struct OrganizeArgs: Decodable {
     let ids: FlexibleIntArray
     let label: String
     let project: String?
+    let summary: String?
 }
 
 struct ConsolidateArgs: Decodable {

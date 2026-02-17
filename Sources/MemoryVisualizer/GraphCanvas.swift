@@ -46,12 +46,23 @@ struct EdgeData {
     let relation: String
 }
 
+// MARK: - Perf tracking (writable from Canvas closure)
+
+private final class PerfStats: @unchecked Sendable {
+    var lastFrameTime: CFAbsoluteTime = 0
+    var fps: Double = 0
+    var drawMs: Double = 0
+    var hullMs: Double = 0
+    var edgeMs: Double = 0
+    var nodeMs: Double = 0
+}
+
 // MARK: - GraphCanvas
 
 /// Pure rendering component for the force-directed graph.
 /// Receives all data from GraphView — no Lattice queries or observers.
 struct GraphCanvas: View {
-    let simulation: ForceSimulation
+    @ObservedObject var simulation: ForceSimulation
     let nodes: [NodeData]
     let edges: [EdgeData]
     let hubs: Set<Int64>
@@ -66,6 +77,7 @@ struct GraphCanvas: View {
 
     @GestureState private var lastMagnification: CGFloat = 1.0
     @State private var frameCount: UInt64 = 0
+    private let perf = PerfStats()
     private let baseRadius: CGFloat = 12
     private let hubScale: CGFloat = 1.6
     private let bgColor = Color(red: 0.051, green: 0.067, blue: 0.09)
@@ -98,25 +110,57 @@ struct GraphCanvas: View {
         }()
         Canvas(rendersAsynchronously: true) { context, size in
             let _ = frameCount
-            viewport.tickPan()
+            let t0 = CFAbsoluteTimeGetCurrent()
+            // FPS from inter-frame interval
+            let p = perf
+            if p.lastFrameTime > 0 {
+                let dt = t0 - p.lastFrameTime
+                if dt > 0 { p.fps = p.fps * 0.9 + (1.0 / dt) * 0.1 }
+            }
+            p.lastFrameTime = t0
+
             var ctx = context
             ctx.translateBy(x: viewport.offset.x, y: viewport.offset.y)
             ctx.scaleBy(x: viewport.scale, y: viewport.scale)
             let positions = simulation.positions
+            let t1 = CFAbsoluteTimeGetCurrent()
             drawClusterHulls(context: &ctx, positions: positions, nodes: mems, hubs: hubSet, edges: vEdges)
+            let t2 = CFAbsoluteTimeGetCurrent()
             drawEdges(context: &ctx, positions: positions, nodes: mems, hubs: hubSet, edges: vEdges, connectedToSelected: connected)
+            let t3 = CFAbsoluteTimeGetCurrent()
             drawNodes(context: &ctx, positions: positions, nodes: mems, hubs: hubSet, edges: vEdges, glowingNodes: glows, connectedToSelected: connected)
+            let t4 = CFAbsoluteTimeGetCurrent()
+            p.drawMs = (t4 - t0) * 1000
+            p.hullMs = (t2 - t1) * 1000
+            p.edgeMs = (t3 - t2) * 1000
+            p.nodeMs = (t4 - t3) * 1000
+            context.draw(
+                Text("\(Int(p.fps))fps \(String(format: "%.0f", p.drawMs))ms [hull:\(String(format: "%.0f", p.hullMs)) edge:\(String(format: "%.0f", p.edgeMs)) node:\(String(format: "%.0f", p.nodeMs))] \(mems.count)n \(vEdges.count)e")
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.green.opacity(0.8)),
+                at: CGPoint(x: size.width / 2, y: size.height - 16)
+            )
+            // Log FPS to file every ~1s
+            if frameCount % 60 == 0 && frameCount > 0 {
+                let line = "[perf] \(Int(p.fps))fps | \(String(format: "%.0f", p.drawMs))ms [hull:\(String(format: "%.0f", p.hullMs)) edge:\(String(format: "%.0f", p.edgeMs)) node:\(String(format: "%.0f", p.nodeMs))] | \(mems.count)n \(vEdges.count)e\n"
+                if let data = line.data(using: .utf8) {
+                    let fh = FileHandle(forWritingAtPath: "/tmp/visualizer-fps.log")
+                        ?? { FileManager.default.createFile(atPath: "/tmp/visualizer-fps.log", contents: nil); return FileHandle(forWritingAtPath: "/tmp/visualizer-fps.log")! }()
+                    fh.seekToEndOfFile()
+                    fh.write(data)
+                    fh.closeFile()
+                }
+            }
         }
         .onReceive(timer) { _ in
-            Task {
-                await simulation.tick()
-                let needsRedraw = simulation.isActive
-                || !glowingNodes.isEmpty
-                || viewport.draggedNode != nil
-                || viewport.isAnimatingPan
-                || (isSearchActive && !searchMatchIds.isEmpty)
-                if needsRedraw { frameCount &+= 1 }
-            }
+            viewport.tickPan()
+            simulation.tick()
+            let needsRedraw = simulation.isActive
+            || !glowingNodes.isEmpty
+            || viewport.draggedNode != nil
+            || viewport.isAnimatingPan
+            || (isSearchActive && !searchMatchIds.isEmpty)
+            if needsRedraw { frameCount &+= 1 }
         }
         .gesture(nodeDragGesture)
         .gesture(magnificationGesture)
@@ -366,8 +410,8 @@ struct GraphCanvas: View {
                 : relationColor
             drawArrowHead(context: &context, from: mid, to: shortenedTo, color: arrowColor, opacity: arrowOpacity)
 
-            // Edge label (only at higher zoom — text rendering is expensive)
-            if isConnected || viewport.scale >= 0.7 {
+            // Edge label (only at very high zoom — text rendering is extremely expensive at 1274 edges)
+            if isConnected || viewport.scale >= 1.8 {
                 context.draw(
                     Text(edge.relation.replacingOccurrences(of: "_", with: " "))
                         .font(.system(size: isConnected ? 9 : 7, weight: isConnected ? .bold : .medium))

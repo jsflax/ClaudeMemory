@@ -406,11 +406,7 @@ struct GraphView: View {
                         : "/System/Library/Sounds/Bottle.aiff"
                     NSSound(contentsOf: URL(fileURLWithPath: sound), byReference: true)?.play()
                 }
-                .onChange(of: hiddenProjects) { _, _ in
-                    recomputeFilteredData()
-                    rebuildSimulationGraph()
-                    recomputeClusters()
-                }
+                // hiddenProjects changes handled surgically in toggleProject()
                 .onChange(of: hiddenRelations) { _, _ in
                     recomputeFilteredData()
                     rebuildSimulationGraph()
@@ -665,9 +661,59 @@ struct GraphView: View {
     private func toggleProject(_ project: String) {
         if hiddenProjects.contains(project) {
             hiddenProjects.remove(project)
+            showProject(project)
         } else {
             hiddenProjects.insert(project)
+            hideProject(project)
         }
+    }
+
+    /// Surgically remove a project's nodes/edges from filtered data and simulation.
+    private func hideProject(_ project: String) {
+        let removedIds = Set(cachedFilteredNodes.filter { $0.project == project }.map(\.id))
+        guard !removedIds.isEmpty else { return }
+        cachedFilteredNodes.removeAll { $0.project == project }
+        cachedFilteredEdges.removeAll { removedIds.contains($0.sourceId) || removedIds.contains($0.targetId) }
+        cachedVisibleNodeIds.subtract(removedIds)
+        for id in removedIds { simulation.removeNode(id) }
+        clusterGroups = clusterGroups.compactMap { cluster in
+            let filtered = cluster.filter { !removedIds.contains($0) }
+            return filtered.count >= 2 ? filtered : nil
+        }
+        recomputeDerivedData()
+    }
+
+    /// Surgically add a project's nodes/edges back into filtered data and simulation.
+    private func showProject(_ project: String) {
+        let newNodes = allNodes.values.filter {
+            $0.project == project &&
+            (debouncedTimeSliderDate == nil || $0.createdAt <= debouncedTimeSliderDate!)
+        }
+        guard !newNodes.isEmpty else { return }
+        cachedFilteredNodes.append(contentsOf: newNodes)
+        let newIds = Set(newNodes.map(\.id))
+        cachedVisibleNodeIds.formUnion(newIds)
+
+        let allVisibleIds = cachedVisibleNodeIds
+        let newEdges = allEdges.values.filter { edge in
+            allVisibleIds.contains(edge.sourceId) && allVisibleIds.contains(edge.targetId) &&
+            !hiddenRelations.contains(edge.relation) &&
+            !cachedFilteredEdges.contains(where: { $0.id == edge.id })
+        }
+        cachedFilteredEdges.append(contentsOf: newEdges)
+
+        for node in newNodes {
+            simulation.addNode(node.id, project: node.project, topic: node.topic)
+        }
+        for edge in newEdges {
+            simulation.addEdge(from: edge.sourceId, to: edge.targetId)
+        }
+
+        recomputeHubs()
+        recomputeDerivedData()
+        clusterGroups.append(contentsOf:
+            findMemoryClusters(in: lattice, project: project, minClusterSize: 2).clusters
+        )
     }
 
     private func toggleRelation(_ relation: String) {

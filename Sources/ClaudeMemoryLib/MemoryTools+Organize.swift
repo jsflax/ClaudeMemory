@@ -112,7 +112,7 @@ extension MemoryTools {
         let project = a.project ?? memories[ids[0]]?.project ?? "global"
 
         // Create hub memory
-        let hubContent = "Hub: \(label)"
+        let hubContent = a.summary ?? "Hub: \(label)"
         var hubEmbedding = Vector<Float>([])
         if let floats = try await embedder.embed(text: hubContent) {
             hubEmbedding = Vector<Float>(floats)
