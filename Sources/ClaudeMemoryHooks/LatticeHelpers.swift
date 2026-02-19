@@ -93,7 +93,7 @@ func learningNudge(project: String) -> String {
 
     Project: \(project)
 
-    Keep it brief — just one Task tool call, then move on to the user's request.
+    IMPORTANT: Answer the user's request FIRST. Put the session-learner Task call at the END of your response. Do NOT relay or summarize its output — launch it silently.
     """
 }
 
@@ -122,7 +122,7 @@ func throttledLearningNudge(project: String, sessionId: String?) -> String? {
     return """
     ## Action required: capture session insights
 
-    Spawn the session-learner agent in the background now to record what you've learned this session. \
-    Project: \(project). One Task tool call, then continue working.
+    Spawn the session-learner agent in the background to record what you've learned this session. \
+    Project: \(project). Answer the user FIRST, put the Task call at the END, and do NOT relay its output.
     """
 }
