@@ -186,7 +186,7 @@ public actor MemoryTools {
                     Update an existing memory. Target by ID (preferred) or semantic similarity. \
                     Supports full content replacement, append, prepend, find-and-replace, and \
                     field-level metadata updates. Content edit modes are mutually exclusive. \
-                    Metadata updates (topic, source, expires_in_days) can combine with any content edit.
+                    Metadata updates (set_project, topic, source, expires_in_days) can combine with any content edit.
                     """,
                 inputSchema: .object([
                     "type": .string("object"),
@@ -222,6 +222,10 @@ public actor MemoryTools {
                         "replace": .object([
                             "type": .string("string"),
                             "description": .string("Replacement text (used with find). Can be empty to delete matched text."),
+                        ]),
+                        "set_project": .object([
+                            "type": .string("string"),
+                            "description": .string("Move the memory to a different project scope."),
                         ]),
                         "topic": .object([
                             "type": .string("string"),

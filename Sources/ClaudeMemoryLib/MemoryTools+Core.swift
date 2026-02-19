@@ -592,9 +592,9 @@ extension MemoryTools {
 
         // 2. Validate at least one edit field
         let hasContentEdit = a.content != nil || a.append != nil || a.prepend != nil || a.find != nil
-        let hasMetadataEdit = a.topic != nil || a.source != nil || a.expiresInDays != nil || a.importance != nil
+        let hasMetadataEdit = a.setProject != nil || a.topic != nil || a.source != nil || a.expiresInDays != nil || a.importance != nil
         guard hasContentEdit || hasMetadataEdit else {
-            throw MCPError.invalidParams("Provide at least one edit: content, append, prepend, find+replace, topic, source, or expires_in_days.")
+            throw MCPError.invalidParams("Provide at least one edit: content, append, prepend, find+replace, set_project, topic, source, or expires_in_days.")
         }
 
         // 3. Validate content edit modes are mutually exclusive
@@ -665,6 +665,11 @@ extension MemoryTools {
             changes.append("content: \(oldContent.prefix(60))... → \(mem.content.prefix(60))...")
         }
 
+        if let project = a.setProject {
+            let old = mem.project
+            mem.project = project
+            changes.append("project: \(old) → \(project)")
+        }
         if let topic = a.topic {
             let old = mem.topic
             mem.topic = topic
@@ -707,7 +712,7 @@ extension MemoryTools {
         let memId = mem.primaryKey.map(String.init) ?? "unknown"
         log("Updated memory [id:\(memId)] [\(mem.project)/\(mem.topic)]: \(changes.joined(separator: ", "))")
         // Count as CRUD op unless only the topic changed
-        let hasNonTopicChange = contentChanged || a.source != nil || a.expiresInDays != nil || a.importance != nil
+        let hasNonTopicChange = contentChanged || a.setProject != nil || a.source != nil || a.expiresInDays != nil || a.importance != nil
         if hasNonTopicChange {
             incrementCrudCounter()
         }

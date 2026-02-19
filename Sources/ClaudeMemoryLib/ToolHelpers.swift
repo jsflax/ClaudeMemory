@@ -168,6 +168,7 @@ struct UpdateArgs: Decodable {
     let replace: String?
 
     // Field-level metadata updates (all optional)
+    let setProject: String?
     let topic: String?
     let source: String?
     let expiresInDays: FlexibleInt?
@@ -175,6 +176,7 @@ struct UpdateArgs: Decodable {
 
     enum CodingKeys: String, CodingKey {
         case id, query, project, content, append, prepend, find, replace, topic, source, importance
+        case setProject = "set_project"
         case expiresInDays = "expires_in_days"
     }
 }
