@@ -366,9 +366,29 @@ final class ForceSimulation: ObservableObject {
 
     // MARK: - Per-frame tick: sync O(n) integration + async force dispatch
 
+    /// Write external positions (e.g. from t-SNE) into internal SoA arrays.
+    /// Force layout resumes from these positions when switching back.
+    func setPositions(_ positions: [Int64: CGPoint]) {
+        for (id, point) in positions {
+            guard let i = idToIndex[id] else { continue }
+            x[i] = point.x
+            y[i] = point.y
+            vx[i] = 0
+            vy[i] = 0
+        }
+        // Reset stored forces so simulation doesn't jump on first tick
+        storedFx = [CGFloat](repeating: 0, count: ids.count)
+        storedFy = [CGFloat](repeating: 0, count: ids.count)
+        forceAge = 100
+        alpha = 0.05
+        syncPositions()
+    }
+
     /// Called every frame by the timer. Applies stored forces, integrates positions (sync O(n)),
     /// then dispatches async O(n²) force recomputation when the pipeline is idle.
     func tick() {
+        guard isActive else { return }
+
         let n = ids.count
         guard n > 1 else {
             if n == 1 { x[0] = center.x; y[0] = center.y; syncPositions() }

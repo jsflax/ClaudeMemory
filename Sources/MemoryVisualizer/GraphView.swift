@@ -102,6 +102,14 @@ struct GraphView: View {
     @State private var minimapDetached: Bool = false
     @State private var minimapPanel = MinimapPanelController()
 
+    // Embedding projection / layout mode
+    @State private var layoutMode: LayoutMode = .forceDirected
+    @State private var embeddingProjection = EmbeddingProjection()
+    @State private var showVoids: Bool = false
+    @State private var transitionProgress: CGFloat = 0  // 0 = force, 1 = embedding
+    @State private var forcePositionSnapshot: [Int64: CGPoint] = [:]
+    @State private var projectionTopologyVersion: UInt64 = 0
+
     // Glow cleanup timer (1s interval — removes entries older than 4.3s)
     private let glowTimer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
@@ -162,6 +170,105 @@ struct GraphView: View {
             all.append(contentsOf: findMemoryClusters(in: lattice, project: project, minClusterSize: 2).clusters)
         }
         clusterGroups = all
+    }
+
+    // MARK: - Embedding Projection
+
+    /// Blended positions: lerp between force layout and t-SNE based on transitionProgress.
+    private var effectivePositions: [Int64: CGPoint]? {
+        guard transitionProgress > 0 else { return nil }  // pure force mode
+        let tsne = embeddingProjection.projectedPositions
+        guard !tsne.isEmpty else { return nil }
+
+        if transitionProgress >= 1.0 {
+            return tsne  // pure embedding mode
+        }
+
+        // Lerp between snapshot and t-SNE
+        var blended: [Int64: CGPoint] = [:]
+        let allIds = Set(forcePositionSnapshot.keys).union(tsne.keys)
+        for id in allIds {
+            let forcePos = forcePositionSnapshot[id] ?? simulation.positions[id] ?? .zero
+            let tsnePos = tsne[id] ?? forcePos
+            blended[id] = CGPoint(
+                x: forcePos.x + (tsnePos.x - forcePos.x) * transitionProgress,
+                y: forcePos.y + (tsnePos.y - forcePos.y) * transitionProgress
+            )
+        }
+        return blended
+    }
+
+    private func switchLayoutMode(to mode: LayoutMode, viewSize: CGSize) {
+        guard mode != layoutMode else { return }
+        layoutMode = mode
+
+        switch mode {
+        case .embedding:
+            // Snapshot current force positions
+            forcePositionSnapshot = simulation.positions
+            // Pause force simulation
+            simulation.isActive = false
+
+            // Clear stale positions from previous run so effectivePositions returns nil
+            // (nodes stay at force positions) until new t-SNE emissions arrive.
+            embeddingProjection.invalidate()
+
+            // Load embeddings and compute projection
+            let nodeIds = cachedVisibleNodeIds
+            embeddingProjection.loadEmbeddings(for: nodeIds, from: lattice)
+
+            let center = simulation.center
+            // t-SNE clusters tend to be very tight — use generous spread relative to node count
+            let nodeScale = max(1.0, sqrt(CGFloat(nodeIds.count) / 30.0))
+            let spread = max(viewSize.width, viewSize.height) * 1.2 * nodeScale
+
+            // Start transition immediately — nodes will drift as t-SNE iterates
+            withAnimation(.easeInOut(duration: 0.8)) {
+                transitionProgress = 1.0
+            }
+
+            Task {
+                await embeddingProjection.computeProjection(
+                    nodeIds: nodeIds,
+                    center: center,
+                    spread: spread,
+                    initialPositions: forcePositionSnapshot
+                )
+                // Detect clusters and voids after projection converges
+                var topics: [Int64: String] = [:]
+                var projects: [Int64: String] = [:]
+                var labels: [Int64: String] = [:]
+                for node in cachedFilteredNodes {
+                    topics[node.id] = node.topic
+                    projects[node.id] = node.project
+                    labels[node.id] = node.label
+                }
+                embeddingProjection.detectClusters(nodeTopics: topics, nodeProjects: projects, nodeLabels: labels)
+                embeddingProjection.detectVoids(nodeTopics: topics, nodeProjects: projects)
+
+                projectionTopologyVersion = 0  // reset — projection is fresh
+            }
+
+        case .forceDirected:
+            // Inject current t-SNE positions into force sim so it resumes smoothly
+            let currentPositions = effectivePositions ?? embeddingProjection.projectedPositions
+            if !currentPositions.isEmpty {
+                simulation.setPositions(currentPositions)
+            }
+            simulation.isActive = true
+            showVoids = false
+
+            // Animate transition back
+            withAnimation(.easeInOut(duration: 0.8)) {
+                transitionProgress = 0
+            }
+
+            // Clean up after animation
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(0.9))
+                forcePositionSnapshot = [:]
+            }
+        }
     }
 
     // MARK: - Date range for time slider (filtered by visible projects)
@@ -378,9 +485,11 @@ struct GraphView: View {
             projectMap[node.id] = node.project
             topicMap[node.id] = node.topic
         }
-//        Task {
             simulation.updateGraph(nodeIds: currentIds, edges: edgePairs, projectForNode: projectMap, topicForNode: topicMap)
-//        }
+        // Mark embedding projection stale if topology changed while in embedding mode
+        if layoutMode == .embedding {
+            projectionTopologyVersion &+= 1
+        }
     }
 
     // MARK: - Body
@@ -489,7 +598,13 @@ struct GraphView: View {
             selectedNode: $selectedMemoryId,
             clusters: clusterGroups,
             topicGroups: cachedTopicGroups,
-            colorMap: colorMap
+            colorMap: colorMap,
+            layoutMode: layoutMode,
+            overridePositions: effectivePositions,
+            knowledgeVoids: showVoids ? embeddingProjection.knowledgeVoids : [],
+            semanticClusters: embeddingProjection.semanticClusters,
+            projectionState: embeddingProjection.state,
+            onAnimationTick: { embeddingProjection.tickAnimation() }
         )
     }
 
@@ -533,6 +648,16 @@ struct GraphView: View {
                     lattice: lattice
                 )
                 SoundToggleButton()
+                LayoutModePicker(
+                    mode: layoutMode,
+                    projectionState: embeddingProjection.state,
+                    onModeChange: { mode in
+                        switchLayoutMode(to: mode, viewSize: NSApp.keyWindow?.frame.size ?? CGSize(width: 800, height: 600))
+                    }
+                )
+                if layoutMode == .embedding && embeddingProjection.state == .ready {
+                    VoidToggleButton(showVoids: $showVoids)
+                }
                 Spacer()
             }
             .padding(12)

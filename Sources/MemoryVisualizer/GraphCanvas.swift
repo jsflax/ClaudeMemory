@@ -85,9 +85,17 @@ struct GraphCanvas: View {
     let clusters: [[Int64]]
     let topicGroups: [TopicGroupInfo]
     let colorMap: [String: Color]
+    var layoutMode: LayoutMode = .forceDirected
+    var overridePositions: [Int64: CGPoint]? = nil
+    var knowledgeVoids: [KnowledgeVoid] = []
+    var semanticClusters: [SemanticCluster] = []
+    var projectionState: ProjectionState = .idle
+    var onAnimationTick: (() -> Void)? = nil
 
     @GestureState private var lastMagnification: CGFloat = 1.0
     @State private var frameCount: UInt64 = 0
+    @State private var clusterFadeStartFrame: UInt64 = 0
+    @State private var hullTransitionFrame: UInt64 = 0  // frame when layout mode last changed
     private let perf = PerfStats()
     private let baseRadius: CGFloat = 12
     private let hubScale: CGFloat = 1.6
@@ -133,9 +141,21 @@ struct GraphCanvas: View {
             var ctx = context
             ctx.translateBy(x: viewport.offset.x, y: viewport.offset.y)
             ctx.scaleBy(x: viewport.scale, y: viewport.scale)
-            let positions = simulation.positions
+            let positions = overridePositions ?? simulation.positions
             let t1 = CFAbsoluteTimeGetCurrent()
-            drawClusterHulls(context: &ctx, positions: positions, nodes: mems, hubs: hubSet, edges: vEdges)
+            // Cross-fade hulls during mode transitions (36 frames / 0.6s)
+            let hullTransitionProgress: CGFloat = hullTransitionFrame > 0 && frameCount > hullTransitionFrame
+                ? min(1.0, CGFloat(frameCount - hullTransitionFrame) / 36.0)
+                : 1.0
+            let forceHullFade: CGFloat = layoutMode == .forceDirected ? hullTransitionProgress : (1.0 - hullTransitionProgress)
+            let semanticHullFade: CGFloat = layoutMode == .embedding ? hullTransitionProgress : (1.0 - hullTransitionProgress)
+            if forceHullFade > 0 {
+                drawClusterHulls(context: &ctx, positions: positions, nodes: mems, hubs: hubSet, edges: vEdges, fade: forceHullFade)
+            }
+            if semanticHullFade > 0 {
+                drawSemanticClusters(context: &ctx, positions: positions, nodes: mems, transitionFade: semanticHullFade)
+            }
+            drawKnowledgeVoids(context: &ctx, positions: positions)
             let t2 = CFAbsoluteTimeGetCurrent()
             drawEdges(context: &ctx, positions: positions, nodes: mems, hubs: hubSet, edges: vEdges, connectedToSelected: connected)
             let t3 = CFAbsoluteTimeGetCurrent()
@@ -151,6 +171,18 @@ struct GraphCanvas: View {
                     .foregroundStyle(.green.opacity(0.8)),
                 at: CGPoint(x: size.width / 2, y: size.height - 16)
             )
+
+            // Semantic mode indicator
+            if layoutMode == .embedding && projectionState == .ready {
+                context.draw(
+                    Text("SEMANTIC VIEW — proximity = embedding similarity")
+                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                        .foregroundStyle(.cyan.opacity(0.4)),
+                    at: CGPoint(x: size.width / 2, y: 20)
+                )
+            }
+
+            // Progress is shown via nodes drifting progressively — no overlay needed
             // Log FPS to file every ~1s
             if frameCount % 60 == 0 && frameCount > 0 {
                 let line = "[perf] \(Int(p.fps))fps | \(String(format: "%.0f", p.drawMs))ms [hull:\(String(format: "%.0f", p.hullMs)) edge:\(String(format: "%.0f", p.edgeMs)) node:\(String(format: "%.0f", p.nodeMs))] | \(mems.count)n \(vEdges.count)e\n"
@@ -166,6 +198,17 @@ struct GraphCanvas: View {
         .onReceive(timer) { _ in
             viewport.tickPan()
             simulation.tick()
+            onAnimationTick?()
+            // Track cluster fade-in: record the frame when clusters first appear
+            if !semanticClusters.isEmpty && clusterFadeStartFrame == 0 {
+                clusterFadeStartFrame = frameCount
+            } else if semanticClusters.isEmpty && clusterFadeStartFrame != 0 {
+                clusterFadeStartFrame = 0
+            }
+            let isProjecting: Bool = {
+                if case .computing = projectionState { return true }
+                return false
+            }()
             let needsRedraw = simulation.isActive
             || !glowingNodes.isEmpty
             || !newNodes.isEmpty
@@ -173,7 +216,14 @@ struct GraphCanvas: View {
             || viewport.draggedNode != nil
             || viewport.isAnimatingPan
             || (isSearchActive && !searchMatchIds.isEmpty)
+            || !knowledgeVoids.isEmpty  // void pulse animation needs frameCount
+            || isProjecting
+            || (clusterFadeStartFrame > 0 && frameCount < clusterFadeStartFrame + 36)
+            || (hullTransitionFrame > 0 && frameCount < hullTransitionFrame + 36)
             if needsRedraw { frameCount &+= 1 }
+        }
+        .onChange(of: layoutMode) { _, _ in
+            hullTransitionFrame = max(frameCount, 1)
         }
         .gesture(nodeDragGesture)
         .gesture(magnificationGesture)
@@ -251,7 +301,7 @@ struct GraphCanvas: View {
 
     private func hitTest(_ screenPoint: CGPoint) -> Int64? {
         let world = screenToWorld(screenPoint)
-        let positions = simulation.positions
+        let positions = overridePositions ?? simulation.positions
         var closest: Int64?
         var closestDist: CGFloat = .greatestFiniteMagnitude
 
@@ -283,7 +333,7 @@ struct GraphCanvas: View {
     // MARK: - Cluster Hulls
 
     private func drawClusterHulls(context: inout GraphicsContext, positions: [Int64: CGPoint],
-                                  nodes: [NodeData], hubs: Set<Int64>, edges: [EdgeData]) {
+                                  nodes: [NodeData], hubs: Set<Int64>, edges: [EdgeData], fade: CGFloat = 1.0) {
         // Per-project hulls (faint background)
         var projectPoints: [String: [CGPoint]] = [:]
         for node in nodes {
@@ -300,8 +350,8 @@ struct GraphCanvas: View {
             path.move(to: expanded[0])
             for i in 1..<expanded.count { path.addLine(to: expanded[i]) }
             path.closeSubpath()
-            context.fill(path, with: .color(color.opacity(0.04)))
-            context.stroke(path, with: .color(color.opacity(0.08)), lineWidth: 1)
+            context.fill(path, with: .color(color.opacity(0.04 * fade)))
+            context.stroke(path, with: .color(color.opacity(0.08 * fade)), lineWidth: 1)
         }
 
         // Per-topic sub-hulls
@@ -335,8 +385,8 @@ struct GraphCanvas: View {
             for i in 1..<expanded.count { path.addLine(to: expanded[i]) }
             path.closeSubpath()
 
-            context.fill(path, with: .color(color.opacity(0.06)))
-            context.stroke(path, with: .color(color.opacity(0.2)), lineWidth: 1.5)
+            context.fill(path, with: .color(color.opacity(0.06 * fade)))
+            context.stroke(path, with: .color(color.opacity(0.2 * fade)), lineWidth: 1.5)
         }
 
         // Per-cluster hulls (semantic clusters — dashed)
@@ -370,8 +420,209 @@ struct GraphCanvas: View {
             for i in 1..<expanded.count { path.addLine(to: expanded[i]) }
             path.closeSubpath()
 
-            context.fill(path, with: .color(color.opacity(0.08)))
-            context.stroke(path, with: .color(color.opacity(0.25)), style: StrokeStyle(lineWidth: 1.5, dash: [6, 4]))
+            context.fill(path, with: .color(color.opacity(0.08 * fade)))
+            context.stroke(path, with: .color(color.opacity(0.25 * fade)), style: StrokeStyle(lineWidth: 1.5, dash: [6, 4]))
+        }
+    }
+
+    // MARK: - Semantic Clusters (embedding mode)
+
+    private func drawSemanticClusters(context: inout GraphicsContext, positions: [Int64: CGPoint], nodes: [NodeData], transitionFade: CGFloat = 1.0) {
+        guard !semanticClusters.isEmpty else { return }
+
+        // Cluster appearance fade (0.6s after clusters first appear from t-SNE)
+        let fadeFrames: CGFloat = 36
+        let appearanceFade: CGFloat
+        if clusterFadeStartFrame > 0 && frameCount > clusterFadeStartFrame {
+            appearanceFade = min(1.0, CGFloat(frameCount - clusterFadeStartFrame) / fadeFrames)
+        } else {
+            appearanceFade = 0
+        }
+        // Combine appearance fade with mode-transition fade
+        let fade = appearanceFade * transitionFade
+        guard fade > 0 else { return }
+
+        for cluster in semanticClusters {
+            guard cluster.hullPoints.count >= 3 else { continue }
+
+            // Determine dominant project color for this cluster
+            let dominantProject = cluster.projectBreakdown.first?.project ?? "global"
+            let color = GraphView.projectColor(for: dominantProject, in: colorMap)
+
+            // Draw hull fill + stroke
+            var path = Path()
+            path.move(to: cluster.hullPoints[0])
+            for i in 1..<cluster.hullPoints.count { path.addLine(to: cluster.hullPoints[i]) }
+            path.closeSubpath()
+
+            context.fill(path, with: .color(color.opacity(0.06 * fade)))
+            context.stroke(path, with: .color(color.opacity(0.2 * fade)), style: StrokeStyle(lineWidth: 1.5, dash: [8, 4]))
+
+            // Cluster label at centroid (above the cluster)
+            // Find top-most point for label placement
+            let topY = cluster.hullPoints.map(\.y).min() ?? cluster.centroid.y
+            let labelPos = CGPoint(x: cluster.centroid.x, y: topY - 14)
+
+            // Node count badge
+            let countText = "\(cluster.nodeIds.count)"
+
+            // Background pill for label
+            let labelText = cluster.label
+            let fontSize: CGFloat = 11
+            let charWidth: CGFloat = fontSize * 0.6
+            let fullLabel = "\(labelText)  (\(countText))"
+            let labelWidth = CGFloat(fullLabel.count) * charWidth + 16
+            let labelHeight: CGFloat = fontSize + 8
+            let pillRect = CGRect(
+                x: labelPos.x - labelWidth / 2,
+                y: labelPos.y - labelHeight / 2,
+                width: labelWidth,
+                height: labelHeight
+            )
+            let pillPath = RoundedRectangle(cornerRadius: 6).path(in: pillRect)
+            context.fill(pillPath, with: .color(bgColor.opacity(0.9 * fade)))
+            context.stroke(pillPath, with: .color(color.opacity(0.35 * fade)), lineWidth: 1)
+
+            context.draw(
+                Text(fullLabel)
+                    .font(.system(size: fontSize, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(color.opacity(0.85 * fade)),
+                at: labelPos
+            )
+
+            // Multi-project indicator: show colored dots if cluster spans multiple projects
+            if cluster.projectBreakdown.count > 1 {
+                let dotY = labelPos.y + labelHeight / 2 + 8
+                let dotSpacing: CGFloat = 12
+                let startX = cluster.centroid.x - CGFloat(cluster.projectBreakdown.count - 1) * dotSpacing / 2
+                for (i, pb) in cluster.projectBreakdown.prefix(5).enumerated() {
+                    let dotX = startX + CGFloat(i) * dotSpacing
+                    let dotColor = GraphView.projectColor(for: pb.project, in: colorMap)
+                    let dotRect = CGRect(x: dotX - 3, y: dotY - 3, width: 6, height: 6)
+                    context.fill(Circle().path(in: dotRect), with: .color(dotColor.opacity(0.7 * fade)))
+                }
+            }
+
+            // Draw sub-cluster hulls (thinner, dotted, lighter)
+            for sub in cluster.subClusters {
+                guard sub.hullPoints.count >= 3 else { continue }
+                let subDominant = sub.projectBreakdown.first?.project ?? dominantProject
+                let subColor = GraphView.projectColor(for: subDominant, in: colorMap)
+
+                var subPath = Path()
+                subPath.move(to: sub.hullPoints[0])
+                for i in 1..<sub.hullPoints.count { subPath.addLine(to: sub.hullPoints[i]) }
+                subPath.closeSubpath()
+
+                context.fill(subPath, with: .color(subColor.opacity(0.04 * fade)))
+                context.stroke(subPath, with: .color(subColor.opacity(0.15 * fade)),
+                               style: StrokeStyle(lineWidth: 1, dash: [4, 3]))
+
+                // Small label for sub-cluster
+                let subTopY = sub.hullPoints.map(\.y).min() ?? sub.centroid.y
+                let subLabelPos = CGPoint(x: sub.centroid.x, y: subTopY - 8)
+                let subFontSize: CGFloat = 9
+                let subCharWidth: CGFloat = subFontSize * 0.55
+                let subFullLabel = sub.label
+                let subLabelWidth = CGFloat(subFullLabel.count) * subCharWidth + 10
+                let subLabelHeight: CGFloat = subFontSize + 6
+                let subPillRect = CGRect(
+                    x: subLabelPos.x - subLabelWidth / 2,
+                    y: subLabelPos.y - subLabelHeight / 2,
+                    width: subLabelWidth,
+                    height: subLabelHeight
+                )
+                let subPillPath = RoundedRectangle(cornerRadius: 4).path(in: subPillRect)
+                context.fill(subPillPath, with: .color(bgColor.opacity(0.8 * fade)))
+                context.stroke(subPillPath, with: .color(subColor.opacity(0.25 * fade)), lineWidth: 0.5)
+
+                context.draw(
+                    Text(subFullLabel)
+                        .font(.system(size: subFontSize, weight: .medium, design: .monospaced))
+                        .foregroundStyle(subColor.opacity(0.7 * fade)),
+                    at: subLabelPos
+                )
+            }
+        }
+    }
+
+    // MARK: - Knowledge Voids
+
+    private func drawKnowledgeVoids(context: inout GraphicsContext, positions: [Int64: CGPoint]) {
+        guard !knowledgeVoids.isEmpty else { return }
+
+        for void in knowledgeVoids {
+            let pos = void.position
+            let r = void.radius
+
+            // Translucent nebula effect — radial gradient from center
+            let pulse = 1.0 + sin(Double(frameCount) * 0.03) * 0.1
+            let outerR = r * CGFloat(pulse)
+            let nebulaRect = CGRect(
+                x: pos.x - outerR, y: pos.y - outerR,
+                width: outerR * 2, height: outerR * 2
+            )
+            let opacity = 0.06 + void.sparsity * 0.08
+            context.fill(
+                Circle().path(in: nebulaRect),
+                with: .color(Color(red: 0.4, green: 0.3, blue: 0.8).opacity(opacity))
+            )
+            // Inner glow
+            let innerR = r * 0.5
+            let innerRect = CGRect(
+                x: pos.x - innerR, y: pos.y - innerR,
+                width: innerR * 2, height: innerR * 2
+            )
+            context.fill(
+                Circle().path(in: innerRect),
+                with: .color(Color(red: 0.5, green: 0.4, blue: 0.9).opacity(opacity * 0.8))
+            )
+
+            // Dashed circle border
+            let borderPath = Circle().path(in: nebulaRect)
+            context.stroke(
+                borderPath,
+                with: .color(Color(red: 0.5, green: 0.4, blue: 0.9).opacity(0.2)),
+                style: StrokeStyle(lineWidth: 1, dash: [4, 4])
+            )
+
+            // "?" marker at center
+            let voidColor = Color(red: 0.6, green: 0.5, blue: 1.0)
+            context.draw(
+                Text("?")
+                    .font(.system(size: max(14, r * 0.3), weight: .bold, design: .rounded))
+                    .foregroundStyle(voidColor.opacity(0.4)),
+                at: pos
+            )
+
+            // Label pill below: "gap near: topic1 · topic2"
+            let labelText: String
+            if !void.nearestTopics.isEmpty {
+                labelText = "gap near: " + void.nearestTopics.joined(separator: " · ")
+            } else {
+                labelText = "knowledge gap"
+            }
+            let fontSize: CGFloat = 10
+            let charWidth: CGFloat = fontSize * 0.58
+            let labelWidth = CGFloat(labelText.count) * charWidth + 14
+            let labelHeight: CGFloat = fontSize + 8
+            let labelPos = CGPoint(x: pos.x, y: pos.y + outerR + 12)
+            let pillRect = CGRect(
+                x: labelPos.x - labelWidth / 2,
+                y: labelPos.y - labelHeight / 2,
+                width: labelWidth,
+                height: labelHeight
+            )
+            let pillPath = RoundedRectangle(cornerRadius: 5).path(in: pillRect)
+            context.fill(pillPath, with: .color(Color(red: 0.15, green: 0.12, blue: 0.25).opacity(0.85)))
+            context.stroke(pillPath, with: .color(voidColor.opacity(0.3)), lineWidth: 1)
+
+            context.draw(
+                Text(labelText)
+                    .font(.system(size: fontSize, weight: .medium, design: .monospaced))
+                    .foregroundStyle(voidColor.opacity(0.7)),
+                at: labelPos
+            )
         }
     }
 
@@ -391,6 +642,7 @@ struct GraphCanvas: View {
             let isConnected = edge.sourceId == selectedNode || edge.targetId == selectedNode
             let dimmed = hasSelection && !isConnected
             let searchDimmed = isSearchActive && !searchMatchIds.contains(edge.sourceId) && !searchMatchIds.contains(edge.targetId)
+            let semanticDimmed = layoutMode == .embedding && !isConnected
 
             let targetNode = nodeByPk[edge.targetId]
             let targetRadius = targetNode.map { nodeRadius(for: $0) } ?? baseRadius
@@ -412,19 +664,20 @@ struct GraphCanvas: View {
                 let color = GraphView.projectColor(for: selectedProject, in: colorMap)
                 context.stroke(path, with: .color(color.opacity(0.6)), lineWidth: 2)
             } else {
-                let baseOpacity: CGFloat = (dimmed || searchDimmed) ? 0.05 : 0.15
-                context.stroke(path, with: .color(relationColor.opacity(baseOpacity)), lineWidth: 1.2)
+                let baseOpacity: CGFloat = semanticDimmed ? 0.03 : ((dimmed || searchDimmed) ? 0.05 : 0.15)
+                context.stroke(path, with: .color(relationColor.opacity(baseOpacity)), lineWidth: semanticDimmed ? 0.5 : 1.2)
             }
 
             // Arrow head
-            let arrowOpacity: CGFloat = isConnected ? 0.6 : ((dimmed || searchDimmed) ? 0.05 : 0.15)
+            let arrowOpacity: CGFloat = isConnected ? 0.6 : (semanticDimmed ? 0.03 : ((dimmed || searchDimmed) ? 0.05 : 0.15))
             let arrowColor = isConnected
                 ? GraphView.projectColor(for: selectedProject, in: colorMap)
                 : relationColor
             drawArrowHead(context: &context, from: mid, to: shortenedTo, color: arrowColor, opacity: arrowOpacity)
 
             // Edge label (only at very high zoom — text rendering is extremely expensive at 1274 edges)
-            if isConnected || viewport.scale >= 1.8 {
+            // Skip in semantic mode where edges are dimmed and less meaningful
+            if !semanticDimmed && (isConnected || viewport.scale >= 1.8) {
                 context.draw(
                     Text(edge.relation.replacingOccurrences(of: "_", with: " "))
                         .font(.system(size: isConnected ? 9 : 7, weight: isConnected ? .bold : .medium))

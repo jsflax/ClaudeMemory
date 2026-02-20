@@ -927,3 +927,89 @@ struct TimeSliderBar: View {
         return "All time"
     }
 }
+
+// MARK: - Layout Mode Picker
+
+struct LayoutModePicker: View {
+    let mode: LayoutMode
+    let projectionState: ProjectionState
+    let onModeChange: (LayoutMode) -> Void
+
+    var body: some View {
+        HStack(spacing: 0) {
+            ForEach(LayoutMode.allCases, id: \.rawValue) { m in
+                Button {
+                    onModeChange(m)
+                } label: {
+                    HStack(spacing: 4) {
+                        if m == .embedding, case .computing(let progress) = projectionState {
+                            // Circular progress indicator
+                            ZStack {
+                                Circle()
+                                    .stroke(.white.opacity(0.15), lineWidth: 1.5)
+                                Circle()
+                                    .trim(from: 0, to: progress)
+                                    .stroke(.cyan.opacity(0.8), style: StrokeStyle(lineWidth: 1.5, lineCap: .round))
+                                    .rotationEffect(.degrees(-90))
+                            }
+                            .frame(width: 10, height: 10)
+                        }
+                        Text(m.rawValue)
+                            .font(.system(size: 11, weight: mode == m ? .semibold : .regular, design: .monospaced))
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(
+                        RoundedRectangle(cornerRadius: 5)
+                            .fill(mode == m ? .white.opacity(0.12) : .clear)
+                    )
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.white.opacity(mode == m ? 0.9 : 0.4))
+            }
+        }
+        .padding(2)
+        .background(
+            RoundedRectangle(cornerRadius: 7)
+                .fill(Color(red: 0.08, green: 0.1, blue: 0.14))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 7)
+                        .strokeBorder(.white.opacity(0.1), lineWidth: 1)
+                )
+        )
+    }
+}
+
+// MARK: - Void Toggle Button
+
+struct VoidToggleButton: View {
+    @Binding var showVoids: Bool
+
+    var body: some View {
+        Button {
+            showVoids.toggle()
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "sparkles")
+                    .font(.system(size: 10))
+                Text("Voids")
+                    .font(.system(size: 11, design: .monospaced))
+            }
+            .foregroundStyle(.white.opacity(showVoids ? 0.8 : 0.35))
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .background(
+                RoundedRectangle(cornerRadius: 7)
+                    .fill(showVoids
+                          ? Color(red: 0.3, green: 0.25, blue: 0.5).opacity(0.4)
+                          : Color(red: 0.08, green: 0.1, blue: 0.14))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 7)
+                            .strokeBorder(.white.opacity(showVoids ? 0.2 : 0.1), lineWidth: 1)
+                    )
+            )
+        }
+        .buttonStyle(.plain)
+        .help("Toggle knowledge void visualization")
+    }
+}
