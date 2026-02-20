@@ -5,7 +5,6 @@ import Foundation
 
 /// Session signals extracted from the transcript JSONL.
 struct SessionSignals {
-    let productiveCount: Int
     let filesEdited: Set<String>
     let bashCommands: [String]
     let errorCount: Int
@@ -16,7 +15,7 @@ struct SessionSignals {
 struct OnStop: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "on-stop",
-        abstract: "Spawn session-learner CLI on stop if significant work detected (Stop hook)"
+        abstract: "Spawn session-learner CLI on stop (Stop hook)"
     )
 
     /// Tool names that indicate code was changed.
@@ -24,9 +23,6 @@ struct OnStop: AsyncParsableCommand {
 
     /// Bash command prefixes that indicate build/test activity.
     private static let buildPatterns = ["swift build", "swift test", "xcodebuild", "npm run build", "npm test", "make", "cargo build", "cargo test", "go build", "go test", "gradle", "mvn"]
-
-    /// Minimum number of productive tool calls to consider the session worth capturing.
-    private static let writeThreshold = 5
 
     func run() async throws {
         let inputData = readStdin()
@@ -45,9 +41,7 @@ struct OnStop: AsyncParsableCommand {
         guard let transcriptPath = input.transcriptPath else { return }
 
         let signals = extractSessionSignals(at: transcriptPath)
-        hookLog("Stop hook: \(signals.productiveCount) productive tool calls, \(signals.filesEdited.count) files edited, \(signals.errorCount) errors")
-
-        guard signals.productiveCount >= Self.writeThreshold else { return }
+        hookLog("Stop hook: \(signals.filesEdited.count) files edited, \(signals.errorCount) errors")
 
         let project = projectName(from: input.cwd)
         let proj = project ?? "unknown"
@@ -72,14 +66,13 @@ struct OnStop: AsyncParsableCommand {
 
     // MARK: - Signal Extraction
 
-    /// Extract rich session signals from the transcript JSONL.
+    /// Extract session signals from the transcript JSONL.
     private func extractSessionSignals(at path: String) -> SessionSignals {
         guard let data = FileManager.default.contents(atPath: path),
               let content = String(data: data, encoding: .utf8) else {
-            return SessionSignals(productiveCount: 0, filesEdited: [], bashCommands: [], errorCount: 0)
+            return SessionSignals(filesEdited: [], bashCommands: [], errorCount: 0)
         }
 
-        var productiveCount = 0
         var filesEdited = Set<String>()
         var bashCommands: [String] = []
         var errorCount = 0
@@ -87,11 +80,9 @@ struct OnStop: AsyncParsableCommand {
         for line in content.components(separatedBy: .newlines) {
             guard !line.isEmpty else { continue }
 
-            // Count write tools and extract file paths
+            // Extract file paths from write tools
             for tool in Self.writeTools {
                 if line.contains("\"name\":\"\(tool)\"") {
-                    productiveCount += 1
-                    // Extract file_path from tool input
                     if let filePath = extractStringField(from: line, field: "file_path") {
                         filesEdited.insert(filePath)
                     }
@@ -99,14 +90,8 @@ struct OnStop: AsyncParsableCommand {
                 }
             }
 
-            // Count build/test commands and collect them
+            // Collect bash commands
             if line.contains("\"name\":\"Bash\"") {
-                for pattern in Self.buildPatterns {
-                    if line.contains(pattern) {
-                        productiveCount += 1
-                        break
-                    }
-                }
                 if let command = extractStringField(from: line, field: "command") {
                     bashCommands.append(command)
                 }
@@ -119,7 +104,6 @@ struct OnStop: AsyncParsableCommand {
         }
 
         return SessionSignals(
-            productiveCount: productiveCount,
             filesEdited: filesEdited,
             bashCommands: bashCommands,
             errorCount: errorCount
@@ -149,10 +133,9 @@ struct OnStop: AsyncParsableCommand {
     private func buildPrompt(signals: SessionSignals, project: String) -> String {
         var parts: [String] = []
 
-        parts.append("Analyze the coding session for project \"\(project)\" and store key insights as memories.")
+        parts.append("Review this coding session for project \"\(project)\" and capture what was learned.")
         parts.append("")
         parts.append("## Session signals")
-        parts.append("- Productive tool calls: \(signals.productiveCount)")
         parts.append("- Files edited: \(signals.filesEdited.count)")
         if !signals.filesEdited.isEmpty {
             let sorted = signals.filesEdited.sorted()
@@ -173,12 +156,12 @@ struct OnStop: AsyncParsableCommand {
         parts.append("- Errors encountered: \(signals.errorCount)")
         parts.append("")
         parts.append("## Instructions")
-        parts.append("1. Derive project name from the working directory.")
-        parts.append("2. Recall existing memories for this project to avoid duplicates.")
-        parts.append("3. Read the recently changed files to understand what was done.")
-        parts.append("4. Store 2-5 atomic memories for genuinely useful insights (debugging findings, architecture decisions, patterns, gotchas).")
-        parts.append("5. Connect new memories to related existing ones using edges.")
-        parts.append("6. Update any stale memories you find along the way.")
+        parts.append("1. Recall existing memories for this project to check what's already stored.")
+        parts.append("2. Read the recently changed files to understand what was done.")
+        parts.append("3. Look for: debugging insights, architecture decisions, new patterns, gotchas, workflow discoveries, or corrections to existing knowledge.")
+        parts.append("4. Store atomic memories for what you find. Connect them to related existing ones.")
+        parts.append("5. Update or correct any stale memories you encounter.")
+        parts.append("6. Skip only if the session was genuinely trivial (e.g., a single question with no code changes).")
 
         return parts.joined(separator: "\n")
     }
@@ -256,6 +239,7 @@ struct OnStop: AsyncParsableCommand {
           --model sonnet \
           --allowedTools '\(allowedTools)' \
           --no-session-persistence \
+          --output-format text \
           --append-system-prompt '\(escapedSystemPrompt)' \
           >> '\(Self.logPath)' 2>&1
         """
