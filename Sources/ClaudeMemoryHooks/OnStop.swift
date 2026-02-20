@@ -25,6 +25,12 @@ struct OnStop: AsyncParsableCommand {
     private static let buildPatterns = ["swift build", "swift test", "xcodebuild", "npm run build", "npm test", "make", "cargo build", "cargo test", "go build", "go test", "gradle", "mvn"]
 
     func run() async throws {
+        // Guard against infinite recursion: session-learner subprocess sets this env var,
+        // so if it's present we're inside a learner — don't spawn another.
+        if ProcessInfo.processInfo.environment["CLAUDE_MEMORY_LEARNER"] != nil {
+            return
+        }
+
         let inputData = readStdin()
         guard !inputData.isEmpty else { return }
 
@@ -247,6 +253,10 @@ struct OnStop: AsyncParsableCommand {
         let sh = Process()
         sh.executableURL = URL(fileURLWithPath: "/bin/sh")
         sh.arguments = ["-c", shellCommand]
+        sh.environment = ProcessInfo.processInfo.environment.merging(
+            ["CLAUDE_MEMORY_LEARNER": "1"],
+            uniquingKeysWith: { _, new in new }
+        )
         if let cwd {
             sh.currentDirectoryURL = URL(fileURLWithPath: cwd)
         }
