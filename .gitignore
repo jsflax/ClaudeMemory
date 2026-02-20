@@ -5,3 +5,4 @@
 *.sqlite-wal
 *.sqlite-shm
 .DS_Store
+.mcp.json
