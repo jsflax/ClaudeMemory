@@ -3,11 +3,13 @@ import Lattice
 import ClaudeMemoryLib
 import UniformTypeIdentifiers
 import ScreenCaptureKit
+import Sparkle
 
 @main
 struct MemoryVisualizerApp: App {
     let lattice: Lattice
     let config: VisualizerConfig
+    private let updaterController: SPUStandardUpdaterController
 
     #if SWIFT_PACKAGE && os(macOS)
     private final class Delegate: NSObject, NSApplicationDelegate {
@@ -21,6 +23,10 @@ struct MemoryVisualizerApp: App {
     #endif
 
     init() {
+        updaterController = SPUStandardUpdaterController(
+            startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil
+        )
+
         let dbPath = ProcessInfo.processInfo.environment["CLAUDE_MEMORY_DB"]
             ?? NSHomeDirectory() + "/.claude/memory.sqlite"
         let lat = try! Lattice(
@@ -35,6 +41,8 @@ struct MemoryVisualizerApp: App {
             lat.add(c)
             return c
         }()
+
+        Task.detached { CLIInstaller.syncIfNeeded() }
     }
 
     var body: some Scene {
@@ -45,6 +53,9 @@ struct MemoryVisualizerApp: App {
                 .frame(minWidth: 800, minHeight: 600)
         }
         .commands {
+            CommandGroup(after: .appInfo) {
+                CheckForUpdatesView(updater: updaterController.updater)
+            }
             CommandGroup(after: .saveItem) {
                 Button("Export as PNG…") {
                     Task {

@@ -17,10 +17,10 @@ jobs:
       - name: Run tests
         run: swift test
 
-      - name: Build release binary
+      - name: Build CLI release binaries
         run: swift build -c release
 
-      - name: Package artifacts
+      - name: Package CLI tarball
         run: |
           mkdir -p staging/agents
           cp .build/release/ClaudeMemory staging/memory
@@ -31,11 +31,165 @@ jobs:
           cp agents/*.md staging/agents/
           cd staging && tar czf ../claude-memory-macos-arm64.tar.gz *
 
-      - name: Create release
+      - name: Import signing certificate
+        if: env.DEVELOPER_ID_CERT_BASE64 != ''
+        env:
+          DEVELOPER_ID_CERT_BASE64: ${{ secrets.DEVELOPER_ID_CERT_BASE64 }}
+          DEVELOPER_ID_CERT_PASSWORD: ${{ secrets.DEVELOPER_ID_CERT_PASSWORD }}
+        run: |
+          KEYCHAIN_PATH=$RUNNER_TEMP/signing.keychain-db
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
+
+          # Create temporary keychain
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Import certificate
+          echo "$DEVELOPER_ID_CERT_BASE64" | base64 --decode > $RUNNER_TEMP/cert.p12
+          security import $RUNNER_TEMP/cert.p12 -P "$DEVELOPER_ID_CERT_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Add to search list
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+
+      - name: Archive app with xcodebuild
+        if: env.DEVELOPER_ID_CERT_BASE64 != ''
+        env:
+          DEVELOPER_ID_CERT_BASE64: ${{ secrets.DEVELOPER_ID_CERT_BASE64 }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          xcodebuild archive \
+            -project MemoryVisualizer.xcodeproj \
+            -scheme MemoryVisualizer \
+            -archivePath build/MemoryVisualizer.xcarchive \
+            -configuration Release \
+            CODE_SIGN_IDENTITY="Developer ID Application" \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            MARKETING_VERSION="$VERSION" \
+            OTHER_CODE_SIGN_FLAGS="--keychain $RUNNER_TEMP/signing.keychain-db"
+
+      - name: Export archive to .app
+        if: env.DEVELOPER_ID_CERT_BASE64 != ''
+        env:
+          DEVELOPER_ID_CERT_BASE64: ${{ secrets.DEVELOPER_ID_CERT_BASE64 }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          # Inject team ID into ExportOptions.plist
+          sed -i '' "s|</dict>|    <key>teamID</key><string>$APPLE_TEAM_ID</string></dict>|" ExportOptions.plist
+          xcodebuild -exportArchive \
+            -archivePath build/MemoryVisualizer.xcarchive \
+            -exportPath build/export \
+            -exportOptionsPlist ExportOptions.plist
+
+      - name: Bundle CLI binaries into .app
+        if: env.DEVELOPER_ID_CERT_BASE64 != ''
+        env:
+          DEVELOPER_ID_CERT_BASE64: ${{ secrets.DEVELOPER_ID_CERT_BASE64 }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          APP="build/export/MemoryVisualizer.app"
+          CLI_DIR="$APP/Contents/Resources/cli"
+          AGENTS_DIR="$CLI_DIR/agents"
+          mkdir -p "$CLI_DIR" "$AGENTS_DIR"
+
+          cp .build/release/ClaudeMemory "$CLI_DIR/memory"
+          cp .build/release/ClaudeMemoryHooks "$CLI_DIR/memory-hooks"
+          cp -R .build/release/ClaudeMemory_ClaudeMemoryLib.bundle "$CLI_DIR/"
+          cp -R .build/release/swift-transformers_Hub.bundle "$CLI_DIR/"
+          cp -R .build/release/SwiftLM_SwiftLM.bundle "$CLI_DIR/"
+          cp agents/*.md "$AGENTS_DIR/"
+
+          # Re-codesign since contents changed
+          codesign --deep --force --sign "Developer ID Application" \
+            --keychain "$RUNNER_TEMP/signing.keychain-db" \
+            --options runtime \
+            "$APP"
+
+      - name: Create DMG
+        if: env.DEVELOPER_ID_CERT_BASE64 != ''
+        env:
+          DEVELOPER_ID_CERT_BASE64: ${{ secrets.DEVELOPER_ID_CERT_BASE64 }}
+        run: |
+          brew install create-dmg
+          VERSION=${GITHUB_REF_NAME#v}
+          create-dmg \
+            --volname "MemoryVisualizer $VERSION" \
+            --window-pos 200 120 \
+            --window-size 600 400 \
+            --icon-size 100 \
+            --icon "MemoryVisualizer.app" 150 190 \
+            --app-drop-link 450 190 \
+            --no-internet-enable \
+            "MemoryVisualizer-${VERSION}.dmg" \
+            "build/export/MemoryVisualizer.app"
+
+      - name: Notarize DMG
+        if: env.DEVELOPER_ID_CERT_BASE64 != ''
+        env:
+          DEVELOPER_ID_CERT_BASE64: ${{ secrets.DEVELOPER_ID_CERT_BASE64 }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          DMG="MemoryVisualizer-${VERSION}.dmg"
+
+          xcrun notarytool submit "$DMG" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+
+          xcrun stapler staple "$DMG"
+
+      - name: Generate Sparkle appcast
+        if: env.SPARKLE_PRIVATE_KEY != ''
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          DMG="MemoryVisualizer-${VERSION}.dmg"
+
+          # Download Sparkle tools
+          SPARKLE_VERSION="2.7.5"
+          curl -sL "https://github.com/sparkle-project/Sparkle/releases/download/${SPARKLE_VERSION}/Sparkle-${SPARKLE_VERSION}.tar.xz" | tar xJ -C /tmp/sparkle-tools bin/
+
+          # Move DMG to a staging dir for generate_appcast
+          mkdir -p appcast_staging
+          cp "$DMG" appcast_staging/
+
+          # Generate appcast from the DMG
+          echo "$SPARKLE_PRIVATE_KEY" | /tmp/sparkle-tools/bin/generate_appcast \
+            --ed-key-file - \
+            --download-url-prefix "https://github.com/jsflax/ClaudeMemory/releases/download/${GITHUB_REF_NAME}/" \
+            appcast_staging
+
+          # Use generated appcast
+          cp appcast_staging/appcast.xml appcast.xml
+
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: claude-memory-macos-arm64.tar.gz
+          files: |
+            claude-memory-macos-arm64.tar.gz
+            MemoryVisualizer-*.dmg
           generate_release_notes: true
+
+      - name: Commit appcast.xml to main
+        if: env.SPARKLE_PRIVATE_KEY != ''
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git checkout main
+          git add appcast.xml
+          git diff --cached --quiet || (git commit -m "Update appcast.xml for ${GITHUB_REF_NAME}" && git push origin main)
 
       - name: Update Homebrew formula
         if: env.TAP_TOKEN != ''
@@ -56,3 +210,48 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Formula/claude-memory.rb
           git diff --cached --quiet || (git commit -m "Update claude-memory to ${VERSION}" && git push)
+
+      - name: Notify Slack
+        if: always() && secrets.SLACK_WEBHOOK_URL != ''
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          REPO="${{ github.repository }}"
+          URL="https://github.com/${REPO}/releases/tag/${TAG}"
+          STATUS="${{ job.status }}"
+
+          if [ "$STATUS" = "success" ]; then
+            EMOJI="✅"
+            TEXT="Release *${TAG}* published successfully"
+          else
+            EMOJI="❌"
+            TEXT="Release *${TAG}* failed"
+          fi
+
+          curl -s -X POST "$SLACK_WEBHOOK_URL" \
+            -H 'Content-Type: application/json' \
+            -d "{
+              \"blocks\": [
+                {
+                  \"type\": \"header\",
+                  \"text\": {\"type\": \"plain_text\", \"text\": \"${EMOJI} ClaudeMemory ${TAG}\"}
+                },
+                {
+                  \"type\": \"section\",
+                  \"text\": {\"type\": \"mrkdwn\", \"text\": \"${TEXT}\"},
+                  \"accessory\": {
+                    \"type\": \"button\",
+                    \"text\": {\"type\": \"plain_text\", \"text\": \"View Release\"},
+                    \"url\": \"${URL}\"
+                  }
+                }
+              ]
+            }"
+
+      - name: Cleanup keychain
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/signing.keychain-db" ]; then
+            security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
+          fi

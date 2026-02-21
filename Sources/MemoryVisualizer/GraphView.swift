@@ -827,6 +827,8 @@ struct GraphView: View {
             semanticClusters3D: embeddingProjection.semanticClusters3D,
             topicGroups: cachedTopicGroups,
             clusters: clusterGroups,
+            searchMatchIds: searchMatchIds,
+            isSearchActive: isSearchActive,
             onAnimationTick: {
                 simulation3D.tick()
                 embeddingProjection.tickAnimation3D()
@@ -836,6 +838,16 @@ struct GraphView: View {
                 camera3DAzimuth = azimuth
                 camera3DPosition = camPos
                 camera3DTarget = camTarget
+            },
+            onHubToggle: { hubId, expanding in
+                let children = cachedFilteredEdges.filter { $0.relation == "part_of" && $0.targetId == hubId }.map(\.sourceId)
+                for childId in children {
+                    if expanding {
+                        simulation3D.pin(childId)
+                    } else {
+                        simulation3D.unpin(childId)
+                    }
+                }
             }
         )
         .transaction { $0.animation = nil }  // prevent overlay animations from resizing the 3D view

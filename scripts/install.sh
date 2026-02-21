@@ -6,6 +6,10 @@ REPO="jsflax/ClaudeMemory"
 
 echo "ClaudeMemory Installer"
 echo "======================"
+echo ""
+echo "Tip: For a GUI with automatic updates, download MemoryVisualizer.dmg from:"
+echo "  https://github.com/$REPO/releases/latest"
+echo ""
 
 # Clean old install
 rm -f "$INSTALL_DIR/memory"

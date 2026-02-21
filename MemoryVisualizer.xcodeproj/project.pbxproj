@@ -11,6 +11,7 @@
 		A1B2C3D400000000000001 /* ClaudeMemoryLib in Frameworks */ = {isa = PBXBuildFile; productRef = D4E5F60000000000000001 /* ClaudeMemoryLib */; };
 		A1B2C3D400000000000002 /* Lattice in Frameworks */ = {isa = PBXBuildFile; productRef = D4E5F60000000000000002 /* Lattice */; };
 		A1B2C3D400000000000003 /* RealityKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = B2C3D4E500000000000001 /* RealityKit.framework */; };
+		A1B2C3D400000000000004 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = D4E5F60000000000000003 /* Sparkle */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -51,6 +52,7 @@
 				A1B2C3D400000000000001 /* ClaudeMemoryLib in Frameworks */,
 				A1B2C3D400000000000002 /* Lattice in Frameworks */,
 				A1B2C3D400000000000003 /* RealityKit.framework in Frameworks */,
+				A1B2C3D400000000000004 /* Sparkle in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -114,6 +116,7 @@
 			packageProductDependencies = (
 				D4E5F60000000000000001 /* ClaudeMemoryLib */,
 				D4E5F60000000000000002 /* Lattice */,
+				D4E5F60000000000000003 /* Sparkle */,
 			);
 			productName = MemoryVisualizer;
 			productReference = B2C3D4E500000000000002 /* MemoryVisualizer.app */;
@@ -265,6 +268,9 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
 				INFOPLIST_KEY_NSDocumentsFolderUsageDescription = "To access the Claude memory DB.";
+				INFOPLIST_KEY_SUEnableAutomaticChecks = YES;
+				INFOPLIST_KEY_SUFeedURL = "https://raw.githubusercontent.com/jsflax/ClaudeMemory/main/appcast.xml";
+				INFOPLIST_KEY_SUPublicEDKey = "1dJlcpyVu57oSerP7cfvyRT0PHx7IuvCDbRSptbflfE=";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
@@ -288,6 +294,9 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
 				INFOPLIST_KEY_NSDocumentsFolderUsageDescription = "To access the Claude memory DB.";
+				INFOPLIST_KEY_SUEnableAutomaticChecks = YES;
+				INFOPLIST_KEY_SUFeedURL = "https://raw.githubusercontent.com/jsflax/ClaudeMemory/main/appcast.xml";
+				INFOPLIST_KEY_SUPublicEDKey = "1dJlcpyVu57oSerP7cfvyRT0PHx7IuvCDbRSptbflfE=";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
@@ -378,6 +387,10 @@
 		D4E5F60000000000000002 /* Lattice */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = Lattice;
+		};
+		D4E5F60000000000000003 /* Sparkle */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = Sparkle;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

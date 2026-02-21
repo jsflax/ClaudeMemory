@@ -13,6 +13,7 @@ let package = Package(
         .package(url: "https://github.com/jsflax/lattice.git", from: "0.3.2"),
         .package(url: "https://github.com/jsflax/SwiftLM.git", branch: "main"),
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.5.0"),
+        .package(url: "https://github.com/sparkle-project/Sparkle.git", from: "2.0.0"),
     ],
     targets: [
         .target(
@@ -49,6 +50,7 @@ let package = Package(
             dependencies: [
                 "ClaudeMemoryLib",
                 .product(name: "Lattice", package: "Lattice"),
+                .product(name: "Sparkle", package: "Sparkle"),
             ],
             swiftSettings: [
                 .interoperabilityMode(.Cxx),

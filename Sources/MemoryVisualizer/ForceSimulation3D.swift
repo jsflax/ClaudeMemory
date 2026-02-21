@@ -207,6 +207,29 @@ final class ForceSimulation3D: ObservableObject {
         syncPositions()
     }
 
+    // MARK: - Pinning (for node expansion)
+
+    /// Pin a node so the force simulation won't move it.
+    func pin(_ id: Int64) {
+        guard let i = idToIndex[id] else { return }
+        pinned[i] = true
+        vx[i] = 0; vy[i] = 0; vz[i] = 0
+    }
+
+    /// Unpin a node so the force simulation resumes moving it.
+    func unpin(_ id: Int64) {
+        guard let i = idToIndex[id] else { return }
+        pinned[i] = false
+    }
+
+    /// Set a node's position directly and zero its velocity.
+    func setPosition(_ id: Int64, to pos: SIMD3<Float>) {
+        guard let i = idToIndex[id] else { return }
+        x[i] = pos.x; y[i] = pos.y; z[i] = pos.z
+        vx[i] = 0; vy[i] = 0; vz[i] = 0
+        positions[id] = pos
+    }
+
     // MARK: - Per-frame tick
 
     func tick() {

@@ -133,6 +133,10 @@ final class Graph3DScene {
         edgeContainer.name = "edges"
         rootEntity.addChild(edgeContainer)
 
+        flowParticleContainer = Entity()
+        flowParticleContainer.name = "flow_particles"
+        rootEntity.addChild(flowParticleContainer)
+
         // World-space lighting — dramatic, fixed in space so shading changes
         // as you orbit around nodes. High contrast: strong key, dim fill.
 
@@ -260,11 +264,41 @@ final class Graph3DScene {
     /// Tracks X/Y buttons for project teleport (Y = next, X = previous).
     private var prevButtonX = false
     private var prevButtonY = false
+    /// Held keyboard keys for WASD/IJKL continuous movement.
+    var heldKeys: Set<String> = []
     /// Current project index for teleport cycling.
     private var teleportProjectIndex = 0
     var teleportCounter: Int = 0
     /// Name of the project we last teleported to (shown briefly in overlay).
     var teleportLabel: String?
+
+    /// Poll held keyboard keys and apply continuous camera movement. Called each render frame.
+    /// WASD = move (dolly/strafe), IJKL = look, QE = rise/descend, Shift = sprint.
+    func pollKeyboard(dt: Float) {
+        guard !heldKeys.isEmpty else { return }
+
+        let sprint: Float = heldKeys.contains("shift") ? 3.0 : 1.0
+        let moveSpeed: Float = 200 * dt * sprint
+        let strafeSpeed: Float = 300 * dt * sprint
+        let vertSpeed: Float = 300 * dt * sprint
+        let lookSpeed: Float = 2.0 * dt
+
+        // WASD → dolly forward/back, strafe left/right
+        if heldKeys.contains("w") { dolly(amount: moveSpeed) }
+        if heldKeys.contains("s") { dolly(amount: -moveSpeed) }
+        if heldKeys.contains("a") { pan(dx: strafeSpeed, dy: 0) }
+        if heldKeys.contains("d") { pan(dx: -strafeSpeed, dy: 0) }
+
+        // QE → rise / descend
+        if heldKeys.contains("e") { pan(dx: 0, dy: vertSpeed) }
+        if heldKeys.contains("q") { pan(dx: 0, dy: -vertSpeed) }
+
+        // IJKL → look around
+        if heldKeys.contains("i") { lookRotate(deltaAz: 0, deltaEl: lookSpeed) }
+        if heldKeys.contains("k") { lookRotate(deltaAz: 0, deltaEl: -lookSpeed) }
+        if heldKeys.contains("j") { lookRotate(deltaAz: lookSpeed, deltaEl: 0) }
+        if heldKeys.contains("l") { lookRotate(deltaAz: -lookSpeed, deltaEl: 0) }
+    }
 
     /// Poll gamepad and apply inputs to camera. Called each frame before updateCamera.
     /// FPS-style: L-stick = move, R-stick = look, triggers = rise/descend, bumpers = cycle nodes.
@@ -313,18 +347,39 @@ final class Graph3DScene {
         let newTarget = hitTest(at: center, viewSize: viewSize, positions: positions)
         if newTarget != reticleTarget { reticleTarget = newTarget }
 
-        // A / Cross → select targeted node (rising edge only)
+        // A / Cross → select targeted node, or toggle hub expansion (rising edge only)
         let buttonA = pad.buttonA.isPressed
         if buttonA && !prevButtonA {
             if let target = reticleTarget {
-                selectedNode = selectedNode == target ? nil : target
+                if renderHubs.contains(target) {
+                    // Collapse other expanded hubs first
+                    for hubId in expandedHubs where hubId != target {
+                        toggleHubExpansion(hubId: hubId)
+                        pendingHubToggles.append((hubId: hubId, expanding: false))
+                    }
+                    let expanding = !expandedHubs.contains(target)
+                    toggleHubExpansion(hubId: target)
+                    pendingHubToggles.append((hubId: target, expanding: expanding))
+                    selectedNode = target
+                } else {
+                    // Collapse all expanded hubs when selecting non-hub
+                    for hubId in expandedHubs {
+                        toggleHubExpansion(hubId: hubId)
+                        pendingHubToggles.append((hubId: hubId, expanding: false))
+                    }
+                    selectedNode = selectedNode == target ? nil : target
+                }
             }
         }
         prevButtonA = buttonA
 
-        // B / Circle → deselect (rising edge only)
+        // B / Circle → deselect + collapse all hubs (rising edge only)
         let buttonB = pad.buttonB.isPressed
         if buttonB && !prevButtonB {
+            for hubId in expandedHubs {
+                toggleHubExpansion(hubId: hubId)
+                pendingHubToggles.append((hubId: hubId, expanding: false))
+            }
             selectedNode = nil
         }
         prevButtonB = buttonB
@@ -625,14 +680,21 @@ final class Graph3DScene {
             // Depth fog (shared by node and point light effects)
             let dist = simd_length(pos - camPos)
             let fogT = max(0, min(1, (dist - fogNear) / (fogFar - fogNear)))
-            let fogOpacity = id == selectedNode ? 1.0 : max(fogMinOpacity, 1.0 - fogT * 0.92)
+            let baseFogOpacity = id == selectedNode ? 1.0 : max(fogMinOpacity, 1.0 - fogT * 0.92)
             let depthFade = max(Float(0.0), 1.0 - fogT * 0.95)  // 1.0 near → 0.05 far
 
-            // Pulse scale for glow/arrival effects (more dramatic in 3D)
+            // Search spotlight dimming
+            let searchDimmed = renderIsSearchActive && !renderSearchMatchIds.contains(id)
+            let searchMatched = renderIsSearchActive && renderSearchMatchIds.contains(id) && id != selectedNode
+            let fogOpacity = searchDimmed ? min(baseFogOpacity, 0.12) : baseFogOpacity
+
+            // Pulse scale for glow/arrival/search effects (more dramatic in 3D)
             if ri > 0 {
                 importanceRadius *= 1.0 + sin(animationTime * 4.0) * 0.2 * ri
             } else if ai > 0 {
                 importanceRadius *= 1.0 + sin(animationTime * 3.0) * 0.2 * ai
+            } else if searchMatched {
+                importanceRadius *= 1 + sin(animationTime * 4) * 0.12
             }
 
             // Choose material based on state
@@ -643,6 +705,12 @@ final class Graph3DScene {
                 mat.roughness = .init(floatLiteral: 0.15)
                 mat.emissiveColor = .init(color: .white)
                 mat.emissiveIntensity = 1.0
+                material = mat
+            } else if searchMatched {
+                // Search match: cyan emissive glow
+                var mat = nodeMaterial(for: nodeData.project, colorMap: colorMap)
+                mat.emissiveColor = .init(color: NSColor(red: 0.0, green: 0.9, blue: 1.0, alpha: 1))
+                mat.emissiveIntensity = 4.0 * (1 + sin(animationTime * 4) * 0.3) * depthFade
                 material = mat
             } else if ri > 0 {
                 // Recalled: intense blue-white emissive, depth-attenuated
@@ -702,6 +770,13 @@ final class Graph3DScene {
                         color: NSColor(red: 1.0, green: 0.8, blue: 0.3, alpha: 1),
                         intensity: 20000 * ai * depthFade * lightPulse,
                         attenuationRadius: 2.0 * depthFade + 0.1
+                    ))
+                } else if searchMatched {
+                    let lightPulse = 1.0 + sin(animationTime * 4.0) * 0.3
+                    entity.components.set(PointLightComponent(
+                        color: NSColor(red: 0.0, green: 0.9, blue: 1.0, alpha: 1),
+                        intensity: 12000 * depthFade * lightPulse,
+                        attenuationRadius: 1.5 * depthFade + 0.1
                     ))
                 } else {
                     entity.components.remove(PointLightComponent.self)
@@ -822,8 +897,14 @@ final class Graph3DScene {
             let phase = (scaledMid.x + scaledMid.y + scaledMid.z) * 8.0
             let pulse = (sin(animationTime * 3.0 + phase) + 1.0) * 0.5
 
+            let searchDimmedEdge = renderIsSearchActive
+                && !renderSearchMatchIds.contains(edge.sourceId)
+                && !renderSearchMatchIds.contains(edge.targetId)
+
             let edgeFog: Float
-            if connected {
+            if searchDimmedEdge && !connected {
+                edgeFog = 0.02 * depthFade
+            } else if connected {
                 edgeFog = 0.5 + pulse * 0.3
             } else if isSemanticMode {
                 edgeFog = (0.02 + pulse * 0.04) * depthFade
@@ -895,8 +976,14 @@ final class Graph3DScene {
             let phase = (midpoint.x + midpoint.y + midpoint.z) * 8.0
             let pulse = (sin(animationTime * 3.0 + phase) + 1.0) * 0.5  // 0..1
 
+            let searchDimmedEdge = renderIsSearchActive
+                && !renderSearchMatchIds.contains(edge.sourceId)
+                && !renderSearchMatchIds.contains(edge.targetId)
+
             let edgeFog: Float
-            if connected {
+            if searchDimmedEdge && !connected {
+                edgeFog = 0.02 * depthFade
+            } else if connected {
                 edgeFog = 0.5 + pulse * 0.3  // 0.5–0.8
             } else if isSemanticMode {
                 edgeFog = (0.02 + pulse * 0.04) * depthFade  // very subtle
@@ -1209,6 +1296,236 @@ final class Graph3DScene {
         for (_, entity) in nebulaEmitters { entity.removeFromParent() }
         nebulaEmitters.removeAll()
         nebulaColorCache.removeAll()
+        // Clean up flow particles
+        for (_, particles) in flowParticles {
+            for p in particles { p.entity.removeFromParent() }
+        }
+        flowParticles.removeAll()
+        flowSpawnTimers.removeAll()
+        // Clean up expansion state
+        expandedHubs.removeAll()
+        preExpansionPositions.removeAll()
+        expansionProgress.removeAll()
+        expansionDirection.removeAll()
+        expandedChildPositions.removeAll()
+    }
+
+    // MARK: - Hub Expansion
+
+    /// Return IDs of children connected to a hub via part_of edges.
+    func childrenOfHub(_ hubId: Int64) -> [Int64] {
+        renderEdges.filter { $0.relation == "part_of" && $0.targetId == hubId }.map(\.sourceId)
+    }
+
+    /// Compute Fibonacci sphere orbit positions for children around a hub.
+    func computeOrbitPositions(hubId: Int64, children: [Int64]) -> [Int64: SIMD3<Float>] {
+        guard let hubPos = renderPositions[hubId] else { return [:] }
+        let radius: Float = 80
+        var result: [Int64: SIMD3<Float>] = [:]
+        let n = children.count
+        guard n > 0 else { return result }
+        let goldenRatio: Float = (1 + sqrt(5)) / 2
+        for (idx, childId) in children.enumerated() {
+            let i = Float(idx)
+            let theta = acos(1 - 2 * (i + 0.5) / Float(n))
+            let phi = 2 * Float.pi * i / goldenRatio
+            let x = radius * sin(theta) * cos(phi)
+            let y = radius * sin(theta) * sin(phi)
+            let z = radius * cos(theta)
+            result[childId] = hubPos + SIMD3(x, y, z)
+        }
+        return result
+    }
+
+    /// Toggle hub expansion: start expanding if collapsed, start collapsing if expanded.
+    func toggleHubExpansion(hubId: Int64) {
+        if expandedHubs.contains(hubId) {
+            expansionDirection[hubId] = false
+        } else {
+            expandedHubs.insert(hubId)
+            let children = childrenOfHub(hubId)
+            for childId in children {
+                preExpansionPositions[childId] = renderPositions[childId] ?? .zero
+            }
+            expansionProgress[hubId] = 0
+            expansionDirection[hubId] = true
+        }
+    }
+
+    /// Per-frame expansion animation: lerp children between original and orbit positions.
+    func updateExpansions(dt: Float) {
+        var toRemove: [Int64] = []
+        var allExpandedPositions: [Int64: SIMD3<Float>] = [:]
+
+        for hubId in expandedHubs {
+            let expanding = expansionDirection[hubId] ?? true
+            var progress = expansionProgress[hubId] ?? 0
+
+            if expanding {
+                progress = min(1.0, progress + dt * 3.0)
+            } else {
+                progress = max(0.0, progress - dt * 3.0)
+            }
+            expansionProgress[hubId] = progress
+
+            // Smooth-step ease
+            let t = progress * progress * (3 - 2 * progress)
+
+            let children = childrenOfHub(hubId)
+            let orbitPositions = computeOrbitPositions(hubId: hubId, children: children)
+
+            for childId in children {
+                let startPos = preExpansionPositions[childId] ?? renderPositions[childId] ?? .zero
+                let endPos = orbitPositions[childId] ?? startPos
+                let lerpedPos = startPos + (endPos - startPos) * t
+                renderPositions[childId] = lerpedPos
+                allExpandedPositions[childId] = lerpedPos
+                if let entity = nodeEntities[childId] {
+                    entity.position = lerpedPos * scaleFactor
+                }
+            }
+
+            // When collapse finishes
+            if !expanding && progress <= 0 {
+                toRemove.append(hubId)
+                for childId in children {
+                    if let original = preExpansionPositions[childId] {
+                        renderPositions[childId] = original
+                    }
+                    preExpansionPositions.removeValue(forKey: childId)
+                }
+            }
+        }
+
+        expandedChildPositions = allExpandedPositions
+
+        for hubId in toRemove {
+            expandedHubs.remove(hubId)
+            expansionProgress.removeValue(forKey: hubId)
+            expansionDirection.removeValue(forKey: hubId)
+        }
+    }
+
+    // MARK: - Edge Flow Particles
+
+    private func flowColorForRelation(_ relation: String) -> SIMD3<Float> {
+        switch relation {
+        case "part_of":       return SIMD3(0.3, 0.6, 1.0)
+        case "contradicts":   return SIMD3(1.0, 0.2, 0.2)
+        case "supersedes":    return SIMD3(1.0, 0.6, 0.15)
+        case "derived_from":  return SIMD3(0.65, 0.3, 1.0)
+        case "summarized_by": return SIMD3(0.2, 0.9, 0.5)
+        default:              return SIMD3(0.8, 0.8, 0.9)
+        }
+    }
+
+    func updateFlowParticles(dt: Float) {
+        let sel = renderSelectedNode
+
+        // Hard cleanup on selection change — flush ALL particles so old paths don't linger
+        if sel != flowLastSelectedNode {
+            for (_, particles) in flowParticles {
+                for p in particles { p.entity.removeFromParent() }
+            }
+            flowParticles.removeAll()
+            flowSpawnTimers.removeAll()
+            flowLastSelectedNode = sel
+        }
+
+        // Determine active edges: connected to selected node or expanded hub children
+        var activeEdges: [EdgeData] = []
+
+        for edge in renderEdges {
+            let isConnectedToSelected = (sel != nil) && (edge.sourceId == sel || edge.targetId == sel)
+            let isExpandedPartOf = edge.relation == "part_of" && expandedHubs.contains(edge.targetId)
+            if isConnectedToSelected || isExpandedPartOf {
+                activeEdges.append(edge)
+            }
+        }
+
+        // Cap active edges for performance
+        if activeEdges.count > 30 {
+            activeEdges = Array(activeEdges.prefix(30))
+        }
+
+        let activeKeys = Set(activeEdges.map { "\($0.sourceId)-\($0.targetId)" })
+
+        // Clean up particles for inactive edges
+        for key in flowParticles.keys where !activeKeys.contains(key) {
+            if let particles = flowParticles[key] {
+                for p in particles { p.entity.removeFromParent() }
+            }
+            flowParticles.removeValue(forKey: key)
+            flowSpawnTimers.removeValue(forKey: key)
+        }
+
+        // Update/spawn particles for active edges
+        for edge in activeEdges {
+            let key = "\(edge.sourceId)-\(edge.targetId)"
+            guard let p1 = renderPositions[edge.sourceId],
+                  let p2 = renderPositions[edge.targetId] else { continue }
+
+            let scaledP1 = p1 * scaleFactor
+            let scaledP2 = p2 * scaleFactor
+            let color = flowColorForRelation(edge.relation)
+
+            // Spawn timer
+            var timer = flowSpawnTimers[key] ?? 0
+            timer += dt
+            if timer >= 0.4 {
+                timer -= 0.4
+                var mat = UnlitMaterial()
+                mat.color = .init(tint: NSColor(
+                    red: CGFloat(color.x), green: CGFloat(color.y),
+                    blue: CGFloat(color.z), alpha: 1.0
+                ))
+                let entity = ModelEntity(mesh: flowParticleMesh, materials: [mat])
+                entity.scale = SIMD3<Float>(repeating: 0.006)
+                entity.position = scaledP1
+                entity.components.set(OpacityComponent(opacity: 0))
+                flowParticleContainer.addChild(entity)
+
+                var particles = flowParticles[key] ?? []
+                particles.append(FlowParticle(entity: entity, t: 0, speed: 0.8))
+                flowParticles[key] = particles
+            }
+            flowSpawnTimers[key] = timer
+
+            // Advance existing particles
+            if var particles = flowParticles[key] {
+                var toRemove: [Int] = []
+                for i in particles.indices {
+                    particles[i].t += dt * particles[i].speed
+                    let t = particles[i].t
+
+                    if t >= 1.0 {
+                        particles[i].entity.removeFromParent()
+                        toRemove.append(i)
+                        continue
+                    }
+
+                    // Position: lerp along edge
+                    let pos = scaledP1 + (scaledP2 - scaledP1) * t
+                    particles[i].entity.position = pos
+
+                    // Opacity: fade in first 10%, fade out last 15%
+                    let opacity: Float
+                    if t < 0.1 {
+                        opacity = t / 0.1
+                    } else if t > 0.85 {
+                        opacity = (1.0 - t) / 0.15
+                    } else {
+                        opacity = 1.0
+                    }
+                    particles[i].entity.components.set(OpacityComponent(opacity: opacity))
+                }
+
+                for i in toRemove.reversed() {
+                    particles.remove(at: i)
+                }
+                flowParticles[key] = particles
+            }
+        }
     }
 
     // MARK: - Display-synced rendering via SceneEvents.Update
@@ -1232,6 +1549,32 @@ final class Graph3DScene {
     var renderTopicGroups: [TopicGroupInfo] = []
     var renderClusters: [[Int64]] = []
     var renderViewSize: CGSize = CGSize(width: 800, height: 600)
+
+    // Search spotlight
+    var renderSearchMatchIds: Set<Int64> = []
+    var renderIsSearchActive: Bool = false
+
+    // Hub expansion state
+    var expandedHubs: Set<Int64> = []
+    private var preExpansionPositions: [Int64: SIMD3<Float>] = [:]
+    private var expansionProgress: [Int64: Float] = [:]
+    private var expansionDirection: [Int64: Bool] = [:]  // true=expanding, false=collapsing
+    /// Expansion-adjusted positions for labels (read by Graph3DView).
+    private(set) var expandedChildPositions: [Int64: SIMD3<Float>] = [:]
+    /// Pending hub toggles from gamepad — consumed by Graph3DView for pinning callback.
+    var pendingHubToggles: [(hubId: Int64, expanding: Bool)] = []
+
+    // Edge flow particles
+    private struct FlowParticle {
+        let entity: ModelEntity
+        var t: Float
+        let speed: Float
+    }
+    private var flowParticles: [String: [FlowParticle]] = [:]
+    private var flowParticleContainer = Entity()
+    private let flowParticleMesh = MeshResource.generateSphere(radius: 1.0)
+    private var flowSpawnTimers: [String: Float] = [:]
+    private var flowLastSelectedNode: Int64?
 
     private var renderFrameCount: UInt64 = 0
     private var renderLastSelectedNode: Int64?
@@ -1277,7 +1620,9 @@ final class Graph3DScene {
             entity.position = pos * scaleFactor
             let dist = simd_length(pos - camPos)
             let fogT = max(0, min(1, (dist - 100) / 1100))
-            let fogOpacity = id == selectedNode ? 1.0 : max(Float(0.08), 1.0 - fogT * 0.92)
+            let baseFogOpacity = id == selectedNode ? 1.0 : max(Float(0.08), 1.0 - fogT * 0.92)
+            let searchDimmed = renderIsSearchActive && !renderSearchMatchIds.contains(id)
+            let fogOpacity = searchDimmed ? min(baseFogOpacity, 0.12) : baseFogOpacity
             // Skip ECS mutation when opacity hasn't changed visibly
             if abs(fogOpacity - (nodeLastOpacity[id] ?? -1)) > 0.02 {
                 entity.components.set(OpacityComponent(opacity: fogOpacity))
@@ -1292,10 +1637,14 @@ final class Graph3DScene {
         let dtSec = lastRenderTime > 0 ? Float(now - lastRenderTime) : Float(1.0 / 60.0)
         let dt = Double(dtSec) * 1000.0
 
+        pollKeyboard(dt: dtSec)
         pollGamepad(dt: dtSec, selectedNode: &renderSelectedNode,
                     positions: renderPositions, viewSize: renderViewSize)
         updateCamera(dt: dtSec)
         animationTime += dtSec
+
+        // Hub expansion animation (before node/edge updates so positions are current)
+        updateExpansions(dt: dtSec)
 
         let selectionChanged = renderSelectedNode != renderLastSelectedNode
 
@@ -1354,6 +1703,9 @@ final class Graph3DScene {
         }
         let tEdges = CFAbsoluteTimeGetCurrent()
 
+        // Edge flow particles
+        updateFlowParticles(dt: dtSec)
+
         // Nebulae: skip during initial settle (first 180 frames) to avoid
         // particle system warm-up competing with heavy force layout work
         if renderFrameCount > 180 {
@@ -1405,10 +1757,14 @@ struct Graph3DView: View {
     let semanticClusters3D: [SemanticCluster3D]
     let topicGroups: [TopicGroupInfo]
     let clusters: [[Int64]]
+    let searchMatchIds: Set<Int64>
+    let isSearchActive: Bool
     /// Called each frame. Must return the CURRENT live positions.
     var onAnimationTick: (() -> [Int64: SIMD3<Float>])?
     /// Called each frame with current camera state for minimap: (azimuth, cameraPosition, cameraTarget).
     var onCameraUpdate: ((Float, SIMD3<Float>, SIMD3<Float>) -> Void)?
+    /// Called when a hub is expanded/collapsed (for pinning children in force simulation).
+    var onHubToggle: ((Int64, Bool) -> Void)?
 
     @State private var scene = Graph3DScene()
     @State private var livePositions: [Int64: SIMD3<Float>] = [:]
@@ -1478,6 +1834,13 @@ struct Graph3DView: View {
                             Label("Twist to rotate", systemImage: "rotate.left")
                             Label("Click to select", systemImage: "cursorarrow.click")
                         }
+                        HStack(spacing: 16) {
+                            Label("WASD move", systemImage: "keyboard")
+                            Label("IJKL look", systemImage: "keyboard")
+                            Label("QE rise/descend", systemImage: "keyboard")
+                            Label("Shift sprint", systemImage: "keyboard")
+                            Label("T/R teleport", systemImage: "keyboard")
+                        }
                         if GCController.current != nil {
                             HStack(spacing: 16) {
                                 Label("L-Stick move", systemImage: "l.joystick")
@@ -1528,8 +1891,12 @@ struct Graph3DView: View {
                 // Gamepad/reticle changed selection — push scene → binding
                 selectedNode = scene.renderSelectedNode
             } else if bindingChanged {
-                // UI (activity panel/tap) changed selection — push binding → scene
+                // UI (activity panel/tap/Escape) changed selection — push binding → scene
                 scene.renderSelectedNode = selectedNode
+                // Collapse all expanded hubs when deselected from any source
+                if selectedNode == nil {
+                    collapseAllHubs()
+                }
             }
             lastSyncedSelection = selectedNode
 
@@ -1547,8 +1914,20 @@ struct Graph3DView: View {
             scene.renderTopicGroups = topicGroups
             scene.renderClusters = clusters
             scene.renderViewSize = viewFrame.size
+            scene.renderSearchMatchIds = searchMatchIds
+            scene.renderIsSearchActive = isSearchActive
+
+            // Consume pending hub toggles from gamepad
+            for toggle in scene.pendingHubToggles {
+                onHubToggle?(toggle.hubId, toggle.expanding)
+            }
+            scene.pendingHubToggles.removeAll()
 
             livePositions = newPos
+            // Override with expansion positions for accurate label placement
+            for (id, pos) in scene.expandedChildPositions {
+                livePositions[id] = pos
+            }
 
             // Report camera state to minimap
             onCameraUpdate?(scene.azimuth, scene.cameraPosition, scene.cameraTarget)
@@ -1649,21 +2028,57 @@ struct Graph3DView: View {
 
     @State private var viewFrame: NSRect = .zero
 
+    /// Keys tracked for continuous WASD/IJKL/QE movement.
+    private static let movementKeys: Set<String> = ["w","a","s","d","i","j","k","l","q","e"]
+
     private func installInputMonitor() {
-        scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: [.scrollWheel, .magnify, .rotate, .keyDown]) { [scene] event in
-            // T/R keys → teleport next/previous project (keyboard equivalent of gamepad Y/X)
-            if event.type == .keyDown {
-                let key = event.charactersIgnoringModifiers
-                let noMods = event.modifierFlags.intersection(.deviceIndependentFlagsMask).isEmpty
-                if key == "t" && noMods {
-                    scene.teleportToNextProject(positions: scene.renderPositions, nodes: scene.renderNodes, direction: 1)
-                    return nil
+        scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: [.scrollWheel, .magnify, .rotate, .keyDown, .keyUp, .flagsChanged]) { [scene] event in
+            // --- Shift tracking (flagsChanged) ---
+            if event.type == .flagsChanged {
+                if event.modifierFlags.contains(.shift) {
+                    scene.heldKeys.insert("shift")
+                } else {
+                    scene.heldKeys.remove("shift")
                 }
-                if key == "r" && noMods {
-                    scene.teleportToNextProject(positions: scene.renderPositions, nodes: scene.renderNodes, direction: -1)
-                    return nil
+                return event
+            }
+
+            // --- Key events ---
+            if event.type == .keyDown || event.type == .keyUp {
+                // Skip if a text field has focus (search bar, etc.)
+                if let responder = event.window?.firstResponder,
+                   responder is NSTextView || responder is NSTextField {
+                    scene.heldKeys.removeAll()
+                    return event
                 }
-                return event  // pass through other key events
+
+                let key = event.charactersIgnoringModifiers?.lowercased() ?? ""
+                let noMods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+                    .subtracting(.shift).isEmpty
+
+                if event.type == .keyDown {
+                    // Track continuous movement keys
+                    if noMods && Self.movementKeys.contains(key) {
+                        scene.heldKeys.insert(key)
+                        return nil  // consume
+                    }
+                    // T/R → teleport next/previous project
+                    if key == "t" && noMods {
+                        scene.teleportToNextProject(positions: scene.renderPositions, nodes: scene.renderNodes, direction: 1)
+                        return nil
+                    }
+                    if key == "r" && noMods {
+                        scene.teleportToNextProject(positions: scene.renderPositions, nodes: scene.renderNodes, direction: -1)
+                        return nil
+                    }
+                } else {
+                    // keyUp — release held key
+                    if Self.movementKeys.contains(key) {
+                        scene.heldKeys.remove(key)
+                        return nil
+                    }
+                }
+                return event
             }
             // Let scroll events pass through to overlay ScrollViews
             if let contentView = event.window?.contentView {
@@ -1703,14 +2118,36 @@ struct Graph3DView: View {
             NSEvent.removeMonitor(monitor)
             scrollMonitor = nil
         }
+        scene.heldKeys.removeAll()
+    }
+
+    private func collapseAllHubs() {
+        for hubId in scene.expandedHubs {
+            scene.toggleHubExpansion(hubId: hubId)
+            onHubToggle?(hubId, false)
+        }
     }
 
     private func tapGesture(viewSize: CGSize) -> some Gesture {
         SpatialTapGesture()
             .onEnded { value in
                 if let nodeId = scene.hitTest(at: value.location, viewSize: viewSize, positions: livePositions) {
-                    selectedNode = selectedNode == nodeId ? nil : nodeId
+                    if hubs.contains(nodeId) {
+                        let expanding = !scene.expandedHubs.contains(nodeId)
+                        // Collapse other expanded hubs first
+                        for hubId in scene.expandedHubs where hubId != nodeId {
+                            scene.toggleHubExpansion(hubId: hubId)
+                            onHubToggle?(hubId, false)
+                        }
+                        scene.toggleHubExpansion(hubId: nodeId)
+                        onHubToggle?(nodeId, expanding)
+                        selectedNode = nodeId
+                    } else {
+                        collapseAllHubs()
+                        selectedNode = selectedNode == nodeId ? nil : nodeId
+                    }
                 } else {
+                    collapseAllHubs()
                     selectedNode = nil
                 }
             }
@@ -1738,6 +2175,14 @@ struct Graph3DView: View {
                 let isHub: Bool
             }
 
+            // Precompute children of expanded hubs for visibility bypass
+            var expandedChildren = Set<Int64>()
+            for hubId in scene.expandedHubs {
+                for childId in scene.childrenOfHub(hubId) {
+                    expandedChildren.insert(childId)
+                }
+            }
+
             var entries: [LabelEntry] = []
             var minDepth: Float = .greatestFiniteMagnitude
             var maxDepth: Float = 0
@@ -1753,7 +2198,8 @@ struct Graph3DView: View {
 
                 // Visibility by actual distance from camera — not a global "zoom level"
                 // Closer nodes are visible; farther nodes culled by tier.
-                if !isSelected {
+                // Children of expanded hubs always visible for inspection.
+                if !isSelected && !expandedChildren.contains(id) {
                     let maxVisible: CGFloat = isHub ? 1200 : (200 + importance * 80)
                     guard CGFloat(depth) < maxVisible else { continue }
                 }
@@ -1803,7 +2249,9 @@ struct Graph3DView: View {
                 let fontSize = max(7, min(20, baseSize * pow(distScale, 0.5)))
 
                 let baseOpacity: CGFloat = entry.isSelected ? 0.95 : (entry.isHub ? 0.8 : 0.6)
-                let opacity = baseOpacity * fadeT * depthFade
+                let searchDimmedLabel = scene.renderIsSearchActive && !scene.renderSearchMatchIds.contains(entry.id)
+                let searchFade: CGFloat = searchDimmedLabel ? 0.15 : 1.0
+                let opacity = baseOpacity * fadeT * depthFade * searchFade
 
                 guard opacity > 0.02 else { continue }
 
