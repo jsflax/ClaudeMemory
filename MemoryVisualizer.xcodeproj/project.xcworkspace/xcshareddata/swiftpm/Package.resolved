@@ -1,5 +1,5 @@
 {
-  "originHash" : "a58c598b21001221bbfa169250f4deda3b457f9cf9a2871e4d3564b1b4397bc7",
+  "originHash" : "618b8ea791838fb38accad3c9ae0786d4a8a9ff45739bf8568fd7640421f5d26",
   "pins" : [
     {
       "identity" : "async-http-client",
@@ -116,6 +116,15 @@
       "state" : {
         "revision" : "1a10ccea61e4248effd23b6e814999ce7bdf0ee0",
         "version" : "4.9.3"
+      }
+    },
+    {
+      "identity" : "sparkle",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/sparkle-project/Sparkle.git",
+      "state" : {
+        "revision" : "5581748cef2bae787496fe6d61139aebe0a451f6",
+        "version" : "2.8.1"
       }
     },
     {
@@ -349,7 +358,7 @@
       "location" : "https://github.com/jsflax/swift-transformers.git",
       "state" : {
         "branch" : "main",
-        "revision" : "ca0eeb29d3b3c9b7deefddaa7311aa4eb6739010"
+        "revision" : "288f020a1c553f6ba594d38c75f7f6e8e545bfac"
       }
     },
     {
@@ -358,7 +367,7 @@
       "location" : "https://github.com/jsflax/SwiftLM.git",
       "state" : {
         "branch" : "main",
-        "revision" : "4c4369c8becc2dfedb5c81fb8083b5453d22d30e"
+        "revision" : "1863161e3af79a354b6e5dc7dd7f91f076040558"
       }
     },
     {
