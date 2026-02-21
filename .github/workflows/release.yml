@@ -181,6 +181,7 @@ jobs:
 
           # Download Sparkle tools
           SPARKLE_VERSION="2.8.1"
+          mkdir -p /tmp/sparkle-tools
           curl -sL "https://github.com/sparkle-project/Sparkle/releases/download/${SPARKLE_VERSION}/Sparkle-${SPARKLE_VERSION}.tar.xz" | tar xJ -C /tmp/sparkle-tools bin/
 
           # Move DMG to a staging dir for generate_appcast
@@ -237,7 +238,7 @@ jobs:
           git diff --cached --quiet || (git commit -m "Update claude-memory to ${VERSION}" && git push)
 
       - name: Notify Slack
-        if: always() && env.SLACK_WEBHOOK_URL != ''
+        if: success() && env.SLACK_WEBHOOK_URL != ''
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
