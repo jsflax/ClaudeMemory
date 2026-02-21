@@ -212,7 +212,7 @@ jobs:
           git diff --cached --quiet || (git commit -m "Update claude-memory to ${VERSION}" && git push)
 
       - name: Notify Slack
-        if: always() && secrets.SLACK_WEBHOOK_URL != ''
+        if: always() && env.SLACK_WEBHOOK_URL != ''
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |

@@ -2,6 +2,21 @@
 
 All notable changes to ClaudeMemory are documented in this file.
 
+## [0.11.0] - 2026-02-21
+
+### Added
+- **Sparkle auto-update** — in-app "Check for Updates..." menu item with Ed25519-signed appcast feed
+- **DMG distribution** — notarized DMG with drag-to-Applications install, built in CI
+- **CLI sync on launch** — app bundles MCP server, hooks, and agents; auto-installs to `~/.claude/bin/` when app version is newer
+- **3D hub expansion** — tap a hub node to orbit its children in a Fibonacci sphere arrangement
+- **3D edge flow particles** — animated particles traveling along edges of selected/expanded nodes
+- **3D search spotlight** — matching nodes glow cyan, non-matches dim to 12% opacity
+
+### Changed
+- Release CI pipeline overhauled: xcodebuild archive, Developer ID signing, DMG creation, notarization, Sparkle appcast generation
+- `appcast.xml` committed to repo root and auto-updated by CI on each release
+- `install.sh` now mentions DMG download as an alternative
+
 ## [0.10.0] - 2026-02-21
 
 ### Added
@@ -196,6 +211,7 @@ All notable changes to ClaudeMemory are documented in this file.
 - CI/CD with GitHub Actions on macOS 26 / Swift 6.2
 - Homebrew tap workflow
 
+[0.11.0]: https://github.com/jsflax/ClaudeMemory/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/jsflax/ClaudeMemory/compare/v0.9.1...v0.10.0
 [0.9.1]: https://github.com/jsflax/ClaudeMemory/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/jsflax/ClaudeMemory/compare/v0.8.2...v0.9.0
