@@ -141,11 +141,23 @@ jobs:
           VERSION=${GITHUB_REF_NAME#v}
           DMG="MemoryVisualizer-${VERSION}.dmg"
 
-          xcrun notarytool submit "$DMG" \
+          SUBMIT_OUT=$(xcrun notarytool submit "$DMG" \
             --apple-id "$APPLE_ID" \
             --password "$APPLE_APP_PASSWORD" \
             --team-id "$APPLE_TEAM_ID" \
-            --wait
+            --wait 2>&1) || true
+          echo "$SUBMIT_OUT"
+
+          # Extract submission ID and fetch log on failure
+          SUB_ID=$(echo "$SUBMIT_OUT" | grep "id:" | head -1 | awk '{print $2}')
+          if echo "$SUBMIT_OUT" | grep -q "status: Invalid"; then
+            echo "--- Notarization log ---"
+            xcrun notarytool log "$SUB_ID" \
+              --apple-id "$APPLE_ID" \
+              --password "$APPLE_APP_PASSWORD" \
+              --team-id "$APPLE_TEAM_ID" || true
+            exit 1
+          fi
 
           xcrun stapler staple "$DMG"
 
