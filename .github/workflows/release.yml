@@ -106,10 +106,20 @@ jobs:
           cp -R .build/release/SwiftLM_SwiftLM.bundle "$CLI_DIR/"
           cp agents/*.md "$AGENTS_DIR/"
 
-          # Re-codesign since contents changed
+          # Sign CLI binaries with Developer ID, hardened runtime, and timestamp
+          for bin in "$CLI_DIR/memory" "$CLI_DIR/memory-hooks"; do
+            codesign --force --sign "Developer ID Application" \
+              --keychain "$RUNNER_TEMP/signing.keychain-db" \
+              --options runtime \
+              --timestamp \
+              "$bin"
+          done
+
+          # Re-codesign the entire .app since contents changed
           codesign --deep --force --sign "Developer ID Application" \
             --keychain "$RUNNER_TEMP/signing.keychain-db" \
             --options runtime \
+            --timestamp \
             "$APP"
 
       - name: Create DMG
