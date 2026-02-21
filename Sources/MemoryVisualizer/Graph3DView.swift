@@ -257,10 +257,12 @@ final class Graph3DScene {
     /// Tracks bumper state for rising-edge cycle detection.
     private var prevLB = false
     private var prevRB = false
-    /// Tracks Y button for project teleport.
+    /// Tracks X/Y buttons for project teleport (Y = next, X = previous).
+    private var prevButtonX = false
     private var prevButtonY = false
     /// Current project index for teleport cycling.
     private var teleportProjectIndex = 0
+    var teleportCounter: Int = 0
     /// Name of the project we last teleported to (shown briefly in overlay).
     var teleportLabel: String?
 
@@ -338,16 +340,23 @@ final class Graph3DScene {
         prevLB = lb
         prevRB = rb
 
-        // Y / Triangle → teleport camera to next project centroid (rising edge)
+        // X / Square → teleport to previous project (rising edge)
+        let buttonX = pad.buttonX.isPressed
+        if buttonX && !prevButtonX {
+            teleportToNextProject(positions: positions, nodes: renderNodes, direction: -1)
+        }
+        prevButtonX = buttonX
+
+        // Y / Triangle → teleport to next project (rising edge)
         let buttonY = pad.buttonY.isPressed
         if buttonY && !prevButtonY {
-            teleportToNextProject(positions: positions, nodes: renderNodes)
+            teleportToNextProject(positions: positions, nodes: renderNodes, direction: 1)
         }
         prevButtonY = buttonY
     }
 
     /// Teleport camera to the hub node of the next project (falls back to centroid).
-    private func teleportToNextProject(positions: [Int64: SIMD3<Float>], nodes: [NodeData]) {
+    func teleportToNextProject(positions: [Int64: SIMD3<Float>], nodes: [NodeData], direction: Int = 1) {
         // Group node IDs and positions by project
         var projectNodeIds: [String: [Int64]] = [:]
         var projectPositions: [String: [SIMD3<Float>]] = [:]
@@ -362,8 +371,8 @@ final class Graph3DScene {
         let projects = projectPositions.keys.sorted()
         guard !projects.isEmpty else { return }
 
-        // Advance to next project
-        teleportProjectIndex = (teleportProjectIndex + 1) % projects.count
+        // Advance to next/previous project
+        teleportProjectIndex = (teleportProjectIndex + direction + projects.count) % projects.count
         let project = projects[teleportProjectIndex]
         let pts = projectPositions[project]!
         let nodeIds = projectNodeIds[project]!
@@ -380,13 +389,45 @@ final class Graph3DScene {
             for p in pts { sum += p }
             targetPos = sum / Float(pts.count)
         }
-        let scaledTarget = targetPos * scaleFactor
 
-        // Teleport: set both target and current for instant jump
-        targetCameraPos = scaledTarget
-        cameraTarget = scaledTarget
+        // Compute the project's bounding sphere to set an appropriate orbit radius
+        var maxSpread: Float = 0
+        for p in pts {
+            maxSpread = max(maxSpread, simd_length(p - targetPos))
+        }
+        // Orbit radius: close to the hub so we're "among" the nodes.
+        // Cap at 250 so even large clusters don't zoom too far out.
+        // Minimum 60 for single-node projects (0.3 RealityKit units ≈ 7.5 node radii).
+        orbitRadius = max(min(maxSpread * 0.4, 250), 60)
 
+        // Teleport: set camera target to UNSCALED position.
+        // cameraTransform() applies scaleFactor once, placing the orbit center at
+        // targetPos * scaleFactor — exactly where the node entity lives in RealityKit.
+        // (Previously this was targetPos * scaleFactor, which got double-scaled by
+        // cameraTransform, putting the orbit center near the origin.)
+        targetCameraPos = targetPos
+        cameraTarget = targetPos
+
+        teleportCounter += 1
         teleportLabel = project
+
+        #if DEBUG
+        // Write teleport verification data for UI tests
+        let camRK = (targetPos + SIMD3(orbitRadius, 0, 0)) * scaleFactor
+        let nodeRK = targetPos * scaleFactor
+        let dist = simd_length(camRK - nodeRK)
+        let line = "\(project),\(targetPos.x),\(targetPos.y),\(targetPos.z),\(orbitRadius),\(dist),\(pts.count)\n"
+        let logPath = "/tmp/teleport-log.csv"
+        if !FileManager.default.fileExists(atPath: logPath) {
+            let header = "project,target_x,target_y,target_z,orbit_radius,rk_distance,node_count\n"
+            FileManager.default.createFile(atPath: logPath, contents: header.data(using: .utf8))
+        }
+        if let fh = FileHandle(forWritingAtPath: logPath) {
+            fh.seekToEndOfFile()
+            fh.write(line.data(using: .utf8)!)
+            fh.closeFile()
+        }
+        #endif
     }
 
     /// Cycle through nodes sorted by distance from camera.
@@ -1400,6 +1441,8 @@ struct Graph3DView: View {
                 }
 
                 // Teleport project label (fades after 2s)
+                // Uses teleportCounter to avoid stomping: each teleport increments
+                // the counter, and the dismiss task only clears if counter hasn't changed.
                 if let label = scene.teleportLabel {
                     Text(label)
                         .font(.system(size: 24, weight: .bold, design: .monospaced))
@@ -1409,9 +1452,12 @@ struct Graph3DView: View {
                         .background(.black.opacity(0.5), in: .capsule)
                         .transition(.opacity)
                         .allowsHitTesting(false)
-                        .task(id: label) {
+                        .task(id: scene.teleportCounter) {
+                            let myCounter = scene.teleportCounter
                             try? await Task.sleep(for: .seconds(2))
-                            scene.teleportLabel = nil
+                            if scene.teleportCounter == myCounter {
+                                scene.teleportLabel = nil
+                            }
                         }
                 }
 
@@ -1438,7 +1484,8 @@ struct Graph3DView: View {
                                 Label("R-Stick look", systemImage: "r.joystick")
                                 Label("Triggers rise/descend", systemImage: "l2.button.roundedtop.horizontal")
                                 Label("A select", systemImage: "a.button.roundedtop.horizontal.fill")
-                                Label("Y teleport", systemImage: "y.button.roundedtop.horizontal.fill")
+                                Label("X prev project", systemImage: "x.button.roundedtop.horizontal.fill")
+                                Label("Y next project", systemImage: "y.button.roundedtop.horizontal.fill")
                                 Label("Bumpers cycle", systemImage: "l1.button.roundedtop.horizontal")
                                 Label("L3/R3 sprint", systemImage: "l.joystick.press.down")
                             }
@@ -1603,7 +1650,21 @@ struct Graph3DView: View {
     @State private var viewFrame: NSRect = .zero
 
     private func installInputMonitor() {
-        scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: [.scrollWheel, .magnify, .rotate]) { [scene] event in
+        scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: [.scrollWheel, .magnify, .rotate, .keyDown]) { [scene] event in
+            // T/R keys → teleport next/previous project (keyboard equivalent of gamepad Y/X)
+            if event.type == .keyDown {
+                let key = event.charactersIgnoringModifiers
+                let noMods = event.modifierFlags.intersection(.deviceIndependentFlagsMask).isEmpty
+                if key == "t" && noMods {
+                    scene.teleportToNextProject(positions: scene.renderPositions, nodes: scene.renderNodes, direction: 1)
+                    return nil
+                }
+                if key == "r" && noMods {
+                    scene.teleportToNextProject(positions: scene.renderPositions, nodes: scene.renderNodes, direction: -1)
+                    return nil
+                }
+                return event  // pass through other key events
+            }
             // Let scroll events pass through to overlay ScrollViews
             if let contentView = event.window?.contentView {
                 let hitView = contentView.hitTest(event.locationInWindow)

@@ -87,6 +87,78 @@ final class FrameTimingTests: XCTestCase {
         analyzeProfilingData()
     }
 
+    func testTeleportProximity() throws {
+        // Switch to 3D mode
+        let threeDButton = app.buttons.matching(NSPredicate(format: "label == '3D'")).firstMatch
+        XCTAssertTrue(threeDButton.waitForExistence(timeout: 10), "3D button not found")
+        threeDButton.tap()
+        sleep(5) // let 3D view initialize and force sim settle
+
+        // Clean up any previous teleport log
+        try? FileManager.default.removeItem(atPath: "/tmp/teleport-log.csv")
+
+        takeScreenshot(name: "teleport-01-initial")
+
+        // Teleport through projects using T key
+        // Each press cycles to the next project alphabetically
+        let window = app.windows.firstMatch
+        XCTAssertTrue(window.exists)
+
+        let teleportCount = 5
+        for i in 0..<teleportCount {
+            window.typeKey("t", modifierFlags: [])
+            sleep(2) // let camera settle
+            takeScreenshot(name: "teleport-\(String(format: "%02d", i + 2))-after-t\(i + 1)")
+        }
+
+        // Rapid teleport test (label stomping)
+        for _ in 0..<3 {
+            window.typeKey("t", modifierFlags: [])
+            usleep(300_000) // 300ms between — should NOT stomp previous label
+        }
+        sleep(2)
+        takeScreenshot(name: "teleport-rapid-final")
+
+        // Verify teleport log
+        analyzeTeleportLog(expectedMinTeleports: teleportCount)
+    }
+
+    private func analyzeTeleportLog(expectedMinTeleports: Int) {
+        let logPath = "/tmp/teleport-log.csv"
+        guard let data = FileManager.default.contents(atPath: logPath),
+              let csv = String(data: data, encoding: .utf8) else {
+            XCTFail("No teleport log at \(logPath)")
+            return
+        }
+
+        let lines = csv.components(separatedBy: "\n").dropFirst().filter { !$0.isEmpty }
+        XCTAssertGreaterThanOrEqual(lines.count, expectedMinTeleports,
+            "Expected at least \(expectedMinTeleports) teleports, got \(lines.count)")
+
+        print("\n╔══════════════════════════════════════════════════════╗")
+        print("║           TELEPORT PROXIMITY RESULTS                ║")
+        print("╠══════════════════════════════════════════════════════╣")
+
+        for line in lines {
+            let cols = line.components(separatedBy: ",")
+            guard cols.count >= 7 else { continue }
+            let project = cols[0]
+            let orbitRadius = Double(cols[4]) ?? 0
+            let rkDistance = Double(cols[5]) ?? 0
+            let nodeCount = Int(cols[6]) ?? 0
+
+            // Camera should be within 2.0 RealityKit units of the target node
+            // (node radius is 0.04, so 2.0 = 50× the node radius — generous)
+            let maxAllowedDistance: Double = 2.0
+            XCTAssertLessThan(rkDistance, maxAllowedDistance,
+                "Teleport to '\(project)' landed \(String(format: "%.3f", rkDistance)) RK units away (max \(maxAllowedDistance))")
+
+            print("║ \(project.padding(toLength: 20, withPad: " ", startingAt: 0)) nodes=\(String(format: "%3d", nodeCount)) orbit=\(String(format: "%6.0f", orbitRadius)) dist=\(String(format: "%.3f", rkDistance)) ║")
+        }
+
+        print("╚══════════════════════════════════════════════════════╝\n")
+    }
+
     // MARK: - Helpers
 
     private func takeScreenshot(name: String) {
