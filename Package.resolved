@@ -358,7 +358,7 @@
       "location" : "https://github.com/jsflax/swift-transformers.git",
       "state" : {
         "branch" : "main",
-        "revision" : "ca0eeb29d3b3c9b7deefddaa7311aa4eb6739010"
+        "revision" : "288f020a1c553f6ba594d38c75f7f6e8e545bfac"
       }
     },
     {
@@ -367,7 +367,7 @@
       "location" : "https://github.com/jsflax/SwiftLM.git",
       "state" : {
         "branch" : "main",
-        "revision" : "731f509cb21ea0af5f9f2eedc02fbc47cc5bce22"
+        "revision" : "1863161e3af79a354b6e5dc7dd7f91f076040558"
       }
     },
     {
