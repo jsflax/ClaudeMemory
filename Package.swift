@@ -5,9 +5,12 @@ import PackageDescription
 let package = Package(
     name: "ClaudeMemory",
     platforms: [.macOS(.v15)],
+    products: [
+        .library(name: "ClaudeMemoryLib", targets: ["ClaudeMemoryLib"]),
+    ],
     dependencies: [
         .package(url: "https://github.com/modelcontextprotocol/swift-sdk.git", from: "0.10.0"),
-        .package(url: "https://github.com/jsflax/lattice.git", from: "0.3.1"),
+        .package(url: "https://github.com/jsflax/lattice.git", from: "0.3.2"),
         .package(url: "https://github.com/jsflax/SwiftLM.git", branch: "main"),
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.5.0"),
     ],
@@ -49,6 +52,9 @@ let package = Package(
             ],
             swiftSettings: [
                 .interoperabilityMode(.Cxx),
+            ],
+            linkerSettings: [
+                .linkedFramework("RealityKit"),
             ]
         ),
         .executableTarget(

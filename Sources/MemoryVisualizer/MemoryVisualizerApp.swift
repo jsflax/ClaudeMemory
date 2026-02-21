@@ -6,6 +6,7 @@ import UniformTypeIdentifiers
 @main
 struct MemoryVisualizerApp: App {
     let lattice: Lattice
+    let config: VisualizerConfig
 
     #if SWIFT_PACKAGE && os(macOS)
     private final class Delegate: NSObject, NSApplicationDelegate {
@@ -17,22 +18,29 @@ struct MemoryVisualizerApp: App {
 
     @NSApplicationDelegateAdaptor(Delegate.self) private var appDelegate
     #endif
-    
+
     init() {
         let dbPath = ProcessInfo.processInfo.environment["CLAUDE_MEMORY_DB"]
             ?? NSHomeDirectory() + "/.claude/memory.sqlite"
-        lattice = try! Lattice(
-            Memory.self, Edge.self, Checkpoint.self,
+        let lat = try! Lattice(
+            Memory.self, Edge.self, Checkpoint.self, VisualizerConfig.self,
             configuration: .init(
                 fileURL: URL(fileURLWithPath: dbPath)
             )
         )
+        lattice = lat
+        config = lat.objects(VisualizerConfig.self).first ?? {
+            let c = VisualizerConfig()
+            lat.add(c)
+            return c
+        }()
     }
 
     var body: some Scene {
         WindowGroup("Memory Graph") {
             GraphView()
                 .environment(\.lattice, lattice)
+                .environment(config)
                 .frame(minWidth: 800, minHeight: 600)
         }
         .commands {

@@ -40,7 +40,15 @@ For **near-duplicate pairs**: `merge(ids: [...], content: "...")` when two memor
 
 For **topic corrections**: Use `organize` to group related memories under a hub, not `update` for individual topic changes.
 
-### 5. Connect the graph
+### 5. Cross-project connections
+
+Auto-connect at remember-time only searches within the same project, so cross-project edges rarely form on their own. This step fills that gap.
+
+For each project, pick a few high-importance memories that represent broadly applicable knowledge — patterns, lessons learned, decisions, insights. `recall` each against other projects to see if semantically similar knowledge exists there. If you find a genuine conceptual overlap, `connect` them with `relates_to`.
+
+Most memories are project-specific, but some knowledge transfers across contexts. Those are the connections worth making.
+
+### 6. Connect the graph
 
 After creating new memories (from consolidate/merge), `connect` them to relevant existing memories:
 - `part_of` for memories that belong to an overview/hub

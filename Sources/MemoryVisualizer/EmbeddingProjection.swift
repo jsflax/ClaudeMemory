@@ -1,12 +1,18 @@
 import SwiftUI
 import Lattice
 import ClaudeMemoryLib
+import simd
 
 // MARK: - Data Types
 
-enum LayoutMode: String, CaseIterable, Equatable {
+enum LayoutMode: String, CaseIterable, Equatable, LatticeEnum {
     case forceDirected = "Force"
     case embedding = "Semantic"
+}
+
+enum DimensionMode: String, CaseIterable, Equatable, LatticeEnum {
+    case twoD = "2D"
+    case threeD = "3D"
 }
 
 enum ProjectionState: Equatable {
@@ -35,6 +41,15 @@ struct SemanticCluster: Identifiable {
     var subClusters: [SemanticCluster] = []
 }
 
+struct SemanticCluster3D: Identifiable {
+    let id = UUID()
+    let nodeIds: [Int64]
+    let centroid: SIMD3<Float>
+    let boundingRadius: Float
+    let label: String
+    let projectBreakdown: [(project: String, count: Int)]
+}
+
 // MARK: - Orchestrator
 
 @Observable
@@ -42,8 +57,10 @@ struct SemanticCluster: Identifiable {
 final class EmbeddingProjection {
     private(set) var state: ProjectionState = .idle
     private(set) var projectedPositions: [Int64: CGPoint] = [:]
+    private(set) var projectedPositions3D: [Int64: SIMD3<Float>] = [:]
     private(set) var knowledgeVoids: [KnowledgeVoid] = []
     private(set) var semanticClusters: [SemanticCluster] = []
+    private(set) var semanticClusters3D: [SemanticCluster3D] = []
 
     /// Raw 384-dim embeddings, cached from Lattice
     private var embeddings: [Int64: [Float]] = [:]
@@ -54,6 +71,7 @@ final class EmbeddingProjection {
     /// Target positions from the latest t-SNE emission — frame-level interpolation
     /// lerps projectedPositions toward these each frame for smooth animation.
     private var targetPositions: [Int64: CGPoint] = [:]
+    private var targetPositions3D: [Int64: SIMD3<Float>] = [:]
 
     /// Authoritative positions for cluster/void detection. Uses targetPositions (the true
     /// final t-SNE result) when available, so hulls are computed at the correct locations
@@ -158,7 +176,7 @@ final class EmbeddingProjection {
         let capturedNoEmbeddingIds = noEmbeddingIds
         let capturedCenter = center
         let capturedSpread = spread
-        let positionsHandler: @Sendable ([(id: Int64, x: Double, y: Double)]) -> Void = { [weak self] rawPositions in
+        let positionsHandler: @Sendable ([(id: Int64, x: Double, y: Double)], _ zValues: [Double]?) -> Void = { [weak self] rawPositions, _ in
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 // Ignore stale emissions that arrive after computation finished
@@ -256,6 +274,149 @@ final class EmbeddingProjection {
         if maxDelta < 0.5 {
             projectedPositions = targetPositions
             targetPositions = [:]
+        }
+    }
+
+    // MARK: - 3D Projection
+
+    func computeProjection3D(
+        nodeIds: Set<Int64>, spread: Float,
+        initialPositions: [Int64: SIMD3<Float>] = [:]
+    ) async {
+        var ids: [Int64] = []
+        var embeddingArrays: [[Float]] = []
+        var noEmbeddingIds: [Int64] = []
+
+        for id in nodeIds {
+            if let emb = embeddings[id], !emb.isEmpty {
+                ids.append(id)
+                embeddingArrays.append(emb)
+            } else {
+                noEmbeddingIds.append(id)
+            }
+        }
+
+        guard ids.count >= 2 else {
+            state = .failed("Need at least 2 memories with embeddings")
+            return
+        }
+
+        state = .computing(progress: 0)
+
+        let perplexity = min(30.0, Double(ids.count - 1) / 3.0)
+
+        // Build initial positions from 3D force layout
+        let tsneInitialPositions: [(x: Double, y: Double)]?
+        if !initialPositions.isEmpty {
+            tsneInitialPositions = ids.map { id in
+                let p = initialPositions[id] ?? .zero
+                return (x: Double(p.x), y: Double(p.y))
+            }
+        } else {
+            tsneInitialPositions = nil
+        }
+
+        let input = TSNEKernel.Input(
+            embeddings: embeddingArrays, ids: ids,
+            perplexity: max(1.0, perplexity), maxIterations: 1000,
+            initialPositions: tsneInitialPositions, outputDims: 3
+        )
+
+        let progressHandler: @Sendable (Double) -> Void = { [weak self] progress in
+            Task { @MainActor [weak self] in
+                self?.state = .computing(progress: progress)
+            }
+        }
+
+        targetPositions3D = [:]
+
+        let capturedNoEmbeddingIds = noEmbeddingIds
+        let capturedSpread = spread
+        let positionsHandler: @Sendable ([(id: Int64, x: Double, y: Double)], _ zValues: [Double]?) -> Void = { [weak self] rawPositions, zValues in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                guard case .computing = self.state else { return }
+                self.targetPositions3D = Self.scaleToWorld3D(
+                    rawPositions, zValues: zValues, spread: capturedSpread,
+                    noEmbeddingIds: capturedNoEmbeddingIds
+                )
+            }
+        }
+
+        let result = await Task.detached(priority: .userInitiated) {
+            await TSNEKernel.compute(input, progress: progressHandler, onPositions: positionsHandler)
+        }.value
+
+        guard !result.positions.isEmpty else {
+            state = .failed("t-SNE 3D produced no positions")
+            return
+        }
+
+        targetPositions3D = Self.scaleToWorld3D(
+            result.positions, zValues: result.zValues, spread: spread,
+            noEmbeddingIds: noEmbeddingIds
+        )
+        projectedNodeIds = nodeIds
+        state = .ready
+    }
+
+    private static func scaleToWorld3D(
+        _ rawPositions: [(id: Int64, x: Double, y: Double)],
+        zValues: [Double]?,
+        spread: Float,
+        noEmbeddingIds: [Int64]
+    ) -> [Int64: SIMD3<Float>] {
+        var minX = Double.greatestFiniteMagnitude, minY = Double.greatestFiniteMagnitude, minZ = Double.greatestFiniteMagnitude
+        var maxX = -Double.greatestFiniteMagnitude, maxY = -Double.greatestFiniteMagnitude, maxZ = -Double.greatestFiniteMagnitude
+        let zVals = zValues ?? [Double](repeating: 0, count: rawPositions.count)
+        for (i, p) in rawPositions.enumerated() {
+            minX = min(minX, p.x); minY = min(minY, p.y)
+            maxX = max(maxX, p.x); maxY = max(maxY, p.y)
+            let zv = i < zVals.count ? zVals[i] : 0
+            minZ = min(minZ, zv); maxZ = max(maxZ, zv)
+        }
+        let rangeX = max(maxX - minX, 1)
+        let rangeY = max(maxY - minY, 1)
+        let rangeZ = max(maxZ - minZ, 1)
+
+        var positions: [Int64: SIMD3<Float>] = [:]
+        for (i, p) in rawPositions.enumerated() {
+            let nx = Float((p.x - minX) / rangeX - 0.5)
+            let ny = Float((p.y - minY) / rangeY - 0.5)
+            let zv = i < zVals.count ? zVals[i] : 0
+            let nz = Float((zv - minZ) / rangeZ - 0.5)
+            positions[p.id] = SIMD3(nx * spread, ny * spread, nz * spread)
+        }
+
+        if !noEmbeddingIds.isEmpty {
+            let edgeRadius = spread * 0.6
+            let angleStep = 2 * Float.pi / Float(noEmbeddingIds.count)
+            for (i, id) in noEmbeddingIds.enumerated() {
+                let angle = angleStep * Float(i)
+                positions[id] = SIMD3(cos(angle) * edgeRadius, sin(angle) * edgeRadius, 0)
+            }
+        }
+
+        return positions
+    }
+
+    /// Lerps projectedPositions3D toward targetPositions3D each frame.
+    func tickAnimation3D() {
+        guard !targetPositions3D.isEmpty else { return }
+        let alpha: Float = 0.15
+        var updated = projectedPositions3D
+        var maxDelta: Float = 0
+        for (id, target) in targetPositions3D {
+            let current = updated[id] ?? target
+            let delta = target - current
+            maxDelta = max(maxDelta, abs(delta.x), abs(delta.y), abs(delta.z))
+            updated[id] = current + delta * alpha
+        }
+        projectedPositions3D = updated
+
+        if maxDelta < 0.5 {
+            projectedPositions3D = targetPositions3D
+            targetPositions3D = [:]
         }
     }
 
@@ -518,9 +679,12 @@ final class EmbeddingProjection {
     func invalidate() {
         state = .idle
         projectedPositions = [:]
+        projectedPositions3D = [:]
         targetPositions = [:]
+        targetPositions3D = [:]
         knowledgeVoids = []
         semanticClusters = []
+        semanticClusters3D = []
         projectedNodeIds = []
     }
 
@@ -621,5 +785,154 @@ final class EmbeddingProjection {
         let mean = values.reduce(0, +) / n
         let variance = values.reduce(0) { $0 + ($1 - mean) * ($1 - mean) } / (n - 1)
         return sqrt(variance)
+    }
+
+    // MARK: - 3D Semantic Cluster Detection
+
+    /// Detect spatial clusters in the projected 3D space using k-means.
+    func detectClusters3D(nodeTopics: [Int64: String], nodeProjects: [Int64: String], nodeLabels: [Int64: String]) {
+        let positions3D = projectedPositions3D
+        guard state == .ready, positions3D.count >= 3 else {
+            semanticClusters3D = []
+            return
+        }
+
+        let ids = Array(positions3D.keys)
+        let positions = ids.map { positions3D[$0]! }
+        let n = ids.count
+
+        let targetK = max(3, min(15, Int(sqrt(Double(n) / 3.0))))
+        let minClusterSize = 3
+        let clusterGroups = kMeans3D(positions: positions, k: targetK, minClusterSize: minClusterSize)
+
+        var clusters: [SemanticCluster3D] = []
+        for memberIndices in clusterGroups {
+            guard memberIndices.count >= minClusterSize else { continue }
+
+            let memberIds = memberIndices.map { ids[$0] }
+            let memberPositions = memberIndices.map { positions[$0] }
+
+            // Centroid
+            var sum = SIMD3<Float>.zero
+            for p in memberPositions { sum += p }
+            let centroid = sum / Float(memberPositions.count)
+
+            // Bounding radius
+            var maxDist: Float = 0
+            for p in memberPositions {
+                let d = simd_length(p - centroid)
+                if d > maxDist { maxDist = d }
+            }
+
+            // Label
+            var topicCounts: [String: Int] = [:]
+            var projectCounts: [String: Int] = [:]
+            for id in memberIds {
+                if let topic = nodeTopics[id], topic != "general", topic != "episode" {
+                    topicCounts[topic, default: 0] += 1
+                }
+                if let project = nodeProjects[id] {
+                    projectCounts[project, default: 0] += 1
+                }
+            }
+            let topTopics = topicCounts.sorted { $0.value > $1.value }.prefix(3).map(\.key)
+            let projectBreakdown = projectCounts.sorted { $0.value > $1.value }.map { (project: $0.key, count: $0.value) }
+            let label: String
+            if topTopics.isEmpty {
+                label = projectBreakdown.first?.project ?? "cluster"
+            } else {
+                label = topTopics.joined(separator: " · ")
+            }
+
+            clusters.append(SemanticCluster3D(
+                nodeIds: memberIds,
+                centroid: centroid,
+                boundingRadius: maxDist,
+                label: label,
+                projectBreakdown: projectBreakdown
+            ))
+        }
+
+        semanticClusters3D = clusters.sorted { $0.nodeIds.count > $1.nodeIds.count }
+    }
+
+    /// K-means clustering on 3D positions. Same algorithm as 2D kMeans but using SIMD3<Float>.
+    private func kMeans3D(positions: [SIMD3<Float>], k: Int, minClusterSize: Int) -> [[Int]] {
+        let n = positions.count
+        guard n >= k, k >= 2 else { return [(0..<n).map { $0 }] }
+
+        // Farthest-first initialization
+        var centroids: [SIMD3<Float>] = []
+        var sum = SIMD3<Float>.zero
+        for p in positions { sum += p }
+        let globalCentroid = sum / Float(n)
+
+        var bestStart = 0
+        var bestStartDist: Float = .greatestFiniteMagnitude
+        for i in 0..<n {
+            let d = simd_length(positions[i] - globalCentroid)
+            if d < bestStartDist { bestStartDist = d; bestStart = i }
+        }
+        centroids.append(positions[bestStart])
+
+        for _ in 1..<k {
+            var farthestIdx = 0
+            var farthestDist: Float = 0
+            for i in 0..<n {
+                var minD: Float = .greatestFiniteMagnitude
+                for c in centroids {
+                    let d = simd_length(positions[i] - c)
+                    minD = min(minD, d)
+                }
+                if minD > farthestDist { farthestDist = minD; farthestIdx = i }
+            }
+            centroids.append(positions[farthestIdx])
+        }
+
+        // Lloyd's algorithm
+        var assignments = [Int](repeating: 0, count: n)
+        for _ in 0..<30 {
+            var changed = false
+            for i in 0..<n {
+                var bestDist: Float = .greatestFiniteMagnitude
+                var bestC = 0
+                for c in 0..<k {
+                    let delta = positions[i] - centroids[c]
+                    let d = simd_length_squared(delta)
+                    if d < bestDist { bestDist = d; bestC = c }
+                }
+                if assignments[i] != bestC { changed = true }
+                assignments[i] = bestC
+            }
+            if !changed { break }
+
+            for c in 0..<k {
+                let members = (0..<n).filter { assignments[$0] == c }
+                guard !members.isEmpty else { continue }
+                var s = SIMD3<Float>.zero
+                for m in members { s += positions[m] }
+                centroids[c] = s / Float(members.count)
+            }
+        }
+
+        // Merge small clusters into nearest neighbor
+        for c in 0..<k {
+            let memberCount = (0..<n).filter { assignments[$0] == c }.count
+            guard memberCount > 0, memberCount < minClusterSize else { continue }
+            var bestOther = -1
+            var bestDist: Float = .greatestFiniteMagnitude
+            for other in 0..<k where other != c {
+                let otherCount = (0..<n).filter { assignments[$0] == other }.count
+                guard otherCount >= minClusterSize else { continue }
+                let d = simd_length(centroids[c] - centroids[other])
+                if d < bestDist { bestDist = d; bestOther = other }
+            }
+            if bestOther >= 0 {
+                for i in 0..<n where assignments[i] == c { assignments[i] = bestOther }
+            }
+        }
+
+        let usedLabels = Set(assignments).sorted()
+        return usedLabels.map { c in (0..<n).filter { assignments[$0] == c } }
     }
 }

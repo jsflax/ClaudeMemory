@@ -4,6 +4,7 @@ import Combine
 import ClaudeMemoryLib
 import UniformTypeIdentifiers
 import AppKit
+import simd
 
 typealias MemoryEdge = ClaudeMemoryLib.Edge
 
@@ -81,8 +82,7 @@ struct GraphView: View {
 
     @State private var simulation = ForceSimulation()
     @State private var viewport = ViewportState()
-    @State private var hiddenProjects: Set<String> = []
-    @State private var hiddenRelations: Set<String> = []
+    @Environment(VisualizerConfig.self) private var config
     @State private var selectedMemoryId: Int64?
     @State private var scrollMonitor: Any?
 
@@ -103,12 +103,17 @@ struct GraphView: View {
     @State private var minimapPanel = MinimapPanelController()
 
     // Embedding projection / layout mode
-    @State private var layoutMode: LayoutMode = .forceDirected
     @State private var embeddingProjection = EmbeddingProjection()
-    @State private var showVoids: Bool = false
     @State private var transitionProgress: CGFloat = 0  // 0 = force, 1 = embedding
     @State private var forcePositionSnapshot: [Int64: CGPoint] = [:]
     @State private var projectionTopologyVersion: UInt64 = 0
+
+    // 3D state
+    @State private var simulation3D = ForceSimulation3D()
+    @State private var forcePositionSnapshot3D: [Int64: SIMD3<Float>] = [:]
+    @State private var camera3DAzimuth: Float = 0
+    @State private var camera3DPosition: SIMD3<Float> = .zero
+    @State private var camera3DTarget: SIMD3<Float> = .zero
 
     // Glow cleanup timer (1s interval — removes entries older than 4.3s)
     private let glowTimer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
@@ -118,14 +123,11 @@ struct GraphView: View {
     /// Recompute all derived data from current filtered nodes/edges. Call after any structural change.
     private func recomputeDerivedData() {
         // Color map
-        let goldenAngle = 0.381966011250105
         let projects = uniqueProjects()
         var map: [String: Color] = ["global": .gray]
         for (i, project) in projects.enumerated() {
             if project == "global" { continue }
-            let hue = Double(i) * goldenAngle
-            let h = hue - hue.rounded(.down)
-            map[project] = Color(hue: h, saturation: 0.65, brightness: 0.9)
+            map[project] = Self.goldenAngleColor(at: i)
         }
         cachedProjectColorMap = map
 
@@ -198,9 +200,138 @@ struct GraphView: View {
         return blended
     }
 
+    /// 3D positions for the current mode. Used by Graph3DView.
+    private var positions3D: [Int64: SIMD3<Float>] {
+        if config.layoutMode == .embedding {
+            let tsne3D = embeddingProjection.projectedPositions3D
+            guard !tsne3D.isEmpty else { return simulation3D.positions }
+            if transitionProgress >= 1.0 { return tsne3D }
+            // Lerp between force snapshot and t-SNE
+            var blended: [Int64: SIMD3<Float>] = [:]
+            let allIds = Set(forcePositionSnapshot3D.keys).union(tsne3D.keys)
+            for id in allIds {
+                let forcePos = forcePositionSnapshot3D[id] ?? simulation3D.positions[id] ?? .zero
+                let tsnePos = tsne3D[id] ?? forcePos
+                blended[id] = forcePos + (tsnePos - forcePos) * Float(transitionProgress)
+            }
+            return blended
+        }
+        return simulation3D.positions
+    }
+
+    private func switchDimensionMode(to mode: DimensionMode, viewSize: CGSize) {
+        guard mode != config.dimensionMode else { return }
+        config.dimensionMode = mode
+
+        switch mode {
+        case .threeD:
+            // Seed 3D simulation from current 2D positions with z-jitter proportional to spread
+            let currentPositions = effectivePositions ?? simulation.positions
+            let xs = currentPositions.values.map { Float($0.x) }
+            let ys = currentPositions.values.map { Float($0.y) }
+            let spreadX = (xs.max() ?? 0) - (xs.min() ?? 0)
+            let spreadY = (ys.max() ?? 0) - (ys.min() ?? 0)
+            let zRange = max(spreadX, spreadY) * 0.4  // z spread = 40% of largest 2D axis
+            var pos3D: [Int64: SIMD3<Float>] = [:]
+            for (id, pt) in currentPositions {
+                pos3D[id] = SIMD3(Float(pt.x), Float(pt.y), Float.random(in: -zRange...zRange))
+            }
+
+            // Rebuild 3D simulation topology
+            let filtered = cachedFilteredNodes
+            let currentIds = Set(filtered.map(\.id))
+            let edgePairs = cachedFilteredEdges.map { ($0.sourceId, $0.targetId) }
+            var projectMap: [Int64: String] = [:]
+            var topicMap: [Int64: String] = [:]
+            for node in filtered { projectMap[node.id] = node.project; topicMap[node.id] = node.topic }
+            simulation3D.updateGraph(nodeIds: currentIds, edges: edgePairs,
+                                     projectForNode: projectMap, topicForNode: topicMap)
+            simulation3D.setPositions(pos3D)
+            simulation3D.isActive = (config.layoutMode == .forceDirected)
+
+            // If in semantic mode, recompute t-SNE in 3D
+            if config.layoutMode == .embedding {
+                forcePositionSnapshot3D = pos3D
+                embeddingProjection.invalidate()
+                let nodeIds = cachedVisibleNodeIds
+                embeddingProjection.loadEmbeddings(for: nodeIds, from: lattice)
+                let nodeScale = max(1.0, sqrt(Float(nodeIds.count) / 30.0))
+                let spread = max(Float(viewSize.width), Float(viewSize.height)) * 1.2 * nodeScale
+
+                Task {
+                    await embeddingProjection.computeProjection3D(
+                        nodeIds: nodeIds, spread: spread, initialPositions: pos3D
+                    )
+                    var topics: [Int64: String] = [:]
+                    var projects: [Int64: String] = [:]
+                    var labels: [Int64: String] = [:]
+                    for node in cachedFilteredNodes {
+                        topics[node.id] = node.topic
+                        projects[node.id] = node.project
+                        labels[node.id] = node.label
+                    }
+                    embeddingProjection.detectClusters3D(nodeTopics: topics, nodeProjects: projects, nodeLabels: labels)
+                }
+            }
+
+        case .twoD:
+            // Project 3D positions to 2D (drop z) and inject into 2D sim
+            let current3D = positions3D
+            var pos2D: [Int64: CGPoint] = [:]
+            for (id, p) in current3D {
+                pos2D[id] = CGPoint(x: CGFloat(p.x), y: CGFloat(p.y))
+            }
+
+            simulation3D.isActive = false
+
+            if config.layoutMode == .forceDirected {
+                simulation.setPositions(pos2D)
+                simulation.isActive = true
+            } else {
+                // Back in 2D semantic — recompute 2D t-SNE
+                embeddingProjection.invalidate()
+                let nodeIds = cachedVisibleNodeIds
+                embeddingProjection.loadEmbeddings(for: nodeIds, from: lattice)
+                let center = simulation.center
+                let nodeScale = max(1.0, sqrt(CGFloat(nodeIds.count) / 30.0))
+                let spread = max(viewSize.width, viewSize.height) * 1.2 * nodeScale
+
+                projectedPositions2DFromSwitch(pos2D)
+
+                Task {
+                    await embeddingProjection.computeProjection(
+                        nodeIds: nodeIds, center: center, spread: spread,
+                        initialPositions: pos2D
+                    )
+                    var topics: [Int64: String] = [:]
+                    var projects: [Int64: String] = [:]
+                    var labels: [Int64: String] = [:]
+                    for node in cachedFilteredNodes {
+                        topics[node.id] = node.topic
+                        projects[node.id] = node.project
+                        labels[node.id] = node.label
+                    }
+                    embeddingProjection.detectClusters(nodeTopics: topics, nodeProjects: projects, nodeLabels: labels)
+                    embeddingProjection.detectVoids(nodeTopics: topics, nodeProjects: projects)
+                }
+            }
+        }
+    }
+
+    /// Helper to set initial 2D positions when switching back from 3D
+    private func projectedPositions2DFromSwitch(_ positions: [Int64: CGPoint]) {
+        forcePositionSnapshot = positions
+        withAnimation(.easeInOut(duration: 0.8)) { transitionProgress = 1.0 }
+    }
+
     private func switchLayoutMode(to mode: LayoutMode, viewSize: CGSize) {
-        guard mode != layoutMode else { return }
-        layoutMode = mode
+        guard mode != config.layoutMode else { return }
+        config.layoutMode = mode
+
+        if config.dimensionMode == .threeD {
+            switchLayoutMode3D(to: mode, viewSize: viewSize)
+            return
+        }
 
         switch mode {
         case .embedding:
@@ -256,7 +387,7 @@ struct GraphView: View {
                 simulation.setPositions(currentPositions)
             }
             simulation.isActive = true
-            showVoids = false
+            config.showVoids = false
 
             // Animate transition back
             withAnimation(.easeInOut(duration: 0.8)) {
@@ -267,6 +398,55 @@ struct GraphView: View {
             Task { @MainActor in
                 try? await Task.sleep(for: .seconds(0.9))
                 forcePositionSnapshot = [:]
+            }
+        }
+    }
+
+    /// Layout mode switching when in 3D dimension mode.
+    private func switchLayoutMode3D(to mode: LayoutMode, viewSize: CGSize) {
+        switch mode {
+        case .embedding:
+            forcePositionSnapshot3D = simulation3D.positions
+            simulation3D.isActive = false
+            embeddingProjection.invalidate()
+
+            let nodeIds = cachedVisibleNodeIds
+            embeddingProjection.loadEmbeddings(for: nodeIds, from: lattice)
+            let nodeScale = max(1.0, sqrt(Float(nodeIds.count) / 30.0))
+            let spread = max(Float(viewSize.width), Float(viewSize.height)) * 1.2 * nodeScale
+
+            withAnimation(.easeInOut(duration: 0.8)) { transitionProgress = 1.0 }
+
+            Task {
+                await embeddingProjection.computeProjection3D(
+                    nodeIds: nodeIds, spread: spread,
+                    initialPositions: forcePositionSnapshot3D
+                )
+                var topics: [Int64: String] = [:]
+                var projects: [Int64: String] = [:]
+                var labels: [Int64: String] = [:]
+                for node in cachedFilteredNodes {
+                    topics[node.id] = node.topic
+                    projects[node.id] = node.project
+                    labels[node.id] = node.label
+                }
+                embeddingProjection.detectClusters3D(nodeTopics: topics, nodeProjects: projects, nodeLabels: labels)
+                projectionTopologyVersion = 0
+            }
+
+        case .forceDirected:
+            let currentPositions = positions3D
+            if !currentPositions.isEmpty {
+                simulation3D.setPositions(currentPositions)
+            }
+            simulation3D.isActive = true
+            config.showVoids = false
+
+            withAnimation(.easeInOut(duration: 0.8)) { transitionProgress = 0 }
+
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(0.9))
+                forcePositionSnapshot3D = [:]
             }
         }
     }
@@ -327,19 +507,25 @@ struct GraphView: View {
             )
             allNodes[pk] = node
             newNodes[pk] = Date()
-            let visible = !hiddenProjects.contains(node.project) &&
+            let visible = !config.hiddenProjects.contains(node.project) &&
                 (debouncedTimeSliderDate == nil || node.createdAt <= debouncedTimeSliderDate!)
             if visible {
                 cachedFilteredNodes.append(node)
                 cachedVisibleNodeIds.insert(pk)
                 simulation.addNode(pk, project: node.project, topic: node.topic)
+                if config.dimensionMode == .threeD {
+                    simulation3D.addNode(pk, project: node.project, topic: node.topic)
+                }
                 // Add edges for this node from existing edge data
                 let nodeIds = cachedVisibleNodeIds
                 for edge in allEdges.values {
                     if (edge.sourceId == pk || edge.targetId == pk) &&
                        nodeIds.contains(edge.sourceId) && nodeIds.contains(edge.targetId) &&
-                       !hiddenRelations.contains(edge.relation) {
+                       !config.hiddenRelations.contains(edge.relation) {
                         simulation.addEdge(from: edge.sourceId, to: edge.targetId)
+                        if config.dimensionMode == .threeD {
+                            simulation3D.addEdge(from: edge.sourceId, to: edge.targetId)
+                        }
                         if !cachedFilteredEdges.contains(where: { $0.id == edge.id }) {
                             cachedFilteredEdges.append(edge)
                         }
@@ -349,6 +535,11 @@ struct GraphView: View {
                 for edge in allEdges.values where edge.relation == "part_of" && edge.targetId == pk {
                     cachedHubs.insert(pk)
                     break
+                }
+                // Assign color for previously unseen project
+                if cachedProjectColorMap[node.project] == nil && node.project != "global" {
+                    let idx = cachedProjectColorMap.count - 1 // subtract "global" entry
+                    cachedProjectColorMap[node.project] = Self.goldenAngleColor(at: idx)
                 }
             }
 
@@ -384,7 +575,7 @@ struct GraphView: View {
             if let idx = cachedFilteredNodes.firstIndex(where: { $0.id == pk }) {
                 cachedFilteredNodes[idx] = node
             }
-            if old!.project != node.project || old!.topic != node.topic {
+            if old?.project != node.project || old?.topic != node.topic {
                 recomputeFilteredData()
                 rebuildSimulationGraph()
             }
@@ -424,9 +615,12 @@ struct GraphView: View {
             cachedEdgeCountByNode[data.targetId, default: 0] += 1
             let nodeIds = cachedVisibleNodeIds
             if nodeIds.contains(data.sourceId) && nodeIds.contains(data.targetId) &&
-               !hiddenRelations.contains(data.relation) {
+               !config.hiddenRelations.contains(data.relation) {
                 cachedFilteredEdges.append(data)
                 simulation.addEdge(from: data.sourceId, to: data.targetId)
+                if config.dimensionMode == .threeD {
+                    simulation3D.addEdge(from: data.sourceId, to: data.targetId)
+                }
             }
             if data.relation == "part_of" { cachedHubs.insert(data.targetId) }
 
@@ -455,14 +649,14 @@ struct GraphView: View {
 
     private func recomputeFilteredData() {
         cachedFilteredNodes = allNodes.values.filter { node in
-            !hiddenProjects.contains(node.project) &&
+            !config.hiddenProjects.contains(node.project) &&
             (debouncedTimeSliderDate == nil || node.createdAt <= debouncedTimeSliderDate!)
         }
         recomputeHubs()
         let nodeIds = Set(cachedFilteredNodes.map(\.id))
         cachedFilteredEdges = allEdges.values.filter { edge in
             nodeIds.contains(edge.sourceId) && nodeIds.contains(edge.targetId) &&
-            !hiddenRelations.contains(edge.relation)
+            !config.hiddenRelations.contains(edge.relation)
         }
         recomputeDerivedData()
     }
@@ -485,9 +679,16 @@ struct GraphView: View {
             projectMap[node.id] = node.project
             topicMap[node.id] = node.topic
         }
-            simulation.updateGraph(nodeIds: currentIds, edges: edgePairs, projectForNode: projectMap, topicForNode: topicMap)
+        simulation.updateGraph(nodeIds: currentIds, edges: edgePairs, projectForNode: projectMap, topicForNode: topicMap)
+
+        // Also update 3D simulation when in 3D mode
+        if config.dimensionMode == .threeD {
+            simulation3D.updateGraph(nodeIds: currentIds, edges: edgePairs,
+                                     projectForNode: projectMap, topicForNode: topicMap)
+        }
+
         // Mark embedding projection stale if topology changed while in embedding mode
-        if layoutMode == .embedding {
+        if config.layoutMode == .embedding {
             projectionTopologyVersion &+= 1
         }
     }
@@ -521,14 +722,14 @@ struct GraphView: View {
                 }
                 .onChange(of: allNodes.count) { oldCount, newCount in
                     guard newCount != oldCount else { return }
-                    guard UserDefaults.standard.bool(forKey: "soundEnabled") else { return }
+                    guard config.soundEnabled else { return }
                     let sound = newCount > oldCount
                         ? "/System/Library/Sounds/Funk.aiff"
                         : "/System/Library/Sounds/Bottle.aiff"
                     NSSound(contentsOf: URL(fileURLWithPath: sound), byReference: true)?.play()
                 }
                 // hiddenProjects changes handled surgically in toggleProject()
-                .onChange(of: hiddenRelations) { _, _ in
+                .onChange(of: config.hiddenRelations) { _, _ in
                     recomputeFilteredData()
                     rebuildSimulationGraph()
                 }
@@ -577,7 +778,11 @@ struct GraphView: View {
         ZStack {
             Color(red: 0.051, green: 0.067, blue: 0.09).ignoresSafeArea()
 
-            graphCanvas(colorMap: colorMap)
+            if config.dimensionMode == .threeD {
+                graph3DView(colorMap: colorMap)
+            } else {
+                graphCanvas(colorMap: colorMap)
+            }
             graphOverlays(size: size, colorMap: colorMap)
             detailPanel(size: size, colorMap: colorMap)
         }
@@ -599,13 +804,41 @@ struct GraphView: View {
             clusters: clusterGroups,
             topicGroups: cachedTopicGroups,
             colorMap: colorMap,
-            layoutMode: layoutMode,
+            layoutMode: config.layoutMode,
             overridePositions: effectivePositions,
-            knowledgeVoids: showVoids ? embeddingProjection.knowledgeVoids : [],
+            knowledgeVoids: config.showVoids ? embeddingProjection.knowledgeVoids : [],
             semanticClusters: embeddingProjection.semanticClusters,
             projectionState: embeddingProjection.state,
             onAnimationTick: { embeddingProjection.tickAnimation() }
         )
+    }
+
+    private func graph3DView(colorMap: [String: Color]) -> some View {
+        Graph3DView(
+            nodes: cachedFilteredNodes,
+            edges: cachedFilteredEdges,
+            hubs: cachedHubs,
+            colorMap: colorMap,
+            layoutMode: config.layoutMode,
+            selectedNode: $selectedMemoryId,
+            glowingNodes: glowingNodes,
+            newNodes: newNodes,
+            dyingNodes: dyingNodes,
+            semanticClusters3D: embeddingProjection.semanticClusters3D,
+            topicGroups: cachedTopicGroups,
+            clusters: clusterGroups,
+            onAnimationTick: {
+                simulation3D.tick()
+                embeddingProjection.tickAnimation3D()
+                return positions3D
+            },
+            onCameraUpdate: { azimuth, camPos, camTarget in
+                camera3DAzimuth = azimuth
+                camera3DPosition = camPos
+                camera3DTarget = camTarget
+            }
+        )
+        .transaction { $0.animation = nil }  // prevent overlay animations from resizing the 3D view
     }
 
     @ViewBuilder
@@ -616,8 +849,8 @@ struct GraphView: View {
                 visibleMemoryCount: cachedVisibleNodeIds.count,
                 visibleEdgeCount: cachedFilteredEdges.count,
                 totalMemories: allNodes.count,
-                hiddenProjects: hiddenProjects,
-                hiddenRelations: hiddenRelations,
+                hiddenProjects: config.hiddenProjects,
+                hiddenRelations: config.hiddenRelations,
                 projects: uniqueProjects(),
                 allRelationCounts: cachedRelationCounts,
                 toggleProject: toggleProject,
@@ -649,14 +882,20 @@ struct GraphView: View {
                 )
                 SoundToggleButton()
                 LayoutModePicker(
-                    mode: layoutMode,
+                    mode: config.layoutMode,
                     projectionState: embeddingProjection.state,
                     onModeChange: { mode in
                         switchLayoutMode(to: mode, viewSize: NSApp.keyWindow?.frame.size ?? CGSize(width: 800, height: 600))
                     }
                 )
-                if layoutMode == .embedding && embeddingProjection.state == .ready {
-                    VoidToggleButton(showVoids: $showVoids)
+                DimensionToggle(
+                    mode: config.dimensionMode,
+                    onModeChange: { mode in
+                        switchDimensionMode(to: mode, viewSize: NSApp.keyWindow?.frame.size ?? CGSize(width: 800, height: 600))
+                    }
+                )
+                if config.layoutMode == .embedding && embeddingProjection.state == .ready && config.dimensionMode == .twoD {
+                    VoidToggleButton(showVoids: Bindable(config).showVoids)
                 }
                 Spacer()
             }
@@ -679,7 +918,11 @@ struct GraphView: View {
                         viewport: viewport,
                         viewportSize: size,
                         colorMap: colorMap,
-                        pipAction: { minimapDetached = true }
+                        pipAction: { minimapDetached = true },
+                        positions3D: config.dimensionMode == .threeD ? positions3D : nil,
+                        cameraAzimuth: config.dimensionMode == .threeD ? camera3DAzimuth : nil,
+                        cameraPosition3D: config.dimensionMode == .threeD ? camera3DPosition : nil,
+                        cameraTarget3D: config.dimensionMode == .threeD ? camera3DTarget : nil
                     )
                     .background(GeometryReader { geo in
                         Color.clear.preference(
@@ -701,16 +944,17 @@ struct GraphView: View {
         )
         .frame(width: 0, height: 0)
 
-        VStack {
-            Spacer()
-            let range = dateRange
-            TimeSliderBar(
-                earliestDate: range.earliest,
-                latestDate: range.latest,
-                sliderDate: $timeSliderDate,
-                isPlaying: $isTimelinePlaying
-            )
-        }
+        // Timeline slider hidden — not useful in current state
+        // VStack {
+        //     Spacer()
+        //     let range = dateRange
+        //     TimeSliderBar(
+        //         earliestDate: range.earliest,
+        //         latestDate: range.latest,
+        //         sliderDate: $timeSliderDate,
+        //         isPlaying: $isTimelinePlaying
+        //     )
+        // }
     }
 
     @ViewBuilder
@@ -746,12 +990,17 @@ struct GraphView: View {
             viewportSize: size,
             colorMap: colorMap,
             pipAction: { minimapPanel.animatedDismiss { minimapDetached = false } },
-            isFloating: true
+            isFloating: true,
+            positions3D: config.dimensionMode == .threeD ? positions3D : nil
+            // No camera chevron in floating mode (per user request)
         )
     }
 
     private func installScrollMonitor() {
         scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { event in
+            // In 3D mode, Graph3DView handles its own scroll-to-pan
+            if config.dimensionMode == .threeD { return event }
+
             if let window = event.window {
                 let loc = event.locationInWindow
                 let rightEdge = window.frame.width
@@ -815,11 +1064,11 @@ struct GraphView: View {
     // MARK: - Helpers
 
     private func toggleProject(_ project: String) {
-        if hiddenProjects.contains(project) {
-            hiddenProjects.remove(project)
+        if config.hiddenProjects.contains(project) {
+            config.hiddenProjects.remove(project)
             showProject(project)
         } else {
-            hiddenProjects.insert(project)
+            config.hiddenProjects.insert(project)
             hideProject(project)
         }
     }
@@ -853,7 +1102,7 @@ struct GraphView: View {
         let allVisibleIds = cachedVisibleNodeIds
         let newEdges = allEdges.values.filter { edge in
             allVisibleIds.contains(edge.sourceId) && allVisibleIds.contains(edge.targetId) &&
-            !hiddenRelations.contains(edge.relation) &&
+            !config.hiddenRelations.contains(edge.relation) &&
             !cachedFilteredEdges.contains(where: { $0.id == edge.id })
         }
         cachedFilteredEdges.append(contentsOf: newEdges)
@@ -873,10 +1122,10 @@ struct GraphView: View {
     }
 
     private func toggleRelation(_ relation: String) {
-        if hiddenRelations.contains(relation) {
-            hiddenRelations.remove(relation)
+        if config.hiddenRelations.contains(relation) {
+            config.hiddenRelations.remove(relation)
         } else {
-            hiddenRelations.insert(relation)
+            config.hiddenRelations.insert(relation)
         }
     }
 
@@ -926,6 +1175,14 @@ struct GraphView: View {
         }
     }
 
+    /// Generate a deterministic color for a project at a given index using golden-angle spacing.
+    private static let goldenAngle = 0.381966011250105
+    static func goldenAngleColor(at index: Int) -> Color {
+        let hue = Double(index) * goldenAngle
+        let h = hue - hue.rounded(.down)
+        return Color(hue: h, saturation: 0.65, brightness: 0.9)
+    }
+
     /// Look up a project's color from a pre-built map. Falls back to gray for unknown projects.
     static func projectColor(for project: String, in colorMap: [String: Color]) -> Color {
         colorMap[project] ?? .gray
@@ -936,18 +1193,18 @@ struct GraphView: View {
 // MARK: - Sound Toggle (isolated to avoid re-rendering GraphView)
 
 struct SoundToggleButton: View {
-    @AppStorage("soundEnabled") private var soundEnabled = false
+    @Environment(VisualizerConfig.self) private var config
 
     var body: some View {
         Button {
-            soundEnabled.toggle()
+            config.soundEnabled.toggle()
         } label: {
-            Image(systemName: soundEnabled ? "speaker.wave.2.fill" : "speaker.slash.fill")
+            Image(systemName: config.soundEnabled ? "speaker.wave.2.fill" : "speaker.slash.fill")
                 .font(.system(size: 12))
-                .foregroundStyle(.white.opacity(soundEnabled ? 0.7 : 0.3))
+                .foregroundStyle(.white.opacity(config.soundEnabled ? 0.7 : 0.3))
         }
         .buttonStyle(.plain)
-        .help(soundEnabled ? "Mute notifications" : "Unmute notifications")
+        .help(config.soundEnabled ? "Mute notifications" : "Unmute notifications")
     }
 }
 

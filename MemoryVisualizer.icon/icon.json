@@ -1,0 +1,41 @@
+{
+  "fill" : {
+    "automatic-gradient" : "extended-srgb:0.00000,0.53333,1.00000,1.00000"
+  },
+  "groups" : [
+    {
+      "blur-material" : 0.5,
+      "layers" : [
+        {
+          "blend-mode" : "darken",
+          "glass" : true,
+          "hidden" : false,
+          "image-name" : "gen-adc9fd93-118c-4ac5-8d0f-adc816f57289.png",
+          "name" : "gen-adc9fd93-118c-4ac5-8d0f-adc816f57289",
+          "position" : {
+            "scale" : 1.4,
+            "translation-in-points" : [
+              0,
+              0
+            ]
+          }
+        }
+      ],
+      "shadow" : {
+        "kind" : "neutral",
+        "opacity" : 0.5
+      },
+      "specular" : true,
+      "translucency" : {
+        "enabled" : true,
+        "value" : 0.5
+      }
+    }
+  ],
+  "supported-platforms" : {
+    "circles" : [
+      "watchOS"
+    ],
+    "squares" : "shared"
+  }
+}

@@ -646,6 +646,9 @@ struct GraphCanvas: View {
 
             let targetNode = nodeByPk[edge.targetId]
             let targetRadius = targetNode.map { nodeRadius(for: $0) } ?? baseRadius
+            // Project color from source node (consistent with 3D edge coloring)
+            let sourceProject = nodeByPk[edge.sourceId]?.project ?? "global"
+            let projectColor = GraphView.projectColor(for: sourceProject, in: colorMap)
 
             let mid = CGPoint(
                 x: (from.x + to.x) / 2 + (from.y - to.y) * 0.08,
@@ -662,14 +665,15 @@ struct GraphCanvas: View {
 
             if isConnected {
                 let color = GraphView.projectColor(for: selectedProject, in: colorMap)
-                context.stroke(path, with: .color(color.opacity(0.6)), lineWidth: 2)
+                context.stroke(path, with: .color(color.opacity(0.6)), lineWidth: 2.5)
             } else {
-                let baseOpacity: CGFloat = semanticDimmed ? 0.03 : ((dimmed || searchDimmed) ? 0.05 : 0.15)
-                context.stroke(path, with: .color(relationColor.opacity(baseOpacity)), lineWidth: semanticDimmed ? 0.5 : 1.2)
+                let baseOpacity: CGFloat = semanticDimmed ? 0.03 : ((dimmed || searchDimmed) ? 0.06 : 0.18)
+                let lineWidth: CGFloat = semanticDimmed ? 0.5 : 1.5
+                context.stroke(path, with: .color(projectColor.opacity(baseOpacity)), lineWidth: lineWidth)
             }
 
-            // Arrow head
-            let arrowOpacity: CGFloat = isConnected ? 0.6 : (semanticDimmed ? 0.03 : ((dimmed || searchDimmed) ? 0.05 : 0.15))
+            // Arrow head — uses relation color to preserve edge type information
+            let arrowOpacity: CGFloat = isConnected ? 0.6 : (semanticDimmed ? 0.03 : ((dimmed || searchDimmed) ? 0.06 : 0.18))
             let arrowColor = isConnected
                 ? GraphView.projectColor(for: selectedProject, in: colorMap)
                 : relationColor

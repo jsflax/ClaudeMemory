@@ -16,29 +16,47 @@ struct TSNEKernel: Sendable {
         let perplexity: Double     // default 30
         let maxIterations: Int     // default 1000
         let initialPositions: [(x: Double, y: Double)]?  // optional init from force layout
+        let outputDims: Int        // 2 or 3
+
+        init(embeddings: [[Float]], ids: [Int64], perplexity: Double, maxIterations: Int,
+             initialPositions: [(x: Double, y: Double)]?, outputDims: Int = 2) {
+            self.embeddings = embeddings
+            self.ids = ids
+            self.perplexity = perplexity
+            self.maxIterations = maxIterations
+            self.initialPositions = initialPositions
+            self.outputDims = outputDims
+        }
     }
 
     struct Output: Sendable {
         let positions: [(id: Int64, x: Double, y: Double)]
+        /// Non-nil only when outputDims == 3
+        let zValues: [Double]?
     }
 
     @ForceSimulatorActor
     static func compute(
         _ input: Input,
         progress: @Sendable (Double) -> Void,
-        onPositions: @Sendable ([(id: Int64, x: Double, y: Double)]) -> Void = { _ in }
+        onPositions: @Sendable ([(id: Int64, x: Double, y: Double)], _ zValues: [Double]?) -> Void = { _, _ in }
     ) -> Output {
         let n = input.embeddings.count
+        let D = input.outputDims  // output dimensionality (2 or 3)
         guard n >= 2 else {
-            return Output(positions: input.ids.enumerated().map { (i, id) in
-                (id: id, x: Double(i) * 50, y: 0)
-            })
+            return Output(
+                positions: input.ids.enumerated().map { (i, id) in (id: id, x: Double(i) * 50, y: 0) },
+                zValues: D == 3 ? [Double](repeating: 0, count: input.ids.count) : nil
+            )
         }
 
         // --- Step 1: Pairwise cosine distance matrix ---
         let dim = input.embeddings[0].count
         guard dim > 0 else {
-            return Output(positions: input.ids.map { (id: $0, x: 0, y: 0) })
+            return Output(
+                positions: input.ids.map { (id: $0, x: 0, y: 0) },
+                zValues: D == 3 ? [Double](repeating: 0, count: n) : nil
+            )
         }
 
         // Precompute norms
@@ -116,7 +134,9 @@ struct TSNEKernel: Sendable {
         }
 
         // --- Step 4: Gradient descent with early exaggeration ---
-        var Y = [Double](repeating: 0, count: n * 2)  // 2D positions, interleaved [x0,y0,x1,y1,...]
+        // Y is interleaved: [x0,y0,(z0),x1,y1,(z1),...] with D components per point
+        var Y = [Double](repeating: 0, count: n * D)
+
         // Initialize from force layout positions (for smooth visual transition) or random
         if let initPos = input.initialPositions, initPos.count == n {
             var meanX: Double = 0, meanY: Double = 0
@@ -129,17 +149,21 @@ struct TSNEKernel: Sendable {
             }
             let scale = 0.01 / maxRange
             for i in 0..<n {
-                Y[i * 2] = (initPos[i].x - meanX) * scale
-                Y[i * 2 + 1] = (initPos[i].y - meanY) * scale
+                Y[i * D] = (initPos[i].x - meanX) * scale
+                Y[i * D + 1] = (initPos[i].y - meanY) * scale
+                if D == 3 {
+                    // Initialize z with small random jitter
+                    Y[i * D + 2] = Double.random(in: -0.005...0.005)
+                }
             }
         } else {
-            for i in 0..<(n * 2) {
+            for i in 0..<(n * D) {
                 Y[i] = Double.random(in: -0.01...0.01)
             }
         }
 
-        var gains = [Double](repeating: 1, count: n * 2)
-        var velocities = [Double](repeating: 0, count: n * 2)
+        var gains = [Double](repeating: 1, count: n * D)
+        var velocities = [Double](repeating: 0, count: n * D)
 
         let earlyExaggerationIters = min(250, input.maxIterations / 4)
         let earlyExaggeration: Double = 12.0
@@ -157,9 +181,12 @@ struct TSNEKernel: Sendable {
             var sumQ: Double = 0
             for i in 0..<n {
                 for j in (i + 1)..<n {
-                    let dy0 = Y[i * 2] - Y[j * 2]
-                    let dy1 = Y[i * 2 + 1] - Y[j * 2 + 1]
-                    let qij = 1.0 / (1.0 + dy0 * dy0 + dy1 * dy1)
+                    var distSq: Double = 0
+                    for d in 0..<D {
+                        let diff = Y[i * D + d] - Y[j * D + d]
+                        distSq += diff * diff
+                    }
+                    let qij = 1.0 / (1.0 + distSq)
                     Q[i * n + j] = qij
                     Q[j * n + i] = qij
                     sumQ += 2 * qij
@@ -168,23 +195,20 @@ struct TSNEKernel: Sendable {
             if sumQ < 1e-300 { sumQ = 1e-300 }
 
             // Compute gradients
-            var gradients = [Double](repeating: 0, count: n * 2)
+            var gradients = [Double](repeating: 0, count: n * D)
             for i in 0..<n {
-                var gx: Double = 0
-                var gy: Double = 0
                 for j in 0..<n where j != i {
                     let pij = P[i * n + j] * exaggeration
                     let qij = Q[i * n + j] / sumQ
                     let mult = 4.0 * (pij - qij) * Q[i * n + j]
-                    gx += mult * (Y[i * 2] - Y[j * 2])
-                    gy += mult * (Y[i * 2 + 1] - Y[j * 2 + 1])
+                    for d in 0..<D {
+                        gradients[i * D + d] += mult * (Y[i * D + d] - Y[j * D + d])
+                    }
                 }
-                gradients[i * 2] = gx
-                gradients[i * 2 + 1] = gy
             }
 
             // Update with adaptive gains and momentum
-            for i in 0..<(n * 2) {
+            for i in 0..<(n * D) {
                 let sameSign = (gradients[i] > 0) == (velocities[i] > 0)
                 gains[i] = sameSign ? max(gains[i] * 0.8, 0.01) : gains[i] + 0.2
                 velocities[i] = momentum * velocities[i] - learningRate * gains[i] * gradients[i]
@@ -192,16 +216,13 @@ struct TSNEKernel: Sendable {
             }
 
             // Center the solution
-            var meanX: Double = 0, meanY: Double = 0
+            var means = [Double](repeating: 0, count: D)
             for i in 0..<n {
-                meanX += Y[i * 2]
-                meanY += Y[i * 2 + 1]
+                for d in 0..<D { means[d] += Y[i * D + d] }
             }
-            meanX /= Double(n)
-            meanY /= Double(n)
+            for d in 0..<D { means[d] /= Double(n) }
             for i in 0..<n {
-                Y[i * 2] -= meanX
-                Y[i * 2 + 1] -= meanY
+                for d in 0..<D { Y[i * D + d] -= means[d] }
             }
 
             // Progress callback at ~10% intervals
@@ -217,10 +238,12 @@ struct TSNEKernel: Sendable {
             if (iter + 1) % emitInterval == 0 {
                 var interPositions: [(id: Int64, x: Double, y: Double)] = []
                 interPositions.reserveCapacity(n)
+                var interZ: [Double]? = D == 3 ? [] : nil
                 for i in 0..<n {
-                    interPositions.append((id: input.ids[i], x: Y[i * 2], y: Y[i * 2 + 1]))
+                    interPositions.append((id: input.ids[i], x: Y[i * D], y: Y[i * D + 1]))
+                    if D == 3 { interZ!.append(Y[i * D + 2]) }
                 }
-                onPositions(interPositions)
+                onPositions(interPositions, interZ)
             }
         }
 
@@ -229,9 +252,11 @@ struct TSNEKernel: Sendable {
         // Build output
         var positions: [(id: Int64, x: Double, y: Double)] = []
         positions.reserveCapacity(n)
+        var zValues: [Double]? = D == 3 ? [] : nil
         for i in 0..<n {
-            positions.append((id: input.ids[i], x: Y[i * 2], y: Y[i * 2 + 1]))
+            positions.append((id: input.ids[i], x: Y[i * D], y: Y[i * D + 1]))
+            if D == 3 { zValues!.append(Y[i * D + 2]) }
         }
-        return Output(positions: positions)
+        return Output(positions: positions, zValues: zValues)
     }
 }

@@ -555,45 +555,50 @@ struct StatsOverlay: View {
 
             Divider().frame(width: 100).overlay(Color.white.opacity(0.2))
 
-            // Project filters
-            ForEach(projects, id: \.self) { project in
-                Button {
-                    toggleProject(project)
-                } label: {
-                    HStack(spacing: 6) {
-                        Circle()
-                            .fill(GraphView.projectColor(for: project, in: colorMap))
-                            .frame(width: 8, height: 8)
-                            .opacity(hiddenProjects.contains(project) ? 0.3 : 1.0)
-                        Text(project)
-                            .font(.system(size: 11, design: .monospaced))
-                            .strikethrough(hiddenProjects.contains(project))
+            ScrollView(.vertical, showsIndicators: false) {
+                VStack(alignment: .trailing, spacing: 6) {
+                    // Project filters
+                    ForEach(projects, id: \.self) { project in
+                        Button {
+                            toggleProject(project)
+                        } label: {
+                            HStack(spacing: 6) {
+                                Circle()
+                                    .fill(GraphView.projectColor(for: project, in: colorMap))
+                                    .frame(width: 8, height: 8)
+                                    .opacity(hiddenProjects.contains(project) ? 0.3 : 1.0)
+                                Text(project)
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .strikethrough(hiddenProjects.contains(project))
+                            }
+                        }
+                        .buttonStyle(.plain)
                     }
-                }
-                .buttonStyle(.plain)
-            }
 
-            // Edge type filters (use unfiltered counts so hidden types remain visible)
-            if !allRelationCounts.isEmpty {
-                Divider().frame(width: 100).overlay(Color.white.opacity(0.2))
+                    // Edge type filters (use unfiltered counts so hidden types remain visible)
+                    if !allRelationCounts.isEmpty {
+                        Divider().frame(width: 100).overlay(Color.white.opacity(0.2))
 
-                ForEach(allRelationCounts, id: \.key) { relation, count in
-                    Button {
-                        toggleRelation(relation)
-                    } label: {
-                        HStack(spacing: 6) {
-                            Circle()
-                                .fill(GraphCanvas.relationColors[relation] ?? .white)
-                                .frame(width: 8, height: 8)
-                                .opacity(hiddenRelations.contains(relation) ? 0.3 : 1.0)
-                            Text("\(relation.replacingOccurrences(of: "_", with: " ")) (\(count))")
-                                .font(.system(size: 11, design: .monospaced))
-                                .strikethrough(hiddenRelations.contains(relation))
+                        ForEach(allRelationCounts, id: \.key) { relation, count in
+                            Button {
+                                toggleRelation(relation)
+                            } label: {
+                                HStack(spacing: 6) {
+                                    Circle()
+                                        .fill(GraphCanvas.relationColors[relation] ?? .white)
+                                        .frame(width: 8, height: 8)
+                                        .opacity(hiddenRelations.contains(relation) ? 0.3 : 1.0)
+                                    Text("\(relation.replacingOccurrences(of: "_", with: " ")) (\(count))")
+                                        .font(.system(size: 11, design: .monospaced))
+                                        .strikethrough(hiddenRelations.contains(relation))
+                                }
+                            }
+                            .buttonStyle(.plain)
                         }
                     }
-                    .buttonStyle(.plain)
                 }
             }
+            .frame(maxHeight: 300)
         }
         .foregroundStyle(.white.opacity(0.7))
         .padding(12)
@@ -615,6 +620,12 @@ struct MinimapView: View {
     let colorMap: [String: Color]
     var pipAction: (() -> Void)?
     var isFloating: Bool = false
+
+    // 3D mode — when positions3D is present, renders XZ top-down projection + camera chevron
+    var positions3D: [Int64: SIMD3<Float>]? = nil
+    var cameraAzimuth: Float? = nil
+    var cameraPosition3D: SIMD3<Float>? = nil
+    var cameraTarget3D: SIMD3<Float>? = nil
 
     @State private var frameCount: UInt64 = 0
     @State private var isHovered: Bool = false
@@ -661,7 +672,7 @@ struct MinimapView: View {
         .shadow(color: .black.opacity(isFloating ? 0.5 : 0), radius: 12)
         .onHover { isHovered = $0 }
         .onReceive(timer) { _ in
-            if simulation.isActive || !glowingNodes.isEmpty || !newNodes.isEmpty || !dyingNodes.isEmpty {
+            if positions3D != nil || simulation.isActive || !glowingNodes.isEmpty || !newNodes.isEmpty || !dyingNodes.isEmpty {
                 frameCount &+= 1
             }
         }
@@ -669,9 +680,20 @@ struct MinimapView: View {
 
     @ViewBuilder
     private func minimapCanvas(nodes: [NodeData], hubIds: Set<Int64>) -> some View {
+        let is3D = positions3D != nil
         let canvas = Canvas { context, size in
             let _ = frameCount
-            let positions = simulation.positions
+            // In 3D mode, project XZ plane; in 2D, use force simulation positions
+            let positions: [Int64: CGPoint]
+            if let pos3D = positions3D {
+                var projected: [Int64: CGPoint] = [:]
+                for (id, p) in pos3D {
+                    projected[id] = CGPoint(x: CGFloat(p.x), y: CGFloat(p.z))
+                }
+                positions = projected
+            } else {
+                positions = simulation.positions
+            }
             guard !positions.isEmpty else { return }
 
             let bounds = computeBounds(positions: positions)
@@ -748,8 +770,8 @@ struct MinimapView: View {
                 }
             }
 
-            // Dying node ghosts (red to black fade-out)
-            let dying = dyingNodes
+            // Dying node ghosts (red to black fade-out) — 2D only, ghosts store CGPoint positions
+            let dying = is3D ? [:] : dyingNodes
             for (_, ghost) in dying {
                 let elapsed = now.timeIntervalSince(ghost.startTime)
                 let flashIn: CGFloat = 0.3, hold: CGFloat = 1.2, fadeOutD: CGFloat = 1.5
@@ -778,22 +800,65 @@ struct MinimapView: View {
                 context.fill(Circle().path(in: rect), with: .color(red.opacity(di)))
             }
 
-            let vpWorldX = -viewport.offset.x / viewport.scale
-            let vpWorldY = -viewport.offset.y / viewport.scale
-            let vpWorldW = viewportSize.width / viewport.scale
-            let vpWorldH = viewportSize.height / viewport.scale
+            if is3D, let camPos = cameraPosition3D, let camTarget = cameraTarget3D, !isFloating {
+                // Camera chevron — shows position and look direction on XZ plane
+                let camMx = (CGFloat(camPos.x) - bounds.minX) * mapScale
+                let camMy = (CGFloat(camPos.z) - bounds.minY) * mapScale
 
-            let vpRect = CGRect(
-                x: (vpWorldX - bounds.minX) * mapScale,
-                y: (vpWorldY - bounds.minY) * mapScale,
-                width: vpWorldW * mapScale,
-                height: vpWorldH * mapScale
-            )
-            context.stroke(
-                Rectangle().path(in: vpRect),
-                with: .color(.white.opacity(0.5)),
-                lineWidth: 1
-            )
+                // Look direction on XZ plane
+                let dx = CGFloat(camTarget.x - camPos.x)
+                let dz = CGFloat(camTarget.z - camPos.z)
+                let angle = atan2(dz, dx)  // angle in minimap space (X right, Y down=Z+)
+
+                // Draw chevron (triangle pointing in look direction)
+                let chevronSize: CGFloat = 8 * dotScale
+                var chevron = Path()
+                // Tip (front)
+                chevron.move(to: CGPoint(
+                    x: camMx + cos(angle) * chevronSize,
+                    y: camMy + sin(angle) * chevronSize
+                ))
+                // Left wing
+                let wingAngle = angle + .pi * 0.75
+                chevron.addLine(to: CGPoint(
+                    x: camMx + cos(wingAngle) * chevronSize * 0.7,
+                    y: camMy + sin(wingAngle) * chevronSize * 0.7
+                ))
+                // Notch (back center)
+                let backAngle = angle + .pi
+                chevron.addLine(to: CGPoint(
+                    x: camMx + cos(backAngle) * chevronSize * 0.25,
+                    y: camMy + sin(backAngle) * chevronSize * 0.25
+                ))
+                // Right wing
+                let rightWingAngle = angle - .pi * 0.75
+                chevron.addLine(to: CGPoint(
+                    x: camMx + cos(rightWingAngle) * chevronSize * 0.7,
+                    y: camMy + sin(rightWingAngle) * chevronSize * 0.7
+                ))
+                chevron.closeSubpath()
+
+                context.fill(chevron, with: .color(.white.opacity(0.9)))
+                context.stroke(chevron, with: .color(.white.opacity(0.4)), lineWidth: 0.5)
+            } else if !is3D {
+                // 2D viewport rectangle
+                let vpWorldX = -viewport.offset.x / viewport.scale
+                let vpWorldY = -viewport.offset.y / viewport.scale
+                let vpWorldW = viewportSize.width / viewport.scale
+                let vpWorldH = viewportSize.height / viewport.scale
+
+                let vpRect = CGRect(
+                    x: (vpWorldX - bounds.minX) * mapScale,
+                    y: (vpWorldY - bounds.minY) * mapScale,
+                    width: vpWorldW * mapScale,
+                    height: vpWorldH * mapScale
+                )
+                context.stroke(
+                    Rectangle().path(in: vpRect),
+                    with: .color(.white.opacity(0.5)),
+                    lineWidth: 1
+                )
+            }
         }
 
         if isFloating {
@@ -816,6 +881,8 @@ struct MinimapView: View {
     }
 
     private func navigateTo(location: CGPoint, in size: CGSize) {
+        // Tap-to-navigate only works in 2D mode
+        guard positions3D == nil else { return }
         let positions = simulation.positions
         guard !positions.isEmpty else { return }
         let bounds = computeBounds(positions: positions)
@@ -968,6 +1035,49 @@ struct LayoutModePicker: View {
                 .foregroundStyle(.white.opacity(mode == m ? 0.9 : 0.4))
             }
         }
+        .padding(2)
+        .background(
+            RoundedRectangle(cornerRadius: 7)
+                .fill(Color(red: 0.08, green: 0.1, blue: 0.14))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 7)
+                        .strokeBorder(.white.opacity(0.1), lineWidth: 1)
+                )
+        )
+    }
+}
+
+// MARK: - Dimension Toggle
+
+struct DimensionToggle: View {
+    let mode: DimensionMode
+    let onModeChange: (DimensionMode) -> Void
+
+    var body: some View {
+        HStack(spacing: 0) {
+            ForEach(DimensionMode.allCases, id: \.rawValue) { m in
+                Button {
+                    onModeChange(m)
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: m == .twoD ? "square" : "cube")
+                            .font(.system(size: 10))
+                        Text(m.rawValue)
+                            .font(.system(size: 11, weight: mode == m ? .semibold : .regular, design: .monospaced))
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(
+                        RoundedRectangle(cornerRadius: 5)
+                            .fill(mode == m ? .white.opacity(0.12) : .clear)
+                    )
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.white.opacity(mode == m ? 0.9 : 0.4))
+                .accessibilityIdentifier("dimension-\(m.rawValue)")
+            }
+        }
+        .accessibilityIdentifier("dimension-toggle")
         .padding(2)
         .background(
             RoundedRectangle(cornerRadius: 7)
