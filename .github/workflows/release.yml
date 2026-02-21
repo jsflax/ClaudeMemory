@@ -68,6 +68,7 @@ jobs:
             -configuration Release \
             -skipMacroValidation \
             -skipPackagePluginValidation \
+            ARCHS=arm64 \
             CODE_SIGN_IDENTITY="Developer ID Application" \
             CODE_SIGN_STYLE=Manual \
             DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
