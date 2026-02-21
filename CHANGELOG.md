@@ -2,6 +2,67 @@
 
 All notable changes to ClaudeMemory are documented in this file.
 
+## [0.10.0] - 2026-02-21
+
+### Added
+- **3D graph visualization** — full RealityKit-based 3D view with orbit camera, fog, nebula particle clusters, and depth-sorted canvas labels with shadow outlines
+- **Gamepad support** — FPS-style controls: L-stick move, R-stick look, triggers rise/descend, A select, B deselect, X/Y teleport prev/next project, bumpers cycle nodes
+- **Keyboard teleport** — T/R keys teleport to next/previous project (equivalent to gamepad Y/X)
+- **Teleport to hub node** — camera jumps to the project's hub memory (target of `part_of` edges) with tight orbit radius, falling back to centroid
+- **Live 3D updates** — new memories and edges appear incrementally without app restart via `ForceSimulation3D.addNode()`/`addEdge()`
+- **Progressive t-SNE animation** — nodes smoothly drift from force layout to semantic positions as t-SNE converges, with lerp-based display/target separation
+- **ScreenCaptureKit export** — Export as PNG captures Metal/RealityKit content correctly (replaces obsoleted `CGWindowListCreateImage`)
+- **UI test suite** — Xcode UI test target with frame timing profiler and teleport proximity verification
+- **Xcode project** — `MemoryVisualizer.xcodeproj` for building/testing outside SPM
+- `set_project` parameter on `update` tool for moving memories between project scopes
+
+### Changed
+- Session-learner rewritten as fire-and-forget `claude` CLI subprocess (eliminates Conductor UI collision)
+- Session-learner always spawns when transcript is present (removed productive-tool-call threshold)
+- Uninstall script now cleans up all installed components (hooks, agents, binary)
+- `.mcp.json` added to `.gitignore`
+
+### Improved
+- **3D render performance** — opacity caching skips redundant ECS mutations, edge distance culling hides off-screen edges, position-change detection gates edge geometry updates, label cap at 80 nearest, shadow filter replaces 5-draw stroke (62% work time reduction)
+- **3D drag sync** — `isDragging` flag skips camera lerp during drag so labels and entities move in lockstep
+- **Activity panel selection** — two-way sync via `lastSyncedSelection` prevents Timer from stomping binding changes
+
+### Fixed
+- Teleport double-scaling bug: camera target was scaled by `scaleFactor` twice (once in teleport, again in `cameraTransform`), placing orbit center near origin instead of the target node
+- Teleport label stomping: rapid teleports no longer cancel each other's dismiss timers (counter-based task ID)
+- Session-learner infinite recursion via `CLAUDE_MEMORY_LEARNER` env var guard
+- Conductor UI collision from session-learner nudge ordering
+
+## [0.9.1] - 2026-02-20
+
+### Changed
+- Session-learner always spawns when transcript is present (removed `productiveCount` threshold gate)
+- Improved session-learner prompt: framing changed to "capture what was learned"; explicit skip instruction for trivial sessions
+- Added `--output-format text` to CLI invocation for human-readable session-learner logs
+
+## [0.9.0] - 2026-02-20
+
+### Added
+- **Fire-and-forget session learning** — Stop hook spawns detached `claude` CLI subprocess, eliminating Conductor UI collision
+- **Progressive t-SNE animation** — nodes drift from force layout to semantic positions as t-SNE converges
+- `set_project` parameter on `update` tool for moving memories between project scopes
+
+### Changed
+- Uninstall script cleans up all installed components
+- `.mcp.json` added to `.gitignore`
+
+## [0.8.2] - 2026-02-16
+
+### Added
+- Node lifecycle animations: arrival glow, death fade, and snap-back physics on drag release
+
+## [0.8.1] - 2026-02-16
+
+### Changed
+- Rebalanced force simulation physics for better node spacing
+- Added `summary` parameter to `organize` tool for custom hub descriptions
+- Added test step to release CI workflow
+
 ## [0.8.0] - 2026-02-16
 
 ### Added
@@ -135,6 +196,11 @@ All notable changes to ClaudeMemory are documented in this file.
 - CI/CD with GitHub Actions on macOS 26 / Swift 6.2
 - Homebrew tap workflow
 
+[0.10.0]: https://github.com/jsflax/ClaudeMemory/compare/v0.9.1...v0.10.0
+[0.9.1]: https://github.com/jsflax/ClaudeMemory/compare/v0.9.0...v0.9.1
+[0.9.0]: https://github.com/jsflax/ClaudeMemory/compare/v0.8.2...v0.9.0
+[0.8.2]: https://github.com/jsflax/ClaudeMemory/compare/v0.8.1...v0.8.2
+[0.8.1]: https://github.com/jsflax/ClaudeMemory/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/jsflax/ClaudeMemory/compare/v0.7.3...v0.8.0
 [0.7.1]: https://github.com/jsflax/ClaudeMemory/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/jsflax/ClaudeMemory/compare/v0.6.0...v0.7.0
