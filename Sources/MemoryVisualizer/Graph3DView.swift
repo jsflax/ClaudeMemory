@@ -17,6 +17,8 @@ final class Graph3DScene {
     private var nodeEntities: [Int64: ModelEntity] = [:]
     private var edgeContainer = Entity()
     private var edgeEntities: [EdgeKey: ModelEntity] = [:]
+    private var edgeLastOpacity: [EdgeKey: Float] = [:]
+    private var nodeLastOpacity: [Int64: Float] = [:]
 
     // Camera state — inputs write to target* values, updateCamera() lerps toward them.
     // This smooths out irregular input event timing for silky camera motion.
@@ -529,6 +531,7 @@ final class Graph3DScene {
         for (id, entity) in nodeEntities where !keepIds.contains(id) {
             entity.removeFromParent()
             nodeEntities.removeValue(forKey: id)
+            nodeLastOpacity.removeValue(forKey: id)
         }
 
         // Fog parameters (in scaled coordinates — world values / 200)
@@ -621,7 +624,10 @@ final class Graph3DScene {
             if let entity = nodeEntities[id] {
                 entity.position = worldPos
                 entity.scale = SIMD3<Float>(repeating: importanceRadius)
-                entity.components.set(OpacityComponent(opacity: fogOpacity))
+                if abs(fogOpacity - (nodeLastOpacity[id] ?? -1)) > 0.02 {
+                    entity.components.set(OpacityComponent(opacity: fogOpacity))
+                    nodeLastOpacity[id] = fogOpacity
+                }
                 entity.model?.materials = [material]
             } else {
                 let entity = ModelEntity(mesh: nodeMesh, materials: [material])
@@ -629,6 +635,7 @@ final class Graph3DScene {
                 entity.scale = SIMD3<Float>(repeating: importanceRadius)
                 entity.name = "node_\(id)"
                 entity.components.set(OpacityComponent(opacity: fogOpacity))
+                nodeLastOpacity[id] = fogOpacity
                 entity.components.set(
                     CollisionComponent(shapes: [.generateSphere(radius: 1.0)])
                 )
@@ -722,9 +729,8 @@ final class Graph3DScene {
     /// Caller passes the raw `animationTime`; this method computes both ring phases.
     /// Repositions existing edge entities with pulse animation (no material/topology changes).
     func repositionEdgesAnimated(positions: [Int64: SIMD3<Float>], edges: [EdgeData],
-                                 selectedNode: Int64?) {
-        let camPos = cameraPosition  // scaled coordinates
-        let fogNear: Float = 100
+                                 selectedNode: Int64?, positionsChanged: Bool) {
+        let camPos = cameraPosition  // scaled coordinates (= unscaled, since camPos comes from cameraPosition which uses unscaled coords)
         let fogFar: Float = 1200
         let isSemanticMode = renderLayoutMode == .embedding
 
@@ -733,25 +739,46 @@ final class Graph3DScene {
             guard let entity = edgeEntities[key],
                   let from = positions[edge.sourceId],
                   let to = positions[edge.targetId] else { continue }
-            let p1 = from * scaleFactor
-            let p2 = to * scaleFactor
-            let delta = p2 - p1
-            let length = simd_length(delta)
-            guard length > 0.001 else { continue }
-            let midpoint = (p1 + p2) / 2
+
             let connected = edge.sourceId == selectedNode || edge.targetId == selectedNode
-            let radius = connected ? edgeRadius * 2.5 : edgeRadius * 1.3
 
-            entity.position = midpoint
-            entity.orientation = simd_quatf(from: SIMD3<Float>(0, 1, 0), to: normalize(delta))
-            entity.scale = SIMD3<Float>(radius, length, radius)
+            // Cull edges entirely beyond fog distance (both endpoints far away and not connected)
+            if !connected {
+                let distFrom = simd_length(from - camPos)
+                let distTo = simd_length(to - camPos)
+                if distFrom > fogFar && distTo > fogFar {
+                    // Hide it and skip all work
+                    if edgeLastOpacity[key] != 0 {
+                        entity.components.set(OpacityComponent(opacity: 0))
+                        edgeLastOpacity[key] = 0
+                    }
+                    continue
+                }
+            }
 
-            // Pulse animation (same formula as full update)
+            // Only reposition geometry when node positions actually changed
+            if positionsChanged {
+                let p1 = from * scaleFactor
+                let p2 = to * scaleFactor
+                let delta = p2 - p1
+                let length = simd_length(delta)
+                guard length > 0.001 else { continue }
+                let midpoint = (p1 + p2) / 2
+                let radius = connected ? edgeRadius * 2.5 : edgeRadius * 1.3
+
+                entity.position = midpoint
+                entity.orientation = simd_quatf(from: SIMD3<Float>(0, 1, 0), to: normalize(delta))
+                entity.scale = SIMD3<Float>(radius, length, radius)
+            }
+
+            // Pulse opacity — update every frame but skip ECS mutation if unchanged
             let edgeMid = (from + to) / 2
             let edgeDist = simd_length(edgeMid - camPos)
+            let fogNear: Float = 100
             let fogT = max(0, min(1, (edgeDist - fogNear) / (fogFar - fogNear)))
             let depthFade = max(Float(0.0), 1.0 - fogT * 0.95)
-            let phase = (midpoint.x + midpoint.y + midpoint.z) * 8.0
+            let scaledMid = edgeMid * scaleFactor
+            let phase = (scaledMid.x + scaledMid.y + scaledMid.z) * 8.0
             let pulse = (sin(animationTime * 3.0 + phase) + 1.0) * 0.5
 
             let edgeFog: Float
@@ -762,7 +789,10 @@ final class Graph3DScene {
             } else {
                 edgeFog = (0.06 + pulse * 0.16) * depthFade
             }
-            entity.components.set(OpacityComponent(opacity: edgeFog))
+            if abs(edgeFog - (edgeLastOpacity[key] ?? -1)) > 0.02 {
+                entity.components.set(OpacityComponent(opacity: edgeFog))
+                edgeLastOpacity[key] = edgeFog
+            }
         }
     }
 
@@ -792,6 +822,7 @@ final class Graph3DScene {
         for (key, entity) in edgeEntities where !currentKeys.contains(key) {
             entity.removeFromParent()
             edgeEntities.removeValue(forKey: key)
+            edgeLastOpacity.removeValue(forKey: key)
         }
 
         // Update or create edge entities
@@ -842,13 +873,17 @@ final class Graph3DScene {
                 entity.orientation = rotation
                 entity.scale = SIMD3<Float>(radius, length, radius)
                 entity.model?.materials = [mat]
-                entity.components.set(OpacityComponent(opacity: edgeFog))
+                if abs(edgeFog - (edgeLastOpacity[key] ?? -1)) > 0.02 {
+                    entity.components.set(OpacityComponent(opacity: edgeFog))
+                    edgeLastOpacity[key] = edgeFog
+                }
             } else {
                 let entity = ModelEntity(mesh: edgeMesh, materials: [mat])
                 entity.position = midpoint
                 entity.orientation = rotation
                 entity.scale = SIMD3<Float>(radius, length, radius)
                 entity.components.set(OpacityComponent(opacity: edgeFog))
+                edgeLastOpacity[key] = edgeFog
                 edgeContainer.addChild(entity)
                 edgeEntities[key] = entity
             }
@@ -1126,8 +1161,10 @@ final class Graph3DScene {
     func clearAll() {
         for (_, entity) in nodeEntities { entity.removeFromParent() }
         nodeEntities.removeAll()
+        nodeLastOpacity.removeAll()
         for (_, entity) in edgeEntities { entity.removeFromParent() }
         edgeEntities.removeAll()
+        edgeLastOpacity.removeAll()
         for (_, entity) in nebulaEmitters { entity.removeFromParent() }
         nebulaEmitters.removeAll()
         nebulaColorCache.removeAll()
@@ -1157,10 +1194,38 @@ final class Graph3DScene {
 
     private var renderFrameCount: UInt64 = 0
     private var renderLastSelectedNode: Int64?
+    /// Tracks previous positions to detect when they've changed (avoids redundant edge work).
+    private var prevPositionHash: Int = 0
 
     // Frame timing diagnostics for render tick
     private var renderLogCounter: UInt64 = 0
     private var lastRenderTime: CFAbsoluteTime = 0
+
+    #if DEBUG
+    /// File-based profiling: accumulates frame data, flushes periodically to /tmp/frame-timing.csv
+    private var profilingLines: [String] = []
+    private var profilingFileHandle: FileHandle?
+    private var profilingReady = false
+
+    func setupProfiling() {
+        let path = "/tmp/frame-timing.csv"
+        FileManager.default.createFile(atPath: path, contents: nil)
+        profilingFileHandle = FileHandle(forWritingAtPath: path)
+        let header = "frame,dt_ms,work_ms,repos_ms,nodes_ms,edges_ms,neb_ms,node_count,edge_count,labels_ms\n"
+        profilingFileHandle?.write(header.data(using: .utf8)!)
+        profilingReady = true
+    }
+
+    /// Canvas label timing — written by the SwiftUI overlay, read by renderTick
+    var lastCanvasLabelMs: Double = 0
+
+    private func flushProfiling() {
+        guard profilingReady, !profilingLines.isEmpty else { return }
+        let data = profilingLines.joined().data(using: .utf8)!
+        profilingFileHandle?.write(data)
+        profilingLines.removeAll(keepingCapacity: true)
+    }
+    #endif
 
     /// Lightweight per-frame node update: position + depth fog only.
     /// Skips material selection, glow/arrival animations, and point light management.
@@ -1172,7 +1237,11 @@ final class Graph3DScene {
             let dist = simd_length(pos - camPos)
             let fogT = max(0, min(1, (dist - 100) / 1100))
             let fogOpacity = id == selectedNode ? 1.0 : max(Float(0.08), 1.0 - fogT * 0.92)
-            entity.components.set(OpacityComponent(opacity: fogOpacity))
+            // Skip ECS mutation when opacity hasn't changed visibly
+            if abs(fogOpacity - (nodeLastOpacity[id] ?? -1)) > 0.02 {
+                entity.components.set(OpacityComponent(opacity: fogOpacity))
+                nodeLastOpacity[id] = fogOpacity
+            }
         }
     }
 
@@ -1189,9 +1258,30 @@ final class Graph3DScene {
 
         let selectionChanged = renderSelectedNode != renderLastSelectedNode
 
-        // Every frame: cheap position + fog update
+        // Detect if node positions actually changed since last frame
+        // Use a cheap hash (count + sample positions) rather than comparing all values
+        let posHash: Int = {
+            var h = renderPositions.count
+            // Sample a few positions to detect changes
+            if let first = renderPositions.first {
+                h ^= first.value.x.bitPattern.hashValue
+                h ^= first.value.y.bitPattern.hashValue
+            }
+            if renderPositions.count > 10 {
+                let mid = renderPositions.index(renderPositions.startIndex,
+                                                 offsetBy: renderPositions.count / 2)
+                h ^= renderPositions[mid].value.x.bitPattern.hashValue
+            }
+            return h
+        }()
+        let positionsChanged = posHash != prevPositionHash
+        prevPositionHash = posHash
+
+        // Every frame: cheap position + fog update (skip when nothing moved)
         let t0 = CFAbsoluteTimeGetCurrent()
-        repositionNodes(positions: renderPositions, selectedNode: renderSelectedNode)
+        if positionsChanged {
+            repositionNodes(positions: renderPositions, selectedNode: renderSelectedNode)
+        }
         let tRepos = CFAbsoluteTimeGetCurrent()
 
         // Every 3 frames (or on state change): full material/light/creation/removal
@@ -1216,8 +1306,10 @@ final class Graph3DScene {
             renderLastSelectedNode = renderSelectedNode
         } else {
             // Lightweight: reposition existing edge entities + update pulse opacity
+            // Passes positionsChanged so geometry is only rebuilt when nodes move
             repositionEdgesAnimated(positions: renderPositions, edges: renderEdges,
-                                    selectedNode: renderSelectedNode)
+                                    selectedNode: renderSelectedNode,
+                                    positionsChanged: positionsChanged)
         }
         let tEdges = CFAbsoluteTimeGetCurrent()
 
@@ -1234,14 +1326,23 @@ final class Graph3DScene {
 
         let elapsed = (tNeb - now) * 1000.0
 
+        let msRepos = (tRepos - t0) * 1000
+        let msNodes = (tNodes - tRepos) * 1000
+        let msEdges = (tEdges - tNodes) * 1000
+        let msNeb = (tNeb - tEdges) * 1000
+
         renderLogCounter &+= 1
         if renderLogCounter % 60 == 0 || dt > 25 || elapsed > 10 {
-            let msRepos = (tRepos - t0) * 1000
-            let msNodes = (tNodes - tRepos) * 1000
-            let msEdges = (tEdges - tNodes) * 1000
-            let msNeb = (tNeb - tEdges) * 1000
             frameLog.error("[3D-render] dt=\(dt, format: .fixed(precision: 1))ms work=\(elapsed, format: .fixed(precision: 2))ms repos=\(msRepos, format: .fixed(precision: 2)) nodes=\(msNodes, format: .fixed(precision: 2)) edges=\(msEdges, format: .fixed(precision: 2)) neb=\(msNeb, format: .fixed(precision: 2)) | n=\(self.renderPositions.count) e=\(self.renderEdges.count) frame=\(self.renderFrameCount)")
         }
+
+        #if DEBUG
+        // Write every frame to CSV for profiling analysis
+        if profilingReady {
+            profilingLines.append("\(renderFrameCount),\(String(format: "%.2f", dt)),\(String(format: "%.2f", elapsed)),\(String(format: "%.2f", msRepos)),\(String(format: "%.2f", msNodes)),\(String(format: "%.2f", msEdges)),\(String(format: "%.2f", msNeb)),\(renderPositions.count),\(renderEdges.count),\(String(format: "%.2f", lastCanvasLabelMs))\n")
+            if renderLogCounter % 60 == 0 { flushProfiling() }
+        }
+        #endif
 
         lastRenderTime = now
         renderFrameCount &+= 1
@@ -1410,6 +1511,9 @@ struct Graph3DView: View {
     private var realityViewContent: some View {
         RealityView { content in
             let (root, camera) = scene.setup()
+            #if DEBUG
+            scene.setupProfiling()
+            #endif
             content.add(root)
             content.add(camera)
 
@@ -1556,7 +1660,14 @@ struct Graph3DView: View {
     @ViewBuilder
     private func labelsOverlay(viewSize: CGSize) -> some View {
         let nodeById = Dictionary(nodes.map { ($0.id, $0) }, uniquingKeysWith: { _, last in last })
-        Canvas { context, size in
+        Canvas { [scene] context, size in
+            #if DEBUG
+            let canvasStart = CFAbsoluteTimeGetCurrent()
+            defer {
+                let canvasMs = (CFAbsoluteTimeGetCurrent() - canvasStart) * 1000
+                Task { @MainActor in scene.lastCanvasLabelMs = canvasMs }
+            }
+            #endif
             struct LabelEntry {
                 let id: Int64
                 let screenPos: CGPoint
@@ -1595,8 +1706,20 @@ struct Graph3DView: View {
                 ))
             }
 
-            // Sort back-to-front: far labels drawn first, near labels on top
-            entries.sort { $0.depthFromCam > $1.depthFromCam }
+            // Sort front-to-back first for cap, then reverse for draw order
+            entries.sort { $0.depthFromCam < $1.depthFromCam }
+
+            // Cap at 80 labels max — nearest labels are most important.
+            // Selected and hub nodes always survive the cap.
+            let maxLabels = 80
+            if entries.count > maxLabels {
+                let prioritized = entries.prefix(while: { $0.isSelected || $0.isHub })
+                let rest = entries.dropFirst(prioritized.count)
+                entries = Array(prioritized) + Array(rest.prefix(maxLabels - prioritized.count))
+            }
+
+            // Reverse to back-to-front: far labels drawn first, near labels on top
+            entries.reverse()
 
             let depthRange = max(1, maxDepth - minDepth)
 
@@ -1627,19 +1750,14 @@ struct Graph3DView: View {
                 let fontWeight: Font.Weight = entry.isSelected || entry.isHub ? .bold : .medium
                 let font: Font = .system(size: fontSize, weight: fontWeight, design: .monospaced)
 
-                // Black stroke (4 cardinal offsets) for readability against any background
-                let strokeText = Text(entry.nodeData.label).font(font)
-                    .foregroundStyle(.black.opacity(min(1.0, opacity * 1.5)))
-                for off in [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {
-                    context.draw(strokeText, at: CGPoint(x: labelPos.x + off.0, y: labelPos.y + off.1))
+                // Single draw with shadow for outline — 5x cheaper than 4-offset stroke
+                let text = Text(entry.nodeData.label).font(font)
+                    .foregroundStyle(.white.opacity(opacity))
+                context.drawLayer { layerCtx in
+                    layerCtx.addFilter(.shadow(color: .black.opacity(min(1.0, opacity * 1.5)),
+                                               radius: 1.5, x: 0, y: 0))
+                    layerCtx.draw(text, at: labelPos)
                 }
-
-                // White fill on top
-                context.draw(
-                    Text(entry.nodeData.label).font(font)
-                        .foregroundStyle(.white.opacity(opacity)),
-                    at: labelPos
-                )
             }
         }
         .allowsHitTesting(false)
