@@ -44,11 +44,6 @@ struct PreCompact: AsyncParsableCommand {
         Do this immediately — after compaction, you will not be able to recall these details.
         """)
 
-        // Maintenance nudge (if threshold crossed)
-        if let nudge = maintenanceNudge(project: proj) {
-            sections.append(nudge)
-        }
-
         // Learning nudge
         sections.append(learningNudge(project: proj))
 

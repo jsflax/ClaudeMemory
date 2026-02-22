@@ -174,8 +174,6 @@ To keep memories clean:
 
 When you receive a learning nudge (from the advise hook, delivered via additionalContext on UserPromptSubmit), spawn the `session-learner` sub-agent in the background as instructed. Keep it brief — just one Task tool call, then move on to the user'"'"'s request.
 
-When you receive a maintenance nudge (from the advise hook, triggered after 10+ CRUD operations), spawn the `memory-maintenance` sub-agent in the background as instructed. It handles organization, consolidation, and cleanup autonomously.
-
 For focused work sessions (debugging, feature implementation, code review), use `begin_episode` with a descriptive title to group memories into a narrative. Use `end_episode` with a summary when done. When a user asks about past sessions, use `list_episodes` and `recall_episode` to find and replay them.
 
 Do NOT use ~/.claude/projects/*/memory/ files for memory. All persistent knowledge goes through the memory MCP server.'

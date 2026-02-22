@@ -243,17 +243,19 @@ jobs:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
           TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
           REPO="${{ github.repository }}"
           URL="https://github.com/${REPO}/releases/tag/${TAG}"
-          STATUS="${{ job.status }}"
 
-          if [ "$STATUS" = "success" ]; then
-            EMOJI="✅"
-            TEXT="Release *${TAG}* published successfully"
-          else
-            EMOJI="❌"
-            TEXT="Release *${TAG}* failed"
-          fi
+          # Extract changelog section for this version (between ## [version] and next ## [)
+          CHANGES=$(awk "/^## \\[${VERSION}\\]/{found=1; next} /^## \\[/{if(found) exit} found{print}" CHANGELOG.md \
+            | sed '/^$/d' \
+            | sed 's/^### /\n*/' \
+            | sed 's/^- /• /' \
+            | head -20)
+
+          # Escape for JSON
+          CHANGES_ESCAPED=$(echo "$CHANGES" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read())[1:-1])')
 
           curl -s -X POST "$SLACK_WEBHOOK_URL" \
             -H 'Content-Type: application/json' \
@@ -261,11 +263,11 @@ jobs:
               \"blocks\": [
                 {
                   \"type\": \"header\",
-                  \"text\": {\"type\": \"plain_text\", \"text\": \"${EMOJI} Engram ${TAG}\"}
+                  \"text\": {\"type\": \"plain_text\", \"text\": \"✅ Engram ${TAG} released\"}
                 },
                 {
                   \"type\": \"section\",
-                  \"text\": {\"type\": \"mrkdwn\", \"text\": \"${TEXT}\"},
+                  \"text\": {\"type\": \"mrkdwn\", \"text\": \"${CHANGES_ESCAPED}\"},
                   \"accessory\": {
                     \"type\": \"button\",
                     \"text\": {\"type\": \"plain_text\", \"text\": \"View Release\"},

@@ -175,26 +175,9 @@ struct OnStop: AsyncParsableCommand {
     // MARK: - CLI Spawning
 
     /// The session-learner system prompt, loaded from agents/session-learner.md or inlined.
-    private static let sessionLearnerSystemPrompt: String = {
-        // Try to load from the agents directory relative to the hooks binary
-        let bundlePath = Bundle.main.bundlePath
-        let possiblePaths = [
-            // Relative to the binary in ~/.claude/bin/
-            NSHomeDirectory() + "/.claude/agents/session-learner.md",
-            // Development path
-            bundlePath + "/../../../agents/session-learner.md",
-        ]
-
-        for path in possiblePaths {
-            if let content = try? String(contentsOfFile: path, encoding: .utf8) {
-                // Strip frontmatter (--- delimited block at the start)
-                let stripped = stripFrontmatter(content)
-                return stripped
-            }
-        }
-
-        // Inline fallback
-        return """
+    private static let sessionLearnerSystemPrompt: String = loadAgentSystemPrompt(
+        name: "session-learner",
+        fallback: """
         You are a session learning agent. Your job is to review what happened in a coding session and store the key insights as memories for future recall.
 
         ## Workflow
@@ -210,62 +193,23 @@ struct OnStop: AsyncParsableCommand {
         - Prefer updating existing memories over creating new ones.
         - Keep total turns low: 2-3 recalls, 2-5 remember/update/connect calls, done.
         """
-    }()
+    )
 
-    /// Strip YAML frontmatter from markdown content.
-    private static func stripFrontmatter(_ content: String) -> String {
-        guard content.hasPrefix("---") else { return content }
-        // Find the closing ---
-        let lines = content.components(separatedBy: .newlines)
-        var endIndex = 0
-        for i in 1..<lines.count {
-            if lines[i].hasPrefix("---") {
-                endIndex = i + 1
-                break
-            }
-        }
-        guard endIndex > 0 else { return content }
-        return lines[endIndex...].joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
-    }
+    private static let allowedTools = "mcp__memory__*,Read,Grep,Glob,Bash"
 
     /// Log file path for session-learner output.
     private static let logPath = NSHomeDirectory() + "/.claude/session-learner.log"
 
-    /// Spawn `claude` CLI as a detached fire-and-forget subprocess, logging output to a file.
-    /// Uses /bin/sh with shell redirection to ensure output is captured even with buffered pipes.
+    /// Spawn `claude` CLI as a detached fire-and-forget subprocess for session learning.
     private func spawnSessionLearner(prompt: String, cwd: String?) throws {
-        // Shell-escape the prompt and system prompt for embedding in a sh -c command
-        let escapedPrompt = prompt.replacingOccurrences(of: "'", with: "'\\''")
-        let escapedSystemPrompt = Self.sessionLearnerSystemPrompt.replacingOccurrences(of: "'", with: "'\\''")
-        let allowedTools = "mcp__memory__remember,mcp__memory__recall,mcp__memory__update,mcp__memory__forget,mcp__memory__merge,mcp__memory__connect,mcp__memory__graph,mcp__memory__list_topics,mcp__memory__stats,Read,Grep,Glob,Bash"
-
-        let shellCommand = """
-        echo '===== session-learner started at '\\''\(ISO8601DateFormatter().string(from: Date()))'\\'' =====' >> '\(Self.logPath)' && \
-        claude -p '\(escapedPrompt)' \
-          --model sonnet \
-          --allowedTools '\(allowedTools)' \
-          --no-session-persistence \
-          --output-format text \
-          --append-system-prompt '\(escapedSystemPrompt)' \
-          >> '\(Self.logPath)' 2>&1
-        """
-
-        let sh = Process()
-        sh.executableURL = URL(fileURLWithPath: "/bin/sh")
-        sh.arguments = ["-c", shellCommand]
-        sh.environment = ProcessInfo.processInfo.environment.merging(
-            ["CLAUDE_MEMORY_LEARNER": "1"],
-            uniquingKeysWith: { _, new in new }
+        try spawnClaudeSubprocess(
+            prompt: prompt,
+            systemPrompt: Self.sessionLearnerSystemPrompt,
+            allowedTools: Self.allowedTools,
+            model: "sonnet",
+            envGuard: (key: "CLAUDE_MEMORY_LEARNER", value: "1"),
+            logPath: Self.logPath,
+            cwd: cwd
         )
-        if let cwd {
-            sh.currentDirectoryURL = URL(fileURLWithPath: cwd)
-        }
-
-        // Detach from our process's stdio
-        sh.standardOutput = FileHandle.nullDevice
-        sh.standardError = FileHandle.nullDevice
-
-        try sh.run()
-        // Don't wait — fire and forget
     }
 }

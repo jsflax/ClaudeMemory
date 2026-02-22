@@ -29,11 +29,6 @@ struct PreTool: AsyncParsableCommand {
 
         var sections: [String] = []
 
-        // Maintenance nudge (if threshold crossed)
-        if let nudge = maintenanceNudge(project: proj) {
-            sections.append(nudge)
-        }
-
         // Learning nudge
         if let nudge = throttledLearningNudge(project: proj, sessionId: input.sessionId) {
             sections.append(nudge)

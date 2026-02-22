@@ -4,10 +4,14 @@ All notable changes to Engram are documented in this file.
 
 > Formerly "ClaudeMemory" — renamed in v0.12.0 to be tool-agnostic.
 
-## [0.12.0] - 2026-02-21
+## [0.12.0] - 2026-02-22
 
 ### Changed
 - **Rebrand to Engram** — product name, Xcode project, bundle ID (`io.engram.app`), CI/CD artifacts, and documentation all renamed. CLI tool names (`memory` / `memory-hooks`) and MCP server name (`memory`) are unchanged.
+- **Fire-and-forget memory maintenance** — maintenance agent now spawns as a detached `claude` CLI subprocess (same pattern as session-learner) instead of injecting a nudge into conversation context. Saves tokens and turns in the main conversation.
+- Extracted shared `spawnClaudeSubprocess()` utility used by both session-learner and maintenance spawners
+- Maintenance nudge removed from all hook handlers (SessionStart, PreToolUse, PostToolUseFailure, PreCompact) — only the Advise hook spawns maintenance now
+- Subprocess allowed tools use wildcard `mcp__memory__*` instead of enumerating each tool
 
 ## [0.11.0] - 2026-02-21
 

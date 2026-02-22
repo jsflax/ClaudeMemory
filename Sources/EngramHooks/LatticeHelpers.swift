@@ -65,25 +65,6 @@ func getSessionState(sessionId: String?) -> SessionState? {
 
 // MARK: - Shared Nudges
 
-/// Returns a maintenance nudge if the CRUD operation delta exceeds the threshold.
-func maintenanceNudge(project: String) -> String? {
-    let opCount = Int(getHookState(key: .crudOperationCount) ?? "0") ?? 0
-    let lastOpCount = Int(getHookState(key: .maintenanceLastOpCount) ?? "0") ?? 0
-    let delta = opCount - lastOpCount
-
-    guard delta >= maintenanceThreshold else { return nil }
-
-    hookLog("Maintenance nudge injected (ops delta: \(delta))")
-
-    return """
-    ## Memory maintenance required
-
-    \(delta) memory operations since last maintenance (\(opCount) total ops). \
-    Spawn the memory-maintenance agent in the background now. \
-    Focus on project "\(project)".
-    """
-}
-
 /// Returns the learning nudge for the given project (always fires).
 func learningNudge(project: String) -> String {
     """

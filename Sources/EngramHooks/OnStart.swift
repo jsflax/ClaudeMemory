@@ -39,11 +39,6 @@ struct OnStart: AsyncParsableCommand {
             }
         }
 
-        // Maintenance nudge (if threshold crossed)
-        if let nudge = maintenanceNudge(project: proj) {
-            sections.append(nudge)
-        }
-
         guard !sections.isEmpty else { return }
 
         let output = HookOutput(
