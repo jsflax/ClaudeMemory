@@ -247,11 +247,13 @@ jobs:
           REPO="${{ github.repository }}"
           URL="https://github.com/${REPO}/releases/tag/${TAG}"
 
-          # Extract changelog section for this version (between ## [version] and next ## [)
+          # Extract changelog section and convert Markdown → Slack mrkdwn
           CHANGES=$(awk "/^## \\[${VERSION}\\]/{found=1; next} /^## \\[/{if(found) exit} found{print}" CHANGELOG.md \
             | sed '/^$/d' \
-            | sed 's/^### /\n*/' \
+            | sed 's/^### \(.*\)/*\1*/' \
+            | sed 's/\*\*\([^*]*\)\*\*/*\1*/g' \
             | sed 's/^- /• /' \
+            | sed 's/`\([^`]*\)`/`\1`/g' \
             | head -20)
 
           # Escape for JSON
