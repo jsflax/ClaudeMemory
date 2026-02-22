@@ -23,13 +23,13 @@ jobs:
       - name: Package CLI tarball
         run: |
           mkdir -p staging/agents
-          cp .build/release/ClaudeMemory staging/memory
-          cp .build/release/ClaudeMemoryHooks staging/memory-hooks
-          cp -R .build/release/ClaudeMemory_ClaudeMemoryLib.bundle staging/
+          cp .build/release/Engram staging/memory
+          cp .build/release/EngramHooks staging/memory-hooks
+          cp -R .build/release/Engram_EngramKit.bundle staging/
           cp -R .build/release/swift-transformers_Hub.bundle staging/
           cp -R .build/release/SwiftLM_SwiftLM.bundle staging/
           cp agents/*.md staging/agents/
-          cd staging && tar czf ../claude-memory-macos-arm64.tar.gz *
+          cd staging && tar czf ../engram-macos-arm64.tar.gz *
 
       - name: Import signing certificate
         if: env.DEVELOPER_ID_CERT_BASE64 != ''
@@ -62,9 +62,9 @@ jobs:
         run: |
           VERSION=${GITHUB_REF_NAME#v}
           xcodebuild archive \
-            -project MemoryVisualizer.xcodeproj \
-            -scheme MemoryVisualizer \
-            -archivePath build/MemoryVisualizer.xcarchive \
+            -project Engram.xcodeproj \
+            -scheme Engram \
+            -archivePath build/Engram.xcarchive \
             -configuration Release \
             -skipMacroValidation \
             -skipPackagePluginValidation \
@@ -84,7 +84,7 @@ jobs:
           # Inject team ID into ExportOptions.plist
           sed -i '' "s|</dict>|    <key>teamID</key><string>$APPLE_TEAM_ID</string></dict>|" ExportOptions.plist
           xcodebuild -exportArchive \
-            -archivePath build/MemoryVisualizer.xcarchive \
+            -archivePath build/Engram.xcarchive \
             -exportPath build/export \
             -exportOptionsPlist ExportOptions.plist
 
@@ -94,14 +94,14 @@ jobs:
           DEVELOPER_ID_CERT_BASE64: ${{ secrets.DEVELOPER_ID_CERT_BASE64 }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          APP="build/export/MemoryVisualizer.app"
+          APP="build/export/Engram.app"
           CLI_DIR="$APP/Contents/Resources/cli"
           AGENTS_DIR="$CLI_DIR/agents"
           mkdir -p "$CLI_DIR" "$AGENTS_DIR"
 
-          cp .build/release/ClaudeMemory "$CLI_DIR/memory"
-          cp .build/release/ClaudeMemoryHooks "$CLI_DIR/memory-hooks"
-          cp -R .build/release/ClaudeMemory_ClaudeMemoryLib.bundle "$CLI_DIR/"
+          cp .build/release/Engram "$CLI_DIR/memory"
+          cp .build/release/EngramHooks "$CLI_DIR/memory-hooks"
+          cp -R .build/release/Engram_EngramKit.bundle "$CLI_DIR/"
           cp -R .build/release/swift-transformers_Hub.bundle "$CLI_DIR/"
           cp -R .build/release/SwiftLM_SwiftLM.bundle "$CLI_DIR/"
           cp agents/*.md "$AGENTS_DIR/"
@@ -130,15 +130,15 @@ jobs:
           brew install create-dmg
           VERSION=${GITHUB_REF_NAME#v}
           create-dmg \
-            --volname "MemoryVisualizer $VERSION" \
+            --volname "Engram $VERSION" \
             --window-pos 200 120 \
             --window-size 600 400 \
             --icon-size 100 \
-            --icon "MemoryVisualizer.app" 150 190 \
+            --icon "Engram.app" 150 190 \
             --app-drop-link 450 190 \
             --no-internet-enable \
-            "MemoryVisualizer-${VERSION}.dmg" \
-            "build/export/MemoryVisualizer.app"
+            "Engram-${VERSION}.dmg" \
+            "build/export/Engram.app"
 
       - name: Notarize DMG
         if: env.DEVELOPER_ID_CERT_BASE64 != ''
@@ -149,7 +149,7 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           VERSION=${GITHUB_REF_NAME#v}
-          DMG="MemoryVisualizer-${VERSION}.dmg"
+          DMG="Engram-${VERSION}.dmg"
 
           SUBMIT_OUT=$(xcrun notarytool submit "$DMG" \
             --apple-id "$APPLE_ID" \
@@ -177,7 +177,7 @@ jobs:
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
         run: |
           VERSION=${GITHUB_REF_NAME#v}
-          DMG="MemoryVisualizer-${VERSION}.dmg"
+          DMG="Engram-${VERSION}.dmg"
 
           # Download Sparkle tools
           SPARKLE_VERSION="2.8.1"
@@ -191,7 +191,7 @@ jobs:
           # Generate appcast from the DMG
           echo "$SPARKLE_PRIVATE_KEY" | /tmp/sparkle-tools/bin/generate_appcast \
             --ed-key-file - \
-            --download-url-prefix "https://github.com/jsflax/ClaudeMemory/releases/download/${GITHUB_REF_NAME}/" \
+            --download-url-prefix "https://github.com/jsflax/Engram/releases/download/${GITHUB_REF_NAME}/" \
             appcast_staging
 
           # Use generated appcast
@@ -201,8 +201,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            claude-memory-macos-arm64.tar.gz
-            MemoryVisualizer-*.dmg
+            engram-macos-arm64.tar.gz
+            Engram-*.dmg
           generate_release_notes: true
 
       - name: Commit appcast.xml to main
@@ -222,20 +222,20 @@ jobs:
         env:
           TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
         run: |
-          SHA=$(shasum -a 256 claude-memory-macos-arm64.tar.gz | awk '{print $1}')
+          SHA=$(shasum -a 256 engram-macos-arm64.tar.gz | awk '{print $1}')
           VERSION=${GITHUB_REF_NAME#v}
 
           git clone https://x-access-token:${TAP_TOKEN}@github.com/jsflax/homebrew-tap.git tap
           cd tap
 
           # Update version and sha256 in existing formula
-          sed -i '' "s/version \".*\"/version \"${VERSION}\"/" Formula/claude-memory.rb
-          sed -i '' "s/sha256 \".*\"/sha256 \"${SHA}\"/" Formula/claude-memory.rb
+          sed -i '' "s/version \".*\"/version \"${VERSION}\"/" Formula/engram.rb
+          sed -i '' "s/sha256 \".*\"/sha256 \"${SHA}\"/" Formula/engram.rb
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Formula/claude-memory.rb
-          git diff --cached --quiet || (git commit -m "Update claude-memory to ${VERSION}" && git push)
+          git add Formula/engram.rb
+          git diff --cached --quiet || (git commit -m "Update engram to ${VERSION}" && git push)
 
       - name: Notify Slack
         if: success() && env.SLACK_WEBHOOK_URL != ''
@@ -261,7 +261,7 @@ jobs:
               \"blocks\": [
                 {
                   \"type\": \"header\",
-                  \"text\": {\"type\": \"plain_text\", \"text\": \"${EMOJI} ClaudeMemory ${TAG}\"}
+                  \"text\": {\"type\": \"plain_text\", \"text\": \"${EMOJI} Engram ${TAG}\"}
                 },
                 {
                   \"type\": \"section\",

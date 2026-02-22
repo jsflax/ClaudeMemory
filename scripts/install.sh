@@ -2,19 +2,19 @@
 set -e
 
 INSTALL_DIR="$HOME/.claude/bin"
-REPO="jsflax/ClaudeMemory"
+REPO="jsflax/Engram"
 
-echo "ClaudeMemory Installer"
-echo "======================"
+echo "Engram Installer"
+echo "================"
 echo ""
-echo "Tip: For a GUI with automatic updates, download MemoryVisualizer.dmg from:"
+echo "Tip: For a GUI with automatic updates, download Engram.dmg from:"
 echo "  https://github.com/$REPO/releases/latest"
 echo ""
 
 # Clean old install
 rm -f "$INSTALL_DIR/memory"
 rm -f "$INSTALL_DIR/memory-hooks"
-rm -rf "$INSTALL_DIR/ClaudeMemory_ClaudeMemoryLib.bundle"
+rm -rf "$INSTALL_DIR/Engram_EngramKit.bundle"
 rm -rf "$INSTALL_DIR/swift-transformers_Hub.bundle"
 rm -rf "$INSTALL_DIR/SwiftLM_SwiftLM.bundle"
 mkdir -p "$INSTALL_DIR"
@@ -24,9 +24,9 @@ if [ "$1" = "--from-source" ]; then
     REPO_DIR="$(dirname "$SCRIPT_DIR")"
     echo "Building from source: $REPO_DIR"
     cd "$REPO_DIR" && swift build -c release
-    cp .build/release/ClaudeMemory "$INSTALL_DIR/memory"
-    cp .build/release/ClaudeMemoryHooks "$INSTALL_DIR/memory-hooks"
-    cp -R .build/release/ClaudeMemory_ClaudeMemoryLib.bundle "$INSTALL_DIR/"
+    cp .build/release/Engram "$INSTALL_DIR/memory"
+    cp .build/release/EngramHooks "$INSTALL_DIR/memory-hooks"
+    cp -R .build/release/Engram_EngramKit.bundle "$INSTALL_DIR/"
     cp -R .build/release/swift-transformers_Hub.bundle "$INSTALL_DIR/"
     cp -R .build/release/SwiftLM_SwiftLM.bundle "$INSTALL_DIR/"
     # Re-sign binaries — linker-signed ad-hoc binaries can be rejected by macOS Taskgated

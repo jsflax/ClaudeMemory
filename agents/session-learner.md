@@ -16,8 +16,8 @@ You will receive a prompt describing what signals were detected (files edited, t
 Derive the default project name from the working directory. Run `recall(query: "project overview", project: "<name>", depth: 1, limit: 3)` to understand what's already known.
 
 **Important**: The working directory tells you *where* something was learned, not *what* it's about. When storing memories, scope each one to its **subject**, not its context. Ask: "If I were in a different project and needed this knowledge, what project name would I search for?"
-- Learning how Lattice handles `Set<String>` while building ClaudeMemory → project: "Lattice" (a specific library you use across projects)
-- Learning how ClaudeMemory's visualizer stores config → project: "ClaudeMemory" (about this codebase specifically)
+- Learning how Lattice handles `Set<String>` while building Engram → project: "Lattice" (a specific library you use across projects)
+- Learning how Engram's visualizer stores config → project: "Engram" (about this codebase specifically)
 - A Swift language quirk or general programming pattern → project: "global" (languages and broad patterns aren't projects — use topic to categorize, e.g. topic: "swift-patterns")
 
 ### 2. Check what's already stored

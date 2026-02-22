@@ -1,13 +1,13 @@
-# ClaudeMemory
+# Engram
 
-A local MCP server that gives Claude Code persistent, semantic memory across sessions.
+A local MCP server that gives AI coding agents persistent, semantic memory across sessions.
 
 ![Demo](claude_memory_graph.gif)
 
 ## Install
 
 ```bash
-curl -sL https://raw.githubusercontent.com/jsflax/ClaudeMemory/main/scripts/install.sh | bash
+curl -sL https://raw.githubusercontent.com/jsflax/Engram/main/scripts/install.sh | bash
 ```
 
 This downloads the pre-built binary, registers the MCP server, and configures Claude Code — takes a few seconds.
@@ -15,24 +15,24 @@ This downloads the pre-built binary, registers the MCP server, and configures Cl
 To build from source instead:
 
 ```bash
-git clone https://github.com/jsflax/ClaudeMemory.git
-cd ClaudeMemory
+git clone https://github.com/jsflax/Engram.git
+cd Engram
 ./scripts/install.sh --from-source
 ```
 
 Start a new Claude Code session — memory tools are immediately available.
 
-### Memory Visualizer
+### Engram Visualizer
 
 ```bash
-swift run -c release MemoryVisualizer
+swift run -c release EngramVisualizer
 ```
 
 ## Why not MEMORY.md?
 
-Claude Code has built-in memory via `MEMORY.md` files. Here's why ClaudeMemory is better:
+Claude Code has built-in memory via `MEMORY.md` files. Here's why Engram is better:
 
-| | MEMORY.md | ClaudeMemory |
+| | MEMORY.md | Engram |
 |---|---|---|
 | **Retrieval** | Dumps entire file into system prompt | Semantic vector search — only relevant memories surfaced |
 | **Capacity** | Truncated at 200 lines | Unlimited — stores thousands, retrieves the best matches |
@@ -43,7 +43,7 @@ Claude Code has built-in memory via `MEMORY.md` files. Here's why ClaudeMemory i
 | **Continuity** | No session awareness | Episodic memory, task checkpoints, clustering + consolidation |
 | **Privacy** | Plain text files | Local SQLite + on-device embeddings (MiniLM-L6). Nothing leaves your machine |
 
-**The one-liner:** MEMORY.md is 200 lines of flat text that gets stale. ClaudeMemory is a vector database that scales, searches semantically, and self-maintains.
+**The one-liner:** MEMORY.md is 200 lines of flat text that gets stale. Engram is a vector database that scales, searches semantically, and self-maintains.
 
 ## Tools
 
@@ -94,9 +94,9 @@ Claude Code has built-in memory via `MEMORY.md` files. Here's why ClaudeMemory i
 | `find_clusters` | Discover groups of semantically similar memories by cosine distance |
 | `consolidate` | Create a summary memory from a cluster, deprioritize originals with `summarized_by` edges |
 
-## Memory Visualizer
+## Engram Visualizer
 
-An interactive force-directed graph visualization of your memory database, built with SwiftUI. Point it at a specific database with `CLAUDE_MEMORY_DB=~/path/to/memory.sqlite swift run -c release MemoryVisualizer`.
+An interactive force-directed graph visualization of your memory database, built with SwiftUI. Point it at a specific database with `CLAUDE_MEMORY_DB=~/path/to/memory.sqlite swift run -c release EngramVisualizer`.
 
 **Features:**
 - Force-directed graph layout with project-colored nodes and inter-project repulsion
@@ -115,7 +115,7 @@ An interactive force-directed graph visualization of your memory database, built
 ## Uninstall
 
 ```bash
-curl -sL https://raw.githubusercontent.com/jsflax/ClaudeMemory/main/scripts/uninstall.sh | bash
+curl -sL https://raw.githubusercontent.com/jsflax/Engram/main/scripts/uninstall.sh | bash
 ```
 
 Removes the binary and MCP registration. Database is preserved at `~/.claude/memory.sqlite` (delete manually if desired).

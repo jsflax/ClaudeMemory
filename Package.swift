@@ -3,10 +3,10 @@
 import PackageDescription
 
 let package = Package(
-    name: "ClaudeMemory",
+    name: "Engram",
     platforms: [.macOS(.v15)],
     products: [
-        .library(name: "ClaudeMemoryLib", targets: ["ClaudeMemoryLib"]),
+        .library(name: "EngramKit", targets: ["EngramKit"]),
     ],
     dependencies: [
         .package(url: "https://github.com/modelcontextprotocol/swift-sdk.git", from: "0.10.0"),
@@ -17,7 +17,7 @@ let package = Package(
     ],
     targets: [
         .target(
-            name: "ClaudeMemoryLib",
+            name: "EngramKit",
             dependencies: [
                 .product(name: "MCP", package: "swift-sdk"),
                 .product(name: "Lattice", package: "Lattice"),
@@ -35,9 +35,9 @@ let package = Package(
             ]
         ),
         .executableTarget(
-            name: "ClaudeMemory",
+            name: "Engram",
             dependencies: [
-                "ClaudeMemoryLib",
+                "EngramKit",
                 .product(name: "MCP", package: "swift-sdk"),
                 .product(name: "Lattice", package: "Lattice"),
             ],
@@ -46,9 +46,9 @@ let package = Package(
             ]
         ),
         .executableTarget(
-            name: "MemoryVisualizer",
+            name: "EngramVisualizer",
             dependencies: [
-                "ClaudeMemoryLib",
+                "EngramKit",
                 .product(name: "Lattice", package: "Lattice"),
                 .product(name: "Sparkle", package: "Sparkle"),
             ],
@@ -60,9 +60,9 @@ let package = Package(
             ]
         ),
         .executableTarget(
-            name: "ClaudeMemoryHooks",
+            name: "EngramHooks",
             dependencies: [
-                "ClaudeMemoryLib",
+                "EngramKit",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
                 .product(name: "Lattice", package: "Lattice"),
             ],
@@ -71,9 +71,9 @@ let package = Package(
             ]
         ),
         .testTarget(
-            name: "ClaudeMemoryTests",
+            name: "EngramTests",
             dependencies: [
-                "ClaudeMemoryLib",
+                "EngramKit",
                 .product(name: "Lattice", package: "Lattice"),
             ],
             swiftSettings: [

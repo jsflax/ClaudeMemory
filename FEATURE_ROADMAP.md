@@ -1,6 +1,6 @@
 # Feature Roadmap
 
-Evolving ClaudeMemory from a memory store into a fully-fledged brain for Claude persistence.
+Evolving Engram from a memory store into a fully-fledged brain for AI agent persistence.
 
 ## Completed
 

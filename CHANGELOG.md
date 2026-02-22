@@ -1,6 +1,13 @@
 # Changelog
 
-All notable changes to ClaudeMemory are documented in this file.
+All notable changes to Engram are documented in this file.
+
+> Formerly "ClaudeMemory" — renamed in v0.12.0 to be tool-agnostic.
+
+## [0.12.0] - 2026-02-21
+
+### Changed
+- **Rebrand to Engram** — product name, Xcode project, bundle ID (`io.engram.app`), CI/CD artifacts, and documentation all renamed. CLI tool names (`memory` / `memory-hooks`) and MCP server name (`memory`) are unchanged.
 
 ## [0.11.0] - 2026-02-21
 
@@ -28,7 +35,7 @@ All notable changes to ClaudeMemory are documented in this file.
 - **Progressive t-SNE animation** — nodes smoothly drift from force layout to semantic positions as t-SNE converges, with lerp-based display/target separation
 - **ScreenCaptureKit export** — Export as PNG captures Metal/RealityKit content correctly (replaces obsoleted `CGWindowListCreateImage`)
 - **UI test suite** — Xcode UI test target with frame timing profiler and teleport proximity verification
-- **Xcode project** — `MemoryVisualizer.xcodeproj` for building/testing outside SPM
+- **Xcode project** — `Engram.xcodeproj` for building/testing outside SPM
 - `set_project` parameter on `update` tool for moving memories between project scopes
 
 ### Changed
@@ -84,16 +91,16 @@ All notable changes to ClaudeMemory are documented in this file.
 - **Stop hook** (`on-stop`) — blocks session end when significant code changes detected, nudges session-learner to capture insights
 - **Per-session state model** (`SessionState`) — replaces global HookState keys for tool call tracking and learning nudge throttling; cleaned up on session end
 - `EmbeddingService.similarity()` method for direct text-to-text similarity comparison
-- MemoryVisualizer: floating PiP panel with drag, resize, and corner-snapping
-- MemoryVisualizer: `@globalActor`-based force simulation for off-MainActor O(n²) computation
-- MemoryVisualizer: synchronous local repulsion on drag for immediate visual feedback
+- Visualizer: floating PiP panel with drag, resize, and corner-snapping
+- Visualizer: `@globalActor`-based force simulation for off-MainActor O(n^2) computation
+- Visualizer: synchronous local repulsion on drag for immediate visual feedback
 
 ### Changed
 - Recall output label changed from "relevance:" to "distance:" for clarity
 - Lattice dependency updated from local path to remote `0.3.1`
 - Hooks: learning nudge skipped when stop hook already fired (prevents double-nudge)
 - Hooks: `openLattice()` simplified — single function replaces `openLattice(at:)` and `openLatticeReadOnly()`
-- MemoryVisualizer: ActivityLogPanel refactored to use `NodeData` instead of `Memory` directly
+- Visualizer: ActivityLogPanel refactored to use `NodeData` instead of `Memory` directly
 - install.sh: auto-approve memory MCP tools
 
 ### Fixed
@@ -105,16 +112,16 @@ All notable changes to ClaudeMemory are documented in this file.
 ## [0.7.1] - 2026-02-15
 
 ### Added
-- MemoryVisualizer: activity log panel — persistent scrollable list of recent memories with animated slide-in, cyan glow on new entries, and click-to-navigate
+- Visualizer: activity log panel — persistent scrollable list of recent memories with animated slide-in, cyan glow on new entries, and click-to-navigate
 
 ### Changed
-- MemoryVisualizer: replace transient toast notifications with the persistent activity log
-- MemoryVisualizer: raise normal label zoom threshold from 1.4x to 1.8x for cleaner overview
-- README: use `swift run -c release` for MemoryVisualizer launch commands
+- Visualizer: replace transient toast notifications with the persistent activity log
+- Visualizer: raise normal label zoom threshold from 1.4x to 1.8x for cleaner overview
+- README: use `swift run -c release` for visualizer launch commands
 
 ### Improved
-- MemoryVisualizer: extract search bar into isolated view to prevent expensive recomputation on each keystroke
-- MemoryVisualizer: move cluster computation to reactive state for snappier search typing
+- Visualizer: extract search bar into isolated view to prevent expensive recomputation on each keystroke
+- Visualizer: move cluster computation to reactive state for snappier search typing
 - Hooks: simplified hook handlers, removed unused Analyze/TranscriptParser modules
 
 ## [0.7.0] - 2026-02-15
@@ -131,7 +138,7 @@ All notable changes to ClaudeMemory are documented in this file.
 - Label propagation uses synchronous updates for deterministic community detection across bridge edges
 
 ### Improved
-- MemoryVisualizer: smaller node label fonts, material background on stats overlay, bold hub labels, golden-angle colors, trackpad gestures, better clustering layout
+- Visualizer: smaller node label fonts, material background on stats overlay, bold hub labels, golden-angle colors, trackpad gestures, better clustering layout
 
 ### Fixed
 - Replace force-unwraps with safe optional handling across MCP tool handlers
@@ -141,7 +148,7 @@ All notable changes to ClaudeMemory are documented in this file.
 ## [0.6.0] - 2026-02-15
 
 ### Added
-- MemoryVisualizer: search, filtering, clustering visualization, and performance fixes
+- Visualizer: search, filtering, clustering visualization, and performance fixes
 - Pre-compile CoreML embedding model at build time for fast MCP startup
 - Lazy-load embeddings on first use instead of at initialization
 
@@ -159,7 +166,7 @@ All notable changes to ClaudeMemory are documented in this file.
 
 ### Added
 - Jaccard term-overlap similarity to conflict detection (reduces false positives from topically similar but distinct memories)
-- MemoryVisualizer macOS app for exploring the knowledge graph
+- Visualizer macOS app for exploring the knowledge graph
 - Demo GIF in README
 
 ## [0.4.4] - 2026-02-14
@@ -211,23 +218,24 @@ All notable changes to ClaudeMemory are documented in this file.
 - CI/CD with GitHub Actions on macOS 26 / Swift 6.2
 - Homebrew tap workflow
 
-[0.11.0]: https://github.com/jsflax/ClaudeMemory/compare/v0.10.0...v0.11.0
-[0.10.0]: https://github.com/jsflax/ClaudeMemory/compare/v0.9.1...v0.10.0
-[0.9.1]: https://github.com/jsflax/ClaudeMemory/compare/v0.9.0...v0.9.1
-[0.9.0]: https://github.com/jsflax/ClaudeMemory/compare/v0.8.2...v0.9.0
-[0.8.2]: https://github.com/jsflax/ClaudeMemory/compare/v0.8.1...v0.8.2
-[0.8.1]: https://github.com/jsflax/ClaudeMemory/compare/v0.8.0...v0.8.1
-[0.8.0]: https://github.com/jsflax/ClaudeMemory/compare/v0.7.3...v0.8.0
-[0.7.1]: https://github.com/jsflax/ClaudeMemory/compare/v0.7.0...v0.7.1
-[0.7.0]: https://github.com/jsflax/ClaudeMemory/compare/v0.6.0...v0.7.0
-[0.6.0]: https://github.com/jsflax/ClaudeMemory/compare/v0.5.2...v0.6.0
-[0.5.2]: https://github.com/jsflax/ClaudeMemory/compare/v0.5.1...v0.5.2
-[0.5.1]: https://github.com/jsflax/ClaudeMemory/compare/v0.5.0...v0.5.1
-[0.5.0]: https://github.com/jsflax/ClaudeMemory/compare/v0.4.4...v0.5.0
-[0.4.4]: https://github.com/jsflax/ClaudeMemory/compare/v0.4.3...v0.4.4
-[0.4.3]: https://github.com/jsflax/ClaudeMemory/compare/v0.4.2...v0.4.3
-[0.4.2]: https://github.com/jsflax/ClaudeMemory/compare/v0.4.1...v0.4.2
-[0.4.1]: https://github.com/jsflax/ClaudeMemory/compare/v0.4.0...v0.4.1
-[0.4.0]: https://github.com/jsflax/ClaudeMemory/compare/v0.3.0...v0.4.0
-[0.3.0]: https://github.com/jsflax/ClaudeMemory/compare/v0.1.0...v0.3.0
-[0.1.0]: https://github.com/jsflax/ClaudeMemory/releases/tag/v0.1.0
+[0.12.0]: https://github.com/jsflax/Engram/compare/v0.11.0...v0.12.0
+[0.11.0]: https://github.com/jsflax/Engram/compare/v0.10.0...v0.11.0
+[0.10.0]: https://github.com/jsflax/Engram/compare/v0.9.1...v0.10.0
+[0.9.1]: https://github.com/jsflax/Engram/compare/v0.9.0...v0.9.1
+[0.9.0]: https://github.com/jsflax/Engram/compare/v0.8.2...v0.9.0
+[0.8.2]: https://github.com/jsflax/Engram/compare/v0.8.1...v0.8.2
+[0.8.1]: https://github.com/jsflax/Engram/compare/v0.8.0...v0.8.1
+[0.8.0]: https://github.com/jsflax/Engram/compare/v0.7.3...v0.8.0
+[0.7.1]: https://github.com/jsflax/Engram/compare/v0.7.0...v0.7.1
+[0.7.0]: https://github.com/jsflax/Engram/compare/v0.6.0...v0.7.0
+[0.6.0]: https://github.com/jsflax/Engram/compare/v0.5.2...v0.6.0
+[0.5.2]: https://github.com/jsflax/Engram/compare/v0.5.1...v0.5.2
+[0.5.1]: https://github.com/jsflax/Engram/compare/v0.5.0...v0.5.1
+[0.5.0]: https://github.com/jsflax/Engram/compare/v0.4.4...v0.5.0
+[0.4.4]: https://github.com/jsflax/Engram/compare/v0.4.3...v0.4.4
+[0.4.3]: https://github.com/jsflax/Engram/compare/v0.4.2...v0.4.3
+[0.4.2]: https://github.com/jsflax/Engram/compare/v0.4.1...v0.4.2
+[0.4.1]: https://github.com/jsflax/Engram/compare/v0.4.0...v0.4.1
+[0.4.0]: https://github.com/jsflax/Engram/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/jsflax/Engram/compare/v0.1.0...v0.3.0
+[0.1.0]: https://github.com/jsflax/Engram/releases/tag/v0.1.0
