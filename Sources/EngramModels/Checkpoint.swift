@@ -13,30 +13,30 @@ import Foundation
 @Model
 public final class Checkpoint {
     /// Short title describing the task.
-    var title: String
+    public var title: String
 
     /// Task status: "active", "paused", or "completed".
-    var status: String
+    public var status: String
 
     /// Which project this task belongs to. Defaults to "global".
-    var project: String
+    public var project: String
 
     /// The planned approach or steps for the task.
-    var plan: String
+    public var plan: String
 
     /// What has been accomplished so far.
-    var progress: String
+    public var progress: String
 
     /// Free-form context: file paths, decisions, blockers, notes, etc.
-    var context: String
+    public var context: String
 
     /// When this task was first created.
-    var createdAt: Date
+    public var createdAt: Date
 
     /// When this task was last checkpointed (created or updated).
-    var checkpointedAt: Date
+    public var checkpointedAt: Date
 
-    init(
+    public init(
         title: String,
         status: String = "active",
         project: String = "global",

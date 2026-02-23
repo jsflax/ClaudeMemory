@@ -51,6 +51,10 @@ public final class Memory {
     /// Explicit importance rating (1-5). 0 means unset. Higher values boost recall ranking.
     public var importance: Int
 
+    /// Whether this memory is private (excluded from team shared graphs and hive mind).
+    /// Private memories still sync to the user's own cloud backup. Default: false.
+    public var isPrivate: Bool
+
     public init(
         content: String,
         topic: String = "general",
@@ -61,7 +65,8 @@ public final class Memory {
         lastAccessedAt: Date = Date(),
         expiresAt: Date = Date.distantFuture,
         accessCount: Int = 0,
-        importance: Int = 0
+        importance: Int = 0,
+        isPrivate: Bool = false
     ) {
         self.content = content
         self.topic = topic
@@ -73,5 +78,6 @@ public final class Memory {
         self.expiresAt = expiresAt
         self.accessCount = accessCount
         self.importance = importance
+        self.isPrivate = isPrivate
     }
 }

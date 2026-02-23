@@ -95,6 +95,10 @@ public actor MemoryTools {
                             "type": .string("integer"),
                             "description": .string("Importance rating (1-5). Higher values boost this memory in recall ranking. Omit or 0 for default."),
                         ]),
+                        "is_private": .object([
+                            "type": .string("boolean"),
+                            "description": .string("Mark this memory as private. Private memories sync to your cloud backup but are excluded from team shared graphs and the hive mind. Default: false."),
+                        ]),
                     ]),
                     "required": .array([.string("content")]),
                     "additionalProperties": .bool(false),
@@ -242,6 +246,10 @@ public actor MemoryTools {
                         "importance": .object([
                             "type": .string("integer"),
                             "description": .string("Update importance rating (1-5). Higher values boost this memory in recall ranking. 0 to clear."),
+                        ]),
+                        "is_private": .object([
+                            "type": .string("boolean"),
+                            "description": .string("Update the memory's private flag. Private memories sync to your cloud backup but are excluded from team shared graphs and the hive mind."),
                         ]),
                     ]),
                     "additionalProperties": .bool(false),

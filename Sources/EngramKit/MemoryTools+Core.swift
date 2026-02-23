@@ -149,7 +149,9 @@ extension MemoryTools {
         }
         lastMemoryTime = Date()
 
-        let memory = Memory(content: content, topic: topic, project: project, source: source, embedding: embeddingVec, expiresAt: expiresAt, importance: importance)
+        let isPrivate = a.isPrivate ?? false
+
+        let memory = Memory(content: content, topic: topic, project: project, source: source, embedding: embeddingVec, expiresAt: expiresAt, importance: importance, isPrivate: isPrivate)
         lattice.add(memory)
 
         guard let memoryId = memory.primaryKey else {
@@ -301,10 +303,11 @@ extension MemoryTools {
 
         let expiresNote = expiresAt == .distantFuture ? "" : ", expires: \(Self.dateFormatter.string(from: expiresAt))"
         let importanceNote = importance > 0 ? ", importance: \(importance)" : ""
+        let privateNote = isPrivate ? ", private: true" : ""
         let autoLinkNote = autoLinkedIds.isEmpty ? "" : ", auto-linked to \(autoLinkedIds.map { "[id:\($0)]" }.joined(separator: ", "))"
         log("Stored memory [\(project)/\(topic)]: \(content.prefix(80))")
 
-        var response = "Stored memory (id: \(memoryId), project: \(project), topic: \(topic)\(parentNote)\(expiresNote)\(importanceNote)\(autoLinkNote)): \(content.prefix(100))\(content.count > 100 ? "..." : "")"
+        var response = "Stored memory (id: \(memoryId), project: \(project), topic: \(topic)\(parentNote)\(expiresNote)\(importanceNote)\(privateNote)\(autoLinkNote)): \(content.prefix(100))\(content.count > 100 ? "..." : "")"
 
         // Nudge toward atomic memories when content is complex
         let lines = content.components(separatedBy: "\n")
@@ -592,7 +595,7 @@ extension MemoryTools {
 
         // 2. Validate at least one edit field
         let hasContentEdit = a.content != nil || a.append != nil || a.prepend != nil || a.find != nil
-        let hasMetadataEdit = a.setProject != nil || a.topic != nil || a.source != nil || a.expiresInDays != nil || a.importance != nil
+        let hasMetadataEdit = a.setProject != nil || a.topic != nil || a.source != nil || a.expiresInDays != nil || a.importance != nil || a.isPrivate != nil
         guard hasContentEdit || hasMetadataEdit else {
             throw MCPError.invalidParams("Provide at least one edit: content, append, prepend, find+replace, set_project, topic, source, or expires_in_days.")
         }
@@ -698,6 +701,11 @@ extension MemoryTools {
             mem.importance = imp
             changes.append("importance: \(old) → \(imp)")
         }
+        if let priv = a.isPrivate {
+            let old = mem.isPrivate
+            mem.isPrivate = priv
+            changes.append("private: \(old) → \(priv)")
+        }
 
         // 8. Re-embed only if content changed
         if contentChanged {
@@ -712,7 +720,7 @@ extension MemoryTools {
         let memId = mem.primaryKey.map(String.init) ?? "unknown"
         log("Updated memory [id:\(memId)] [\(mem.project)/\(mem.topic)]: \(changes.joined(separator: ", "))")
         // Count as CRUD op unless only the topic changed
-        let hasNonTopicChange = contentChanged || a.setProject != nil || a.source != nil || a.expiresInDays != nil || a.importance != nil
+        let hasNonTopicChange = contentChanged || a.setProject != nil || a.source != nil || a.expiresInDays != nil || a.importance != nil || a.isPrivate != nil
         if hasNonTopicChange {
             incrementCrudCounter()
         }

@@ -12,6 +12,10 @@ let modelPath = ProcessInfo.processInfo.environment["CLAUDE_MEMORY_MODEL"]
 let dbPath = ProcessInfo.processInfo.environment["CLAUDE_MEMORY_DB"]
     ?? NSHomeDirectory() + "/.claude/memory.sqlite"
 
+/// Cloud sync configuration (optional — omit for local-only mode).
+let syncEndpoint = ProcessInfo.processInfo.environment["ENGRAM_SYNC_ENDPOINT"]
+let syncToken = ProcessInfo.processInfo.environment["ENGRAM_SYNC_TOKEN"]
+
 // Ensure parent directory exists
 let dbDir = (dbPath as NSString).deletingLastPathComponent
 do {
@@ -25,7 +29,15 @@ do {
 
 let lattice: Lattice
 do {
-    lattice = try Lattice(Memory.self, Edge.self, Checkpoint.self, HookState.self, SessionState.self, configuration: .init(fileURL: URL(fileURLWithPath: dbPath)))
+    let config: Lattice.Configuration
+    if let endpoint = syncEndpoint, let token = syncToken, let url = URL(string: endpoint) {
+        config = .init(fileURL: URL(fileURLWithPath: dbPath), authorizationToken: token, wssEndpoint: url)
+        log("Sync enabled: \(endpoint)")
+    } else {
+        config = .init(fileURL: URL(fileURLWithPath: dbPath))
+        log("Local-only mode (no sync endpoint configured)")
+    }
+    lattice = try Lattice(Memory.self, Edge.self, Checkpoint.self, HookState.self, SessionState.self, configuration: config)
 } catch {
     log("Failed to initialize database at \(dbPath): \(error)")
     exit(1)

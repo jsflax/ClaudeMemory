@@ -1,11 +1,156 @@
 import Foundation
 import Accelerate
+@preconcurrency import Metal
 import simd
+import os
+
+private let frameLog = Logger(subsystem: "com.claudememory.visualizer", category: "ForceSimulation3D")
+
+// MARK: - Metal Force Compute
+
+/// Manages Metal compute pipeline for GPU-accelerated charge force computation.
+/// Falls back to CPU when Metal is unavailable or node count is too small.
+@MainActor
+final class MetalForceCompute {
+    private let device: MTLDevice
+    private let commandQueue: MTLCommandQueue
+    private let pipelineState: MTLComputePipelineState
+
+    // Persistent buffers — resized only when node count changes
+    private var nodeBuffer: MTLBuffer?
+    private var forceBuffer: MTLBuffer?
+    private var paramBuffer: MTLBuffer?
+    private var currentNodeCount: Int = 0
+
+    /// Matches the `ForceNode` struct in Shaders.metal.
+    struct GPUForceNode {
+        var px: Float, py: Float, pz: Float
+        var projectGroup: Int32
+        var topicGroup: Int32
+        var _pad: Int32
+    }
+
+    /// Matches the `ForceParams` struct in Shaders.metal.
+    struct GPUForceParams {
+        var chargeStrength: Float
+        var crossChargeMultiplier: Float
+        var sameTopicChargeScale: Float
+        var sameProjectChargeScale: Float
+        var cutoffSq: Float
+        var nodeCount: UInt32
+    }
+
+    init?() {
+        guard let device = MTLCreateSystemDefaultDevice(),
+              let queue = device.makeCommandQueue(),
+              let library = device.makeDefaultLibrary(),
+              let function = library.makeFunction(name: "compute_charge_forces"),
+              let pipeline = try? device.makeComputePipelineState(function: function)
+        else { return nil }
+
+        self.device = device
+        self.commandQueue = queue
+        self.pipelineState = pipeline
+    }
+
+    /// Dispatch charge force computation on GPU. Non-blocking — calls completion on main thread.
+    /// Result from GPU charge force computation.
+    struct ChargeResult: Sendable {
+        let fx: [Float], fy: [Float], fz: [Float]
+    }
+
+    func dispatchChargeForces(
+        positions: (x: [Float], y: [Float], z: [Float]),
+        projectGroups: [Int],
+        topicGroups: [Int],
+        chargeStrength: Float,
+        sameTopicChargeScale: Float,
+        sameProjectChargeScale: Float
+    ) async -> ChargeResult {
+        let n = positions.x.count
+        guard n > 0 else { return ChargeResult(fx: [], fy: [], fz: []) }
+
+        // Resize buffers if node count changed
+        if n != currentNodeCount {
+            let nodeSize = MemoryLayout<GPUForceNode>.stride * n
+            let forceSize = MemoryLayout<SIMD3<Float>>.stride * n
+            nodeBuffer = device.makeBuffer(length: nodeSize, options: .storageModeShared)
+            forceBuffer = device.makeBuffer(length: forceSize, options: .storageModeShared)
+            paramBuffer = device.makeBuffer(length: MemoryLayout<GPUForceParams>.stride, options: .storageModeShared)
+            currentNodeCount = n
+        }
+
+        let zeros = ChargeResult(
+            fx: [Float](repeating: 0, count: n),
+            fy: [Float](repeating: 0, count: n),
+            fz: [Float](repeating: 0, count: n)
+        )
+        guard let nodeBuffer, let forceBuffer, let paramBuffer else { return zeros }
+
+        // Pack node data
+        let nodePtr = nodeBuffer.contents().bindMemory(to: GPUForceNode.self, capacity: n)
+        for i in 0..<n {
+            nodePtr[i] = GPUForceNode(
+                px: positions.x[i], py: positions.y[i], pz: positions.z[i],
+                projectGroup: Int32(projectGroups[i]),
+                topicGroup: Int32(i < topicGroups.count ? topicGroups[i] : -1),
+                _pad: 0
+            )
+        }
+
+        // Set params
+        let paramPtr = paramBuffer.contents().bindMemory(to: GPUForceParams.self, capacity: 1)
+        paramPtr.pointee = GPUForceParams(
+            chargeStrength: chargeStrength,
+            crossChargeMultiplier: 3.0,
+            sameTopicChargeScale: sameTopicChargeScale,
+            sameProjectChargeScale: sameProjectChargeScale,
+            cutoffSq: 500 * 500,
+            nodeCount: UInt32(n)
+        )
+
+        // Zero force buffer
+        memset(forceBuffer.contents(), 0, MemoryLayout<SIMD3<Float>>.stride * n)
+
+        guard let cmdBuffer = commandQueue.makeCommandBuffer(),
+              let encoder = cmdBuffer.makeComputeCommandEncoder() else { return zeros }
+
+        encoder.setComputePipelineState(pipelineState)
+        encoder.setBuffer(nodeBuffer, offset: 0, index: 0)
+        encoder.setBuffer(forceBuffer, offset: 0, index: 1)
+        encoder.setBuffer(paramBuffer, offset: 0, index: 2)
+
+        let threadGroupSize = min(pipelineState.maxTotalThreadsPerThreadgroup, n)
+        let gridSize = MTLSize(width: n, height: 1, depth: 1)
+        let threadGroup = MTLSize(width: threadGroupSize, height: 1, depth: 1)
+        encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadGroup)
+        encoder.endEncoding()
+
+        // Use continuation to bridge Metal's callback-based API to async/await
+        let capturedForceBuffer = forceBuffer
+        let capturedN = n
+        return await withCheckedContinuation { continuation in
+            cmdBuffer.addCompletedHandler { @Sendable _ in
+                let forcePtr = capturedForceBuffer.contents().bindMemory(to: SIMD3<Float>.self, capacity: capturedN)
+                var fx = [Float](repeating: 0, count: capturedN)
+                var fy = [Float](repeating: 0, count: capturedN)
+                var fz = [Float](repeating: 0, count: capturedN)
+                for i in 0..<capturedN {
+                    fx[i] = forcePtr[i].x
+                    fy[i] = forcePtr[i].y
+                    fz[i] = forcePtr[i].z
+                }
+                continuation.resume(returning: ChargeResult(fx: fx, fy: fy, fz: fz))
+            }
+            cmdBuffer.commit()
+        }
+    }
+}
 
 /// 3D force-directed graph layout engine. Same split architecture as ForceSimulation:
 /// O(n²) force computation runs async on @ForceSimulatorActor, O(n) integration runs sync at 60fps.
 @MainActor
-final class ForceSimulation3D: ObservableObject {
+final class ForceSimulation3D {
     // SoA layout for cache-friendly iteration
     private var ids: [Int64] = []
     private var x: [Float] = []
@@ -30,6 +175,10 @@ final class ForceSimulation3D: ObservableObject {
     private var storedFy: [Float] = []
     private var storedFz: [Float] = []
 
+    /// Pending force result from async computation — written off-MainActor, read by tick().
+    /// Using OSAllocatedUnfairLock for safe cross-isolation handoff without MainActor hop.
+    private let pendingForces = OSAllocatedUnfairLock<ForceResult?>(initialState: nil)
+
     private(set) var positions: [Int64: SIMD3<Float>] = [:]
 
     // Force parameters (tuned for 3D — slightly stronger since space is larger)
@@ -37,6 +186,7 @@ final class ForceSimulation3D: ObservableObject {
     private let crossProjectSpringLength: Float = 400
     private let springStrength: Float = 0.0004
     private let chargeStrength: Float = 500
+    private let sameProjectChargeScale: Float = 0.6
     private let sameTopicChargeScale: Float = 0.35
     private let centerStrength: Float = 0.006
     private let cohesionStrength: Float = 0.0015
@@ -47,14 +197,37 @@ final class ForceSimulation3D: ObservableObject {
     private let maxSpeed: Float = 12.0
 
     private var alpha: Float = 1.0
-    private let alphaDecay: Float = 0.997
+    private let alphaDecay: Float = 0.995  // ~920 frames (~15s) to floor — more force iterations before convergence
     private let alphaFloor: Float = 0.01
     private var tickInFlight = false
     private var forceAge: Int = 100
     private var topologyVersion: UInt64 = 0
+    private var postAlphaDispatches = 0
+    private let maxPostAlphaDispatches = 60  // ~3s of post-alpha polish — gives cohesion forces time to pull same-project nodes together
+
+    /// Metal compute for GPU-accelerated charge force calculation.
+    private var metalForceCompute: MetalForceCompute? = MetalForceCompute()
 
     var center: SIMD3<Float> = .zero
     var isActive: Bool = true
+
+    /// True when the simulation has converged (alpha at floor, velocities near-zero).
+    /// When settled, tick() skips syncPositions and force dispatch to save CPU.
+    private(set) var isSettled = false
+    private var settledFrameCount = 0
+
+    /// Max speed² from the last tick. Used by the Timer to throttle visual updates
+    /// when nodes are barely moving (convergence tail).
+    private(set) var lastMaxSpeedSq: Float = 0
+
+    /// Wake the simulation from settled state (e.g. after topology change or user interaction).
+    func wake() {
+        alpha = max(alpha, 0.3)
+        isSettled = false
+        settledFrameCount = 0
+        postAlphaDispatches = 0
+        forceAge = 2
+    }
 
     // MARK: - Graph Management
 
@@ -139,6 +312,7 @@ final class ForceSimulation3D: ObservableObject {
 
         alpha = max(alpha, 0.05)
         topologyVersion &+= 1
+        isSettled = false; settledFrameCount = 0
         rebuildPositions()
     }
 
@@ -180,6 +354,7 @@ final class ForceSimulation3D: ObservableObject {
         storedFx.append(0); storedFy.append(0); storedFz.append(0)
         alpha = max(alpha, 0.05)
         topologyVersion &+= 1
+        isSettled = false; settledFrameCount = 0
         rebuildPositions()
     }
 
@@ -190,6 +365,7 @@ final class ForceSimulation3D: ObservableObject {
         edgeIndices.append((si, ti))
         alpha = max(alpha, 0.05)
         topologyVersion &+= 1
+        isSettled = false; settledFrameCount = 0
     }
 
     /// Write external positions (e.g. from 2D positions + z jitter) into internal arrays.
@@ -240,10 +416,23 @@ final class ForceSimulation3D: ObservableObject {
             return
         }
 
+        // Fast path: when settled, skip all work (no integration, no sync, no force dispatch)
+        if isSettled { return }
+
+        // Drain pending force results from async computation (lock-free MainActor handoff)
+        if let result = pendingForces.withLock({ value -> ForceResult? in
+            let r = value; value = nil; return r
+        }) {
+            storedFx = result.fx; storedFy = result.fy; storedFz = result.fz
+            forceAge = 2
+            tickInFlight = false
+        }
+
         let hasForcesComputed = storedFx.count == n
         let attenuation = pow(damping, Float(forceAge))
         forceAge += 1
 
+        var maxSpeedSq: Float = 0
         for i in 0..<n where !pinned[i] {
             if hasForcesComputed {
                 vx[i] += storedFx[i] * attenuation
@@ -253,6 +442,7 @@ final class ForceSimulation3D: ObservableObject {
             vx[i] *= damping; vy[i] *= damping; vz[i] *= damping
 
             let speedSq = vx[i] * vx[i] + vy[i] * vy[i] + vz[i] * vz[i]
+            maxSpeedSq = max(maxSpeedSq, speedSq)
             if speedSq > maxSpeed * maxSpeed {
                 let scale = maxSpeed / sqrt(speedSq)
                 vx[i] *= scale; vy[i] *= scale; vz[i] *= scale
@@ -261,9 +451,36 @@ final class ForceSimulation3D: ObservableObject {
             x[i] += vx[i]; y[i] += vy[i]; z[i] += vz[i]
         }
         alpha = max(alpha * alphaDecay, alphaFloor)
+        lastMaxSpeedSq = maxSpeedSq
+
+        // Settle detection: alpha at floor AND all nodes nearly stationary AND
+        // post-alpha dispatches exhausted. Without the last condition, the sim
+        // would settle mid-convergence while extra force iterations are still pending.
+        if hasForcesComputed && alpha <= alphaFloor * 1.01 && maxSpeedSq < 0.01
+            && postAlphaDispatches >= maxPostAlphaDispatches {
+            settledFrameCount += 1
+            if settledFrameCount >= 30 {
+                isSettled = true
+                syncPositions()  // one final sync
+                return
+            }
+        } else {
+            settledFrameCount = 0
+        }
+
         syncPositions()
 
-        if !tickInFlight { dispatchForceComputation() }
+        // Dispatch new forces while alpha is above the floor, plus extra iterations
+        // after alpha converges to let nodes reach proper equilibrium.
+        if !tickInFlight {
+            if alpha > alphaFloor * 1.01 {
+                postAlphaDispatches = 0
+                dispatchForceComputation()
+            } else if postAlphaDispatches < maxPostAlphaDispatches {
+                postAlphaDispatches += 1
+                dispatchForceComputation()
+            }
+        }
     }
 
     // MARK: - Async force computation
@@ -275,7 +492,7 @@ final class ForceSimulation3D: ObservableObject {
         let edgeIndices: [(Int, Int)]
         let topicProjectGroup: [Int]
         let alpha: Float, center: SIMD3<Float>
-        let chargeStrength: Float, sameTopicChargeScale: Float
+        let chargeStrength: Float, sameProjectChargeScale: Float, sameTopicChargeScale: Float
         let centerStrength: Float
         let springLength: Float, crossProjectSpringLength: Float, springStrength: Float
         let cohesionStrength: Float, centroidRepulsion: Float
@@ -293,12 +510,13 @@ final class ForceSimulation3D: ObservableObject {
         tickInFlight = true
         let version = topologyVersion
 
+        // Capture state needed for CPU forces (springs, cohesion, center)
         let state = SimState(
             n: n, x: x, y: y, z: z,
             projectGroup: projectGroup, topicGroup: topicGroup,
             edgeIndices: edgeIndices, topicProjectGroup: topicProjectGroup,
             alpha: alpha, center: center,
-            chargeStrength: chargeStrength, sameTopicChargeScale: sameTopicChargeScale,
+            chargeStrength: chargeStrength, sameProjectChargeScale: sameProjectChargeScale, sameTopicChargeScale: sameTopicChargeScale,
             centerStrength: centerStrength,
             springLength: springLength, crossProjectSpringLength: crossProjectSpringLength,
             springStrength: springStrength,
@@ -306,15 +524,180 @@ final class ForceSimulation3D: ObservableObject {
             topicCohesionStrength: topicCohesionStrength, topicCentroidRepulsion: topicCentroidRepulsion
         )
 
-        Task.detached(priority: .userInitiated) {
+        // Try GPU path for charge forces (O(n²) bottleneck)
+        if let metal = metalForceCompute, n >= 16 {
+            let positions = (x: Array(x), y: Array(y), z: Array(z))
+            let projGroups = Array(projectGroup)
+            let topGroups = Array(topicGroup)
+
+            // GPU dispatch must be on MainActor (Metal command buffers).
+            // Combination with CPU forces and result storage happen in a detached task
+            // to avoid blocking the main thread between renderTick calls.
+            Task { @MainActor [pendingForces] in
+                let chargeResult = await metal.dispatchChargeForces(
+                    positions: positions,
+                    projectGroups: projGroups,
+                    topicGroups: topGroups,
+                    chargeStrength: state.chargeStrength,
+                    sameTopicChargeScale: state.sameTopicChargeScale,
+                    sameProjectChargeScale: state.sameProjectChargeScale
+                )
+                // Move combination work off MainActor
+                let capturedCharge = chargeResult
+                let capturedState = state
+                Task.detached(priority: .userInitiated) {
+                    let cpuForces = Self.computeCPUOnlyForces(capturedState)
+                    let nn = min(capturedCharge.fx.count, cpuForces.fx.count)
+                    var combinedFx = [Float](repeating: 0, count: nn)
+                    var combinedFy = [Float](repeating: 0, count: nn)
+                    var combinedFz = [Float](repeating: 0, count: nn)
+                    for i in 0..<nn {
+                        combinedFx[i] = capturedCharge.fx[i] + cpuForces.fx[i]
+                        combinedFy[i] = capturedCharge.fy[i] + cpuForces.fy[i]
+                        combinedFz[i] = capturedCharge.fz[i] + cpuForces.fz[i]
+                    }
+                    let result = ForceResult(fx: combinedFx, fy: combinedFy, fz: combinedFz)
+                    pendingForces.withLock { $0 = result }
+                }
+            }
+            return
+        }
+
+        // CPU fallback path — should not be reached in production (Metal always available on macOS)
+        frameLog.error("[ForceSimulation3D] ⚠️ CPU fallback path hit — Metal unavailable or n<16 (n=\(n))")
+        Task.detached(priority: .userInitiated) { [pendingForces] in
             let result = await Self.computeForces(state)
-            await MainActor.run { [self] in
-                guard topologyVersion == version else { tickInFlight = false; return }
-                storedFx = result.fx; storedFy = result.fy; storedFz = result.fz
-                forceAge = 2
-                tickInFlight = false
+            pendingForces.withLock { $0 = result }
+        }
+    }
+
+    /// Compute CPU-only forces (spring attraction, topic/project cohesion, center gravity).
+    /// These are O(n) or O(groups²) and not worth GPU-offloading.
+    /// CPU-only forces (springs, cohesion, center) — nonisolated static so it can run off MainActor.
+    /// Used by GPU path to combine with GPU-computed charge forces.
+    private nonisolated static func computeCPUOnlyForces(_ s: SimState) -> ForceResult {
+        let n = s.n
+        let x = s.x, y = s.y, z = s.z
+        let projectGroup = s.projectGroup, topicGroup = s.topicGroup
+        var fx = [Float](repeating: 0, count: n)
+        var fy = [Float](repeating: 0, count: n)
+        var fz = [Float](repeating: 0, count: n)
+
+        let hasProjects = !projectGroup.isEmpty
+        let hasTopics = !topicGroup.isEmpty
+
+        // Spring attraction
+        for (si, ti) in s.edgeIndices {
+            let dx = x[ti] - x[si], dy = y[ti] - y[si], dz = z[ti] - z[si]
+            var d = sqrt(dx * dx + dy * dy + dz * dz)
+            if d < 1 { d = 1 }
+            let cross = hasProjects && projectGroup[si] != projectGroup[ti]
+            let rest = cross ? s.crossProjectSpringLength : s.springLength
+            let force = s.springStrength * (d - rest)
+            let efx = (dx / d) * force, efy = (dy / d) * force, efz = (dz / d) * force
+            fx[si] += efx; fy[si] += efy; fz[si] += efz
+            fx[ti] -= efx; fy[ti] -= efy; fz[ti] -= efz
+        }
+
+        // Topic centroid forces
+        let topicN = hasTopics ? ((topicGroup.max() ?? -1) + 1) : 0
+        if topicN > 1 {
+            var tSumX = [Float](repeating: 0, count: topicN)
+            var tSumY = [Float](repeating: 0, count: topicN)
+            var tSumZ = [Float](repeating: 0, count: topicN)
+            var tCount = [Int](repeating: 0, count: topicN)
+            for i in 0..<n {
+                let g = topicGroup[i]
+                tSumX[g] += x[i]; tSumY[g] += y[i]; tSumZ[g] += z[i]; tCount[g] += 1
+            }
+            for i in 0..<n {
+                let g = topicGroup[i]; let cnt = Float(tCount[g])
+                if cnt < 2 { continue }
+                let cx = tSumX[g] / cnt, cy = tSumY[g] / cnt, cz = tSumZ[g] / cnt
+                fx[i] += (cx - x[i]) * s.topicCohesionStrength
+                fy[i] += (cy - y[i]) * s.topicCohesionStrength
+                fz[i] += (cz - z[i]) * s.topicCohesionStrength
+            }
+            let tpg = s.topicProjectGroup
+            for g1 in 0..<topicN {
+                guard tCount[g1] > 0 else { continue }
+                let c1x = tSumX[g1] / Float(tCount[g1])
+                let c1y = tSumY[g1] / Float(tCount[g1])
+                let c1z = tSumZ[g1] / Float(tCount[g1])
+                for g2 in (g1 + 1)..<topicN {
+                    guard tCount[g2] > 0 else { continue }
+                    guard g1 < tpg.count && g2 < tpg.count, tpg[g1] == tpg[g2] else { continue }
+                    let c2x = tSumX[g2] / Float(tCount[g2])
+                    let c2y = tSumY[g2] / Float(tCount[g2])
+                    let c2z = tSumZ[g2] / Float(tCount[g2])
+                    var tdx = c1x - c2x, tdy = c1y - c2y, tdz = c1z - c2z
+                    var tdist = sqrt(tdx * tdx + tdy * tdy + tdz * tdz)
+                    if tdist < 1 { tdist = 1; tdx = .random(in: -1...1); tdy = .random(in: -1...1); tdz = .random(in: -1...1) }
+                    let force = s.topicCentroidRepulsion / (tdist * tdist)
+                    let tfx = (tdx / tdist) * force, tfy = (tdy / tdist) * force, tfz = (tdz / tdist) * force
+                    let f1 = 1.0 / Float(tCount[g1]), f2 = 1.0 / Float(tCount[g2])
+                    for i in 0..<n where topicGroup[i] == g1 {
+                        fx[i] += tfx * f1; fy[i] += tfy * f1; fz[i] += tfz * f1
+                    }
+                    for i in 0..<n where topicGroup[i] == g2 {
+                        fx[i] -= tfx * f2; fy[i] -= tfy * f2; fz[i] -= tfz * f2
+                    }
+                }
             }
         }
+
+        // Project centroid forces
+        if hasProjects {
+            let groupN = (projectGroup.max() ?? -1) + 1
+            if groupN > 0 {
+                var gSumX = [Float](repeating: 0, count: groupN)
+                var gSumY = [Float](repeating: 0, count: groupN)
+                var gSumZ = [Float](repeating: 0, count: groupN)
+                var gCount = [Int](repeating: 0, count: groupN)
+                for i in 0..<n {
+                    let g = projectGroup[i]
+                    gSumX[g] += x[i]; gSumY[g] += y[i]; gSumZ[g] += z[i]; gCount[g] += 1
+                }
+                for i in 0..<n {
+                    let g = projectGroup[i]; let cnt = Float(gCount[g])
+                    if cnt < 2 { continue }
+                    let cx = gSumX[g] / cnt, cy = gSumY[g] / cnt, cz = gSumZ[g] / cnt
+                    fx[i] += (cx - x[i]) * s.cohesionStrength
+                    fy[i] += (cy - y[i]) * s.cohesionStrength
+                    fz[i] += (cz - z[i]) * s.cohesionStrength
+                }
+                for g1 in 0..<groupN {
+                    guard gCount[g1] > 0 else { continue }
+                    let c1 = SIMD3<Float>(gSumX[g1], gSumY[g1], gSumZ[g1]) / Float(gCount[g1])
+                    for g2 in (g1 + 1)..<groupN {
+                        guard gCount[g2] > 0 else { continue }
+                        let c2 = SIMD3<Float>(gSumX[g2], gSumY[g2], gSumZ[g2]) / Float(gCount[g2])
+                        var delta = c1 - c2
+                        var pdist = simd_length(delta)
+                        if pdist < 1 { pdist = 1; delta = SIMD3(.random(in: -1...1), .random(in: -1...1), .random(in: -1...1)) }
+                        let force = s.centroidRepulsion / (pdist * pdist)
+                        let fVec = (delta / pdist) * force
+                        let f1 = 1.0 / Float(gCount[g1]), f2 = 1.0 / Float(gCount[g2])
+                        for i in 0..<n where projectGroup[i] == g1 {
+                            fx[i] += fVec.x * f1; fy[i] += fVec.y * f1; fz[i] += fVec.z * f1
+                        }
+                        for i in 0..<n where projectGroup[i] == g2 {
+                            fx[i] -= fVec.x * f2; fy[i] -= fVec.y * f2; fz[i] -= fVec.z * f2
+                        }
+                    }
+                }
+            }
+        }
+
+        // Center gravity
+        let c = s.center
+        for i in 0..<n {
+            fx[i] += (c.x - x[i]) * s.alpha * s.centerStrength
+            fy[i] += (c.y - y[i]) * s.alpha * s.centerStrength
+            fz[i] += (c.z - z[i]) * s.alpha * s.centerStrength
+        }
+
+        return ForceResult(fx: fx, fy: fy, fz: fz)
     }
 
     @ForceSimulatorActor
@@ -334,6 +717,7 @@ final class ForceSimulation3D: ObservableObject {
         // --- Charge repulsion (O(n²)) ---
         let chargeBase = s.chargeStrength
         let chargeCross = chargeBase * 3.0
+        let chargeSameProject = chargeBase * s.sameProjectChargeScale
         let chargeSameTopic = chargeBase * s.sameTopicChargeScale
         let cutoffSq: Float = 500 * 500
 
@@ -353,6 +737,8 @@ final class ForceSimulation3D: ObservableObject {
                     charge = chargeCross
                 } else if hasTopics && topicGroup[j] == tg_i {
                     charge = chargeSameTopic
+                } else if hasProjects {
+                    charge = chargeSameProject  // same project, different topic
                 } else {
                     charge = chargeBase
                 }

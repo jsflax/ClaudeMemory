@@ -73,6 +73,9 @@ final class EmbeddingProjection {
     private var targetPositions: [Int64: CGPoint] = [:]
     private var targetPositions3D: [Int64: SIMD3<Float>] = [:]
 
+    /// Whether the 3D lerp animation has converged (no pending targets).
+    var is3DAnimationSettled: Bool { targetPositions3D.isEmpty }
+
     /// Authoritative positions for cluster/void detection. Uses targetPositions (the true
     /// final t-SNE result) when available, so hulls are computed at the correct locations
     /// even while projectedPositions is still lerping toward them.

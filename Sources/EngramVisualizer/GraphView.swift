@@ -16,6 +16,20 @@ struct TopicGroupInfo: Equatable {
     let ids: [Int64]
 }
 
+// MARK: - Camera 3D state (isolated from GraphView to avoid body re-evaluation on camera changes)
+
+/// Holds 3D camera state + minimap positions. Written by renderTick's cameraCallback.
+/// Only MinimapView reads these properties, so only MinimapView re-renders when they change —
+/// GraphView's body passes this by reference without reading properties.
+@Observable
+@MainActor
+final class Camera3DState {
+    var azimuth: Float = 0
+    var position: SIMD3<Float> = .zero
+    var target: SIMD3<Float> = .zero
+    var positions: [Int64: SIMD3<Float>] = [:]
+}
+
 // MARK: - Viewport state (isolated from query data to avoid expensive recomputation on pan/zoom)
 
 @Observable
@@ -111,9 +125,7 @@ struct GraphView: View {
     // 3D state
     @State private var simulation3D = ForceSimulation3D()
     @State private var forcePositionSnapshot3D: [Int64: SIMD3<Float>] = [:]
-    @State private var camera3DAzimuth: Float = 0
-    @State private var camera3DPosition: SIMD3<Float> = .zero
-    @State private var camera3DTarget: SIMD3<Float> = .zero
+    @State private var camera3DState = Camera3DState()
 
     // Glow cleanup timer (1s interval — removes entries older than 4.3s)
     private let glowTimer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
@@ -484,7 +496,11 @@ struct GraphView: View {
 
         recomputeFilteredData()
         rebuildSimulationGraph()
-        recomputeClusters()
+        // Defer cluster computation — nearest-neighbor queries can crash if embeddings
+        // have mismatched dimensions. Run after initial render to avoid blocking launch.
+        Task { @MainActor in
+            recomputeClusters()
+        }
 
         // Fine-grained collection observers for cross-process changes
         edgeObserver = lattice.objects(MemoryEdge.self).observe { change in
@@ -829,26 +845,11 @@ struct GraphView: View {
             clusters: clusterGroups,
             searchMatchIds: searchMatchIds,
             isSearchActive: isSearchActive,
-            onAnimationTick: {
-                simulation3D.tick()
-                embeddingProjection.tickAnimation3D()
-                return positions3D
-            },
-            onCameraUpdate: { azimuth, camPos, camTarget in
-                camera3DAzimuth = azimuth
-                camera3DPosition = camPos
-                camera3DTarget = camTarget
-            },
-            onHubToggle: { hubId, expanding in
-                let children = cachedFilteredEdges.filter { $0.relation == "part_of" && $0.targetId == hubId }.map(\.sourceId)
-                for childId in children {
-                    if expanding {
-                        simulation3D.pin(childId)
-                    } else {
-                        simulation3D.unpin(childId)
-                    }
-                }
-            }
+            simulation3D: simulation3D,
+            embeddingProjection: embeddingProjection,
+            camera3DState: camera3DState,
+            forcePositionSnapshot3D: forcePositionSnapshot3D,
+            transitionProgress: transitionProgress
         )
         .transaction { $0.animation = nil }  // prevent overlay animations from resizing the 3D view
     }
@@ -931,10 +932,7 @@ struct GraphView: View {
                         viewportSize: size,
                         colorMap: colorMap,
                         pipAction: { minimapDetached = true },
-                        positions3D: config.dimensionMode == .threeD ? positions3D : nil,
-                        cameraAzimuth: config.dimensionMode == .threeD ? camera3DAzimuth : nil,
-                        cameraPosition3D: config.dimensionMode == .threeD ? camera3DPosition : nil,
-                        cameraTarget3D: config.dimensionMode == .threeD ? camera3DTarget : nil
+                        camera3DState: config.dimensionMode == .threeD ? camera3DState : nil
                     )
                     .background(GeometryReader { geo in
                         Color.clear.preference(
@@ -1003,7 +1001,7 @@ struct GraphView: View {
             colorMap: colorMap,
             pipAction: { minimapPanel.animatedDismiss { minimapDetached = false } },
             isFloating: true,
-            positions3D: config.dimensionMode == .threeD ? positions3D : nil
+            camera3DState: config.dimensionMode == .threeD ? camera3DState : nil
             // No camera chevron in floating mode (per user request)
         )
     }
@@ -1280,6 +1278,11 @@ struct SearchBarView: View {
                 .font(.system(size: 12, design: .monospaced))
                 .foregroundStyle(.white.opacity(0.9))
                 .focused($isFocused)
+                .onAppear {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                        isFocused = false
+                    }
+                }
                 .frame(width: 180)
                 .onKeyPress(.escape) {
                     text = ""

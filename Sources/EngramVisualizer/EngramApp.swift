@@ -1,6 +1,7 @@
 import SwiftUI
 import Lattice
 import EngramKit
+import GoogleSignIn
 import UniformTypeIdentifiers
 import ScreenCaptureKit
 import Sparkle
@@ -10,6 +11,8 @@ struct EngramApp: App {
     let lattice: Lattice
     let config: VisualizerConfig
     private let updaterController: SPUStandardUpdaterController
+    @State private var accountService = AccountService()
+    @State private var showingAccount = false
 
     #if SWIFT_PACKAGE && os(macOS)
     private final class Delegate: NSObject, NSApplicationDelegate {
@@ -41,20 +44,52 @@ struct EngramApp: App {
             lat.add(c)
             return c
         }()
+        // DIAG: force 3D mode for performance testing
+        config.dimensionMode = .threeD
+
+        // Configure Google Sign-In if client ID is available
+        if let googleClientID = ProcessInfo.processInfo.environment["GOOGLE_CLIENT_ID"]
+            ?? Bundle.main.object(forInfoDictionaryKey: "GIDClientID") as? String
+        {
+            GIDSignIn.sharedInstance.configuration = GIDConfiguration(clientID: googleClientID)
+        }
 
         Task.detached { CLIInstaller.syncIfNeeded() }
     }
 
     var body: some Scene {
-        WindowGroup("Memory Graph") {
+        WindowGroup("Engram") {
             GraphView()
                 .environment(\.lattice, lattice)
                 .environment(config)
                 .frame(minWidth: 800, minHeight: 600)
+                .toolbar {
+                    ToolbarItem(placement: .automatic) {
+                        HStack(spacing: 12) {
+                            SyncStatusView(accountService: accountService)
+
+                            Button {
+                                showingAccount.toggle()
+                            } label: {
+                                Image(systemName: "person.circle")
+                            }
+                            .popover(isPresented: $showingAccount) {
+                                AccountView(accountService: accountService)
+                            }
+                        }
+                        .padding(.leading, 8)
+                    }
+                }
         }
         .commands {
             CommandGroup(after: .appInfo) {
                 CheckForUpdatesView(updater: updaterController.updater)
+            }
+            CommandGroup(after: .appInfo) {
+                Button("Account...") {
+                    showingAccount = true
+                }
+                .keyboardShortcut(",", modifiers: [.command])
             }
             CommandGroup(after: .saveItem) {
                 Button("Export as PNG…") {
@@ -75,6 +110,13 @@ struct EngramApp: App {
                 .keyboardShortcut("e", modifiers: [.command, .shift])
             }
         }
+        MenuBarExtra {
+            MenuBarActivityFeed()
+                .environment(\.lattice, lattice)
+        } label: {
+            Image(systemName: "brain.head.profile")
+        }
+        .menuBarExtraStyle(.window)
     }
 }
 

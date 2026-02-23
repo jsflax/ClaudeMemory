@@ -130,11 +130,13 @@ struct RememberArgs: Decodable {
     let force: Bool?
     let importance: FlexibleInt?
     let parentId: FlexibleInt?
+    let isPrivate: Bool?
 
     enum CodingKeys: String, CodingKey {
         case content, topic, project, source, force, importance
         case expiresInDays = "expires_in_days"
         case parentId = "parent_id"
+        case isPrivate = "is_private"
     }
 }
 
@@ -173,11 +175,13 @@ struct UpdateArgs: Decodable {
     let source: String?
     let expiresInDays: FlexibleInt?
     let importance: FlexibleInt?
+    let isPrivate: Bool?
 
     enum CodingKeys: String, CodingKey {
         case id, query, project, content, append, prepend, find, replace, topic, source, importance
         case setProject = "set_project"
         case expiresInDays = "expires_in_days"
+        case isPrivate = "is_private"
     }
 }
 

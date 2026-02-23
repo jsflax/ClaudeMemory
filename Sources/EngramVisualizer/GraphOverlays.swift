@@ -1,5 +1,8 @@
 import SwiftUI
 import AppKit
+import os
+
+private let minimapLog = Logger(subsystem: "com.claudememory.visualizer", category: "Minimap")
 
 // MARK: - Inline minimap frame preference (for arc animation source/dest)
 
@@ -621,16 +624,17 @@ struct MinimapView: View {
     var pipAction: (() -> Void)?
     var isFloating: Bool = false
 
-    // 3D mode — when positions3D is present, renders XZ top-down projection + camera chevron
-    var positions3D: [Int64: SIMD3<Float>]? = nil
-    var cameraAzimuth: Float? = nil
-    var cameraPosition3D: SIMD3<Float>? = nil
-    var cameraTarget3D: SIMD3<Float>? = nil
+    // 3D mode — when camera3DState is present, renders XZ top-down projection + camera chevron.
+    // Camera3DState is @Observable: only MinimapView reads its properties, so only MinimapView
+    // re-renders on camera changes — GraphView's body is never re-evaluated.
+    var camera3DState: Camera3DState? = nil
 
     @State private var frameCount: UInt64 = 0
     @State private var isHovered: Bool = false
     @State private var renderedSize: CGSize = .zero
-    private let timer = Timer.publish(every: 1.0 / 60.0, on: .main, in: .common).autoconnect()
+    // DIAGNOSTIC: throttled to 10fps (was 60fps). At 60fps this fires a main-thread
+    // @State write + Canvas redraw every 16ms, potentially starving SceneEvents.Update.
+    private let timer = Timer.publish(every: 1.0 / 10.0, on: .main, in: .common).autoconnect()
 
     private let inlineSize = CGSize(width: 160, height: 120)
 
@@ -672,7 +676,7 @@ struct MinimapView: View {
         .shadow(color: .black.opacity(isFloating ? 0.5 : 0), radius: 12)
         .onHover { isHovered = $0 }
         .onReceive(timer) { _ in
-            if positions3D != nil || simulation.isActive || !glowingNodes.isEmpty || !newNodes.isEmpty || !dyingNodes.isEmpty {
+            if camera3DState != nil || simulation.isActive || !glowingNodes.isEmpty || !newNodes.isEmpty || !dyingNodes.isEmpty {
                 frameCount &+= 1
             }
         }
@@ -680,12 +684,13 @@ struct MinimapView: View {
 
     @ViewBuilder
     private func minimapCanvas(nodes: [NodeData], hubIds: Set<Int64>) -> some View {
-        let is3D = positions3D != nil
+        let is3D = camera3DState != nil
         let canvas = Canvas { context, size in
+            let canvasStart = CFAbsoluteTimeGetCurrent()
             let _ = frameCount
             // In 3D mode, project XZ plane; in 2D, use force simulation positions
             let positions: [Int64: CGPoint]
-            if let pos3D = positions3D {
+            if let pos3D = camera3DState?.positions {
                 var projected: [Int64: CGPoint] = [:]
                 for (id, p) in pos3D {
                     projected[id] = CGPoint(x: CGFloat(p.x), y: CGFloat(p.z))
@@ -800,7 +805,7 @@ struct MinimapView: View {
                 context.fill(Circle().path(in: rect), with: .color(red.opacity(di)))
             }
 
-            if is3D, let camPos = cameraPosition3D, let camTarget = cameraTarget3D, !isFloating {
+            if is3D, let camPos = camera3DState?.position, let camTarget = camera3DState?.target, !isFloating {
                 // Camera chevron — shows position and look direction on XZ plane
                 let camMx = (CGFloat(camPos.x) - bounds.minX) * mapScale
                 let camMy = (CGFloat(camPos.z) - bounds.minY) * mapScale
@@ -859,6 +864,10 @@ struct MinimapView: View {
                     lineWidth: 1
                 )
             }
+            let canvasMs = (CFAbsoluteTimeGetCurrent() - canvasStart) * 1000.0
+            if frameCount % 60 == 0 || canvasMs > 3 {
+                minimapLog.error("[MINIMAP] draw=\(canvasMs, format: .fixed(precision: 2))ms nodes=\(nodes.count) frame=\(frameCount)")
+            }
         }
 
         if isFloating {
@@ -882,7 +891,7 @@ struct MinimapView: View {
 
     private func navigateTo(location: CGPoint, in size: CGSize) {
         // Tap-to-navigate only works in 2D mode
-        guard positions3D == nil else { return }
+        guard camera3DState == nil else { return }
         let positions = simulation.positions
         guard !positions.isEmpty else { return }
         let bounds = computeBounds(positions: positions)

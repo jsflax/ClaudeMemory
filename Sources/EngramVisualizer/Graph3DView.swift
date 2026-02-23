@@ -1,6 +1,7 @@
 import SwiftUI
 import RealityKit
 import GameController
+import Metal
 import simd
 import os
 
@@ -14,11 +15,11 @@ private let frameLog = Logger(subsystem: "com.claudememory.visualizer", category
 final class Graph3DScene {
     private var rootEntity = Entity()
     private var cameraEntity: PerspectiveCamera?
-    private var nodeEntities: [Int64: ModelEntity] = [:]
     private var edgeContainer = Entity()
-    private var edgeEntities: [EdgeKey: ModelEntity] = [:]
-    private var edgeLastOpacity: [EdgeKey: Float] = [:]
-    private var nodeLastOpacity: [Int64: Float] = [:]
+
+    /// Weak reference to the native label overlay NSView.
+    /// renderTick sets needsDisplay = true when labels need updating — bypasses SwiftUI entirely.
+    @ObservationIgnored weak var labelOverlayView: LabelOverlayNSView?
 
     // Camera state — inputs write to target* values, updateCamera() lerps toward them.
     // This smooths out irregular input event timing for silky camera motion.
@@ -29,9 +30,11 @@ final class Graph3DScene {
     var targetCameraPos: SIMD3<Float> = .zero  // the look-at point
 
     // Smoothed state (lerped each frame, used for rendering)
-    private(set) var azimuth: Float = 0
-    private(set) var elevation: Float = 0.3
-    private(set) var cameraTarget: SIMD3<Float> = .zero
+    // @ObservationIgnored: written every frame by updateCamera(), only read within
+    // renderTick and gesture handlers — never by SwiftUI body evaluation.
+    @ObservationIgnored private(set) var azimuth: Float = 0
+    @ObservationIgnored private(set) var elevation: Float = 0.3
+    @ObservationIgnored private(set) var cameraTarget: SIMD3<Float> = .zero
 
     var orbitRadius: Float = 2.0 // orbit arm length — set by centerOnGraph to fit the scene
     private let smoothing: Float = 0.2  // lerp factor per frame (0=frozen, 1=instant)
@@ -60,16 +63,130 @@ final class Graph3DScene {
         cross(right, forward)
     }
 
-    // Material cache — PBR for nodes (lit, 3D shading), unlit for edges
-    private var materialCache: [String: PhysicallyBasedMaterial] = [:]
-    private var edgeMaterialCache: [String: UnlitMaterial] = [:]
-    private var edgeMaterialConnected: UnlitMaterial?
-    private var edgeMaterialSemantic: UnlitMaterial?
-    var animationTime: Float = 0
+    // Metal shaders for CustomMaterial — all visual effects run on GPU
+    private var metalDevice: MTLDevice?
+    private var metalLibrary: MTLLibrary?
+    private var edgeSurfaceShader: CustomMaterial.SurfaceShader?
+
+    // Batched node rendering — all nodes as a single LowLevelMesh (1 draw call).
+    // Metal compute kernel stamps template sphere vertices at each node position.
+    private var nodeBatchMesh: LowLevelMesh?
+    private var nodeBatchEntity: ModelEntity?
+    private var nodeBatchMaterial: CustomMaterial?
+    private var nodeBatchCapacity: Int = 0
+    private var nodeColorCache: [String: SIMD3<Float>] = [:]
+
+    // Metal compute pipeline for sphere instancing
+    // stamp_node_spheres compute pipeline removed — CPU stamping is faster for <1K nodes
+    // (avoids command buffer encode + submit + fence wait overhead)
+    // sphereTemplateBuffer removed — using sphereTemplateVertices Swift array instead     // template sphere vertices
+    private var sphereTemplateIndices: [UInt32] = [] // template sphere index data
+    private var sphereTemplateVertices: [(pos: SIMD3<Float>, norm: SIMD3<Float>)] = []
+    private var vertsPerSphere: Int = 0
+    private var indicesPerSphere: Int = 0
+    private var instanceArray: [NodeInstance] = []     // per-node instance data (CPU staging)
+
+    // Point lights for glowing/arriving/search-matched nodes
+    private var pointLightEntities: [Int64: Entity] = [:]
+
+    // Dying node entities — individual PBR entities with red flash animation (max ~5 at a time)
+    private var dyingNodeEntities: [Int64: ModelEntity] = [:]
+    private var dyingNodePos3D: [Int64: SIMD3<Float>] = [:]
+
+    // Batched edge rendering — all edges as a single LowLevelMesh (1 draw call)
+    private var edgeBatchMesh: LowLevelMesh?
+    private var edgeBatchEntity: ModelEntity?
+    private var edgeBatchMaterial: CustomMaterial?
+    private var edgeBatchCapacity: Int = 0
+    private var edgeColorCache: [String: SIMD3<Float>] = [:]
+
+    // Track last mesh part index counts to avoid calling parts.replaceAll() every frame.
+    // Calling replaceAll forces RealityKit to rebuild internal structures — can cause 1-frame blanks.
+    // Using capacity-based counts so replaceAll only fires on mesh creation/resize.
+    @ObservationIgnored private var lastNodePartIndexCount: Int = -1
+    @ObservationIgnored private var lastEdgePartIndexCount: Int = -1
+
+    /// 48-byte vertex layout shared by batched nodes and edges.
+    private struct BatchVertex {
+        var px: Float, py: Float, pz: Float     // position
+        var nx: Float, ny: Float, nz: Float     // normal
+        var u: Float, v: Float                   // uv0
+        var cr: Float, cg: Float, cb: Float, ca: Float  // color
+    }
+
+    /// Per-node instance data for the Metal compute stamping kernel (32 bytes).
+    private struct NodeInstance {
+        var px: Float, py: Float, pz: Float  // world position
+        var scale: Float                      // sphere radius
+        var cr: Float, cg: Float, cb: Float  // color
+        var packed: Float                     // packedState
+    }
+
+    /// Generate a UV sphere template. Returns (vertices, indices).
+    /// vertices: array of (position, normal) pairs for a unit sphere.
+    private static func generateSphereTemplate(segments: Int = 10, rings: Int = 6)
+        -> (vertices: [(SIMD3<Float>, SIMD3<Float>)], indices: [UInt32])
+    {
+        var vertices: [(SIMD3<Float>, SIMD3<Float>)] = []
+        var indices: [UInt32] = []
+
+        // Top pole
+        vertices.append((.init(0, 1, 0), .init(0, 1, 0)))
+
+        // Ring vertices
+        for ring in 1..<rings {
+            let phi = Float.pi * Float(ring) / Float(rings)
+            let sinPhi = sin(phi)
+            let cosPhi = cos(phi)
+            for seg in 0..<segments {
+                let theta = 2.0 * Float.pi * Float(seg) / Float(segments)
+                let pos = SIMD3<Float>(sinPhi * cos(theta), cosPhi, sinPhi * sin(theta))
+                vertices.append((pos, pos)) // unit sphere: normal = position
+            }
+        }
+
+        // Bottom pole
+        vertices.append((.init(0, -1, 0), .init(0, -1, 0)))
+
+        // Top cap
+        for seg in 0..<segments {
+            let next = (seg + 1) % segments
+            indices.append(0)
+            indices.append(UInt32(1 + seg))
+            indices.append(UInt32(1 + next))
+        }
+
+        // Body quads
+        for ring in 0..<(rings - 2) {
+            let ringStart = 1 + ring * segments
+            let nextStart = 1 + (ring + 1) * segments
+            for seg in 0..<segments {
+                let next = (seg + 1) % segments
+                let a = UInt32(ringStart + seg)
+                let b = UInt32(ringStart + next)
+                let c = UInt32(nextStart + seg)
+                let d = UInt32(nextStart + next)
+                indices.append(contentsOf: [a, c, b, b, c, d])
+            }
+        }
+
+        // Bottom cap
+        let bottomPole = UInt32(vertices.count - 1)
+        let lastStart = 1 + (rings - 2) * segments
+        for seg in 0..<segments {
+            let next = (seg + 1) % segments
+            indices.append(bottomPole)
+            indices.append(UInt32(lastStart + next))
+            indices.append(UInt32(lastStart + seg))
+        }
+
+        return (vertices, indices)
+    }
+
+    @ObservationIgnored var animationTime: Float = 0
 
     // Shared meshes — created once, reused for all entities
     private let nodeMesh = MeshResource.generateSphere(radius: 1.0)
-    private let edgeMesh = MeshResource.generateCylinder(height: 1.0, radius: 1.0)
 
     // Nebula particle emitter container
     private var nebulaContainer = Entity()
@@ -78,7 +195,7 @@ final class Graph3DScene {
 
     private let scaleFactor: Float = 1.0 / 200.0
     private let nodeRadius: Float = 0.04
-    private let edgeRadius: Float = 0.002
+    private let edgeRadius: Float = 0.004
 
     private struct EdgeKey: Hashable {
         let source: Int64
@@ -136,6 +253,56 @@ final class Graph3DScene {
         flowParticleContainer = Entity()
         flowParticleContainer.name = "flow_particles"
         rootEntity.addChild(flowParticleContainer)
+
+        // Initialize Metal device, shaders, and compute pipelines
+        if let device = MTLCreateSystemDefaultDevice(),
+           let library = device.makeDefaultLibrary() {
+            metalDevice = device
+            metalLibrary = library
+            frameLog.error("[setup] Metal device=\(device.name), library functionNames=\(library.functionNames)")
+            edgeSurfaceShader = CustomMaterial.SurfaceShader(named: "edge_surface", in: library)
+
+            // Node batch: CustomMaterial with lit PBR + geometry modifier for scale pulse.
+            // Real sphere geometry in a single LowLevelMesh — per-vertex color carries state.
+            let nodeBatchSurf = CustomMaterial.SurfaceShader(named: "node_batch_lit_surface", in: library)
+            let nodeBatchGeom = CustomMaterial.GeometryModifier(named: "node_batch_geometry", in: library)
+            do {
+                var mat = try CustomMaterial(surfaceShader: nodeBatchSurf,
+                                             geometryModifier: nodeBatchGeom,
+                                             lightingModel: .lit)
+                // OPAQUE — no transparent blending. Fog/dimming baked into base color
+                // by the shader. Enables early-Z rejection and avoids per-fragment sorting.
+                mat.baseColor.tint = .white  // color comes from vertex data
+                nodeBatchMaterial = mat
+                frameLog.error("[setup] ✅ nodeBatchMaterial created (.lit, OPAQUE)")
+            } catch {
+                frameLog.error("[setup] ❌ nodeBatchMaterial FAILED: \(error)")
+            }
+
+            // Generate sphere template — stored as Swift array for CPU stamping
+            let template = Self.generateSphereTemplate(segments: 16, rings: 10)
+            vertsPerSphere = template.vertices.count
+            indicesPerSphere = template.indices.count
+            sphereTemplateIndices = template.indices
+            sphereTemplateVertices = template.vertices
+            frameLog.error("[setup] sphere template: \(self.vertsPerSphere) verts, \(self.indicesPerSphere) indices")
+
+            // Edge batch material
+            if let surf = edgeSurfaceShader {
+                do {
+                    var mat = try CustomMaterial(surfaceShader: surf, lightingModel: .unlit)
+                    mat.blending = .transparent(opacity: .init(floatLiteral: 1.0))
+                    mat.baseColor.tint = .white
+                    mat.faceCulling = .none
+                    edgeBatchMaterial = mat
+                    frameLog.error("[setup] ✅ edgeBatchMaterial created (TRANSPARENT)")
+                } catch {
+                    frameLog.error("[setup] ❌ edgeBatchMaterial FAILED: \(error)")
+                }
+            }
+        } else {
+            frameLog.error("[setup] ❌ Metal init FAILED: no device or no default library")
+        }
 
         // World-space lighting — dramatic, fixed in space so shading changes
         // as you orbit around nodes. High contrast: strong key, dim fill.
@@ -528,8 +695,11 @@ final class Graph3DScene {
         // Without this, every tiny lerp residual triggers SwiftUI Canvas re-render (O(n) projections).
         let threshold: Float = 0.0001
         if abs(newAz - azimuth) > threshold { azimuth = newAz }
+        else if azimuth != targetAzimuth { azimuth = targetAzimuth }  // snap to stop cameraMoving
         if abs(newEl - elevation) > threshold { elevation = newEl }
+        else if elevation != targetElevation { elevation = targetElevation }
         if simd_length(newTarget - cameraTarget) > threshold { cameraTarget = newTarget }
+        else if cameraTarget != targetCameraPos { cameraTarget = targetCameraPos }
         cameraEntity?.transform = cameraTransform()
     }
 
@@ -558,103 +728,237 @@ final class Graph3DScene {
         cameraTarget = scaledCentroid
     }
 
-    private func nodeMaterial(for project: String, colorMap: [String: Color]) -> PhysicallyBasedMaterial {
-        if let cached = materialCache[project] { return cached }
+    /// Get cached NSColor tint for a project.
+    /// Get cached node color as SIMD3<Float> for vertex data.
+    private func nodeColorFloat3(for project: String, colorMap: [String: Color]) -> SIMD3<Float> {
+        if let cached = nodeColorCache[project] { return cached }
         let color = colorMap[project] ?? .gray
-        let resolved = NSColor(color)
-        var mat = PhysicallyBasedMaterial()
-        mat.baseColor = .init(tint: resolved.withAlphaComponent(0.95))
-        mat.roughness = .init(floatLiteral: 0.15)    // very glossy — sharp specular highlights
-        mat.metallic = .init(floatLiteral: 0.05)     // mostly dielectric, natural specular
-        mat.emissiveColor = .init(color: resolved.withAlphaComponent(0.1))
-        mat.emissiveIntensity = 0.15  // subtle self-glow so shadow side isn't pure black
-        materialCache[project] = mat
-        return mat
+        let nsColor = NSColor(color).usingColorSpace(.sRGB) ?? NSColor(color)
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        nsColor.getRed(&r, green: &g, blue: &b, alpha: &a)
+        let c = SIMD3<Float>(Float(r), Float(g), Float(b))
+        nodeColorCache[project] = c
+        return c
     }
 
-    /// Edge materials use full alpha — opacity is controlled entirely via OpacityComponent
-    /// so the pulse animation can swing through a wide visible range.
-    private func getEdgeMaterial(connected: Bool, semantic: Bool,
-                                project: String? = nil,
-                                colorMap: [String: Color] = [:]) -> UnlitMaterial {
-        if connected {
-            if edgeMaterialConnected == nil {
-                var mat = UnlitMaterial()
-                mat.color = .init(tint: .white)
-                edgeMaterialConnected = mat
-            }
-            return edgeMaterialConnected!
+    // MARK: - Node Batch Mesh
+
+    /// Create or resize the LowLevelMesh for batched node rendering (real sphere geometry).
+    private func ensureNodeBatchMesh(capacity: Int) {
+        guard capacity > nodeBatchCapacity else { return }
+        let newCapacity = max(capacity * 2, 512)
+
+        let totalVerts = newCapacity * vertsPerSphere
+        let totalIndices = newCapacity * indicesPerSphere
+
+        var desc = LowLevelMesh.Descriptor()
+        desc.vertexCapacity = totalVerts
+        desc.indexCapacity = totalIndices
+        desc.vertexAttributes = [
+            .init(semantic: .position, format: .float3, offset: 0),
+            .init(semantic: .normal, format: .float3, offset: 12),
+            .init(semantic: .uv0, format: .float2, offset: 24),
+            .init(semantic: .color, format: .float4, offset: 32),
+        ]
+        desc.vertexLayouts = [.init(bufferIndex: 0, bufferStride: 48)]
+        desc.indexType = .uint32
+
+        guard let mesh = try? LowLevelMesh(descriptor: desc) else {
+            frameLog.error("[nodeBatch] ❌ LowLevelMesh creation failed")
+            return
         }
-        // Project-colored edge (both force and semantic modes)
+
+        // Pre-fill index buffer: stamp template indices for each node instance
+        let templateIndices = sphereTemplateIndices
+        let vpn = UInt32(vertsPerSphere)
+        mesh.withUnsafeMutableIndices { raw in
+            let indices = raw.bindMemory(to: UInt32.self)
+            for node in 0..<newCapacity {
+                let baseVert = UInt32(node) * vpn
+                let baseIdx = node * indicesPerSphere
+                for i in 0..<indicesPerSphere {
+                    indices[baseIdx + i] = baseVert + templateIndices[i]
+                }
+            }
+        }
+
+        // Set parts to full capacity BEFORE assigning to entity — ensures the mesh
+        // is never visible with zero parts. Vertices beyond actual node count are zero
+        // from allocation (degenerate triangles, zero-area, GPU discards instantly).
+        // This eliminates the need for parts.replaceAll during updateNodeBatch, which
+        // caused 1-frame blanks when RealityKit rebuilt internal structures.
+        let generousBounds = BoundingBox(min: SIMD3(-10, -10, -10), max: SIMD3(10, 10, 10))
+        mesh.parts.replaceAll([
+            LowLevelMesh.Part(
+                indexCount: totalIndices,
+                topology: .triangle,
+                materialIndex: 0,
+                bounds: generousBounds
+            )
+        ])
+
+        nodeBatchMesh = mesh
+        nodeBatchCapacity = newCapacity
+        lastNodePartIndexCount = totalIndices  // Match capacity — prevents per-frame parts.replaceAll
+
+        guard let resource = try? MeshResource(from: mesh),
+              let material = nodeBatchMaterial else { return }
+
+        if let entity = nodeBatchEntity {
+            entity.model = ModelComponent(mesh: resource, materials: [material])
+        } else {
+            let entity = ModelEntity(mesh: resource, materials: [material])
+            entity.name = "node_batch"
+            rootEntity.addChild(entity)
+            nodeBatchEntity = entity
+        }
+        frameLog.error("[nodeBatch] ✅ mesh created: \(newCapacity) nodes, \(totalVerts) verts, \(totalIndices) indices")
+    }
+
+    /// Get cached edge color as SIMD3<Float> for vertex data.
+    private func edgeColorFloat3(for project: String?, colorMap: [String: Color]) -> SIMD3<Float> {
+        let key = project ?? "__default"
+        if let cached = edgeColorCache[key] { return cached }
         if let project, let swiftColor = colorMap[project] {
-            let key = semantic ? "sem_\(project)" : project
-            if let cached = edgeMaterialCache[key] { return cached }
             let nsColor = NSColor(swiftColor).usingColorSpace(.sRGB) ?? NSColor(swiftColor)
-            // Brighten the color so it reads well at low opacity
             var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
             nsColor.getRed(&r, green: &g, blue: &b, alpha: &a)
-            let brightened = NSColor(
-                red: min(1.0, r * 1.4 + 0.15),
-                green: min(1.0, g * 1.4 + 0.15),
-                blue: min(1.0, b * 1.4 + 0.15),
-                alpha: 1.0
+            let c = SIMD3<Float>(
+                Float(min(1.0, r * 1.4 + 0.15)),
+                Float(min(1.0, g * 1.4 + 0.15)),
+                Float(min(1.0, b * 1.4 + 0.15))
             )
-            var mat = UnlitMaterial()
-            mat.color = .init(tint: brightened)
-            edgeMaterialCache[key] = mat
-            return mat
+            edgeColorCache[key] = c
+            return c
+        } else {
+            let c = SIMD3<Float>(0.6, 0.6, 0.6)
+            edgeColorCache[key] = c
+            return c
         }
-        var mat = UnlitMaterial()
-        mat.color = .init(tint: NSColor(white: 0.6, alpha: 1.0))
-        return mat
     }
 
-    func updateNodes(positions: [Int64: SIMD3<Float>],
-                     nodes: [NodeData], hubs: Set<Int64>,
-                     colorMap: [String: Color],
-                     selectedNode: Int64?,
-                     glowingNodes: [Int64: Date],
-                     newNodes: [Int64: Date],
-                     dyingNodes: [Int64: DyingNode]) {
-        let nodeById = Dictionary(nodes.map { ($0.id, $0) }, uniquingKeysWith: { _, last in last })
-        let camPos = cameraPosition  // scaled coordinates
-        let now = Date()
+    // MARK: - Edge Batch Mesh
 
-        // Keep entities for visible nodes + active dying nodes
-        let visibleIds = Set(nodeById.keys)
-        let dyingIds = Set(dyingNodes.keys)
-        let keepIds = visibleIds.union(dyingIds)
-        for (id, entity) in nodeEntities where !keepIds.contains(id) {
-            entity.removeFromParent()
-            nodeEntities.removeValue(forKey: id)
-            nodeLastOpacity.removeValue(forKey: id)
+    /// Create or resize the LowLevelMesh for batched edge rendering.
+    private func ensureEdgeBatchMesh(capacity: Int) {
+        guard capacity > edgeBatchCapacity else { return }
+        let newCapacity = max(capacity * 2, 2048)
+
+        var desc = LowLevelMesh.Descriptor()
+        desc.vertexCapacity = newCapacity * 12   // 12 vertices per cylinder (6-segment tube)
+        desc.indexCapacity = newCapacity * 36    // 36 indices per cylinder (6 quad faces × 2 triangles × 3)
+        desc.vertexAttributes = [
+            .init(semantic: .position, format: .float3, offset: 0),
+            .init(semantic: .normal, format: .float3, offset: 12),
+            .init(semantic: .uv0, format: .float2, offset: 24),
+            .init(semantic: .color, format: .float4, offset: 32),
+        ]
+        desc.vertexLayouts = [.init(bufferIndex: 0, bufferStride: 48)]
+        desc.indexType = .uint32
+
+        guard let mesh = try? LowLevelMesh(descriptor: desc) else { return }
+
+        // Pre-fill index buffer (6-sided cylinder topology: 6 quad faces per edge)
+        mesh.withUnsafeMutableIndices { raw in
+            let indices = raw.bindMemory(to: UInt32.self)
+            for i in 0..<newCapacity {
+                let vBase = UInt32(i * 12)    // 12 verts per edge (bottom ring 0..5, top ring 6..11)
+                let iBase = i * 36            // 36 indices per edge
+                for seg in 0..<6 {
+                    let next = (seg + 1) % 6
+                    let b0 = vBase + UInt32(seg)        // bottom ring
+                    let b1 = vBase + UInt32(next)
+                    let t0 = vBase + UInt32(seg + 6)    // top ring
+                    let t1 = vBase + UInt32(next + 6)
+                    let idx = iBase + seg * 6
+                    // Two triangles per quad face (CCW from outside)
+                    indices[idx]     = b0; indices[idx + 1] = t0; indices[idx + 2] = t1
+                    indices[idx + 3] = b0; indices[idx + 4] = t1; indices[idx + 5] = b1
+                }
+            }
         }
 
-        // Fog parameters (in scaled coordinates — world values / 200)
+        // Set parts to full capacity before assigning to entity — same pattern as node batch.
+        // Eliminates per-frame parts.replaceAll that caused 1-frame blanks.
+        let generousBounds = BoundingBox(min: SIMD3(-10, -10, -10), max: SIMD3(10, 10, 10))
+        mesh.parts.replaceAll([
+            LowLevelMesh.Part(
+                indexCount: newCapacity * 36,
+                topology: .triangle,
+                materialIndex: 0,
+                bounds: generousBounds
+            )
+        ])
+
+        edgeBatchMesh = mesh
+        edgeBatchCapacity = newCapacity
+        lastEdgePartIndexCount = newCapacity * 36  // Match capacity — prevents per-frame parts.replaceAll
+
+        guard let resource = try? MeshResource(from: mesh),
+              let material = edgeBatchMaterial else { return }
+
+        if let entity = edgeBatchEntity {
+            entity.model = ModelComponent(mesh: resource, materials: [material])
+        } else {
+            let entity = ModelEntity(mesh: resource, materials: [material])
+            entity.name = "edge_batch"
+            edgeContainer.addChild(entity)
+            edgeBatchEntity = entity
+        }
+    }
+
+    /// Rebuild the batched node mesh using Metal compute to stamp sphere instances.
+    /// All alive nodes rendered as real sphere triangles in a single LowLevelMesh (1 draw call).
+    /// Point lights managed as separate lightweight entities (~5-10 at most).
+    func updateNodeBatch(positions: [Int64: SIMD3<Float>],
+                         nodes: [NodeData], hubs: Set<Int64>,
+                         colorMap: [String: Color],
+                         selectedNode: Int64?,
+                         glowingNodes: [Int64: Date],
+                         newNodes: [Int64: Date]) {
+        let nodeCount = positions.count
+        guard nodeCount > 0, vertsPerSphere > 0 else {
+            if lastNodePartIndexCount != 0 {
+                frameLog.error("[nodeBatch] ⚠️ ZERO-GUARD: clearing parts (nodeCount=\(nodeCount), vps=\(self.vertsPerSphere))")
+                nodeBatchMesh?.parts.replaceAll([])
+                lastNodePartIndexCount = 0
+            }
+            return
+        }
+
+        ensureNodeBatchMesh(capacity: nodeCount)
+        guard let mesh = nodeBatchMesh else { return }
+
+        let nodeById = Dictionary(nodes.map { ($0.id, $0) }, uniquingKeysWith: { _, last in last })
+        let now = Date()
+        let camPos = cameraPosition
         let fogNear: Float = 100
         let fogFar: Float = 1200
-        let fogMinOpacity: Float = 0.08
 
+        // Ensure instance array is large enough
+        if instanceArray.count < nodeCount {
+            instanceArray = [NodeInstance](repeating: NodeInstance(px: 0, py: 0, pz: 0, scale: 0, cr: 0, cg: 0, cb: 0, packed: 0), count: max(nodeCount * 2, 512))
+        }
 
-        // Add/update live nodes
+        // Fill instance array + track point lights
+        var activeLightIds = Set<Int64>()
+        var idx = 0
+
         for (id, pos) in positions {
-            let worldPos = pos * scaleFactor
             guard let nodeData = nodeById[id] else { continue }
 
+            let worldPos = pos * scaleFactor
             let isHub = hubs.contains(id)
             let importance = max(1, nodeData.importance)
             let baseRadius: Float = isHub ? nodeRadius * 1.6 : nodeRadius
-            var importanceRadius = baseRadius * (1.0 + Float(importance - 1) * 0.08)
+            let r = baseRadius * (1.0 + Float(importance - 1) * 0.08)
 
-            // Recall glow intensity (slow fade in → hold → fade out)
+            // Recall glow intensity
             let ri: Float = {
                 guard let glowStart = glowingNodes[id], id != selectedNode else { return 0 }
                 let elapsed = Float(now.timeIntervalSince(glowStart))
                 let fadeIn: Float = 1.0, hold: Float = 1.5, fadeOut: Float = 2.0
-                if elapsed < fadeIn {
-                    // Smooth ease-in: cubic for gentle build-up
-                    let t = elapsed / fadeIn; return t * t * t
-                }
+                if elapsed < fadeIn { let t = elapsed / fadeIn; return t * t * t }
                 else if elapsed < fadeIn + hold { return 1.0 }
                 else if elapsed < fadeIn + hold + fadeOut {
                     let t = 1.0 - (elapsed - fadeIn - hold) / fadeOut; return t * t
@@ -662,14 +966,12 @@ final class Graph3DScene {
                 return 0
             }()
 
-            // Arrival (new node) intensity
+            // Arrival intensity
             let ai: Float = {
                 guard let arrivalTime = newNodes[id] else { return 0 }
                 let elapsed = Float(now.timeIntervalSince(arrivalTime))
                 let fadeIn: Float = 0.8, hold: Float = 2.0, fadeOut: Float = 3.0
-                if elapsed < fadeIn {
-                    let t = elapsed / fadeIn; return t * t * t
-                }
+                if elapsed < fadeIn { let t = elapsed / fadeIn; return t * t * t }
                 else if elapsed < fadeIn + hold { return 1.0 }
                 else if elapsed < fadeIn + hold + fadeOut {
                     let t = 1.0 - (elapsed - fadeIn - hold) / fadeOut; return t * t
@@ -677,126 +979,183 @@ final class Graph3DScene {
                 return 0
             }()
 
-            // Depth fog (shared by node and point light effects)
-            let dist = simd_length(pos - camPos)
-            let fogT = max(0, min(1, (dist - fogNear) / (fogFar - fogNear)))
-            let baseFogOpacity = id == selectedNode ? 1.0 : max(fogMinOpacity, 1.0 - fogT * 0.92)
-            let depthFade = max(Float(0.0), 1.0 - fogT * 0.95)  // 1.0 near → 0.05 far
-
-            // Search spotlight dimming
             let searchDimmed = renderIsSearchActive && !renderSearchMatchIds.contains(id)
             let searchMatched = renderIsSearchActive && renderSearchMatchIds.contains(id) && id != selectedNode
-            let fogOpacity = searchDimmed ? min(baseFogOpacity, 0.12) : baseFogOpacity
 
-            // Pulse scale for glow/arrival/search effects (more dramatic in 3D)
-            if ri > 0 {
-                importanceRadius *= 1.0 + sin(animationTime * 4.0) * 0.2 * ri
-            } else if ai > 0 {
-                importanceRadius *= 1.0 + sin(animationTime * 3.0) * 0.2 * ai
-            } else if searchMatched {
-                importanceRadius *= 1 + sin(animationTime * 4) * 0.12
-            }
-
-            // Choose material based on state
-            let material: PhysicallyBasedMaterial
+            let curState: Float
+            let curIntensity: Float
             if id == selectedNode {
-                var mat = PhysicallyBasedMaterial()
-                mat.baseColor = .init(tint: .white)
-                mat.roughness = .init(floatLiteral: 0.15)
-                mat.emissiveColor = .init(color: .white)
-                mat.emissiveIntensity = 1.0
-                material = mat
-            } else if searchMatched {
-                // Search match: cyan emissive glow
-                var mat = nodeMaterial(for: nodeData.project, colorMap: colorMap)
-                mat.emissiveColor = .init(color: NSColor(red: 0.0, green: 0.9, blue: 1.0, alpha: 1))
-                mat.emissiveIntensity = 4.0 * (1 + sin(animationTime * 4) * 0.3) * depthFade
-                material = mat
+                curState = 1; curIntensity = 0
             } else if ri > 0 {
-                // Recalled: intense blue-white emissive, depth-attenuated
-                var mat = nodeMaterial(for: nodeData.project, colorMap: colorMap)
-                mat.emissiveColor = .init(color: NSColor(red: 0.7, green: 0.9, blue: 1.0, alpha: 1))
-                let emPulse = 1.0 + sin(animationTime * 5.0) * 0.3
-                mat.emissiveIntensity = 8.0 * ri * emPulse * depthFade
-                material = mat
+                curState = 2; curIntensity = ri
             } else if ai > 0 {
-                // New arrival: intense golden emissive, depth-attenuated
-                var mat = nodeMaterial(for: nodeData.project, colorMap: colorMap)
-                mat.emissiveColor = .init(color: NSColor(red: 1.0, green: 0.85, blue: 0.4, alpha: 1))
-                let emPulse = 1.0 + sin(animationTime * 3.5) * 0.3
-                mat.emissiveIntensity = 8.0 * ai * emPulse * depthFade
-                material = mat
+                curState = 3; curIntensity = ai
+            } else if searchMatched {
+                curState = 4; curIntensity = 0
             } else {
-                material = nodeMaterial(for: nodeData.project, colorMap: colorMap)
+                curState = 0; curIntensity = 0
             }
 
-            if let entity = nodeEntities[id] {
-                entity.position = worldPos
-                entity.scale = SIMD3<Float>(repeating: importanceRadius)
-                if abs(fogOpacity - (nodeLastOpacity[id] ?? -1)) > 0.02 {
-                    entity.components.set(OpacityComponent(opacity: fogOpacity))
-                    nodeLastOpacity[id] = fogOpacity
+            let packedState: Float = curState + (searchDimmed ? 10.0 : 0.0) + curIntensity * 0.01
+
+            let color: SIMD3<Float> = id == selectedNode
+                ? SIMD3<Float>(1, 1, 1)
+                : nodeColorFloat3(for: nodeData.project, colorMap: colorMap)
+
+            instanceArray[idx] = NodeInstance(
+                px: worldPos.x, py: worldPos.y, pz: worldPos.z,
+                scale: r,
+                cr: color.x, cg: color.y, cb: color.z,
+                packed: packedState
+            )
+
+            idx += 1
+
+            // Point lights for glowing/arriving/search-matched nodes
+            if !Self.DIAG_SKIP_POINT_LIGHTS, ri > 0 || ai > 0 || searchMatched {
+                activeLightIds.insert(id)
+                let lightEntity: Entity
+                if let existing = pointLightEntities[id] {
+                    lightEntity = existing
+                } else {
+                    lightEntity = Entity()
+                    lightEntity.name = "ptlight_\(id)"
+                    rootEntity.addChild(lightEntity)
+                    pointLightEntities[id] = lightEntity
                 }
-                entity.model?.materials = [material]
-            } else {
-                let entity = ModelEntity(mesh: nodeMesh, materials: [material])
-                entity.position = worldPos
-                entity.scale = SIMD3<Float>(repeating: importanceRadius)
-                entity.name = "node_\(id)"
-                entity.components.set(OpacityComponent(opacity: fogOpacity))
-                nodeLastOpacity[id] = fogOpacity
-                entity.components.set(
-                    CollisionComponent(shapes: [.generateSphere(radius: 1.0)])
-                )
-                rootEntity.addChild(entity)
-                nodeEntities[id] = entity
-            }
+                lightEntity.position = worldPos
 
-            // --- Pulsing point light (depth-attenuated, no geometry) ---
-            // High intensity + large attenuation radius so light visibly washes
-            // over neighboring nodes. Nodes are ~0.04 units, spaced ~0.1–0.3 apart
-            // in scaled coords, so attenuationRadius needs to be 0.5+ to reach neighbors.
-            if let entity = nodeEntities[id] {
+                let dist = simd_length(pos - camPos)
+                let fogT = max(Float(0), min(Float(1), (dist - fogNear) / (fogFar - fogNear)))
+                let depthFade = max(Float(0.0), 1.0 - fogT * 0.95)
+
                 if ri > 0 {
                     let lightPulse = 1.0 + sin(animationTime * 3.0) * 0.4
-                    entity.components.set(PointLightComponent(
+                    lightEntity.components.set(PointLightComponent(
                         color: NSColor(red: 0.7, green: 0.9, blue: 1.0, alpha: 1),
                         intensity: 20000 * ri * depthFade * lightPulse,
                         attenuationRadius: 2.0 * depthFade + 0.1
                     ))
                 } else if ai > 0 {
                     let lightPulse = 1.0 + sin(animationTime * 2.5) * 0.4
-                    entity.components.set(PointLightComponent(
+                    lightEntity.components.set(PointLightComponent(
                         color: NSColor(red: 1.0, green: 0.8, blue: 0.3, alpha: 1),
                         intensity: 20000 * ai * depthFade * lightPulse,
                         attenuationRadius: 2.0 * depthFade + 0.1
                     ))
-                } else if searchMatched {
+                } else {
                     let lightPulse = 1.0 + sin(animationTime * 4.0) * 0.3
-                    entity.components.set(PointLightComponent(
+                    lightEntity.components.set(PointLightComponent(
                         color: NSColor(red: 0.0, green: 0.9, blue: 1.0, alpha: 1),
                         intensity: 12000 * depthFade * lightPulse,
                         attenuationRadius: 1.5 * depthFade + 0.1
                     ))
-                } else {
-                    entity.components.remove(PointLightComponent.self)
+                }
+            }
+        }
+        let actualNodeCount = idx
+
+        // --- CPU stamp: directly write sphere vertices into mesh buffer ---
+        // For ~500 nodes × 52 verts = 26K vertices, CPU is faster than GPU dispatch
+        // overhead (command buffer encode + submit + fence wait).
+        let templateVerts = sphereTemplateVertices
+        let vps = vertsPerSphere
+        let instances = instanceArray
+        mesh.withUnsafeMutableBytes(bufferIndex: 0) { raw in
+            let outPtr = raw.baseAddress!.assumingMemoryBound(to: Float.self)
+            for nodeIdx in 0..<actualNodeCount {
+                let inst = instances[nodeIdx]
+                let instPos = SIMD3<Float>(inst.px, inst.py, inst.pz)
+                let scale = inst.scale
+                let cr = inst.cr, cg = inst.cg, cb = inst.cb, packed = inst.packed
+                for vertIdx in 0..<vps {
+                    let tv = templateVerts[vertIdx]
+                    let wp = instPos + tv.pos * scale
+                    let base = (nodeIdx * vps + vertIdx) * 12
+                    outPtr[base + 0]  = wp.x
+                    outPtr[base + 1]  = wp.y
+                    outPtr[base + 2]  = wp.z
+                    outPtr[base + 3]  = tv.norm.x
+                    outPtr[base + 4]  = tv.norm.y
+                    outPtr[base + 5]  = tv.norm.z
+                    outPtr[base + 6]  = 0  // uv0.x (reserved — nonzero causes lit pipeline artifacts)
+                    outPtr[base + 7]  = 0
+                    outPtr[base + 8]  = cr
+                    outPtr[base + 9]  = cg
+                    outPtr[base + 10] = cb
+                    outPtr[base + 11] = packed
                 }
             }
         }
 
-        // Dying nodes: red flash → dark fade → remove
+        // Use capacity-based index count — parts.replaceAll only fires when recovering
+        // from the zero-guard (which clears parts and sets lastNodePartIndexCount=0).
+        // During normal operation, capacity doesn't change so this never fires.
+        let capacityIndexCount = nodeBatchCapacity * indicesPerSphere
+        if capacityIndexCount != lastNodePartIndexCount {
+            frameLog.error("[nodeBatch] ⚠️ PARTS RECOVERY: \(self.lastNodePartIndexCount) → \(capacityIndexCount)")
+            let generousBounds = BoundingBox(min: SIMD3(-10, -10, -10), max: SIMD3(10, 10, 10))
+            mesh.parts.replaceAll([
+                LowLevelMesh.Part(
+                    indexCount: capacityIndexCount,
+                    topology: .triangle,
+                    materialIndex: 0,
+                    bounds: generousBounds
+                )
+            ])
+            lastNodePartIndexCount = capacityIndexCount
+        }
+
+        // Remove stale point lights (or ALL if diagnostics skip them)
+        if Self.DIAG_SKIP_POINT_LIGHTS {
+            for (_, e) in pointLightEntities { e.removeFromParent() }
+            pointLightEntities.removeAll()
+        } else {
+            for id in pointLightEntities.keys where !activeLightIds.contains(id) {
+                pointLightEntities[id]?.removeFromParent()
+                pointLightEntities.removeValue(forKey: id)
+            }
+        }
+    }
+
+    /// Update dying nodes — individual PBR entities with red flash animation (max ~5 at a time).
+    func updateDyingNodes(positions: [Int64: SIMD3<Float>],
+                          dyingNodes: [Int64: DyingNode]) {
+        let now = Date()
+
+        // Capture 3D positions for dying nodes while they're still in positions
+        for id in dyingNodes.keys {
+            if dyingNodePos3D[id] == nil, let pos = positions[id] {
+                dyingNodePos3D[id] = pos
+            }
+        }
+
         for (id, dying) in dyingNodes {
-            if positions[id] != nil { continue }  // still live, handled above
-            guard let entity = nodeEntities[id] else { continue }
+            if positions[id] != nil { continue }  // still live, handled in batch
 
             let elapsed = Float(now.timeIntervalSince(dying.startTime))
             let flashIn: Float = 0.3, hold: Float = 1.2, fadeOut: Float = 1.5
             let total = flashIn + hold + fadeOut
+
             guard elapsed < total else {
-                entity.removeFromParent()
-                nodeEntities.removeValue(forKey: id)
+                if let entity = dyingNodeEntities[id] {
+                    entity.removeFromParent()
+                    dyingNodeEntities.removeValue(forKey: id)
+                }
+                dyingNodePos3D.removeValue(forKey: id)
                 continue
             }
+
+            // Create entity on first frame if needed
+            if dyingNodeEntities[id] == nil {
+                let pos3D = dyingNodePos3D[id] ?? .zero
+                let entity = ModelEntity(mesh: nodeMesh, materials: [PhysicallyBasedMaterial()])
+                entity.position = pos3D * scaleFactor
+                entity.name = "dying_\(id)"
+                rootEntity.addChild(entity)
+                dyingNodeEntities[id] = entity
+            }
+            guard let entity = dyingNodeEntities[id] else { continue }
 
             let di: Float
             if elapsed < flashIn {
@@ -807,7 +1166,6 @@ final class Graph3DScene {
                 let t = 1.0 - (elapsed - flashIn - hold) / fadeOut; di = t * t
             }
 
-            // Red material that darkens over time
             let darkening = elapsed > flashIn ? min(1.0, (elapsed - flashIn) / (hold + fadeOut)) : 0.0
             var mat = PhysicallyBasedMaterial()
             mat.baseColor = .init(tint: NSColor(
@@ -821,202 +1179,182 @@ final class Graph3DScene {
             mat.roughness = .init(floatLiteral: 0.3)
             entity.model?.materials = [mat]
 
-            // Red point light during death — bright enough to illuminate neighbors
             entity.components.set(PointLightComponent(
                 color: NSColor(red: 1.0, green: 0.15, blue: 0.05, alpha: 1),
                 intensity: 15000 * di,
                 attenuationRadius: 1.5
             ))
 
-            // Shrink during fade-out phase
             let shrink: Float = elapsed > flashIn + hold ? 1.0 - (1.0 - di) * 0.5 : 1.0
             let baseR: Float = dying.isHub ? nodeRadius * 1.6 : nodeRadius
             let impR = baseR * (1.0 + Float(max(1, dying.importance) - 1) * 0.08)
             entity.scale = SIMD3<Float>(repeating: impR * shrink)
             entity.components.set(OpacityComponent(opacity: di))
         }
-    }
 
-    /// Create or update a dual pulse sphere pair for a node effect.
-    /// Two rings offset by half-period create a seamless loop — one is always
-    /// mid-expansion when the other resets, eliminating the visible pop.
-    ///
-    /// `period`: seconds per full cycle.  `phase`: 0→1 progress through one cycle.
-    /// Caller passes the raw `animationTime`; this method computes both ring phases.
-    /// Repositions existing edge entities with pulse animation (no material/topology changes).
-    func repositionEdgesAnimated(positions: [Int64: SIMD3<Float>], edges: [EdgeData],
-                                 selectedNode: Int64?, positionsChanged: Bool) {
-        let camPos = cameraPosition  // scaled coordinates (= unscaled, since camPos comes from cameraPosition which uses unscaled coords)
-        let fogFar: Float = 1200
-        let isSemanticMode = renderLayoutMode == .embedding
-
-        for edge in edges {
-            let key = EdgeKey(source: edge.sourceId, target: edge.targetId)
-            guard let entity = edgeEntities[key],
-                  let from = positions[edge.sourceId],
-                  let to = positions[edge.targetId] else { continue }
-
-            let connected = edge.sourceId == selectedNode || edge.targetId == selectedNode
-
-            // Cull edges entirely beyond fog distance (both endpoints far away and not connected)
-            if !connected {
-                let distFrom = simd_length(from - camPos)
-                let distTo = simd_length(to - camPos)
-                if distFrom > fogFar && distTo > fogFar {
-                    // Hide it and skip all work
-                    if edgeLastOpacity[key] != 0 {
-                        entity.components.set(OpacityComponent(opacity: 0))
-                        edgeLastOpacity[key] = 0
-                    }
-                    continue
-                }
-            }
-
-            // Only reposition geometry when node positions actually changed
-            if positionsChanged {
-                let p1 = from * scaleFactor
-                let p2 = to * scaleFactor
-                let delta = p2 - p1
-                let length = simd_length(delta)
-                guard length > 0.001 else { continue }
-                let midpoint = (p1 + p2) / 2
-                let radius = connected ? edgeRadius * 2.5 : edgeRadius * 1.3
-
-                entity.position = midpoint
-                entity.orientation = simd_quatf(from: SIMD3<Float>(0, 1, 0), to: normalize(delta))
-                entity.scale = SIMD3<Float>(radius, length, radius)
-            }
-
-            // Pulse opacity — update every frame but skip ECS mutation if unchanged
-            let edgeMid = (from + to) / 2
-            let edgeDist = simd_length(edgeMid - camPos)
-            let fogNear: Float = 100
-            let fogT = max(0, min(1, (edgeDist - fogNear) / (fogFar - fogNear)))
-            let depthFade = max(Float(0.0), 1.0 - fogT * 0.95)
-            let scaledMid = edgeMid * scaleFactor
-            let phase = (scaledMid.x + scaledMid.y + scaledMid.z) * 8.0
-            let pulse = (sin(animationTime * 3.0 + phase) + 1.0) * 0.5
-
-            let searchDimmedEdge = renderIsSearchActive
-                && !renderSearchMatchIds.contains(edge.sourceId)
-                && !renderSearchMatchIds.contains(edge.targetId)
-
-            let edgeFog: Float
-            if searchDimmedEdge && !connected {
-                edgeFog = 0.02 * depthFade
-            } else if connected {
-                edgeFog = 0.5 + pulse * 0.3
-            } else if isSemanticMode {
-                edgeFog = (0.02 + pulse * 0.04) * depthFade
-            } else {
-                edgeFog = (0.06 + pulse * 0.16) * depthFade
-            }
-            if abs(edgeFog - (edgeLastOpacity[key] ?? -1)) > 0.02 {
-                entity.components.set(OpacityComponent(opacity: edgeFog))
-                edgeLastOpacity[key] = edgeFog
-            }
+        // Clean up finished dying entities
+        for id in dyingNodeEntities.keys where dyingNodes[id] == nil {
+            dyingNodeEntities[id]?.removeFromParent()
+            dyingNodeEntities.removeValue(forKey: id)
         }
     }
 
-    func updateEdges(positions: [Int64: SIMD3<Float>],
-                     edges: [EdgeData],
-                     nodes: [NodeData],
-                     layoutMode: LayoutMode,
-                     colorMap: [String: Color],
-                     selectedNode: Int64?) {
-        let isSemanticMode = layoutMode == .embedding
-        let camPos = cameraPosition  // scaled coordinates
-        let fogNear: Float = 100
-        let fogFar: Float = 1200
+    /// Rebuild the batched edge mesh. All edges are rendered as a single LowLevelMesh
+    /// with per-edge state encoded in vertex UV and color in vertex color attribute.
+    /// This produces 1 draw call instead of 1238 separate entities.
+    func updateEdgeBatch(positions: [Int64: SIMD3<Float>],
+                         edges: [EdgeData],
+                         nodes: [NodeData],
+                         hubs: Set<Int64>,
+                         layoutMode: LayoutMode,
+                         colorMap: [String: Color],
+                         selectedNode: Int64?) {
+        let edgeCount = edges.count
+        guard edgeCount > 0 else {
+            if lastEdgePartIndexCount != 0 {
+                frameLog.error("[edgeBatch] ⚠️ ZERO-GUARD: clearing parts (edgeCount=0)")
+                edgeBatchMesh?.parts.replaceAll([])
+                lastEdgePartIndexCount = 0
+            }
+            return
+        }
 
-        // Build node project lookup
+        ensureEdgeBatchMesh(capacity: edgeCount)
+        guard let mesh = edgeBatchMesh else { return }
+
+        let isSemanticMode = layoutMode == .embedding
         let nodeProject: [Int64: String] = Dictionary(
             nodes.map { ($0.id, $0.project) }, uniquingKeysWith: { _, last in last }
         )
 
-        // Build current edge set
-        var currentKeys = Set<EdgeKey>()
-        for edge in edges {
-            currentKeys.insert(EdgeKey(source: edge.sourceId, target: edge.targetId))
+        // Build per-node radius lookup for endpoint inset (same formula as updateNodeBatch)
+        var nodeRadii: [Int64: Float] = [:]
+        for node in nodes {
+            let isHub = hubs.contains(node.id)
+            let importance = max(1, node.importance)
+            let baseR: Float = isHub ? nodeRadius * 1.6 : nodeRadius
+            nodeRadii[node.id] = baseR * (1.0 + Float(importance - 1) * 0.08)
         }
 
-        // Remove entities for edges no longer present
-        for (key, entity) in edgeEntities where !currentKeys.contains(key) {
-            entity.removeFromParent()
-            edgeEntities.removeValue(forKey: key)
-            edgeLastOpacity.removeValue(forKey: key)
-        }
+        var actualEdges = 0
 
-        // Update or create edge entities
-        for edge in edges {
-            guard let from = positions[edge.sourceId],
-                  let to = positions[edge.targetId] else { continue }
+        mesh.withUnsafeMutableBytes(bufferIndex: 0) { raw in
+            let vertices = raw.bindMemory(to: BatchVertex.self)
+            var vi = 0
 
-            let p1 = from * scaleFactor
-            let p2 = to * scaleFactor
-            let delta = p2 - p1
-            let length = simd_length(delta)
-            guard length > 0.001 else { continue }
-
-            let midpoint = (p1 + p2) / 2
-            let dir = normalize(delta)
-            let rotation = simd_quatf(from: SIMD3<Float>(0, 1, 0), to: dir)
-            let connected = edge.sourceId == selectedNode || edge.targetId == selectedNode
-            let project = nodeProject[edge.sourceId]
-            let mat = getEdgeMaterial(connected: connected, semantic: isSemanticMode,
-                                      project: project, colorMap: colorMap)
-
-            // Depth fog
-            let edgeMid = (from + to) / 2
-            let edgeDist = simd_length(edgeMid - camPos)
-            let fogT = max(0, min(1, (edgeDist - fogNear) / (fogFar - fogNear)))
-            let depthFade = max(Float(0.0), 1.0 - fogT * 0.95)
-
-            // Pulse animation — opacity swings from dim to bright
-            let phase = (midpoint.x + midpoint.y + midpoint.z) * 8.0
-            let pulse = (sin(animationTime * 3.0 + phase) + 1.0) * 0.5  // 0..1
-
-            let searchDimmedEdge = renderIsSearchActive
-                && !renderSearchMatchIds.contains(edge.sourceId)
-                && !renderSearchMatchIds.contains(edge.targetId)
-
-            let edgeFog: Float
-            if searchDimmedEdge && !connected {
-                edgeFog = 0.02 * depthFade
-            } else if connected {
-                edgeFog = 0.5 + pulse * 0.3  // 0.5–0.8
-            } else if isSemanticMode {
-                edgeFog = (0.02 + pulse * 0.04) * depthFade  // very subtle
-            } else {
-                edgeFog = (0.06 + pulse * 0.16) * depthFade  // 0.06–0.22, clearly visible pulse
-            }
-
-            let key = EdgeKey(source: edge.sourceId, target: edge.targetId)
-
-            // Connected edges get slightly thicker
-            let radius = connected ? edgeRadius * 2.5 : edgeRadius * 1.3
-
-            if let entity = edgeEntities[key] {
-                entity.position = midpoint
-                entity.orientation = rotation
-                entity.scale = SIMD3<Float>(radius, length, radius)
-                entity.model?.materials = [mat]
-                if abs(edgeFog - (edgeLastOpacity[key] ?? -1)) > 0.02 {
-                    entity.components.set(OpacityComponent(opacity: edgeFog))
-                    edgeLastOpacity[key] = edgeFog
+            for edge in edges {
+                guard let from = positions[edge.sourceId],
+                      let to = positions[edge.targetId] else {
+                    // Degenerate: write 12 zero vertices (cylinder has 12 verts)
+                    let zero = BatchVertex(px: 0, py: 0, pz: 0, nx: 0, ny: 1, nz: 0,
+                                               u: 0, v: 0, cr: 0, cg: 0, cb: 0, ca: 0)
+                    for _ in 0..<12 { vertices[vi] = zero; vi += 1 }
+                    continue
                 }
-            } else {
-                let entity = ModelEntity(mesh: edgeMesh, materials: [mat])
-                entity.position = midpoint
-                entity.orientation = rotation
-                entity.scale = SIMD3<Float>(radius, length, radius)
-                entity.components.set(OpacityComponent(opacity: edgeFog))
-                edgeLastOpacity[key] = edgeFog
-                edgeContainer.addChild(entity)
-                edgeEntities[key] = entity
+
+                let p1 = from * scaleFactor
+                let p2 = to * scaleFactor
+                let delta = p2 - p1
+                let length = simd_length(delta)
+
+                // Inset endpoints by node radii so edges stop at sphere surfaces
+                let r1 = nodeRadii[edge.sourceId] ?? nodeRadius
+                let r2 = nodeRadii[edge.targetId] ?? nodeRadius
+                guard length > r1 + r2 else {
+                    // Edge too short — nodes overlap, write 12 degenerate vertices
+                    let zero = BatchVertex(px: 0, py: 0, pz: 0, nx: 0, ny: 1, nz: 0,
+                                               u: 0, v: 0, cr: 0, cg: 0, cb: 0, ca: 0)
+                    for _ in 0..<12 { vertices[vi] = zero; vi += 1 }
+                    continue
+                }
+
+                let dir = delta / length
+                let p1inset = p1 + dir * r1
+                let p2inset = p2 - dir * r2
+
+                // Build perpendicular basis vectors for cylinder cross-section
+                let basisUp: SIMD3<Float> = abs(dir.y) < 0.99 ? SIMD3(0, 1, 0) : SIMD3(1, 0, 0)
+                let basisRight = simd_normalize(cross(dir, basisUp))
+                let basisForward = simd_normalize(cross(basisRight, dir))
+
+                let connected = edge.sourceId == selectedNode || edge.targetId == selectedNode
+                let radius = connected ? edgeRadius * 2.5 : edgeRadius * 1.3
+
+                // State encoding for shader
+                let searchDimmed = renderIsSearchActive
+                    && !renderSearchMatchIds.contains(edge.sourceId)
+                    && !renderSearchMatchIds.contains(edge.targetId)
+                let state: Float
+                if connected { state = 1 }
+                else if searchDimmed { state = 2 }
+                else if isSemanticMode { state = 3 }
+                else { state = 0 }
+
+                // Per-edge color
+                let color: SIMD3<Float>
+                if connected {
+                    color = SIMD3<Float>(1, 1, 1)
+                } else {
+                    color = edgeColorFloat3(for: nodeProject[edge.sourceId], colorMap: colorMap)
+                }
+
+                // Cylinder: 12 vertices (bottom ring 0..5, top ring 6..11)
+                // Bottom ring at p1inset
+                for seg in 0..<6 {
+                    let angle = Float(seg) * (.pi * 2 / 6)
+                    let c = cos(angle), s = sin(angle)
+                    let offset = (basisRight * c + basisForward * s) * radius
+                    let normal = simd_normalize(basisRight * c + basisForward * s)
+                    let bp = p1inset + offset
+                    vertices[vi] = BatchVertex(px: bp.x, py: bp.y, pz: bp.z,
+                                                   nx: normal.x, ny: normal.y, nz: normal.z,
+                                                   u: state, v: 0,
+                                                   cr: color.x, cg: color.y, cb: color.z, ca: 1)
+                    vi += 1
+                }
+                // Top ring at p2inset
+                for seg in 0..<6 {
+                    let angle = Float(seg) * (.pi * 2 / 6)
+                    let c = cos(angle), s = sin(angle)
+                    let offset = (basisRight * c + basisForward * s) * radius
+                    let normal = simd_normalize(basisRight * c + basisForward * s)
+                    let tp = p2inset + offset
+                    vertices[vi] = BatchVertex(px: tp.x, py: tp.y, pz: tp.z,
+                                                   nx: normal.x, ny: normal.y, nz: normal.z,
+                                                   u: state, v: 1,
+                                                   cr: color.x, cg: color.y, cb: color.z, ca: 1)
+                    vi += 1
+                }
+                actualEdges += 1
             }
+        }
+
+        // Use capacity-based index count — parts.replaceAll only fires when recovering
+        // from the zero-guard (which clears parts and sets lastEdgePartIndexCount=0).
+        let capacityIndexCount = edgeBatchCapacity * 36
+        if capacityIndexCount != lastEdgePartIndexCount {
+            frameLog.error("[edgeBatch] ⚠️ PARTS RECOVERY: \(self.lastEdgePartIndexCount) → \(capacityIndexCount)")
+            let generousBounds = BoundingBox(min: SIMD3(-10, -10, -10), max: SIMD3(10, 10, 10))
+            mesh.parts.replaceAll([
+                LowLevelMesh.Part(
+                    indexCount: capacityIndexCount,
+                    topology: .triangle,
+                    materialIndex: 0,
+                    bounds: generousBounds
+                )
+            ])
+            lastEdgePartIndexCount = capacityIndexCount
         }
     }
+
+    // MARK: - Diagnostics: disable expensive features to isolate bottleneck
+    // Toggle these to measure the impact of each subsystem.
+    // RESULTS: record dt after each toggle, then remove this block.
+    private static let DIAG_SKIP_NEBULAE = false      // skip ALL particle emitters
+    private static let DIAG_SKIP_POINT_LIGHTS = false  // skip per-node point lights
+    private static let DIAG_SKIP_GEOM_MOD = false     // skip geometry modifier on node batch
+    private static let DIAG_SKIP_NODE_BATCH = false   // skip node LowLevelMesh update
+    private static let DIAG_SKIP_EDGE_BATCH = false   // skip edge LowLevelMesh update
 
     // MARK: - Nebulae (particle-based gaseous hulls)
 
@@ -1173,6 +1511,12 @@ final class Graph3DScene {
 
     /// Full nebula update — creates/removes/repositions particle emitter entities.
     func updateNebulae() {
+        if Self.DIAG_SKIP_NEBULAE {
+            // Remove any existing emitters for clean measurement
+            for (_, e) in nebulaEmitters { e.removeFromParent() }
+            nebulaEmitters.removeAll()
+            return
+        }
         let groups = nebulaGroupsForCurrentMode()
         let currentKeys = Set(groups.map(\.key))
 
@@ -1225,6 +1569,7 @@ final class Graph3DScene {
 
     /// Per-frame position update for existing emitters (particles animate themselves).
     func updateNebulaBreathing() {
+        if Self.DIAG_SKIP_NEBULAE { return }
         let groups = nebulaGroupsForCurrentMode()
         let groupByKey = Dictionary(groups.map { ($0.key, $0) }, uniquingKeysWith: { _, last in last })
 
@@ -1287,12 +1632,25 @@ final class Graph3DScene {
     }
 
     func clearAll() {
-        for (_, entity) in nodeEntities { entity.removeFromParent() }
-        nodeEntities.removeAll()
-        nodeLastOpacity.removeAll()
-        for (_, entity) in edgeEntities { entity.removeFromParent() }
-        edgeEntities.removeAll()
-        edgeLastOpacity.removeAll()
+        // Clear batched node mesh
+        nodeBatchEntity?.removeFromParent()
+        nodeBatchEntity = nil
+        nodeBatchMesh = nil
+        nodeBatchCapacity = 0
+        nodeColorCache.removeAll()
+        // Clear point lights
+        for (_, entity) in pointLightEntities { entity.removeFromParent() }
+        pointLightEntities.removeAll()
+        // Clear dying node entities
+        for (_, entity) in dyingNodeEntities { entity.removeFromParent() }
+        dyingNodeEntities.removeAll()
+        dyingNodePos3D.removeAll()
+        // Clear batched edge mesh
+        edgeBatchEntity?.removeFromParent()
+        edgeBatchEntity = nil
+        edgeBatchMesh = nil
+        edgeBatchCapacity = 0
+        edgeColorCache.removeAll()
         for (_, entity) in nebulaEmitters { entity.removeFromParent() }
         nebulaEmitters.removeAll()
         nebulaColorCache.removeAll()
@@ -1380,9 +1738,7 @@ final class Graph3DScene {
                 let lerpedPos = startPos + (endPos - startPos) * t
                 renderPositions[childId] = lerpedPos
                 allExpandedPositions[childId] = lerpedPos
-                if let entity = nodeEntities[childId] {
-                    entity.position = lerpedPos * scaleFactor
-                }
+                // Position updated in renderPositions — batch mesh picks it up automatically
             }
 
             // When collapse finishes
@@ -1533,36 +1889,54 @@ final class Graph3DScene {
     /// Retained subscription for RealityKit scene update events (vsync-synced).
     var renderSubscription: EventSubscription?
 
-    /// Render inputs — written by Timer (force sim), read by SceneEvents.Update (render).
-    /// Both run on @MainActor so no races.
-    var renderPositions: [Int64: SIMD3<Float>] = [:]
-    var renderNodes: [NodeData] = []
-    var renderEdges: [EdgeData] = []
-    var renderHubs: Set<Int64> = []
-    var renderColorMap: [String: Color] = [:]
-    var renderSelectedNode: Int64?
-    var renderLayoutMode: LayoutMode = .forceDirected
-    var renderGlowingNodes: [Int64: Date] = [:]
-    var renderNewNodes: [Int64: Date] = [:]
-    var renderDyingNodes: [Int64: DyingNode] = [:]
-    var renderSemanticClusters3D: [SemanticCluster3D] = []
-    var renderTopicGroups: [TopicGroupInfo] = []
-    var renderClusters: [[Int64]] = []
-    var renderViewSize: CGSize = CGSize(width: 800, height: 600)
+    // Direct references — owned by GraphView, injected once during setup.
+    // renderTick calls methods directly on these objects, bypassing SwiftUI observation.
+    // CRITICAL: these must be @ObservationIgnored so reading them in renderTick
+    // does NOT trigger SwiftUI body re-evaluation (the root cause of the 50%+ slow frames).
+    @ObservationIgnored var simulation3D: ForceSimulation3D?
+    @ObservationIgnored var embeddingProjection: EmbeddingProjection?
+    @ObservationIgnored var camera3DState: Camera3DState?
+    @ObservationIgnored var forcePositionSnapshot3D: [Int64: SIMD3<Float>] = [:]
+    @ObservationIgnored var transitionProgress: CGFloat = 0
+
+    // Selection callback — still needed because it writes to a @Binding in Graph3DView.
+    @ObservationIgnored var selectionCallback: ((Int64?) -> Void)?
+
+    // Camera centering state (driven by renderTick)
+    @ObservationIgnored private var hasCenteredCamera = false
+    @ObservationIgnored private var cameraStartTime: Date?
+    @ObservationIgnored private var centerTickCount: Int = 0
+
+    /// Render inputs — read by renderTick (SceneEvents.Update).
+    /// @ObservationIgnored: internal data channel, must NOT trigger SwiftUI body re-evaluation.
+    @ObservationIgnored var renderPositions: [Int64: SIMD3<Float>] = [:]
+    @ObservationIgnored var renderNodes: [NodeData] = []
+    @ObservationIgnored var renderEdges: [EdgeData] = []
+    @ObservationIgnored var renderHubs: Set<Int64> = []
+    @ObservationIgnored var renderColorMap: [String: Color] = [:]
+    @ObservationIgnored var renderSelectedNode: Int64?
+    @ObservationIgnored var renderLayoutMode: LayoutMode = .forceDirected
+    @ObservationIgnored var renderGlowingNodes: [Int64: Date] = [:]
+    @ObservationIgnored var renderNewNodes: [Int64: Date] = [:]
+    @ObservationIgnored var renderDyingNodes: [Int64: DyingNode] = [:]
+    @ObservationIgnored var renderSemanticClusters3D: [SemanticCluster3D] = []
+    @ObservationIgnored var renderTopicGroups: [TopicGroupInfo] = []
+    @ObservationIgnored var renderClusters: [[Int64]] = []
+    @ObservationIgnored var renderViewSize: CGSize = CGSize(width: 800, height: 600)
 
     // Search spotlight
-    var renderSearchMatchIds: Set<Int64> = []
-    var renderIsSearchActive: Bool = false
+    @ObservationIgnored var renderSearchMatchIds: Set<Int64> = []
+    @ObservationIgnored var renderIsSearchActive: Bool = false
 
     // Hub expansion state
-    var expandedHubs: Set<Int64> = []
-    private var preExpansionPositions: [Int64: SIMD3<Float>] = [:]
-    private var expansionProgress: [Int64: Float] = [:]
-    private var expansionDirection: [Int64: Bool] = [:]  // true=expanding, false=collapsing
+    @ObservationIgnored var expandedHubs: Set<Int64> = []
+    @ObservationIgnored private var preExpansionPositions: [Int64: SIMD3<Float>] = [:]
+    @ObservationIgnored private var expansionProgress: [Int64: Float] = [:]
+    @ObservationIgnored private var expansionDirection: [Int64: Bool] = [:]  // true=expanding, false=collapsing
     /// Expansion-adjusted positions for labels (read by Graph3DView).
-    private(set) var expandedChildPositions: [Int64: SIMD3<Float>] = [:]
+    @ObservationIgnored private(set) var expandedChildPositions: [Int64: SIMD3<Float>] = [:]
     /// Pending hub toggles from gamepad — consumed by Graph3DView for pinning callback.
-    var pendingHubToggles: [(hubId: Int64, expanding: Bool)] = []
+    @ObservationIgnored var pendingHubToggles: [(hubId: Int64, expanding: Bool)] = []
 
     // Edge flow particles
     private struct FlowParticle {
@@ -1578,8 +1952,12 @@ final class Graph3DScene {
 
     private var renderFrameCount: UInt64 = 0
     private var renderLastSelectedNode: Int64?
-    /// Tracks previous positions to detect when they've changed (avoids redundant edge work).
-    private var prevPositionHash: Int = 0
+    private var renderLastSearchActive: Bool = false
+    private var renderLastSearchMatchIds: Set<Int64> = []
+    /// Dirty counter: after any position change, write node/edge buffers for N consecutive
+    /// frames to flush all of RealityKit's internal LowLevelMesh buffers (double/triple-buffered).
+    /// Prevents stale/zero buffer from being rendered when we skip a frame.
+    private var meshDirtyFrames: Int = 0
 
     // Frame timing diagnostics for render tick
     private var renderLogCounter: UInt64 = 0
@@ -1595,7 +1973,7 @@ final class Graph3DScene {
         let path = "/tmp/frame-timing.csv"
         FileManager.default.createFile(atPath: path, contents: nil)
         profilingFileHandle = FileHandle(forWritingAtPath: path)
-        let header = "frame,dt_ms,work_ms,repos_ms,nodes_ms,edges_ms,neb_ms,node_count,edge_count,labels_ms\n"
+        let header = "frame,dt_ms,work_ms,expand_ms,nodes_ms,edges_ms,neb_ms,node_count,edge_count,labels_ms,flow_ms,idle,entities,reason\n"
         profilingFileHandle?.write(header.data(using: .utf8)!)
         profilingReady = true
     }
@@ -1611,134 +1989,274 @@ final class Graph3DScene {
     }
     #endif
 
-    /// Lightweight per-frame node update: position + depth fog only.
-    /// Skips material selection, glow/arrival animations, and point light management.
-    func repositionNodes(positions: [Int64: SIMD3<Float>], selectedNode: Int64?) {
-        let camPos = cameraPosition
-        for (id, pos) in positions {
-            guard let entity = nodeEntities[id] else { continue }
-            entity.position = pos * scaleFactor
-            let dist = simd_length(pos - camPos)
-            let fogT = max(0, min(1, (dist - 100) / 1100))
-            let baseFogOpacity = id == selectedNode ? 1.0 : max(Float(0.08), 1.0 - fogT * 0.92)
-            let searchDimmed = renderIsSearchActive && !renderSearchMatchIds.contains(id)
-            let fogOpacity = searchDimmed ? min(baseFogOpacity, 0.12) : baseFogOpacity
-            // Skip ECS mutation when opacity hasn't changed visibly
-            if abs(fogOpacity - (nodeLastOpacity[id] ?? -1)) > 0.02 {
-                entity.components.set(OpacityComponent(opacity: fogOpacity))
-                nodeLastOpacity[id] = fogOpacity
-            }
-        }
-    }
-
     /// Called every RealityKit render frame (vsync-synchronized).
+    /// Consecutive frames with no meaningful work — used to detect idle state.
+    @ObservationIgnored private(set) var idleFrameCount: UInt64 = 0
+
     func renderTick() {
         let now = CFAbsoluteTimeGetCurrent()
         let dtSec = lastRenderTime > 0 ? Float(now - lastRenderTime) : Float(1.0 / 60.0)
         let dt = Double(dtSec) * 1000.0
 
+        // Always poll inputs + update camera (cheap, needed for responsiveness)
+        let preInputSelection = renderSelectedNode
         pollKeyboard(dt: dtSec)
         pollGamepad(dt: dtSec, selectedNode: &renderSelectedNode,
                     positions: renderPositions, viewSize: renderViewSize)
         updateCamera(dt: dtSec)
+
+        // Detect selection change from gamepad/keyboard → notify parent
+        if renderSelectedNode != preInputSelection {
+            selectionCallback?(renderSelectedNode)
+        }
+
+        // --- Single-loop: tick simulation + projection directly (no closures crossing SwiftUI boundary) ---
+        var didUpdatePositions = false
+        if let sim = simulation3D, let proj = embeddingProjection {
+            sim.tick()
+            proj.tickAnimation3D()
+
+            // Compute positions (same logic as GraphView.positions3D, but reads objects directly)
+            let newPositions: [Int64: SIMD3<Float>]?
+            if sim.isSettled && proj.is3DAnimationSettled {
+                newPositions = nil  // settled — no position update needed
+            } else if renderLayoutMode == .embedding {
+                let tsne3D = proj.projectedPositions3D
+                if tsne3D.isEmpty {
+                    newPositions = sim.positions
+                } else if transitionProgress >= 1.0 {
+                    newPositions = tsne3D
+                } else {
+                    // Lerp between force snapshot and t-SNE
+                    var blended: [Int64: SIMD3<Float>] = [:]
+                    let allIds = Set(forcePositionSnapshot3D.keys).union(tsne3D.keys)
+                    for id in allIds {
+                        let forcePos = forcePositionSnapshot3D[id] ?? sim.positions[id] ?? .zero
+                        let tsnePos = tsne3D[id] ?? forcePos
+                        blended[id] = forcePos + (tsnePos - forcePos) * Float(transitionProgress)
+                    }
+                    newPositions = blended
+                }
+            } else {
+                newPositions = sim.positions
+            }
+            if let positions = newPositions {
+                renderPositions = positions
+                didUpdatePositions = true
+
+                // Camera centering (first 3 seconds after positions appear)
+                if cameraStartTime == nil { cameraStartTime = Date() }
+                let elapsed = Date().timeIntervalSince(cameraStartTime!)
+                if (!hasCenteredCamera || elapsed < 3.0) && !isDragging {
+                    centerTickCount += 1
+                    if centerTickCount % 6 == 0 {
+                        centerOnGraph(positions: renderPositions)
+                    }
+                    if elapsed >= 3.0 { hasCenteredCamera = true }
+                }
+            }
+        }
+
+        // Consume pending hub toggles — pin/unpin children in simulation directly
+        if !pendingHubToggles.isEmpty, let sim = simulation3D {
+            for toggle in pendingHubToggles {
+                let children = renderEdges.filter { $0.relation == "part_of" && $0.targetId == toggle.hubId }.map(\.sourceId)
+                for childId in children {
+                    if toggle.expanding { sim.pin(childId) } else { sim.unpin(childId) }
+                }
+            }
+            pendingHubToggles.removeAll()
+        }
+
+        // --- Idle detection ---
+        // Camera still lerping?
+        let cameraMoving = abs(targetAzimuth - azimuth) > 0.0001
+            || abs(targetElevation - elevation) > 0.0001
+            || simd_length(targetCameraPos - cameraTarget) > 0.01
+        let hasInput = !heldKeys.isEmpty || GCController.current?.extendedGamepad != nil
+            && (abs(GCController.current?.extendedGamepad?.leftThumbstick.xAxis.value ?? 0) > 0.1
+             || abs(GCController.current?.extendedGamepad?.leftThumbstick.yAxis.value ?? 0) > 0.1
+             || abs(GCController.current?.extendedGamepad?.rightThumbstick.xAxis.value ?? 0) > 0.1
+             || abs(GCController.current?.extendedGamepad?.rightThumbstick.yAxis.value ?? 0) > 0.1)
+        let hasExpansions = !expandedHubs.isEmpty
+        let hasParticles = !flowParticles.isEmpty
+        let hasGlowing = !renderGlowingNodes.isEmpty || !renderNewNodes.isEmpty || !renderDyingNodes.isEmpty
+        let selectionChanged = renderSelectedNode != renderLastSelectedNode
+        let searchChanged = renderIsSearchActive != renderLastSearchActive
+            || renderSearchMatchIds != renderLastSearchMatchIds
+
+        // Position change detection: use the authoritative flag from the simulation
+        // update path. The old hash-based approach was unreliable — Dictionary iteration
+        // order is non-deterministic, so the 3-value hash could collide even when
+        // positions changed, causing skipped buffer writes and stale-buffer flicker.
+        let positionsChanged = didUpdatePositions
+
+        // When positions change, set dirty counter to flush all RealityKit internal
+        // LowLevelMesh buffers (double/triple-buffered). This ensures the GPU never
+        // renders from a stale or zero-initialized buffer.
+        if positionsChanged || selectionChanged || hasGlowing || searchChanged || hasExpansions {
+            meshDirtyFrames = 3
+        }
+
+        // Scene-level changes that require entity updates (nodes, edges, nebulae).
+        // meshDirtyFrames > 0 means we still need to write buffers to flush internal
+        // double/triple-buffering, even if nothing changed THIS frame.
+        let sceneNeedsUpdate = meshDirtyFrames > 0
+        // Camera-only activity (orbit, keyboard) doesn't need entity work —
+        // GPU shaders compute fog/lighting from camera position autonomously.
+        let isActive = sceneNeedsUpdate || cameraMoving || hasInput || hasParticles
+
+        if !isActive {
+            idleFrameCount += 1
+            // When idle: skip all heavy work. Only wake every 30th frame
+            // for a cheap maintenance pass (nebula breathing, etc.)
+            if idleFrameCount > 10 && idleFrameCount % 30 != 0 {
+                lastRenderTime = now
+                renderFrameCount &+= 1
+                return
+            }
+        } else {
+            idleFrameCount = 0
+        }
+
         animationTime += dtSec
 
-        // Hub expansion animation (before node/edge updates so positions are current)
-        updateExpansions(dt: dtSec)
+        if renderFrameCount == 10 {
+            frameLog.error("[DIAG] SKIP_NEBULAE=\(Self.DIAG_SKIP_NEBULAE) SKIP_POINT_LIGHTS=\(Self.DIAG_SKIP_POINT_LIGHTS) SKIP_GEOM_MOD=\(Self.DIAG_SKIP_GEOM_MOD) SKIP_NODE_BATCH=\(Self.DIAG_SKIP_NODE_BATCH) SKIP_EDGE_BATCH=\(Self.DIAG_SKIP_EDGE_BATCH)")
+        }
 
-        let selectionChanged = renderSelectedNode != renderLastSelectedNode
-
-        // Detect if node positions actually changed since last frame
-        // Use a cheap hash (count + sample positions) rather than comparing all values
-        let posHash: Int = {
-            var h = renderPositions.count
-            // Sample a few positions to detect changes
-            if let first = renderPositions.first {
-                h ^= first.value.x.bitPattern.hashValue
-                h ^= first.value.y.bitPattern.hashValue
-            }
-            if renderPositions.count > 10 {
-                let mid = renderPositions.index(renderPositions.startIndex,
-                                                 offsetBy: renderPositions.count / 2)
-                h ^= renderPositions[mid].value.x.bitPattern.hashValue
-            }
-            return h
-        }()
-        let positionsChanged = posHash != prevPositionHash
-        prevPositionHash = posHash
-
-        // Every frame: cheap position + fog update (skip when nothing moved)
         let t0 = CFAbsoluteTimeGetCurrent()
-        if positionsChanged {
-            repositionNodes(positions: renderPositions, selectedNode: renderSelectedNode)
-        }
-        let tRepos = CFAbsoluteTimeGetCurrent()
+        var msExpand = 0.0, msNodes = 0.0, msEdges = 0.0, msNeb = 0.0, msFlow = 0.0
 
-        // Every 3 frames (or on state change): full material/light/creation/removal
-        var tNodes = tRepos
-        if renderFrameCount % 3 == 0 || selectionChanged {
-            updateNodes(
-                positions: renderPositions, nodes: renderNodes, hubs: renderHubs,
-                colorMap: renderColorMap, selectedNode: renderSelectedNode,
-                glowingNodes: renderGlowingNodes, newNodes: renderNewNodes,
-                dyingNodes: renderDyingNodes
-            )
-            tNodes = CFAbsoluteTimeGetCurrent()
-        }
+        // Only do entity updates when scene state changed — camera orbit is free
+        // because GPU shaders compute fog/emissive from camera distance autonomously.
+        if sceneNeedsUpdate {
+            // Hub expansion animation (before node/edge updates so positions are current)
+            updateExpansions(dt: dtSec)
+            let tExpand = CFAbsoluteTimeGetCurrent()
+            msExpand = (tExpand - t0) * 1000
 
-        let edgeInterval: UInt64 = renderFrameCount < 180 ? 12 : 6
-        if selectionChanged || renderFrameCount % edgeInterval == 0 {
-            updateEdges(
-                positions: renderPositions, edges: renderEdges,
-                nodes: renderNodes, layoutMode: renderLayoutMode,
-                colorMap: renderColorMap, selectedNode: renderSelectedNode
-            )
-            renderLastSelectedNode = renderSelectedNode
-        } else {
-            // Lightweight: reposition existing edge entities + update pulse opacity
-            // Passes positionsChanged so geometry is only rebuilt when nodes move
-            repositionEdgesAnimated(positions: renderPositions, edges: renderEdges,
-                                    selectedNode: renderSelectedNode,
-                                    positionsChanged: positionsChanged)
-        }
-        let tEdges = CFAbsoluteTimeGetCurrent()
-
-        // Edge flow particles
-        updateFlowParticles(dt: dtSec)
-
-        // Nebulae: skip during initial settle (first 180 frames) to avoid
-        // particle system warm-up competing with heavy force layout work
-        if renderFrameCount > 180 {
-            if renderFrameCount % 30 == 0 {
-                updateNebulae()
-            } else if renderFrameCount % 2 == 0 {
-                updateNebulaBreathing()
+            // Batched nodes: Metal compute stamps sphere instances → single LowLevelMesh.
+            if !Self.DIAG_SKIP_NODE_BATCH {
+                updateNodeBatch(
+                    positions: renderPositions, nodes: renderNodes, hubs: renderHubs,
+                    colorMap: renderColorMap, selectedNode: renderSelectedNode,
+                    glowingNodes: renderGlowingNodes, newNodes: renderNewNodes
+                )
             }
+            let tNodes = CFAbsoluteTimeGetCurrent()
+            msNodes = (tNodes - tExpand) * 1000
+
+            // Dying nodes: individual PBR entities (max ~5, temporary)
+            if !renderDyingNodes.isEmpty || !dyingNodeEntities.isEmpty {
+                updateDyingNodes(positions: renderPositions, dyingNodes: renderDyingNodes)
+            }
+
+            // Batched edge mesh: rebuild when positions, selection, or search changes.
+            // Also re-write during dirty flush frames to flush all internal LowLevelMesh buffers.
+            // Camera movement does NOT require rebuild — GPU shader handles fog/pulse.
+            if !Self.DIAG_SKIP_EDGE_BATCH,
+               positionsChanged || selectionChanged || searchChanged || hasExpansions || meshDirtyFrames > 0 {
+                updateEdgeBatch(
+                    positions: renderPositions, edges: renderEdges,
+                    nodes: renderNodes, hubs: renderHubs,
+                    layoutMode: renderLayoutMode,
+                    colorMap: renderColorMap, selectedNode: renderSelectedNode
+                )
+                renderLastSelectedNode = renderSelectedNode
+                renderLastSearchActive = renderIsSearchActive
+                renderLastSearchMatchIds = renderSearchMatchIds
+            }
+            let tEdges = CFAbsoluteTimeGetCurrent()
+            msEdges = (tEdges - tNodes) * 1000
+
+            // Edge flow particles — only when selection exists
+            if renderSelectedNode != nil || !flowParticles.isEmpty {
+                updateFlowParticles(dt: dtSec)
+            }
+            let tFlow = CFAbsoluteTimeGetCurrent()
+            msFlow = (tFlow - tEdges) * 1000
+
+            // Nebulae
+            if renderFrameCount > 180 {
+                if renderFrameCount % 30 == 0 {
+                    updateNebulae()
+                } else if positionsChanged && renderFrameCount % 4 == 0 {
+                    updateNebulaBreathing()
+                }
+            }
+            msNeb = (CFAbsoluteTimeGetCurrent() - tFlow) * 1000
+
+            // Decrement dirty counter — ensures we write buffers for N consecutive
+            // frames to flush all RealityKit internal double/triple-buffers.
+            meshDirtyFrames = max(0, meshDirtyFrames - 1)
         }
-        let tNeb = CFAbsoluteTimeGetCurrent()
 
-        let elapsed = (tNeb - now) * 1000.0
+        // Trigger native label overlay redraw at ~20fps (every 3rd frame).
+        // This bypasses SwiftUI entirely — just sets needsDisplay on the NSView.
+        // Outside sceneNeedsUpdate gate: camera movement changes screen projections
+        // of 3D positions even when node positions haven't changed.
+        if positionsChanged || selectionChanged || searchChanged || cameraMoving,
+           renderFrameCount % 3 == 0 {
+            labelOverlayView?.needsDisplay = true
+        }
 
-        let msRepos = (tRepos - t0) * 1000
-        let msNodes = (tNodes - tRepos) * 1000
-        let msEdges = (tEdges - tNodes) * 1000
-        let msNeb = (tNeb - tEdges) * 1000
+        let elapsed = (CFAbsoluteTimeGetCurrent() - now) * 1000.0
+
+        // Count total entities in scene (used for both logging and CSV)
+        func countEntities(_ e: Entity) -> Int {
+            1 + e.children.reduce(0) { $0 + countEntities($1) }
+        }
+        let totalEntities = countEntities(rootEntity)
 
         renderLogCounter &+= 1
         if renderLogCounter % 60 == 0 || dt > 25 || elapsed > 10 {
-            frameLog.error("[3D-render] dt=\(dt, format: .fixed(precision: 1))ms work=\(elapsed, format: .fixed(precision: 2))ms repos=\(msRepos, format: .fixed(precision: 2)) nodes=\(msNodes, format: .fixed(precision: 2)) edges=\(msEdges, format: .fixed(precision: 2)) neb=\(msNeb, format: .fixed(precision: 2)) | n=\(self.renderPositions.count) e=\(self.renderEdges.count) frame=\(self.renderFrameCount)")
+            frameLog.error("[3D-render] dt=\(dt, format: .fixed(precision: 1))ms work=\(elapsed, format: .fixed(precision: 2))ms expand=\(msExpand, format: .fixed(precision: 2)) nodes=\(msNodes, format: .fixed(precision: 2)) edges=\(msEdges, format: .fixed(precision: 2)) flow=\(msFlow, format: .fixed(precision: 2)) neb=\(msNeb, format: .fixed(precision: 2)) | n=\(self.renderPositions.count) e=\(self.renderEdges.count) entities=\(totalEntities) nebEmitters=\(self.nebulaEmitters.count) ptLights=\(self.pointLightEntities.count) frame=\(self.renderFrameCount) idle=\(self.idleFrameCount)")
         }
 
         #if DEBUG
         // Write every frame to CSV for profiling analysis
         if profilingReady {
-            profilingLines.append("\(renderFrameCount),\(String(format: "%.2f", dt)),\(String(format: "%.2f", elapsed)),\(String(format: "%.2f", msRepos)),\(String(format: "%.2f", msNodes)),\(String(format: "%.2f", msEdges)),\(String(format: "%.2f", msNeb)),\(renderPositions.count),\(renderEdges.count),\(String(format: "%.2f", lastCanvasLabelMs))\n")
+            let idleFlag = isActive ? 0 : 1
+            // Build reason flags: P=posChanged S=selChanged E=expansions G=glowing X=searchChanged C=cameraMoving K=keyInput
+            var reason = ""
+            if positionsChanged { reason += "P" }
+            if selectionChanged { reason += "S" }
+            if hasExpansions { reason += "E" }
+            if hasGlowing { reason += "G" }
+            if searchChanged { reason += "X" }
+            if cameraMoving { reason += "C" }
+            if hasInput { reason += "K" }
+            if reason.isEmpty { reason = "-" }
+            profilingLines.append("\(renderFrameCount),\(String(format: "%.2f", dt)),\(String(format: "%.2f", elapsed)),\(String(format: "%.2f", msExpand)),\(String(format: "%.2f", msNodes)),\(String(format: "%.2f", msEdges)),\(String(format: "%.2f", msNeb)),\(renderPositions.count),\(renderEdges.count),\(String(format: "%.2f", lastCanvasLabelMs)),\(String(format: "%.2f", msFlow)),\(idleFlag),\(totalEntities),\(reason)\n")
             if renderLogCounter % 60 == 0 { flushProfiling() }
         }
         #endif
 
+        // Report camera state directly (writes to Camera3DState @Observable —
+        // only MinimapView re-renders, GraphView body is NOT re-evaluated).
+        // Only write when values differ to avoid triggering SwiftUI observation every frame.
+        if let camState = camera3DState {
+            if azimuth != camState.azimuth { camState.azimuth = azimuth }
+            if cameraPosition != camState.position { camState.position = cameraPosition }
+            if cameraTarget != camState.target { camState.target = cameraTarget }
+            if didUpdatePositions { camState.positions = renderPositions }
+        }
+
         lastRenderTime = now
         renderFrameCount &+= 1
+
+        // DIAGNOSTIC: main queue saturation probe — measures how much main-thread work
+        // is queued between renderTick calls. If this delta is large (~100ms), something
+        // on the main queue (SwiftUI body evals, Canvas draws, etc.) is starving SceneEvents.Update.
+        let probePostTime = CFAbsoluteTimeGetCurrent()
+        let probeFrame = renderFrameCount
+        DispatchQueue.main.async {
+            let probeDelta = (CFAbsoluteTimeGetCurrent() - probePostTime) * 1000.0
+            if probeDelta > 5.0 {
+                frameLog.error("[PROBE] frame=\(probeFrame) mainQ-delay=\(probeDelta, format: .fixed(precision: 1))ms")
+            }
+        }
     }
 }
 
@@ -1759,22 +2277,16 @@ struct Graph3DView: View {
     let clusters: [[Int64]]
     let searchMatchIds: Set<Int64>
     let isSearchActive: Bool
-    /// Called each frame. Must return the CURRENT live positions.
-    var onAnimationTick: (() -> [Int64: SIMD3<Float>])?
-    /// Called each frame with current camera state for minimap: (azimuth, cameraPosition, cameraTarget).
-    var onCameraUpdate: ((Float, SIMD3<Float>, SIMD3<Float>) -> Void)?
-    /// Called when a hub is expanded/collapsed (for pinning children in force simulation).
-    var onHubToggle: ((Int64, Bool) -> Void)?
+    /// Direct references for renderTick — avoids closures crossing SwiftUI observation boundary.
+    let simulation3D: ForceSimulation3D
+    let embeddingProjection: EmbeddingProjection
+    let camera3DState: Camera3DState
+    let forcePositionSnapshot3D: [Int64: SIMD3<Float>]
+    let transitionProgress: CGFloat
 
     @State private var scene = Graph3DScene()
-    @State private var livePositions: [Int64: SIMD3<Float>] = [:]
     @State private var scrollMonitor: Any?
-    @State private var hasCenteredCamera = false
-    @State private var cameraStartTime: Date?
-    @State private var centerTickCount: Int = 0
-    /// Tracks the last synced selection value to detect which side (binding vs gamepad) changed.
-    @State private var lastSyncedSelection: Int64? = nil
-    private let timer = Timer.publish(every: 1.0 / 60.0, on: .main, in: .common).autoconnect()
+    @State private var updateClosureCount: UInt64 = 0
 
 
     var body: some View {
@@ -1787,9 +2299,10 @@ struct Graph3DView: View {
                         proxy.frame(in: .global)
                     } action: { frame in
                         viewFrame = frame
+                        scene.renderViewSize = frame.size
                     }
 
-                labelsOverlay(viewSize: geo.size)
+                labelsOverlay
 
                 // Center reticle (only when gamepad connected)
                 if GCController.current != nil {
@@ -1866,72 +2379,33 @@ struct Graph3DView: View {
         .accessibilityIdentifier("graph-3d-view")
         .onAppear { installInputMonitor() }
         .onDisappear { removeInputMonitor() }
-        .onReceive(timer) { _ in
-            // Force simulation tick — compute new positions
-            let newPos = onAnimationTick?() ?? scene.renderPositions
-
-            // Keep re-centering camera for the first 3 seconds so force simulation
-            // has time to spread nodes out — initial positions are often clustered at origin.
-            if !newPos.isEmpty {
-                if cameraStartTime == nil { cameraStartTime = Date() }
-                let elapsed = Date().timeIntervalSince(cameraStartTime ?? Date())
-                if (!hasCenteredCamera || elapsed < 3.0) && !scene.isDragging {
-                    centerTickCount += 1
-                    if centerTickCount % 6 == 0 {
-                        scene.centerOnGraph(positions: newPos)
-                    }
-                    if elapsed >= 3.0 { hasCenteredCamera = true }
-                }
-            }
-
-            // Two-way selection sync: detect which side changed and propagate
-            let sceneChanged = scene.renderSelectedNode != lastSyncedSelection
-            let bindingChanged = selectedNode != lastSyncedSelection
-            if sceneChanged {
-                // Gamepad/reticle changed selection — push scene → binding
-                selectedNode = scene.renderSelectedNode
-            } else if bindingChanged {
-                // UI (activity panel/tap/Escape) changed selection — push binding → scene
-                scene.renderSelectedNode = selectedNode
-                // Collapse all expanded hubs when deselected from any source
-                if selectedNode == nil {
+        .onChange(of: selectedNode) { _, newValue in
+            // SwiftUI → scene: push selection when binding changes from parent
+            if newValue != scene.renderSelectedNode {
+                scene.renderSelectedNode = newValue
+                if newValue == nil {
                     collapseAllHubs()
                 }
             }
-            lastSyncedSelection = selectedNode
-
-            // Push data to scene for vsync-synced rendering
-            scene.renderPositions = newPos
-            scene.renderNodes = nodes
-            scene.renderEdges = edges
-            scene.renderHubs = hubs
-            scene.renderColorMap = colorMap
-            scene.renderLayoutMode = layoutMode
-            scene.renderGlowingNodes = glowingNodes
-            scene.renderNewNodes = newNodes
-            scene.renderDyingNodes = dyingNodes
-            scene.renderSemanticClusters3D = semanticClusters3D
-            scene.renderTopicGroups = topicGroups
-            scene.renderClusters = clusters
-            scene.renderViewSize = viewFrame.size
-            scene.renderSearchMatchIds = searchMatchIds
-            scene.renderIsSearchActive = isSearchActive
-
-            // Consume pending hub toggles from gamepad
-            for toggle in scene.pendingHubToggles {
-                onHubToggle?(toggle.hubId, toggle.expanding)
-            }
-            scene.pendingHubToggles.removeAll()
-
-            livePositions = newPos
-            // Override with expansion positions for accurate label placement
-            for (id, pos) in scene.expandedChildPositions {
-                livePositions[id] = pos
-            }
-
-            // Report camera state to minimap
-            onCameraUpdate?(scene.azimuth, scene.cameraPosition, scene.cameraTarget)
         }
+    }
+
+    /// Push slow-changing data from SwiftUI to the scene.
+    /// Called from RealityView make/update — only fires when SwiftUI inputs actually change.
+    private func pushDataToScene() {
+        scene.renderNodes = nodes
+        scene.renderEdges = edges
+        scene.renderHubs = hubs
+        scene.renderColorMap = colorMap
+        scene.renderLayoutMode = layoutMode
+        scene.renderGlowingNodes = glowingNodes
+        scene.renderNewNodes = newNodes
+        scene.renderDyingNodes = dyingNodes
+        scene.renderSemanticClusters3D = semanticClusters3D
+        scene.renderTopicGroups = topicGroups
+        scene.renderClusters = clusters
+        scene.renderSearchMatchIds = searchMatchIds
+        scene.renderIsSearchActive = isSearchActive
     }
 
     private var realityViewContent: some View {
@@ -1943,11 +2417,36 @@ struct Graph3DView: View {
             content.add(root)
             content.add(camera)
 
-            // Subscribe to RealityKit's display-synced update event.
-            // This fires at vsync, eliminating phase mismatch between
-            // Timer and RealityKit's render loop.
+            // Inject direct references — renderTick calls methods on these directly,
+            // bypassing closures that would cross the SwiftUI observation boundary.
+            scene.simulation3D = simulation3D
+            scene.embeddingProjection = embeddingProjection
+            scene.camera3DState = camera3DState
+            scene.forcePositionSnapshot3D = forcePositionSnapshot3D
+            scene.transitionProgress = transitionProgress
+            scene.selectionCallback = { newSelection in
+                selectedNode = newSelection
+            }
+
+            // Single render loop: SceneEvents.Update → renderTick (like a game engine).
+            // No Timer. renderTick ticks the simulation, updates entities, triggers labels.
             scene.renderSubscription = content.subscribe(to: SceneEvents.Update.self) { _ in
                 scene.renderTick()
+            }
+
+            pushDataToScene()
+        } update: { content in
+            updateClosureCount &+= 1
+            let t0 = CFAbsoluteTimeGetCurrent()
+            // Update snapshot/transition state (these change when layout mode switches)
+            scene.forcePositionSnapshot3D = forcePositionSnapshot3D
+            scene.transitionProgress = transitionProgress
+
+            // Push slow-changing data when SwiftUI inputs change
+            pushDataToScene()
+            let elapsed = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0
+            if updateClosureCount % 30 == 0 || elapsed > 2 {
+                frameLog.error("[RV-update] count=\(updateClosureCount) elapsed=\(elapsed, format: .fixed(precision: 2))ms")
             }
         }
         .background(Color(red: 0.051, green: 0.067, blue: 0.09))
@@ -2124,23 +2623,31 @@ struct Graph3DView: View {
     private func collapseAllHubs() {
         for hubId in scene.expandedHubs {
             scene.toggleHubExpansion(hubId: hubId)
-            onHubToggle?(hubId, false)
+            pinUnpinHubChildren(hubId: hubId, expanding: false)
+        }
+    }
+
+    /// Pin/unpin hub children in the force simulation directly (no closure crossing SwiftUI boundary).
+    private func pinUnpinHubChildren(hubId: Int64, expanding: Bool) {
+        let children = edges.filter { $0.relation == "part_of" && $0.targetId == hubId }.map(\.sourceId)
+        for childId in children {
+            if expanding { simulation3D.pin(childId) } else { simulation3D.unpin(childId) }
         }
     }
 
     private func tapGesture(viewSize: CGSize) -> some Gesture {
         SpatialTapGesture()
             .onEnded { value in
-                if let nodeId = scene.hitTest(at: value.location, viewSize: viewSize, positions: livePositions) {
+                if let nodeId = scene.hitTest(at: value.location, viewSize: viewSize, positions: scene.renderPositions) {
                     if hubs.contains(nodeId) {
                         let expanding = !scene.expandedHubs.contains(nodeId)
                         // Collapse other expanded hubs first
                         for hubId in scene.expandedHubs where hubId != nodeId {
                             scene.toggleHubExpansion(hubId: hubId)
-                            onHubToggle?(hubId, false)
+                            pinUnpinHubChildren(hubId: hubId, expanding: false)
                         }
                         scene.toggleHubExpansion(hubId: nodeId)
-                        onHubToggle?(nodeId, expanding)
+                        pinUnpinHubChildren(hubId: nodeId, expanding: expanding)
                         selectedNode = nodeId
                     } else {
                         collapseAllHubs()
@@ -2153,122 +2660,172 @@ struct Graph3DView: View {
             }
     }
 
-    // MARK: - Labels Overlay
+    // MARK: - Labels Overlay (NSViewRepresentable — bypasses SwiftUI per-frame overhead)
 
-    @ViewBuilder
-    private func labelsOverlay(viewSize: CGSize) -> some View {
-        let nodeById = Dictionary(nodes.map { ($0.id, $0) }, uniquingKeysWith: { _, last in last })
-        Canvas { [scene] context, size in
-            #if DEBUG
-            let canvasStart = CFAbsoluteTimeGetCurrent()
-            defer {
-                let canvasMs = (CFAbsoluteTimeGetCurrent() - canvasStart) * 1000
-                Task { @MainActor in scene.lastCanvasLabelMs = canvasMs }
-            }
-            #endif
-            struct LabelEntry {
-                let id: Int64
-                let screenPos: CGPoint
-                let nodeData: NodeData
-                let depthFromCam: Float
-                let isSelected: Bool
-                let isHub: Bool
-            }
+    private var labelsOverlay: some View {
+        LabelOverlayRepresentable(scene: scene, nodes: nodes, hubs: hubs,
+                                   selectedNode: selectedNode)
+            .allowsHitTesting(false)
+    }
+}
 
-            // Precompute children of expanded hubs for visibility bypass
-            var expandedChildren = Set<Int64>()
-            for hubId in scene.expandedHubs {
-                for childId in scene.childrenOfHub(hubId) {
-                    expandedChildren.insert(childId)
-                }
-            }
+// MARK: - Native Label Overlay
 
-            var entries: [LabelEntry] = []
-            var minDepth: Float = .greatestFiniteMagnitude
-            var maxDepth: Float = 0
+/// NSView that draws node labels using Core Graphics.
+/// Bypasses SwiftUI's observation/diffing/Canvas pipeline entirely.
+/// Redraws are triggered by renderTick setting `needsDisplay = true` at ~20fps.
+@MainActor
+final class LabelOverlayNSView: NSView {
+    weak var scene: Graph3DScene?
+    var nodeById: [Int64: NodeData] = [:]
+    var hubs: Set<Int64> = []
+    var selectedNode: Int64?
 
-            for (id, pos3D) in livePositions {
-                guard let screenPos = scene.project(point3D: pos3D, viewSize: size) else { continue }
-                guard let nodeData = nodeById[id] else { continue }
+    override var isFlipped: Bool { true }
 
-                let depth = scene.cameraDistance(to: pos3D)
-                let isSelected = id == selectedNode
-                let isHub = hubs.contains(id)
-                let importance = CGFloat(max(1, nodeData.importance))
-
-                // Visibility by actual distance from camera — not a global "zoom level"
-                // Closer nodes are visible; farther nodes culled by tier.
-                // Children of expanded hubs always visible for inspection.
-                if !isSelected && !expandedChildren.contains(id) {
-                    let maxVisible: CGFloat = isHub ? 1200 : (200 + importance * 80)
-                    guard CGFloat(depth) < maxVisible else { continue }
-                }
-
-                minDepth = min(minDepth, depth)
-                maxDepth = max(maxDepth, depth)
-
-                entries.append(LabelEntry(
-                    id: id, screenPos: screenPos, nodeData: nodeData,
-                    depthFromCam: depth, isSelected: isSelected, isHub: isHub
-                ))
-            }
-
-            // Sort front-to-back first for cap, then reverse for draw order
-            entries.sort { $0.depthFromCam < $1.depthFromCam }
-
-            // Cap at 80 labels max — nearest labels are most important.
-            // Selected and hub nodes always survive the cap.
-            let maxLabels = 80
-            if entries.count > maxLabels {
-                let prioritized = entries.prefix(while: { $0.isSelected || $0.isHub })
-                let rest = entries.dropFirst(prioritized.count)
-                entries = Array(prioritized) + Array(rest.prefix(maxLabels - prioritized.count))
-            }
-
-            // Reverse to back-to-front: far labels drawn first, near labels on top
-            entries.reverse()
-
-            let depthRange = max(1, maxDepth - minDepth)
-
-            for entry in entries {
-                let importance = CGFloat(max(1, entry.nodeData.importance))
-                let nodeDist = CGFloat(entry.depthFromCam)
-
-                // Depth factor: 1.0 for nearest, fades toward farthest visible
-                let depthNorm = CGFloat((entry.depthFromCam - minDepth) / depthRange)
-                let depthFade = entry.isSelected ? 1.0 : (1.0 - depthNorm * 0.7)
-
-                // Distance-based fade: smooth fade-in as camera approaches
-                let maxVisible: CGFloat = entry.isHub ? 1200 : (200 + importance * 80)
-                let fadeRange: CGFloat = maxVisible * 0.3
-                let fadeT = entry.isSelected ? 1.0 : min(1.0, max(0.0, (maxVisible - nodeDist) / fadeRange))
-
-                // Font size: larger when close, smaller when far — per-node distance
-                let baseSize: CGFloat = entry.isSelected ? 12 : (entry.isHub ? 10 : 8.5)
-                let distScale = CGFloat(400.0 / max(entry.depthFromCam, 50))
-                let fontSize = max(7, min(20, baseSize * pow(distScale, 0.5)))
-
-                let baseOpacity: CGFloat = entry.isSelected ? 0.95 : (entry.isHub ? 0.8 : 0.6)
-                let searchDimmedLabel = scene.renderIsSearchActive && !scene.renderSearchMatchIds.contains(entry.id)
-                let searchFade: CGFloat = searchDimmedLabel ? 0.15 : 1.0
-                let opacity = baseOpacity * fadeT * depthFade * searchFade
-
-                guard opacity > 0.02 else { continue }
-
-                let labelPos = CGPoint(x: entry.screenPos.x, y: entry.screenPos.y - fontSize - 4)
-                let fontWeight: Font.Weight = entry.isSelected || entry.isHub ? .bold : .medium
-                let font: Font = .system(size: fontSize, weight: fontWeight, design: .monospaced)
-
-                // Single draw with shadow for outline — 5x cheaper than 4-offset stroke
-                let text = Text(entry.nodeData.label).font(font)
-                    .foregroundStyle(.white.opacity(opacity))
-                context.drawLayer { layerCtx in
-                    layerCtx.addFilter(.shadow(color: .black.opacity(min(1.0, opacity * 1.5)),
-                                               radius: 1.5, x: 0, y: 0))
-                    layerCtx.draw(text, at: labelPos)
-                }
+    static var drawCount: UInt64 = 0
+    override func draw(_ dirtyRect: NSRect) {
+        let drawStart = CFAbsoluteTimeGetCurrent()
+        defer {
+            Self.drawCount &+= 1
+            let drawMs = (CFAbsoluteTimeGetCurrent() - drawStart) * 1000.0
+            if Self.drawCount % 20 == 0 || drawMs > 5 {
+                frameLog.error("[LABELS] draw=\(drawMs, format: .fixed(precision: 2))ms count=\(Self.drawCount)")
             }
         }
-        .allowsHitTesting(false)
+        guard let scene else { return }
+        let size = bounds.size
+        guard size.width > 0, size.height > 0 else { return }
+
+        var positions = scene.renderPositions
+        for (id, pos) in scene.expandedChildPositions {
+            positions[id] = pos
+        }
+
+        struct LabelEntry {
+            let id: Int64
+            let screenPos: CGPoint
+            let nodeData: NodeData
+            let depthFromCam: Float
+            let isSelected: Bool
+            let isHub: Bool
+        }
+
+        var expandedChildren = Set<Int64>()
+        for hubId in scene.expandedHubs {
+            for childId in scene.childrenOfHub(hubId) {
+                expandedChildren.insert(childId)
+            }
+        }
+
+        var entries: [LabelEntry] = []
+        var minDepth: Float = .greatestFiniteMagnitude
+        var maxDepth: Float = 0
+
+        for (id, pos3D) in positions {
+            guard let screenPos = scene.project(point3D: pos3D, viewSize: size) else { continue }
+            guard let nodeData = nodeById[id] else { continue }
+
+            let depth = scene.cameraDistance(to: pos3D)
+            let isSelected = id == selectedNode
+            let isHub = hubs.contains(id)
+            let importance = CGFloat(max(1, nodeData.importance))
+
+            if !isSelected && !expandedChildren.contains(id) {
+                let maxVisible: CGFloat = isHub ? 1200 : (200 + importance * 80)
+                guard CGFloat(depth) < maxVisible else { continue }
+            }
+
+            minDepth = min(minDepth, depth)
+            maxDepth = max(maxDepth, depth)
+
+            entries.append(LabelEntry(
+                id: id, screenPos: screenPos, nodeData: nodeData,
+                depthFromCam: depth, isSelected: isSelected, isHub: isHub
+            ))
+        }
+
+        entries.sort { $0.depthFromCam < $1.depthFromCam }
+
+        let maxLabels = 80
+        if entries.count > maxLabels {
+            let prioritized = entries.prefix(while: { $0.isSelected || $0.isHub })
+            let rest = entries.dropFirst(prioritized.count)
+            entries = Array(prioritized) + Array(rest.prefix(max(0, maxLabels - prioritized.count)))
+        }
+
+        entries.reverse()
+
+        let depthRange = max(1, maxDepth - minDepth)
+
+        for entry in entries {
+            let importance = CGFloat(max(1, entry.nodeData.importance))
+            let nodeDist = CGFloat(entry.depthFromCam)
+
+            let depthNorm = CGFloat((entry.depthFromCam - minDepth) / depthRange)
+            let depthFade = entry.isSelected ? 1.0 : (1.0 - depthNorm * 0.7)
+
+            let maxVisible: CGFloat = entry.isHub ? 1200 : (200 + importance * 80)
+            let fadeRange: CGFloat = maxVisible * 0.3
+            let fadeT = entry.isSelected ? 1.0 : min(1.0, max(0.0, (maxVisible - nodeDist) / fadeRange))
+
+            let baseSize: CGFloat = entry.isSelected ? 12 : (entry.isHub ? 10 : 8.5)
+            let distScale = CGFloat(400.0 / max(entry.depthFromCam, 50))
+            let fontSize = max(7, min(20, baseSize * pow(distScale, 0.5)))
+
+            let baseOpacity: CGFloat = entry.isSelected ? 0.95 : (entry.isHub ? 0.8 : 0.6)
+            let searchDimmed = scene.renderIsSearchActive && !scene.renderSearchMatchIds.contains(entry.id)
+            let searchFade: CGFloat = searchDimmed ? 0.15 : 1.0
+            let opacity = baseOpacity * fadeT * depthFade * searchFade
+
+            guard opacity > 0.02 else { continue }
+
+            let weight: NSFont.Weight = entry.isSelected || entry.isHub ? .bold : .medium
+            let font = NSFont.monospacedSystemFont(ofSize: fontSize, weight: weight)
+
+            let shadow = NSShadow()
+            shadow.shadowColor = NSColor.black.withAlphaComponent(min(1.0, opacity * 1.5))
+            shadow.shadowBlurRadius = 1.5
+            shadow.shadowOffset = .zero
+
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: font,
+                .foregroundColor: NSColor.white.withAlphaComponent(opacity),
+                .shadow: shadow,
+            ]
+
+            let text = entry.nodeData.label as NSString
+            let textSize = text.size(withAttributes: attrs)
+
+            let x = entry.screenPos.x - textSize.width / 2
+            let y = entry.screenPos.y - fontSize - 4
+            text.draw(at: CGPoint(x: x, y: y), withAttributes: attrs)
+        }
+    }
+}
+
+/// SwiftUI wrapper — creates the NSView once, then renderTick drives updates directly.
+private struct LabelOverlayRepresentable: NSViewRepresentable {
+    let scene: Graph3DScene
+    let nodes: [NodeData]
+    let hubs: Set<Int64>
+    let selectedNode: Int64?
+
+    func makeNSView(context: Context) -> LabelOverlayNSView {
+        let view = LabelOverlayNSView()
+        view.wantsLayer = true
+        view.layer?.isOpaque = false
+        view.scene = scene
+        scene.labelOverlayView = view
+        return view
+    }
+
+    func updateNSView(_ nsView: LabelOverlayNSView, context: Context) {
+        // Push data that changes with SwiftUI state (selection, node list)
+        nsView.nodeById = Dictionary(nodes.map { ($0.id, $0) }, uniquingKeysWith: { _, last in last })
+        nsView.hubs = hubs
+        nsView.selectedNode = selectedNode
+        // Trigger redraw for selection/data changes from SwiftUI side
+        nsView.needsDisplay = true
     }
 }

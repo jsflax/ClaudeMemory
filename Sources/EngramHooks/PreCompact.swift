@@ -3,14 +3,42 @@ import EngramKit
 import Lattice
 import Foundation
 
-/// PreCompact hook: saves important context before compaction, nudges learning and maintenance.
+/// PreCompact hook: spawns session-learner on auto-compaction to capture knowledge
+/// before context is summarized. The learner reads the full transcript from disk.
 struct PreCompact: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "pre-compact",
-        abstract: "Save context before compaction, nudge learning and maintenance (PreCompact hook)"
+        abstract: "Spawn session-learner on auto-compaction (PreCompact hook)"
     )
 
+    private static let sessionLearnerSystemPrompt: String = loadAgentSystemPrompt(
+        name: "session-learner",
+        fallback: """
+        You are a session learning agent. Your job is to review what happened in a coding session and store the key insights as memories for future recall.
+
+        ## Workflow
+        1. Derive the project name from the working directory. Recall existing memories for context.
+        2. Check what's already stored to prevent duplicates.
+        3. Focus on: debugging insights, architecture decisions, workflow patterns, gotchas.
+        4. Store memories using `remember` — atomic, concise, scoped, connected, prioritized.
+        5. Connect new memories to related existing ones using edges.
+        6. Update stale memories rather than creating duplicates.
+
+        ## Guidelines
+        - Be selective. A session with 20 file edits might only produce 2-3 useful memories.
+        - Prefer updating existing memories over creating new ones.
+        - Keep total turns low: 2-3 recalls, 2-5 remember/update/connect calls, done.
+        """
+    )
+
+    private static let allowedTools = "mcp__memory__*,Read,Grep,Glob,Bash"
+    private static let logPath = NSHomeDirectory() + "/.claude/session-learner.log"
+
     func run() async throws {
+        if ProcessInfo.processInfo.environment["CLAUDE_MEMORY_LEARNER"] != nil {
+            return
+        }
+
         let inputData = readStdin()
         guard !inputData.isEmpty else { return }
 
@@ -22,37 +50,56 @@ struct PreCompact: AsyncParsableCommand {
             return
         }
 
-        // Only nudge on auto-compaction — manual compaction is intentional
+        // Only spawn on auto-compaction — manual compaction is intentional
         guard input.trigger == "auto" else { return }
+        guard let transcriptPath = input.transcriptPath else { return }
 
-        let project = projectName(from: input.cwd)
-        let proj = project ?? "unknown"
+        let project = projectName(from: input.cwd) ?? "unknown"
 
-        var sections: [String] = []
+        hookLog("PreCompact hook: auto-compaction, spawning session-learner for \(project)")
 
-        sections.append("""
-        ## IMPORTANT: Context compaction starting
+        let prompt = """
+        Review this coding session for project "\(project)" and capture what was learned.
+        This is a mid-session learning run triggered by context compaction — the session is still active.
 
-        Your conversation context is about to be compacted — earlier messages will be \
-        summarized and details lost. Before this happens, you MUST save any unsaved \
-        knowledge from this session:
+        The full conversation transcript is at: \(transcriptPath)
+        It is a JSONL file — one JSON object per line.
 
-        1. Any decisions made, patterns discovered, or bugs debugged → `remember` them now
-        2. Any in-progress work → `checkpoint` with current plan, progress, and context
-        3. Any corrections or mistakes → `remember` the correct approach
+        ## How to read the transcript
+        - Use Grep and Read to query it selectively. Do NOT try to read the entire file at once — it may be very large.
+        - Grep for `"role":"assistant"` lines to find reasoning and decisions.
+        - Grep for `"is_error":true` or `"type":"error"` to find errors and debugging.
+        - Grep for tool names like `"name":"Edit"`, `"name":"Write"` to find what code was changed.
+        - Use Read with offset/limit to page through interesting sections.
 
-        Do this immediately — after compaction, you will not be able to recall these details.
-        """)
+        ## What to look for
+        - Debugging insights: what went wrong, what the root cause was, how it was fixed
+        - Architecture decisions: why something was designed a certain way
+        - Patterns and conventions: recurring approaches worth remembering
+        - Gotchas: non-obvious pitfalls discovered during the session
+        - Corrections: anything that contradicts or updates existing knowledge
 
-        // Learning nudge
-        sections.append(learningNudge(project: proj))
+        ## Instructions
+        1. Recall existing memories for project "\(project)" to check what's already stored.
+        2. Query the transcript to understand what happened and why.
+        3. Store atomic memories for what you find. Connect them to related existing ones.
+        4. Update or correct any stale memories you encounter.
+        5. Skip only if nothing meaningful has happened yet.
+        """
 
-        let output = HookOutput(
-            hookSpecificOutput: HookSpecificOutput(
-                hookEventName: "PreCompact",
-                additionalContext: sections.joined(separator: "\n\n")
+        do {
+            try spawnClaudeSubprocess(
+                prompt: prompt,
+                systemPrompt: Self.sessionLearnerSystemPrompt,
+                allowedTools: Self.allowedTools,
+                model: "sonnet",
+                envGuard: (key: "CLAUDE_MEMORY_LEARNER", value: "1"),
+                logPath: Self.logPath,
+                cwd: input.cwd
             )
-        )
-        try writeOutput(output)
+            hookLog("PreCompact hook: spawned session-learner CLI for project \(project)")
+        } catch {
+            hookLog("PreCompact hook: failed to spawn session-learner: \(error)")
+        }
     }
 }

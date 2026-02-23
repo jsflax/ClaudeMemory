@@ -91,11 +91,13 @@ struct StopInput: Decodable {
 /// Input for the PreCompact hook.
 struct PreCompactInput: Decodable {
     let sessionId: String?
+    let transcriptPath: String?
     let cwd: String?
     let trigger: String?  // "manual" or "auto"
 
     enum CodingKeys: String, CodingKey {
         case sessionId = "session_id"
+        case transcriptPath = "transcript_path"
         case cwd
         case trigger
     }

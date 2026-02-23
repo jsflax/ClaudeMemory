@@ -7,18 +7,30 @@ let package = Package(
     platforms: [.macOS(.v15)],
     products: [
         .library(name: "EngramKit", targets: ["EngramKit"]),
+        .library(name: "EngramModels", targets: ["EngramModels"]),
     ],
     dependencies: [
         .package(url: "https://github.com/modelcontextprotocol/swift-sdk.git", from: "0.10.0"),
-        .package(url: "https://github.com/jsflax/lattice.git", from: "0.3.2"),
+        .package(name: "Lattice", path: "../Lattice"),
         .package(url: "https://github.com/jsflax/SwiftLM.git", branch: "main"),
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.5.0"),
         .package(url: "https://github.com/sparkle-project/Sparkle.git", from: "2.0.0"),
+        .package(url: "https://github.com/google/GoogleSignIn-iOS.git", from: "7.0.0"),
     ],
     targets: [
         .target(
+            name: "EngramModels",
+            dependencies: [
+                .product(name: "Lattice", package: "Lattice"),
+            ],
+            swiftSettings: [
+                .interoperabilityMode(.Cxx),
+            ]
+        ),
+        .target(
             name: "EngramKit",
             dependencies: [
+                "EngramModels",
                 .product(name: "MCP", package: "swift-sdk"),
                 .product(name: "Lattice", package: "Lattice"),
                 .product(name: "SwiftLM", package: "SwiftLM"),
@@ -51,6 +63,8 @@ let package = Package(
                 "EngramKit",
                 .product(name: "Lattice", package: "Lattice"),
                 .product(name: "Sparkle", package: "Sparkle"),
+                .product(name: "GoogleSignIn", package: "GoogleSignIn-iOS"),
+                .product(name: "GoogleSignInSwift", package: "GoogleSignIn-iOS"),
             ],
             swiftSettings: [
                 .interoperabilityMode(.Cxx),
