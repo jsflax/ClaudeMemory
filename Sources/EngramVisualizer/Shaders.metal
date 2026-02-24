@@ -360,6 +360,72 @@ kernel void stamp_node_spheres(
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// MARK: - Label Billboard Geometry Modifier
+//
+// Billboard quad: vertex position is the anchor (node world pos), normal carries
+// pre-multiplied corner offset (cx*halfW, cy*halfH, 0). The geometry modifier
+// expands corners along camera right/up vectors so quads always face the camera.
+// Distance-based scaling (sqrt) keeps labels readable at varying distances.
+// ──────────────────────────────────────────────────────────────────────────────
+
+[[visible]]
+void label_geometry(realitykit::geometry_parameters params)
+{
+    float3 corner = params.geometry().normal();  // (cx*halfW, cy*halfH, 0)
+
+    // Camera basis from model_to_view matrix (entity has identity transform)
+    float4x4 mv = params.uniforms().model_to_view();
+    float3 camRight = float3(mv[0][0], mv[1][0], mv[2][0]);
+    float3 camUp    = float3(mv[0][1], mv[1][1], mv[2][1]);
+
+    // Distance-based partial perspective scaling (sqrt = same curve as old overlay)
+    float3 anchor = params.geometry().model_position();
+    float3 viewT = float3(mv[3][0], mv[3][1], mv[3][2]);
+    float3x3 viewR = float3x3(mv[0].xyz, mv[1].xyz, mv[2].xyz);
+    float3 camPos = -(transpose(viewR) * viewT);
+    float dist = length(anchor - camPos);
+    float distScale = sqrt(0.5 / max(dist, 0.05));
+
+    float3 offset = (camRight * corner.x + camUp * corner.y) * distScale;
+
+    // corner.z (from vertex nz) encodes forward bias toward camera.
+    // Project labels use nz > 0 to render in front of edges.
+    if (corner.z > 0.0) {
+        float3 camForward = -float3(mv[0][2], mv[1][2], mv[2][2]);
+        offset += camForward * corner.z;
+    }
+
+    params.geometry().set_model_position_offset(offset);
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// MARK: - Label Billboard Surface Shader (unlit, textured)
+//
+// Samples the label texture atlas. Per-vertex opacity in color.a, tint from color.rgb.
+// Fog applied from camera distance. Alpha from texture × vertex × fog.
+// ──────────────────────────────────────────────────────────────────────────────
+
+[[visible]]
+void label_surface(realitykit::surface_parameters params)
+{
+    constexpr sampler s(filter::linear, address::clamp_to_edge);
+    half4 texColor = params.textures().custom().sample(s, params.geometry().uv0());
+
+    float vertexOpacity = params.geometry().color().a;
+    float3 worldPos = params.geometry().world_position();
+    float dist = cameraDistance(worldPos, params.uniforms().world_to_view());
+    float fogFade = max(0.0f, 1.0f - fogFactor(dist) * 0.95f);
+
+    half alpha = texColor.a * half(vertexOpacity) * half(fogFade);
+    if (alpha < 0.01h) { params.surface().set_opacity(0.0h); return; }
+
+    // Vertex color RGB: (1,1,1) for node labels (white), project color for project labels
+    half3 tint = half3(params.geometry().color().rgb);
+    params.surface().set_emissive_color(tint);
+    params.surface().set_opacity(alpha);
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // MARK: - Force Compute Kernel
 //
 // Each of N threads computes charge (Coulomb) repulsion from all other N nodes.

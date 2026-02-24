@@ -146,14 +146,19 @@ struct GraphView: View {
 
     /// Recompute all derived data from current filtered nodes/edges. Call after any structural change.
     private func recomputeDerivedData() {
-        // Color map
+        // Color map — preserve existing colors (stable across streaming + filter changes),
+        // only assign new colors for projects not yet in the map.
         let projects = uniqueProjects()
-        var map: [String: Color] = ["global": .gray]
-        for (i, project) in projects.enumerated() {
-            if project == "global" { continue }
-            map[project] = Self.goldenAngleColor(at: i)
+        if cachedProjectColorMap["global"] == nil {
+            cachedProjectColorMap["global"] = .gray
         }
-        cachedProjectColorMap = map
+        for project in projects {
+            if project == "global" { continue }
+            if cachedProjectColorMap[project] == nil {
+                let idx = cachedProjectColorMap.count - 1  // -1 for global
+                cachedProjectColorMap[project] = Self.goldenAngleColor(at: idx)
+            }
+        }
 
         // Visible node IDs
         cachedVisibleNodeIds = Set(cachedFilteredNodes.map(\.id))

@@ -64,7 +64,11 @@ final class GraphRenderStore {
     var nodeById: [Int64: NodeData] = [:]
     var edges: [EdgeData] = []
     var hubs: Set<Int64> = []
-    var colorMap: [String: Color] = [:]
+    var colorMap: [String: Color] = [:] {
+        didSet { colorMapVersion &+= 1 }
+    }
+    /// Incremented whenever colorMap changes. Scene checks this to invalidate its SIMD cache.
+    private(set) var colorMapVersion: UInt64 = 0
 }
 
 // MARK: - Perf tracking (writable from Canvas closure)

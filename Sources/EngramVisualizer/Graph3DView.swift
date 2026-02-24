@@ -112,6 +112,16 @@ final class Graph3DScene {
     private var labelAtlasRects: [Int64: (u0: Float, v0: Float, u1: Float, v1: Float)] = [:]
     private var labelAtlasNodeIds: Set<Int64> = []
     private var labelAtlasHubIds: Set<Int64> = []
+    // Project labels — larger billboard quads floating above each project cluster
+    private var projectLabelAtlasRects: [String: (u0: Float, v0: Float, u1: Float, v1: Float)] = [:]
+    private var labelAtlasProjects: Set<String> = []
+    @ObservationIgnored private var projectCentroids: [String: (centroid: SIMD3<Float>, radius: Float, maxY: Float)] = [:]
+    /// Correction factor for text aspect ratio: atlasW / (2 * atlasH).
+    /// Quad spans -halfW..+halfW (2x) horizontally but 0..halfH (1x) vertically.
+    @ObservationIgnored private var labelAtlasAspectCorrection: Float = 1.0
+    /// Debounce atlas regeneration to prevent flicker from texture/UV mismatch
+    /// in RealityKit's triple-buffered LowLevelMesh vertex buffers.
+    @ObservationIgnored private var labelAtlasRegenFrame: UInt64 = 0
 
     /// 48-byte vertex layout shared by batched nodes and edges.
     private struct BatchVertex {
@@ -932,16 +942,57 @@ final class Graph3DScene {
 
     // MARK: - Label Batch (GPU billboard quads)
 
-    /// Generate a texture atlas containing all node labels.
-    /// Row-based packing into a single 4096×2048 CGContext (2x retina = 8192×4096 pixels).
-    /// Returns the atlas texture resource; populates `labelAtlasRects` with per-node UV rects.
-    private func generateLabelAtlas(nodes: [NodeData], hubs: Set<Int64>) {
+    /// Generate a texture atlas containing all node labels and project labels.
+    /// Two-pass: first measures all label sizes to compute exact atlas height, then draws.
+    /// Returns the atlas texture resource; populates `labelAtlasRects` and `projectLabelAtlasRects`.
+    private func generateLabelAtlas(nodes: [NodeData], hubs: Set<Int64>, projects: Set<String>) {
         let atlasW = 4096
-        let atlasH = 2048
+        let padding: CGFloat = 4
+        let fontSize: CGFloat = 28
+        let projFontSize: CGFloat = 40
+
+        // Pre-compute all label sizes (measurement pass)
+        struct LabelSize { let width: CGFloat; let height: CGFloat }
+        var nodeSizes: [LabelSize] = []
+        nodeSizes.reserveCapacity(nodes.count)
+        for node in nodes {
+            let isHub = hubs.contains(node.id)
+            let weight: NSFont.Weight = isHub ? .bold : .medium
+            let font = NSFont.monospacedSystemFont(ofSize: fontSize, weight: weight)
+            let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: NSColor.white]
+            let size = (node.label as NSString).size(withAttributes: attrs)
+            nodeSizes.append(LabelSize(width: ceil(size.width) + padding * 2, height: ceil(size.height) + padding))
+        }
+
+        let projFont = NSFont.systemFont(ofSize: projFontSize, weight: .bold)
+        let projAttrs: [NSAttributedString.Key: Any] = [.font: projFont, .foregroundColor: NSColor.white]
+        let sortedProjects = projects.sorted()
+        var projSizes: [LabelSize] = []
+        for project in sortedProjects {
+            let size = (project as NSString).size(withAttributes: projAttrs)
+            projSizes.append(LabelSize(width: ceil(size.width) + padding * 2, height: ceil(size.height) + padding))
+        }
+
+        // Simulate packing to compute needed height
+        var cursorX: CGFloat = 2
+        var cursorY: CGFloat = 0
+        var rowHeight: CGFloat = 0
+        for s in nodeSizes {
+            if cursorX + s.width > CGFloat(atlasW) { cursorX = 2; cursorY += rowHeight + padding; rowHeight = 0 }
+            cursorX += s.width + padding; rowHeight = max(rowHeight, s.height)
+        }
+        cursorX = 2; cursorY += rowHeight + padding; rowHeight = 0
+        for s in projSizes {
+            if cursorX + s.width > CGFloat(atlasW) { cursorX = 2; cursorY += rowHeight + padding; rowHeight = 0 }
+            cursorX += s.width + padding; rowHeight = max(rowHeight, s.height)
+        }
+        let neededH = Int(ceil(cursorY + rowHeight + padding))
+        let atlasH = max(512, neededH + 32)  // small margin
+        labelAtlasAspectCorrection = Float(atlasW) / (2.0 * Float(atlasH))
+
         let scale = 2  // retina
         let pixelW = atlasW * scale
         let pixelH = atlasH * scale
-        let fontSize: CGFloat = 28
 
         let colorSpace = CGColorSpaceCreateDeviceRGB()
         guard let ctx = CGContext(
@@ -958,52 +1009,53 @@ final class Graph3DScene {
         ctx.translateBy(x: 0, y: CGFloat(pixelH))
         ctx.scaleBy(x: CGFloat(scale), y: CGFloat(-scale))
 
+        // Drawing pass — node labels
         var rects: [Int64: (u0: Float, v0: Float, u1: Float, v1: Float)] = [:]
-        var cursorX: CGFloat = 2  // padding
-        var cursorY: CGFloat = 0
-        var rowHeight: CGFloat = 0
-        let padding: CGFloat = 4
+        cursorX = 2; cursorY = 0; rowHeight = 0
 
-        for node in nodes {
+        for (i, node) in nodes.enumerated() {
+            let s = nodeSizes[i]
+            if cursorX + s.width > CGFloat(atlasW) { cursorX = 2; cursorY += rowHeight + padding; rowHeight = 0 }
+            if cursorY + s.height > CGFloat(atlasH) { break }
+
             let isHub = hubs.contains(node.id)
             let weight: NSFont.Weight = isHub ? .bold : .medium
             let font = NSFont.monospacedSystemFont(ofSize: fontSize, weight: weight)
+            let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: NSColor.white]
 
-            let attrs: [NSAttributedString.Key: Any] = [
-                .font: font,
-                .foregroundColor: NSColor.white,
-            ]
-            let text = node.label as NSString
-            let size = text.size(withAttributes: attrs)
-            let cellW = ceil(size.width) + padding * 2
-            let cellH = ceil(size.height) + padding
-
-            // Wrap to next row if needed
-            if cursorX + cellW > CGFloat(atlasW) {
-                cursorX = 2
-                cursorY += rowHeight + padding
-                rowHeight = 0
-            }
-
-            // Out of vertical space — stop packing
-            if cursorY + cellH > CGFloat(atlasH) { break }
-
-            // Draw text
             let drawPoint = CGPoint(x: cursorX + padding, y: cursorY + padding * 0.5)
             NSGraphicsContext.saveGraphicsState()
             NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx, flipped: true)
-            text.draw(at: drawPoint, withAttributes: attrs)
+            (node.label as NSString).draw(at: drawPoint, withAttributes: attrs)
             NSGraphicsContext.restoreGraphicsState()
 
-            // Store UV rect (normalized 0..1)
-            let u0 = Float(cursorX) / Float(atlasW)
-            let v0 = Float(cursorY) / Float(atlasH)
-            let u1 = Float(cursorX + cellW) / Float(atlasW)
-            let v1 = Float(cursorY + cellH) / Float(atlasH)
-            rects[node.id] = (u0, v0, u1, v1)
+            rects[node.id] = (
+                Float(cursorX) / Float(atlasW), Float(cursorY) / Float(atlasH),
+                Float(cursorX + s.width) / Float(atlasW), Float(cursorY + s.height) / Float(atlasH)
+            )
+            cursorX += s.width + padding; rowHeight = max(rowHeight, s.height)
+        }
 
-            cursorX += cellW + padding
-            rowHeight = max(rowHeight, cellH)
+        // Drawing pass — project labels
+        var projRects: [String: (u0: Float, v0: Float, u1: Float, v1: Float)] = [:]
+        cursorX = 2; cursorY += rowHeight + padding; rowHeight = 0
+
+        for (i, project) in sortedProjects.enumerated() {
+            let s = projSizes[i]
+            if cursorX + s.width > CGFloat(atlasW) { cursorX = 2; cursorY += rowHeight + padding; rowHeight = 0 }
+            if cursorY + s.height > CGFloat(atlasH) { break }
+
+            let drawPoint = CGPoint(x: cursorX + padding, y: cursorY + padding * 0.5)
+            NSGraphicsContext.saveGraphicsState()
+            NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx, flipped: true)
+            (project as NSString).draw(at: drawPoint, withAttributes: projAttrs)
+            NSGraphicsContext.restoreGraphicsState()
+
+            projRects[project] = (
+                Float(cursorX) / Float(atlasW), Float(cursorY) / Float(atlasH),
+                Float(cursorX + s.width) / Float(atlasW), Float(cursorY + s.height) / Float(atlasH)
+            )
+            cursorX += s.width + padding; rowHeight = max(rowHeight, s.height)
         }
 
         guard let cgImage = ctx.makeImage() else {
@@ -1017,8 +1069,10 @@ final class Graph3DScene {
 
         labelAtlasTexture = texture
         labelAtlasRects = rects
+        projectLabelAtlasRects = projRects
         labelAtlasNodeIds = Set(nodes.map(\.id))
         labelAtlasHubIds = hubs
+        labelAtlasProjects = projects
 
         // Update material texture binding
         if var mat = labelBatchMaterial {
@@ -1027,7 +1081,7 @@ final class Graph3DScene {
             labelBatchEntity?.model?.materials = [mat]
         }
 
-        frameLog.error("[labelAtlas] ✅ atlas generated: \(rects.count) labels, \(atlasW)×\(atlasH)")
+        frameLog.error("[labelAtlas] ✅ atlas generated: \(rects.count) node + \(projRects.count) project labels, \(atlasW)×\(atlasH), cursorY=\(cursorY) projects=\(projects.sorted())")
     }
 
     /// Create or resize the LowLevelMesh for batched label rendering.
@@ -1115,19 +1169,54 @@ final class Graph3DScene {
             return
         }
 
-        // Regenerate atlas if node set or hub set changed
+        // Regenerate atlas if node set, hub set, or project set changed.
+        // Debounce: wait 60 frames (~1s) between regens to prevent flicker from
+        // texture/UV mismatch in RealityKit's triple-buffered vertex data.
+        // Nodes without atlas rects just skip rendering until the next regen.
         let currentNodeIds = Set(positions.keys)
-        if labelAtlasTexture == nil || currentNodeIds != labelAtlasNodeIds || hubs != labelAtlasHubIds {
-            generateLabelAtlas(nodes: nodes, hubs: hubs)
+        let currentProjects = Set(nodes.map(\.project))
+        let atlasNeedsRegen = labelAtlasTexture == nil || currentNodeIds != labelAtlasNodeIds || hubs != labelAtlasHubIds || currentProjects != labelAtlasProjects
+        if atlasNeedsRegen {
+            let isFirstAtlas = labelAtlasTexture == nil
+            let framesSinceRegen = renderFrameCount &- labelAtlasRegenFrame
+            if isFirstAtlas || framesSinceRegen >= 60 {
+                generateLabelAtlas(nodes: nodes, hubs: hubs, projects: currentProjects)
+                labelAtlasRegenFrame = renderFrameCount
+            }
         }
         guard labelAtlasTexture != nil else { return }
 
-        ensureLabelBatchMesh(capacity: nodeCount)
+        // Compute per-project centroids directly from node positions
+        var projectNodePositions: [String: [SIMD3<Float>]] = [:]
+        for node in nodes {
+            guard let pos = positions[node.id] else { continue }
+            projectNodePositions[node.project, default: []].append(pos)
+        }
+        projectCentroids.removeAll(keepingCapacity: true)
+        for (project, pts) in projectNodePositions where pts.count >= 2 {
+            var sum = SIMD3<Float>.zero
+            var maxY: Float = -.greatestFiniteMagnitude
+            for p in pts { sum += p; maxY = max(maxY, p.y) }
+            let centroid = sum / Float(pts.count)
+            var maxDist: Float = 0
+            for p in pts { maxDist = max(maxDist, simd_length(p - centroid)) }
+            projectCentroids[project] = (centroid: centroid, radius: maxDist, maxY: maxY)
+        }
+
+        // Pre-compute project colors outside the unsafe buffer closure
+        var projectColors: [String: SIMD3<Float>] = [:]
+        for project in projectCentroids.keys {
+            projectColors[project] = nodeColorFloat3(for: project, colorMap: renderColorMap)
+        }
+
+        let projectLabelCount = projectCentroids.count
+        ensureLabelBatchMesh(capacity: nodeCount + projectLabelCount)
         guard let mesh = labelBatchMesh else { return }
 
         let nodeById = Dictionary(nodes.map { ($0.id, $0) }, uniquingKeysWith: { _, last in last })
         let camPos = cameraPosition
         let sf = scaleFactor
+        let aspectCorr = labelAtlasAspectCorrection
 
         // Merge expanded child positions
         var allPositions = positions
@@ -1204,7 +1293,7 @@ final class Graph3DScene {
 
                 // Quad dimensions — halfH from node type, halfW from text aspect ratio
                 let halfH: Float = isSelected ? 0.025 : (isHub ? 0.022 : 0.018)
-                let textAspect = (rect.u1 - rect.u0) / max(0.001, rect.v1 - rect.v0)
+                let textAspect = (rect.u1 - rect.u0) / max(0.001, rect.v1 - rect.v0) * aspectCorr
                 let halfW = halfH * textAspect
 
                 // Anchor position: node world pos scaled + Y offset above sphere
@@ -1238,6 +1327,76 @@ final class Graph3DScene {
                     nx: halfW, ny: 0, nz: 0,
                     u: rect.u1, v: rect.v1,
                     cr: 1, cg: 1, cb: 1, ca: opacity)
+
+                quadIdx += 1
+            }
+
+            // Project labels — larger quads floating above each project cluster
+            let projCentroids = projectCentroids
+            let projAtlasRects = projectLabelAtlasRects
+            for (project, centroidData) in projCentroids {
+                guard let rect = projAtlasRects[project] else { continue }
+
+                // Position label above the topmost node in the cluster, not at centroid
+                let labelY = centroidData.maxY * sf + 0.15  // above highest node
+                let anchor = SIMD3<Float>(centroidData.centroid.x * sf, labelY, centroidData.centroid.z * sf)
+                let depth = simd_length(centroidData.centroid - camPos)
+
+                // LOD — visible from much farther than node labels
+                let maxVisible: Float = 12000
+                guard depth < maxVisible else {
+                    let base = quadIdx * 4
+                    for c in 0..<4 {
+                        verts[base + c] = BatchVertex(px: 0, py: 0, pz: 0, nx: 0, ny: 0, nz: 0, u: 0, v: 0, cr: 0, cg: 0, cb: 0, ca: 0)
+                    }
+                    quadIdx += 1
+                    continue
+                }
+
+                let fadeRange = maxVisible * 0.3
+                let fadeT = min(1.0, max(0.0, (maxVisible - depth) / fadeRange))
+                let opacity: Float = 0.9 * fadeT
+
+                if opacity < 0.02 {
+                    let base = quadIdx * 4
+                    for c in 0..<4 {
+                        verts[base + c] = BatchVertex(px: 0, py: 0, pz: 0, nx: 0, ny: 0, nz: 0, u: 0, v: 0, cr: 0, cg: 0, cb: 0, ca: 0)
+                    }
+                    quadIdx += 1
+                    continue
+                }
+
+                // ~7x node label size for prominent project labels
+                let halfH: Float = 0.15
+                let textAspect = (rect.u1 - rect.u0) / max(0.001, rect.v1 - rect.v0) * aspectCorr
+                let halfW = halfH * textAspect
+
+                // Pre-computed project color
+                let color = projectColors[project] ?? SIMD3<Float>(1, 1, 1)
+
+                // nz encodes forward bias toward camera (rendered in front of nodes and edges)
+                let fwd: Float = 0.25
+                let base = quadIdx * 4
+                verts[base] = BatchVertex(
+                    px: anchor.x, py: anchor.y, pz: anchor.z,
+                    nx: -halfW, ny: halfH, nz: fwd,
+                    u: rect.u0, v: rect.v0,
+                    cr: color.x, cg: color.y, cb: color.z, ca: opacity)
+                verts[base + 1] = BatchVertex(
+                    px: anchor.x, py: anchor.y, pz: anchor.z,
+                    nx: halfW, ny: halfH, nz: fwd,
+                    u: rect.u1, v: rect.v0,
+                    cr: color.x, cg: color.y, cb: color.z, ca: opacity)
+                verts[base + 2] = BatchVertex(
+                    px: anchor.x, py: anchor.y, pz: anchor.z,
+                    nx: -halfW, ny: 0, nz: fwd,
+                    u: rect.u0, v: rect.v1,
+                    cr: color.x, cg: color.y, cb: color.z, ca: opacity)
+                verts[base + 3] = BatchVertex(
+                    px: anchor.x, py: anchor.y, pz: anchor.z,
+                    nx: halfW, ny: 0, nz: fwd,
+                    u: rect.u1, v: rect.v1,
+                    cr: color.x, cg: color.y, cb: color.z, ca: opacity)
 
                 quadIdx += 1
             }
@@ -1277,6 +1436,13 @@ final class Graph3DScene {
                          selectedNode: Int64?,
                          glowingNodes: [Int64: Date],
                          newNodes: [Int64: Date]) {
+        // Invalidate SIMD color caches when the color map changes
+        if let version = renderStore?.colorMapVersion, version != lastColorMapVersion {
+            nodeColorCache.removeAll(keepingCapacity: true)
+            edgeColorCache.removeAll(keepingCapacity: true)
+            lastColorMapVersion = version
+        }
+
         let nodeCount = positions.count
         guard nodeCount > 0, vertsPerSphere > 0 else {
             if lastNodePartIndexCount != 0 {
@@ -1453,6 +1619,14 @@ final class Graph3DScene {
                     outPtr[base + 10] = cb
                     outPtr[base + 11] = packed
                 }
+            }
+            // Zero stale vertices beyond actualNodeCount to prevent ghost rendering.
+            // Part indexCount covers full capacity, so unwritten slots must be degenerate.
+            let writtenFloats = actualNodeCount * vps * 12
+            let capacityFloats = nodeBatchCapacity * vps * 12
+            if writtenFloats < capacityFloats {
+                let startPtr = outPtr + writtenFloats
+                startPtr.update(repeating: 0, count: capacityFloats - writtenFloats)
             }
         }
 
@@ -1699,6 +1873,18 @@ final class Graph3DScene {
                     vi += 1
                 }
                 actualEdges += 1
+            }
+
+            // Zero stale vertices beyond actual edges to prevent ghost rendering.
+            let vertsPerEdge = 12
+            let writtenVerts = actualEdges * vertsPerEdge
+            let capacityVerts = edgeBatchCapacity * vertsPerEdge
+            if writtenVerts < capacityVerts {
+                let zero = BatchVertex(px: 0, py: 0, pz: 0, nx: 0, ny: 1, nz: 0,
+                                       u: 0, v: 0, cr: 0, cg: 0, cb: 0, ca: 0)
+                for i in writtenVerts..<capacityVerts {
+                    vertices[i] = zero
+                }
             }
         }
 
@@ -2032,8 +2218,11 @@ final class Graph3DScene {
         labelBatchCapacity = 0
         labelAtlasTexture = nil
         labelAtlasRects.removeAll()
+        projectLabelAtlasRects.removeAll()
         labelAtlasNodeIds.removeAll()
         labelAtlasHubIds.removeAll()
+        labelAtlasProjects.removeAll()
+        projectCentroids.removeAll()
         for (_, entity) in nebulaEmitters { entity.removeFromParent() }
         nebulaEmitters.removeAll()
         nebulaColorCache.removeAll()
@@ -2355,6 +2544,8 @@ final class Graph3DScene {
     private var renderLastSelectedNode: Int64?
     private var renderLastSearchActive: Bool = false
     private var renderLastSearchMatchIds: Set<Int64> = []
+    /// Tracks renderStore.colorMapVersion to invalidate nodeColorCache when colors change.
+    @ObservationIgnored private var lastColorMapVersion: UInt64 = 0
     /// Dirty counter: after any position change, write node/edge buffers for N consecutive
     /// frames to flush all of RealityKit's internal LowLevelMesh buffers (double/triple-buffered).
     /// Prevents stale/zero buffer from being rendered when we skip a frame.

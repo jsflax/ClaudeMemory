@@ -186,13 +186,13 @@ final class ForceSimulation3D {
     private let crossProjectSpringLength: Float = 400
     private let springStrength: Float = 0.0004
     private let chargeStrength: Float = 500
-    private let sameProjectChargeScale: Float = 0.6
-    private let sameTopicChargeScale: Float = 0.35
+    private let sameProjectChargeScale: Float = 0.35
+    private let sameTopicChargeScale: Float = 0.25
     private let centerStrength: Float = 0.006
-    private let cohesionStrength: Float = 0.0015
-    private let centroidRepulsion: Float = 2500
-    private let topicCohesionStrength: Float = 0.009
-    private let topicCentroidRepulsion: Float = 3500
+    private let cohesionStrength: Float = 0.004
+    private let centroidRepulsion: Float = 4000
+    private let topicCohesionStrength: Float = 0.005
+    private let topicCentroidRepulsion: Float = 6000
     private let damping: Float = 0.78
     private let maxSpeed: Float = 12.0
 
