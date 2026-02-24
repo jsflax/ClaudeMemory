@@ -76,6 +76,8 @@ struct GraphView: View {
     // Lightweight data store — replaces @LatticeQuery with manual observation
     @State private var allNodes: [Int64: NodeData] = [:]
     @State private var allEdges: [Int64: EdgeData] = [:]
+    @State private var edgesByNode: [Int64: [EdgeData]] = [:]  // adjacency index for O(degree) edge lookup
+    @State private var isInitialLoad: Bool = true  // suppress sounds during streaming load
     @State private var nodeObserver: AnyCancellable?
     @State private var edgeObserver: AnyCancellable?
     @State private var glowingNodes: [Int64: Date] = [:]
@@ -479,35 +481,139 @@ struct GraphView: View {
     // MARK: - Data Loading & Observation
 
     private func loadData() {
-        // One-shot population — extract lightweight primitives from Lattice models
-        for m in lattice.objects(Memory.self) {
-            guard let pk = m.primaryKey else { continue }
-            allNodes[pk] = NodeData(
-                id: pk, project: m.project, topic: m.topic,
-                label: extractLabel(content: m.content, topic: m.topic),
-                createdAt: m.createdAt, lastAccessedAt: m.lastAccessedAt,
-                importance: m.importance
-            )
-        }
-        for e in lattice.objects(MemoryEdge.self) {
-            guard let pk = e.primaryKey else { continue }
-            allEdges[pk] = EdgeData(id: pk, sourceId: e.sourceId, targetId: e.targetId, relation: e.relation)
-        }
+        let batchSize = 50
+        let ref = lattice.sendableReference
+        let hiddenProjects = config.hiddenProjects
+        let hiddenRelations = config.hiddenRelations
+        let timeFilter = debouncedTimeSliderDate
+        let is3D = config.dimensionMode == .threeD
 
-        recomputeFilteredData()
-        rebuildSimulationGraph()
-        // Defer cluster computation — nearest-neighbor queries can crash if embeddings
-        // have mismatched dimensions. Run after initial render to avoid blocking launch.
-        Task { @MainActor in
-            recomputeClusters()
-        }
+        Task.detached {
+            guard let bgLattice = ref.resolve() else { return }
 
-        // Fine-grained collection observers for cross-process changes
-        edgeObserver = lattice.objects(MemoryEdge.self).observe { change in
-            Task { @MainActor in handleEdgeChange(change) }
+            // 1. Read all edges off main actor — pure SQLite reads + struct construction.
+            var allEdgeBatch: [EdgeData] = []
+            for e in bgLattice.objects(MemoryEdge.self) {
+                guard let pk = e.primaryKey else { continue }
+                allEdgeBatch.append(EdgeData(id: pk, sourceId: e.sourceId, targetId: e.targetId, relation: e.relation))
+            }
+
+            // Flush edges to main actor in one shot (lightweight — just dict insertions).
+            await MainActor.run {
+                for ed in allEdgeBatch {
+                    allEdges[ed.id] = ed
+                    edgesByNode[ed.sourceId, default: []].append(ed)
+                    edgesByNode[ed.targetId, default: []].append(ed)
+                }
+            }
+
+            // 2. Read nodes in batches off main actor, flush each batch to main actor
+            //    so nodes pop in incrementally while the run loop stays responsive.
+            var nodeBatch: [NodeData] = []
+            for m in bgLattice.objects(Memory.self) {
+                guard let pk = m.primaryKey else { continue }
+                nodeBatch.append(NodeData(
+                    id: pk, project: m.project, topic: m.topic,
+                    label: extractLabel(content: m.content, topic: m.topic),
+                    createdAt: m.createdAt, lastAccessedAt: m.lastAccessedAt,
+                    importance: m.importance
+                ))
+                if nodeBatch.count >= batchSize {
+                    let batch = nodeBatch
+                    nodeBatch = []
+                    await MainActor.run {
+                        insertNodeBatch(batch, hiddenProjects: hiddenProjects,
+                                        hiddenRelations: hiddenRelations,
+                                        timeFilter: timeFilter, is3D: is3D)
+                    }
+                }
+            }
+            // Flush remainder
+            if !nodeBatch.isEmpty {
+                let batch = nodeBatch
+                await MainActor.run {
+                    insertNodeBatch(batch, hiddenProjects: hiddenProjects,
+                                    hiddenRelations: hiddenRelations,
+                                    timeFilter: timeFilter, is3D: is3D)
+                }
+            }
+
+            // 3. Final reconciliation on main actor
+            await MainActor.run {
+                recomputeDerivedData()
+                isInitialLoad = false
+
+                // 4. Set up live observers (uses original lattice from environment)
+                edgeObserver = lattice.objects(MemoryEdge.self).observe { change in
+                    Task { @MainActor in handleEdgeChange(change) }
+                }
+                nodeObserver = lattice.objects(Memory.self).observe { change in
+                    Task { @MainActor in handleNodeChange(change) }
+                }
+            }
+
+            // 5. Cluster computation — vector search queries, run off main actor
+            let visibleProjects = await MainActor.run { Set(cachedFilteredNodes.map(\.project)) }
+            var clusters: [[Int64]] = []
+            for project in visibleProjects {
+                clusters.append(contentsOf: findMemoryClusters(in: bgLattice, project: project, minClusterSize: 2).clusters)
+            }
+            let result = clusters
+            await MainActor.run {
+                clusterGroups = result
+            }
         }
-        nodeObserver = lattice.objects(Memory.self).observe { change in
-            Task { @MainActor in handleNodeChange(change) }
+    }
+
+    /// Insert a batch of nodes into state + simulation. Called from loadData on main actor.
+    private func insertNodeBatch(_ batch: [NodeData], hiddenProjects: Set<String>,
+                                 hiddenRelations: Set<String>, timeFilter: Date?, is3D: Bool) {
+        for nd in batch {
+            allNodes[nd.id] = nd
+
+            let visible = !hiddenProjects.contains(nd.project) &&
+                (timeFilter == nil || nd.createdAt <= timeFilter!)
+            guard visible else { continue }
+
+            cachedFilteredNodes.append(nd)
+            cachedVisibleNodeIds.insert(nd.id)
+
+            simulation.addNode(nd.id, project: nd.project, topic: nd.topic)
+            if is3D {
+                simulation3D.addNode(nd.id, project: nd.project, topic: nd.topic)
+            }
+
+            // Wire edges where BOTH endpoints now exist (O(degree) via adjacency index)
+            for edge in edgesByNode[nd.id] ?? [] {
+                let otherId = edge.sourceId == nd.id ? edge.targetId : edge.sourceId
+                guard cachedVisibleNodeIds.contains(otherId) else { continue }
+                guard !hiddenRelations.contains(edge.relation) else { continue }
+                if !cachedFilteredEdges.contains(where: { $0.id == edge.id }) {
+                    cachedFilteredEdges.append(edge)
+                    simulation.addEdge(from: edge.sourceId, to: edge.targetId)
+                    if is3D {
+                        simulation3D.addEdge(from: edge.sourceId, to: edge.targetId)
+                    }
+                }
+            }
+
+            // Hub detection
+            if let edges = edgesByNode[nd.id] {
+                for edge in edges where edge.relation == "part_of" && edge.targetId == nd.id {
+                    cachedHubs.insert(nd.id)
+                    break
+                }
+            }
+
+            // Assign color for previously unseen project
+            if cachedProjectColorMap[nd.project] == nil {
+                if nd.project == "global" {
+                    cachedProjectColorMap["global"] = .gray
+                } else {
+                    let idx = cachedProjectColorMap.count - (cachedProjectColorMap["global"] != nil ? 1 : 0)
+                    cachedProjectColorMap[nd.project] = Self.goldenAngleColor(at: idx)
+                }
+            }
         }
     }
 
@@ -627,6 +733,8 @@ struct GraphView: View {
             guard let edge = lattice.object(MemoryEdge.self, primaryKey: pk) else { return }
             let data = EdgeData(id: pk, sourceId: edge.sourceId, targetId: edge.targetId, relation: edge.relation)
             allEdges[pk] = data
+            edgesByNode[data.sourceId, default: []].append(data)
+            edgesByNode[data.targetId, default: []].append(data)
             cachedEdgeCountByNode[data.sourceId, default: 0] += 1
             cachedEdgeCountByNode[data.targetId, default: 0] += 1
             let nodeIds = cachedVisibleNodeIds
@@ -652,6 +760,8 @@ struct GraphView: View {
             if let old = allEdges[pk] {
                 simulation.removeEdge(from: old.sourceId, to: old.targetId)
                 cachedFilteredEdges.removeAll { $0.id == pk }
+                edgesByNode[old.sourceId]?.removeAll { $0.id == pk }
+                edgesByNode[old.targetId]?.removeAll { $0.id == pk }
                 cachedEdgeCountByNode[old.sourceId, default: 1] -= 1
                 cachedEdgeCountByNode[old.targetId, default: 1] -= 1
                 if old.relation == "part_of" {
@@ -737,7 +847,7 @@ struct GraphView: View {
                     debouncedTimeSliderDate = timeSliderDate
                 }
                 .onChange(of: allNodes.count) { oldCount, newCount in
-                    guard newCount != oldCount else { return }
+                    guard newCount != oldCount, !isInitialLoad else { return }
                     guard config.soundEnabled else { return }
                     let sound = newCount > oldCount
                         ? "/System/Library/Sounds/Funk.aiff"
