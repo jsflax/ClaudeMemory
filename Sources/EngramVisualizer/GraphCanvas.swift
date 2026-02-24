@@ -55,6 +55,18 @@ struct DyingNode {
     let startTime: Date
 }
 
+/// Shared render data store — written by GraphView (insertNodeBatch, handleNodeChange, etc.),
+/// read by Graph3DScene's renderTick. Both run on MainActor, so no race.
+/// NOT @Observable — must not trigger SwiftUI re-evaluation.
+@MainActor
+final class GraphRenderStore {
+    var nodes: [NodeData] = []
+    var nodeById: [Int64: NodeData] = [:]
+    var edges: [EdgeData] = []
+    var hubs: Set<Int64> = []
+    var colorMap: [String: Color] = [:]
+}
+
 // MARK: - Perf tracking (writable from Canvas closure)
 
 private final class PerfStats: @unchecked Sendable {

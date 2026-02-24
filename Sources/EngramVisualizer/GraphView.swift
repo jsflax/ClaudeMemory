@@ -128,11 +128,21 @@ struct GraphView: View {
     @State private var simulation3D = ForceSimulation3D()
     @State private var forcePositionSnapshot3D: [Int64: SIMD3<Float>] = [:]
     @State private var camera3DState = Camera3DState()
+    @State private var renderStore = GraphRenderStore()
 
     // Glow cleanup timer (1s interval — removes entries older than 4.3s)
     private let glowTimer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
     // MARK: - Derived Data (cached, recomputed on structural changes)
+
+    /// Bulk-sync the render store from cached state. Called after filter changes or full recompute.
+    private func syncRenderStore() {
+        renderStore.nodes = cachedFilteredNodes
+        renderStore.nodeById = Dictionary(cachedFilteredNodes.map { ($0.id, $0) }, uniquingKeysWith: { _, b in b })
+        renderStore.edges = cachedFilteredEdges
+        renderStore.hubs = cachedHubs
+        renderStore.colorMap = cachedProjectColorMap
+    }
 
     /// Recompute all derived data from current filtered nodes/edges. Call after any structural change.
     private func recomputeDerivedData() {
@@ -541,6 +551,7 @@ struct GraphView: View {
             // 3. Final reconciliation on main actor
             await MainActor.run {
                 recomputeDerivedData()
+                syncRenderStore()
                 isInitialLoad = false
 
                 // 4. Set up live observers (uses original lattice from environment)
@@ -578,6 +589,10 @@ struct GraphView: View {
             cachedFilteredNodes.append(nd)
             cachedVisibleNodeIds.insert(nd.id)
 
+            // Write to shared render store (read by render tick — no SwiftUI intermediary)
+            renderStore.nodes.append(nd)
+            renderStore.nodeById[nd.id] = nd
+
             simulation.addNode(nd.id, project: nd.project, topic: nd.topic)
             if is3D {
                 simulation3D.addNode(nd.id, project: nd.project, topic: nd.topic)
@@ -590,6 +605,7 @@ struct GraphView: View {
                 guard !hiddenRelations.contains(edge.relation) else { continue }
                 if !cachedFilteredEdges.contains(where: { $0.id == edge.id }) {
                     cachedFilteredEdges.append(edge)
+                    renderStore.edges.append(edge)
                     simulation.addEdge(from: edge.sourceId, to: edge.targetId)
                     if is3D {
                         simulation3D.addEdge(from: edge.sourceId, to: edge.targetId)
@@ -601,6 +617,7 @@ struct GraphView: View {
             if let edges = edgesByNode[nd.id] {
                 for edge in edges where edge.relation == "part_of" && edge.targetId == nd.id {
                     cachedHubs.insert(nd.id)
+                    renderStore.hubs.insert(nd.id)
                     break
                 }
             }
@@ -609,9 +626,12 @@ struct GraphView: View {
             if cachedProjectColorMap[nd.project] == nil {
                 if nd.project == "global" {
                     cachedProjectColorMap["global"] = .gray
+                    renderStore.colorMap["global"] = .gray
                 } else {
                     let idx = cachedProjectColorMap.count - (cachedProjectColorMap["global"] != nil ? 1 : 0)
-                    cachedProjectColorMap[nd.project] = Self.goldenAngleColor(at: idx)
+                    let color = Self.goldenAngleColor(at: idx)
+                    cachedProjectColorMap[nd.project] = color
+                    renderStore.colorMap[nd.project] = color
                 }
             }
         }
@@ -634,6 +654,8 @@ struct GraphView: View {
             if visible {
                 cachedFilteredNodes.append(node)
                 cachedVisibleNodeIds.insert(pk)
+                renderStore.nodes.append(node)
+                renderStore.nodeById[pk] = node
                 simulation.addNode(pk, project: node.project, topic: node.topic)
                 if config.dimensionMode == .threeD {
                     simulation3D.addNode(pk, project: node.project, topic: node.topic)
@@ -650,18 +672,22 @@ struct GraphView: View {
                         }
                         if !cachedFilteredEdges.contains(where: { $0.id == edge.id }) {
                             cachedFilteredEdges.append(edge)
+                            renderStore.edges.append(edge)
                         }
                     }
                 }
                 // Check if this new node is a hub target (any part_of edges point to it)
                 for edge in allEdges.values where edge.relation == "part_of" && edge.targetId == pk {
                     cachedHubs.insert(pk)
+                    renderStore.hubs.insert(pk)
                     break
                 }
                 // Assign color for previously unseen project
                 if cachedProjectColorMap[node.project] == nil && node.project != "global" {
                     let idx = cachedProjectColorMap.count - 1 // subtract "global" entry
-                    cachedProjectColorMap[node.project] = Self.goldenAngleColor(at: idx)
+                    let color = Self.goldenAngleColor(at: idx)
+                    cachedProjectColorMap[node.project] = color
+                    renderStore.colorMap[node.project] = color
                 }
             }
 
@@ -694,12 +720,17 @@ struct GraphView: View {
                 importance: memory.importance
             )
             allNodes[pk] = node
+            renderStore.nodeById[pk] = node
             if let idx = cachedFilteredNodes.firstIndex(where: { $0.id == pk }) {
                 cachedFilteredNodes[idx] = node
+            }
+            if let idx = renderStore.nodes.firstIndex(where: { $0.id == pk }) {
+                renderStore.nodes[idx] = node
             }
             if old?.project != node.project || old?.topic != node.topic {
                 recomputeFilteredData()
                 rebuildSimulationGraph()
+                syncRenderStore()
             }
 
         case .delete(let pk):
@@ -719,6 +750,10 @@ struct GraphView: View {
             cachedVisibleNodeIds.remove(pk)
             simulation.removeNode(pk)
             cachedHubs.remove(pk)
+            renderStore.nodes.removeAll { $0.id == pk }
+            renderStore.nodeById.removeValue(forKey: pk)
+            renderStore.edges.removeAll { $0.sourceId == pk || $0.targetId == pk }
+            renderStore.hubs.remove(pk)
             // Remove from cluster groups surgically
             clusterGroups = clusterGroups.compactMap { cluster in
                 let filtered = cluster.filter { $0 != pk }
@@ -741,12 +776,16 @@ struct GraphView: View {
             if nodeIds.contains(data.sourceId) && nodeIds.contains(data.targetId) &&
                !config.hiddenRelations.contains(data.relation) {
                 cachedFilteredEdges.append(data)
+                renderStore.edges.append(data)
                 simulation.addEdge(from: data.sourceId, to: data.targetId)
                 if config.dimensionMode == .threeD {
                     simulation3D.addEdge(from: data.sourceId, to: data.targetId)
                 }
             }
-            if data.relation == "part_of" { cachedHubs.insert(data.targetId) }
+            if data.relation == "part_of" {
+                cachedHubs.insert(data.targetId)
+                renderStore.hubs.insert(data.targetId)
+            }
 
         case .update(let pk):
             guard let edge = lattice.object(MemoryEdge.self, primaryKey: pk) else { return }
@@ -755,11 +794,15 @@ struct GraphView: View {
             if let idx = cachedFilteredEdges.firstIndex(where: { $0.id == pk }) {
                 cachedFilteredEdges[idx] = data
             }
+            if let idx = renderStore.edges.firstIndex(where: { $0.id == pk }) {
+                renderStore.edges[idx] = data
+            }
 
         case .delete(let pk):
             if let old = allEdges[pk] {
                 simulation.removeEdge(from: old.sourceId, to: old.targetId)
                 cachedFilteredEdges.removeAll { $0.id == pk }
+                renderStore.edges.removeAll { $0.id == pk }
                 edgesByNode[old.sourceId]?.removeAll { $0.id == pk }
                 edgesByNode[old.targetId]?.removeAll { $0.id == pk }
                 cachedEdgeCountByNode[old.sourceId, default: 1] -= 1
@@ -785,6 +828,7 @@ struct GraphView: View {
             !config.hiddenRelations.contains(edge.relation)
         }
         recomputeDerivedData()
+        syncRenderStore()
     }
 
     private func recomputeHubs() {
@@ -959,7 +1003,8 @@ struct GraphView: View {
             embeddingProjection: embeddingProjection,
             camera3DState: camera3DState,
             forcePositionSnapshot3D: forcePositionSnapshot3D,
-            transitionProgress: transitionProgress
+            transitionProgress: transitionProgress,
+            renderStore: renderStore
         )
         .transaction { $0.animation = nil }  // prevent overlay animations from resizing the 3D view
     }
@@ -1206,6 +1251,7 @@ struct GraphView: View {
             return filtered.count >= 2 ? filtered : nil
         }
         recomputeDerivedData()
+        syncRenderStore()
     }
 
     /// Surgically add a project's nodes/edges back into filtered data and simulation.
@@ -1236,6 +1282,7 @@ struct GraphView: View {
 
         recomputeHubs()
         recomputeDerivedData()
+        syncRenderStore()
         clusterGroups.append(contentsOf:
             findMemoryClusters(in: lattice, project: project, minClusterSize: 2).clusters
         )

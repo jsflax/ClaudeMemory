@@ -17,10 +17,6 @@ final class Graph3DScene {
     private var cameraEntity: PerspectiveCamera?
     private var edgeContainer = Entity()
 
-    /// Weak reference to the native label overlay NSView.
-    /// renderTick sets needsDisplay = true when labels need updating — bypasses SwiftUI entirely.
-    @ObservationIgnored weak var labelOverlayView: LabelOverlayNSView?
-
     // Camera state — inputs write to target* values, updateCamera() lerps toward them.
     // This smooths out irregular input event timing for silky camera motion.
 
@@ -105,6 +101,17 @@ final class Graph3DScene {
     // Using capacity-based counts so replaceAll only fires on mesh creation/resize.
     @ObservationIgnored private var lastNodePartIndexCount: Int = -1
     @ObservationIgnored private var lastEdgePartIndexCount: Int = -1
+
+    // Batched label rendering — all labels as billboard quads in a single LowLevelMesh (1 draw call)
+    private var labelBatchMesh: LowLevelMesh?
+    private var labelBatchEntity: ModelEntity?
+    private var labelBatchMaterial: CustomMaterial?
+    private var labelBatchCapacity: Int = 0
+    @ObservationIgnored private var lastLabelPartIndexCount: Int = -1
+    private var labelAtlasTexture: TextureResource?
+    private var labelAtlasRects: [Int64: (u0: Float, v0: Float, u1: Float, v1: Float)] = [:]
+    private var labelAtlasNodeIds: Set<Int64> = []
+    private var labelAtlasHubIds: Set<Int64> = []
 
     /// 48-byte vertex layout shared by batched nodes and edges.
     private struct BatchVertex {
@@ -299,6 +306,22 @@ final class Graph3DScene {
                 } catch {
                     frameLog.error("[setup] ❌ edgeBatchMaterial FAILED: \(error)")
                 }
+            }
+
+            // Label batch material — unlit billboard quads with texture atlas
+            let labelSurf = CustomMaterial.SurfaceShader(named: "label_surface", in: library)
+            let labelGeom = CustomMaterial.GeometryModifier(named: "label_geometry", in: library)
+            do {
+                var mat = try CustomMaterial(
+                    surfaceShader: labelSurf,
+                    geometryModifier: labelGeom,
+                    lightingModel: .unlit)
+                mat.blending = .transparent(opacity: .init(floatLiteral: 1.0))
+                mat.faceCulling = .none
+                labelBatchMaterial = mat
+                frameLog.error("[setup] ✅ labelBatchMaterial created (TRANSPARENT)")
+            } catch {
+                frameLog.error("[setup] ❌ labelBatchMaterial FAILED: \(error)")
             }
         } else {
             frameLog.error("[setup] ❌ Metal init FAILED: no device or no default library")
@@ -907,6 +930,344 @@ final class Graph3DScene {
         }
     }
 
+    // MARK: - Label Batch (GPU billboard quads)
+
+    /// Generate a texture atlas containing all node labels.
+    /// Row-based packing into a single 4096×2048 CGContext (2x retina = 8192×4096 pixels).
+    /// Returns the atlas texture resource; populates `labelAtlasRects` with per-node UV rects.
+    private func generateLabelAtlas(nodes: [NodeData], hubs: Set<Int64>) {
+        let atlasW = 4096
+        let atlasH = 2048
+        let scale = 2  // retina
+        let pixelW = atlasW * scale
+        let pixelH = atlasH * scale
+        let fontSize: CGFloat = 28
+
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        guard let ctx = CGContext(
+            data: nil, width: pixelW, height: pixelH,
+            bitsPerComponent: 8, bytesPerRow: pixelW * 4,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            frameLog.error("[labelAtlas] ❌ CGContext creation failed")
+            return
+        }
+
+        // Flip for correct text rendering (Core Graphics is bottom-up)
+        ctx.translateBy(x: 0, y: CGFloat(pixelH))
+        ctx.scaleBy(x: CGFloat(scale), y: CGFloat(-scale))
+
+        var rects: [Int64: (u0: Float, v0: Float, u1: Float, v1: Float)] = [:]
+        var cursorX: CGFloat = 2  // padding
+        var cursorY: CGFloat = 0
+        var rowHeight: CGFloat = 0
+        let padding: CGFloat = 4
+
+        for node in nodes {
+            let isHub = hubs.contains(node.id)
+            let weight: NSFont.Weight = isHub ? .bold : .medium
+            let font = NSFont.monospacedSystemFont(ofSize: fontSize, weight: weight)
+
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: font,
+                .foregroundColor: NSColor.white,
+            ]
+            let text = node.label as NSString
+            let size = text.size(withAttributes: attrs)
+            let cellW = ceil(size.width) + padding * 2
+            let cellH = ceil(size.height) + padding
+
+            // Wrap to next row if needed
+            if cursorX + cellW > CGFloat(atlasW) {
+                cursorX = 2
+                cursorY += rowHeight + padding
+                rowHeight = 0
+            }
+
+            // Out of vertical space — stop packing
+            if cursorY + cellH > CGFloat(atlasH) { break }
+
+            // Draw text
+            let drawPoint = CGPoint(x: cursorX + padding, y: cursorY + padding * 0.5)
+            NSGraphicsContext.saveGraphicsState()
+            NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx, flipped: true)
+            text.draw(at: drawPoint, withAttributes: attrs)
+            NSGraphicsContext.restoreGraphicsState()
+
+            // Store UV rect (normalized 0..1)
+            let u0 = Float(cursorX) / Float(atlasW)
+            let v0 = Float(cursorY) / Float(atlasH)
+            let u1 = Float(cursorX + cellW) / Float(atlasW)
+            let v1 = Float(cursorY + cellH) / Float(atlasH)
+            rects[node.id] = (u0, v0, u1, v1)
+
+            cursorX += cellW + padding
+            rowHeight = max(rowHeight, cellH)
+        }
+
+        guard let cgImage = ctx.makeImage() else {
+            frameLog.error("[labelAtlas] ❌ CGImage creation failed")
+            return
+        }
+        guard let texture = try? TextureResource.generate(from: cgImage, options: .init(semantic: .raw)) else {
+            frameLog.error("[labelAtlas] ❌ TextureResource generation failed")
+            return
+        }
+
+        labelAtlasTexture = texture
+        labelAtlasRects = rects
+        labelAtlasNodeIds = Set(nodes.map(\.id))
+        labelAtlasHubIds = hubs
+
+        // Update material texture binding
+        if var mat = labelBatchMaterial {
+            mat.custom.texture = .init(CustomMaterial.Texture(texture))
+            labelBatchMaterial = mat
+            labelBatchEntity?.model?.materials = [mat]
+        }
+
+        frameLog.error("[labelAtlas] ✅ atlas generated: \(rects.count) labels, \(atlasW)×\(atlasH)")
+    }
+
+    /// Create or resize the LowLevelMesh for batched label rendering.
+    /// 4 vertices per label (billboard quad), 6 indices per quad.
+    private func ensureLabelBatchMesh(capacity: Int) {
+        guard capacity > labelBatchCapacity else { return }
+        let newCapacity = max(capacity * 2, 512)
+
+        var desc = LowLevelMesh.Descriptor()
+        desc.vertexCapacity = newCapacity * 4   // 4 verts per quad
+        desc.indexCapacity = newCapacity * 6    // 6 indices per quad (2 triangles)
+        desc.vertexAttributes = [
+            .init(semantic: .position, format: .float3, offset: 0),
+            .init(semantic: .normal, format: .float3, offset: 12),
+            .init(semantic: .uv0, format: .float2, offset: 24),
+            .init(semantic: .color, format: .float4, offset: 32),
+        ]
+        desc.vertexLayouts = [.init(bufferIndex: 0, bufferStride: 48)]
+        desc.indexType = .uint32
+
+        guard let mesh = try? LowLevelMesh(descriptor: desc) else {
+            frameLog.error("[labelBatch] ❌ LowLevelMesh creation failed")
+            return
+        }
+
+        // Pre-fill index buffer: 2 triangles per quad (CCW winding for billboard facing camera)
+        mesh.withUnsafeMutableIndices { raw in
+            let indices = raw.bindMemory(to: UInt32.self)
+            for i in 0..<newCapacity {
+                let vBase = UInt32(i * 4)
+                let iBase = i * 6
+                // v0=TL, v1=TR, v2=BL, v3=BR
+                // Tri 1: v0→v2→v1 (CCW from camera)
+                // Tri 2: v1→v2→v3 (CCW from camera)
+                indices[iBase]     = vBase
+                indices[iBase + 1] = vBase + 2
+                indices[iBase + 2] = vBase + 1
+                indices[iBase + 3] = vBase + 1
+                indices[iBase + 4] = vBase + 2
+                indices[iBase + 5] = vBase + 3
+            }
+        }
+
+        // Set parts to full capacity (same pattern as node/edge batch)
+        let generousBounds = BoundingBox(min: SIMD3(-10, -10, -10), max: SIMD3(10, 10, 10))
+        mesh.parts.replaceAll([
+            LowLevelMesh.Part(
+                indexCount: newCapacity * 6,
+                topology: .triangle,
+                materialIndex: 0,
+                bounds: generousBounds
+            )
+        ])
+
+        labelBatchMesh = mesh
+        labelBatchCapacity = newCapacity
+        lastLabelPartIndexCount = newCapacity * 6
+
+        guard let resource = try? MeshResource(from: mesh),
+              let material = labelBatchMaterial else { return }
+
+        if let entity = labelBatchEntity {
+            entity.model = ModelComponent(mesh: resource, materials: [material])
+        } else {
+            let entity = ModelEntity(mesh: resource, materials: [material])
+            entity.name = "label_batch"
+            rootEntity.addChild(entity)
+            labelBatchEntity = entity
+        }
+        frameLog.error("[labelBatch] ✅ mesh created: \(newCapacity) labels capacity")
+    }
+
+    /// Per-frame vertex stamping for label billboard quads.
+    /// Encodes position (anchor), normal (corner offset), UV (atlas), color (opacity).
+    func updateLabelBatch(positions: [Int64: SIMD3<Float>],
+                          nodes: [NodeData], hubs: Set<Int64>,
+                          selectedNode: Int64?) {
+        let nodeCount = positions.count
+        guard nodeCount > 0 else {
+            if lastLabelPartIndexCount != 0 {
+                frameLog.error("[labelBatch] ⚠️ ZERO-GUARD: clearing parts")
+                labelBatchMesh?.parts.replaceAll([])
+                lastLabelPartIndexCount = 0
+            }
+            return
+        }
+
+        // Regenerate atlas if node set or hub set changed
+        let currentNodeIds = Set(positions.keys)
+        if labelAtlasTexture == nil || currentNodeIds != labelAtlasNodeIds || hubs != labelAtlasHubIds {
+            generateLabelAtlas(nodes: nodes, hubs: hubs)
+        }
+        guard labelAtlasTexture != nil else { return }
+
+        ensureLabelBatchMesh(capacity: nodeCount)
+        guard let mesh = labelBatchMesh else { return }
+
+        let nodeById = Dictionary(nodes.map { ($0.id, $0) }, uniquingKeysWith: { _, last in last })
+        let camPos = cameraPosition
+        let sf = scaleFactor
+
+        // Merge expanded child positions
+        var allPositions = positions
+        for (id, pos) in expandedChildPositions {
+            allPositions[id] = pos
+        }
+        var expandedChildren = Set<Int64>()
+        for hubId in expandedHubs {
+            for childId in childrenOfHub(hubId) {
+                expandedChildren.insert(childId)
+            }
+        }
+
+        // Depth range for normalization
+        var minDepth: Float = .greatestFiniteMagnitude
+        var maxDepth: Float = 0
+        for (_, pos) in allPositions {
+            let d = simd_length(pos - camPos)
+            minDepth = min(minDepth, d)
+            maxDepth = max(maxDepth, d)
+        }
+        let depthRange = max(1.0, maxDepth - minDepth)
+
+        mesh.withUnsafeMutableBytes(bufferIndex: 0) { raw in
+            let verts = raw.bindMemory(to: BatchVertex.self)
+            var quadIdx = 0
+
+            for (id, pos3D) in allPositions {
+                guard let nodeData = nodeById[id],
+                      let rect = labelAtlasRects[id] else {
+                    continue
+                }
+
+                let depth = simd_length(pos3D - camPos)
+                let isSelected = id == selectedNode
+                let isHub = hubs.contains(id)
+                let importance = Float(max(1, nodeData.importance))
+
+                // LOD check — same thresholds as old overlay
+                if !isSelected && !expandedChildren.contains(id) {
+                    let maxVisible: Float = isHub ? 1200 : (200 + importance * 80)
+                    guard depth < maxVisible else {
+                        // Write 4 degenerate zero vertices
+                        let base = quadIdx * 4
+                        for c in 0..<4 {
+                            verts[base + c] = BatchVertex(px: 0, py: 0, pz: 0, nx: 0, ny: 0, nz: 0, u: 0, v: 0, cr: 0, cg: 0, cb: 0, ca: 0)
+                        }
+                        quadIdx += 1
+                        continue
+                    }
+                }
+
+                // Opacity — same formula as old overlay
+                let depthNorm = (depth - minDepth) / depthRange
+                let depthFade: Float = isSelected ? 1.0 : (1.0 - depthNorm * 0.7)
+
+                let maxVisible: Float = isHub ? 1200 : (200 + importance * 80)
+                let fadeRange = maxVisible * 0.3
+                let fadeT: Float = isSelected ? 1.0 : min(1.0, max(0.0, (maxVisible - depth) / fadeRange))
+
+                let baseOpacity: Float = isSelected ? 0.95 : (isHub ? 0.8 : 0.6)
+                let searchDimmed = renderIsSearchActive && !renderSearchMatchIds.contains(id)
+                let searchFade: Float = searchDimmed ? 0.15 : 1.0
+                let opacity = baseOpacity * fadeT * depthFade * searchFade
+
+                if opacity < 0.02 {
+                    let base = quadIdx * 4
+                    for c in 0..<4 {
+                        verts[base + c] = BatchVertex(px: 0, py: 0, pz: 0, nx: 0, ny: 0, nz: 0, u: 0, v: 0, cr: 0, cg: 0, cb: 0, ca: 0)
+                    }
+                    quadIdx += 1
+                    continue
+                }
+
+                // Quad dimensions — halfH from node type, halfW from text aspect ratio
+                let halfH: Float = isSelected ? 0.025 : (isHub ? 0.022 : 0.018)
+                let textAspect = (rect.u1 - rect.u0) / max(0.001, rect.v1 - rect.v0)
+                let halfW = halfH * textAspect
+
+                // Anchor position: node world pos scaled + Y offset above sphere
+                let anchor = pos3D * sf + SIMD3<Float>(0, nodeRadius * 1.8, 0)
+
+                // Corners: TL(0), TR(1), BL(2), BR(3)
+                // normal carries pre-multiplied billboard offset (cx*halfW, cy*halfH, 0)
+                let base = quadIdx * 4
+
+                // v0 = TL: corner (-1, +1)
+                verts[base] = BatchVertex(
+                    px: anchor.x, py: anchor.y, pz: anchor.z,
+                    nx: -halfW, ny: halfH, nz: 0,
+                    u: rect.u0, v: rect.v0,
+                    cr: 1, cg: 1, cb: 1, ca: opacity)
+                // v1 = TR: corner (+1, +1)
+                verts[base + 1] = BatchVertex(
+                    px: anchor.x, py: anchor.y, pz: anchor.z,
+                    nx: halfW, ny: halfH, nz: 0,
+                    u: rect.u1, v: rect.v0,
+                    cr: 1, cg: 1, cb: 1, ca: opacity)
+                // v2 = BL: corner (-1, 0)
+                verts[base + 2] = BatchVertex(
+                    px: anchor.x, py: anchor.y, pz: anchor.z,
+                    nx: -halfW, ny: 0, nz: 0,
+                    u: rect.u0, v: rect.v1,
+                    cr: 1, cg: 1, cb: 1, ca: opacity)
+                // v3 = BR: corner (+1, 0)
+                verts[base + 3] = BatchVertex(
+                    px: anchor.x, py: anchor.y, pz: anchor.z,
+                    nx: halfW, ny: 0, nz: 0,
+                    u: rect.u1, v: rect.v1,
+                    cr: 1, cg: 1, cb: 1, ca: opacity)
+
+                quadIdx += 1
+            }
+
+            // Zero remaining vertices
+            let totalUsed = quadIdx * 4
+            let totalCapacity = labelBatchCapacity * 4
+            if totalUsed < totalCapacity {
+                for i in totalUsed..<totalCapacity {
+                    verts[i] = BatchVertex(px: 0, py: 0, pz: 0, nx: 0, ny: 0, nz: 0, u: 0, v: 0, cr: 0, cg: 0, cb: 0, ca: 0)
+                }
+            }
+        }
+
+        // Capacity-based recovery (same pattern as node/edge)
+        let capacityIndexCount = labelBatchCapacity * 6
+        if capacityIndexCount != lastLabelPartIndexCount {
+            let generousBounds = BoundingBox(min: SIMD3(-10, -10, -10), max: SIMD3(10, 10, 10))
+            mesh.parts.replaceAll([
+                LowLevelMesh.Part(
+                    indexCount: capacityIndexCount,
+                    topology: .triangle,
+                    materialIndex: 0,
+                    bounds: generousBounds
+                )
+            ])
+            lastLabelPartIndexCount = capacityIndexCount
+        }
+    }
+
     /// Rebuild the batched node mesh using Metal compute to stamp sphere instances.
     /// All alive nodes rendered as real sphere triangles in a single LowLevelMesh (1 draw call).
     /// Point lights managed as separate lightweight entities (~5-10 at most).
@@ -1011,12 +1372,19 @@ final class Graph3DScene {
 
             idx += 1
 
-            // Point lights for glowing/arriving/search-matched nodes
+            // Point lights for glowing/arriving/search-matched nodes.
+            // Reuses deactivated lights from the pool to avoid addChild scene graph churn.
             if !Self.DIAG_SKIP_POINT_LIGHTS, ri > 0 || ai > 0 || searchMatched {
                 activeLightIds.insert(id)
                 let lightEntity: Entity
                 if let existing = pointLightEntities[id] {
                     lightEntity = existing
+                } else if let recycled = pointLightEntities.first(where: { !activeLightIds.contains($0.key) && $0.key != id }) {
+                    // Recycle a deactivated light entity — avoids addChild()
+                    pointLightEntities.removeValue(forKey: recycled.key)
+                    lightEntity = recycled.value
+                    lightEntity.name = "ptlight_\(id)"
+                    pointLightEntities[id] = lightEntity
                 } else {
                     lightEntity = Entity()
                     lightEntity.name = "ptlight_\(id)"
@@ -1106,14 +1474,19 @@ final class Graph3DScene {
             lastNodePartIndexCount = capacityIndexCount
         }
 
-        // Remove stale point lights (or ALL if diagnostics skip them)
+        // Deactivate stale point lights instead of removing them from the scene graph.
+        // removeFromParent() triggers scene graph rebuilds → flicker. Setting intensity to 0
+        // keeps the entity in the tree (no rebuild) but makes it invisible/free.
+        // Deactivated lights accumulate in pointLightEntities and are reused when needed.
         if Self.DIAG_SKIP_POINT_LIGHTS {
-            for (_, e) in pointLightEntities { e.removeFromParent() }
-            pointLightEntities.removeAll()
+            for (_, e) in pointLightEntities {
+                e.components.set(PointLightComponent(color: .black, intensity: 0, attenuationRadius: 0))
+            }
         } else {
             for id in pointLightEntities.keys where !activeLightIds.contains(id) {
-                pointLightEntities[id]?.removeFromParent()
-                pointLightEntities.removeValue(forKey: id)
+                pointLightEntities[id]?.components.set(
+                    PointLightComponent(color: .black, intensity: 0, attenuationRadius: 0)
+                )
             }
         }
     }
@@ -1355,6 +1728,7 @@ final class Graph3DScene {
     private static let DIAG_SKIP_GEOM_MOD = false     // skip geometry modifier on node batch
     private static let DIAG_SKIP_NODE_BATCH = false   // skip node LowLevelMesh update
     private static let DIAG_SKIP_EDGE_BATCH = false   // skip edge LowLevelMesh update
+    private static let DIAG_SKIP_LABEL_BATCH = false  // skip label LowLevelMesh update
 
     // MARK: - Nebulae (particle-based gaseous hulls)
 
@@ -1651,13 +2025,23 @@ final class Graph3DScene {
         edgeBatchMesh = nil
         edgeBatchCapacity = 0
         edgeColorCache.removeAll()
+        // Clear batched label mesh
+        labelBatchEntity?.removeFromParent()
+        labelBatchEntity = nil
+        labelBatchMesh = nil
+        labelBatchCapacity = 0
+        labelAtlasTexture = nil
+        labelAtlasRects.removeAll()
+        labelAtlasNodeIds.removeAll()
+        labelAtlasHubIds.removeAll()
         for (_, entity) in nebulaEmitters { entity.removeFromParent() }
         nebulaEmitters.removeAll()
         nebulaColorCache.removeAll()
-        // Clean up flow particles
-        for (_, particles) in flowParticles {
-            for p in particles { p.entity.removeFromParent() }
-        }
+        // Clean up flow particles (container swap — single entity removal)
+        flowParticleContainer.removeFromParent()
+        flowParticleContainer = Entity()
+        flowParticleContainer.name = "flow_particles"
+        rootEntity.addChild(flowParticleContainer)
         flowParticles.removeAll()
         flowSpawnTimers.removeAll()
         // Clean up expansion state
@@ -1778,11 +2162,15 @@ final class Graph3DScene {
     func updateFlowParticles(dt: Float) {
         let sel = renderSelectedNode
 
-        // Hard cleanup on selection change — flush ALL particles so old paths don't linger
+        // Hard cleanup on selection change — flush ALL particles so old paths don't linger.
+        // Swap the container entity instead of removing children individually.
+        // N individual removeFromParent() calls cause N scene graph rebuilds → flicker.
+        // One container swap = 1 removal + 1 addition regardless of particle count.
         if sel != flowLastSelectedNode {
-            for (_, particles) in flowParticles {
-                for p in particles { p.entity.removeFromParent() }
-            }
+            flowParticleContainer.removeFromParent()
+            flowParticleContainer = Entity()
+            flowParticleContainer.name = "flow_particles"
+            rootEntity.addChild(flowParticleContainer)
             flowParticles.removeAll()
             flowSpawnTimers.removeAll()
             flowLastSelectedNode = sel
@@ -1806,10 +2194,15 @@ final class Graph3DScene {
 
         let activeKeys = Set(activeEdges.map { "\($0.sourceId)-\($0.targetId)" })
 
-        // Clean up particles for inactive edges
+        // Clean up particles for inactive edges — hide instead of removing.
+        // Set scale to zero (invisible, degenerate) to avoid scene graph churn.
+        // Entity cleanup deferred to the container swap on next selection change.
         for key in flowParticles.keys where !activeKeys.contains(key) {
             if let particles = flowParticles[key] {
-                for p in particles { p.entity.removeFromParent() }
+                for p in particles {
+                    p.entity.scale = .zero
+                    p.entity.components.set(OpacityComponent(opacity: 0))
+                }
             }
             flowParticles.removeValue(forKey: key)
             flowSpawnTimers.removeValue(forKey: key)
@@ -1855,7 +2248,9 @@ final class Graph3DScene {
                     let t = particles[i].t
 
                     if t >= 1.0 {
-                        particles[i].entity.removeFromParent()
+                        // Hide instead of removeFromParent — deferred to container swap
+                        particles[i].entity.scale = .zero
+                        particles[i].entity.components.set(OpacityComponent(opacity: 0))
                         toRemove.append(i)
                         continue
                     }
@@ -1910,10 +2305,16 @@ final class Graph3DScene {
     /// Render inputs — read by renderTick (SceneEvents.Update).
     /// @ObservationIgnored: internal data channel, must NOT trigger SwiftUI body re-evaluation.
     @ObservationIgnored var renderPositions: [Int64: SIMD3<Float>] = [:]
-    @ObservationIgnored var renderNodes: [NodeData] = []
-    @ObservationIgnored var renderEdges: [EdgeData] = []
-    @ObservationIgnored var renderHubs: Set<Int64> = []
-    @ObservationIgnored var renderColorMap: [String: Color] = [:]
+    /// Shared render store — written directly by GraphView alongside simulation updates.
+    /// Eliminates timing mismatch between SwiftUI push and render tick.
+    @ObservationIgnored var renderStore: GraphRenderStore?
+
+    /// Convenience accessors — redirect to renderStore so call sites don't change.
+    var renderNodes: [NodeData] { renderStore?.nodes ?? [] }
+    var renderEdges: [EdgeData] { renderStore?.edges ?? [] }
+    var renderHubs: Set<Int64> { renderStore?.hubs ?? [] }
+    var renderColorMap: [String: Color] { renderStore?.colorMap ?? [:] }
+
     @ObservationIgnored var renderSelectedNode: Int64?
     @ObservationIgnored var renderLayoutMode: LayoutMode = .forceDirected
     @ObservationIgnored var renderGlowingNodes: [Int64: Date] = [:]
@@ -2122,7 +2523,7 @@ final class Graph3DScene {
         animationTime += dtSec
 
         if renderFrameCount == 10 {
-            frameLog.error("[DIAG] SKIP_NEBULAE=\(Self.DIAG_SKIP_NEBULAE) SKIP_POINT_LIGHTS=\(Self.DIAG_SKIP_POINT_LIGHTS) SKIP_GEOM_MOD=\(Self.DIAG_SKIP_GEOM_MOD) SKIP_NODE_BATCH=\(Self.DIAG_SKIP_NODE_BATCH) SKIP_EDGE_BATCH=\(Self.DIAG_SKIP_EDGE_BATCH)")
+            frameLog.error("[DIAG] SKIP_NEBULAE=\(Self.DIAG_SKIP_NEBULAE) SKIP_POINT_LIGHTS=\(Self.DIAG_SKIP_POINT_LIGHTS) SKIP_GEOM_MOD=\(Self.DIAG_SKIP_GEOM_MOD) SKIP_NODE_BATCH=\(Self.DIAG_SKIP_NODE_BATCH) SKIP_EDGE_BATCH=\(Self.DIAG_SKIP_EDGE_BATCH) SKIP_LABEL_BATCH=\(Self.DIAG_SKIP_LABEL_BATCH)")
         }
 
         let t0 = CFAbsoluteTimeGetCurrent()
@@ -2192,13 +2593,12 @@ final class Graph3DScene {
             meshDirtyFrames = max(0, meshDirtyFrames - 1)
         }
 
-        // Trigger native label overlay redraw at ~20fps (every 3rd frame).
-        // This bypasses SwiftUI entirely — just sets needsDisplay on the NSView.
-        // Outside sceneNeedsUpdate gate: camera movement changes screen projections
-        // of 3D positions even when node positions haven't changed.
-        if positionsChanged || selectionChanged || searchChanged || cameraMoving,
-           renderFrameCount % 3 == 0 {
-            labelOverlayView?.needsDisplay = true
+        // GPU billboard labels — update when scene changes or camera moves (for LOD/opacity).
+        // Billboarding itself is handled by the geometry modifier on GPU.
+        if !Self.DIAG_SKIP_LABEL_BATCH,
+           sceneNeedsUpdate || (cameraMoving && renderFrameCount % 3 == 0) {
+            updateLabelBatch(positions: renderPositions, nodes: renderNodes,
+                             hubs: renderHubs, selectedNode: renderSelectedNode)
         }
 
         let elapsed = (CFAbsoluteTimeGetCurrent() - now) * 1000.0
@@ -2283,6 +2683,7 @@ struct Graph3DView: View {
     let camera3DState: Camera3DState
     let forcePositionSnapshot3D: [Int64: SIMD3<Float>]
     let transitionProgress: CGFloat
+    let renderStore: GraphRenderStore
 
     @State private var scene = Graph3DScene()
     @State private var scrollMonitor: Any?
@@ -2301,8 +2702,6 @@ struct Graph3DView: View {
                         viewFrame = frame
                         scene.renderViewSize = frame.size
                     }
-
-                labelsOverlay
 
                 // Center reticle (only when gamepad connected)
                 if GCController.current != nil {
@@ -2392,11 +2791,9 @@ struct Graph3DView: View {
 
     /// Push slow-changing data from SwiftUI to the scene.
     /// Called from RealityView make/update — only fires when SwiftUI inputs actually change.
+    /// NOTE: nodes/edges/hubs/colorMap are NOT pushed here — they're read directly from
+    /// renderStore by the render tick, eliminating the SwiftUI timing mismatch.
     private func pushDataToScene() {
-        scene.renderNodes = nodes
-        scene.renderEdges = edges
-        scene.renderHubs = hubs
-        scene.renderColorMap = colorMap
         scene.renderLayoutMode = layoutMode
         scene.renderGlowingNodes = glowingNodes
         scene.renderNewNodes = newNodes
@@ -2422,6 +2819,7 @@ struct Graph3DView: View {
             scene.simulation3D = simulation3D
             scene.embeddingProjection = embeddingProjection
             scene.camera3DState = camera3DState
+            scene.renderStore = renderStore
             scene.forcePositionSnapshot3D = forcePositionSnapshot3D
             scene.transitionProgress = transitionProgress
             scene.selectionCallback = { newSelection in
@@ -2660,172 +3058,4 @@ struct Graph3DView: View {
             }
     }
 
-    // MARK: - Labels Overlay (NSViewRepresentable — bypasses SwiftUI per-frame overhead)
-
-    private var labelsOverlay: some View {
-        LabelOverlayRepresentable(scene: scene, nodes: nodes, hubs: hubs,
-                                   selectedNode: selectedNode)
-            .allowsHitTesting(false)
-    }
-}
-
-// MARK: - Native Label Overlay
-
-/// NSView that draws node labels using Core Graphics.
-/// Bypasses SwiftUI's observation/diffing/Canvas pipeline entirely.
-/// Redraws are triggered by renderTick setting `needsDisplay = true` at ~20fps.
-@MainActor
-final class LabelOverlayNSView: NSView {
-    weak var scene: Graph3DScene?
-    var nodeById: [Int64: NodeData] = [:]
-    var hubs: Set<Int64> = []
-    var selectedNode: Int64?
-
-    override var isFlipped: Bool { true }
-
-    static var drawCount: UInt64 = 0
-    override func draw(_ dirtyRect: NSRect) {
-        let drawStart = CFAbsoluteTimeGetCurrent()
-        defer {
-            Self.drawCount &+= 1
-            let drawMs = (CFAbsoluteTimeGetCurrent() - drawStart) * 1000.0
-            if Self.drawCount % 20 == 0 || drawMs > 5 {
-                frameLog.error("[LABELS] draw=\(drawMs, format: .fixed(precision: 2))ms count=\(Self.drawCount)")
-            }
-        }
-        guard let scene else { return }
-        let size = bounds.size
-        guard size.width > 0, size.height > 0 else { return }
-
-        var positions = scene.renderPositions
-        for (id, pos) in scene.expandedChildPositions {
-            positions[id] = pos
-        }
-
-        struct LabelEntry {
-            let id: Int64
-            let screenPos: CGPoint
-            let nodeData: NodeData
-            let depthFromCam: Float
-            let isSelected: Bool
-            let isHub: Bool
-        }
-
-        var expandedChildren = Set<Int64>()
-        for hubId in scene.expandedHubs {
-            for childId in scene.childrenOfHub(hubId) {
-                expandedChildren.insert(childId)
-            }
-        }
-
-        var entries: [LabelEntry] = []
-        var minDepth: Float = .greatestFiniteMagnitude
-        var maxDepth: Float = 0
-
-        for (id, pos3D) in positions {
-            guard let screenPos = scene.project(point3D: pos3D, viewSize: size) else { continue }
-            guard let nodeData = nodeById[id] else { continue }
-
-            let depth = scene.cameraDistance(to: pos3D)
-            let isSelected = id == selectedNode
-            let isHub = hubs.contains(id)
-            let importance = CGFloat(max(1, nodeData.importance))
-
-            if !isSelected && !expandedChildren.contains(id) {
-                let maxVisible: CGFloat = isHub ? 1200 : (200 + importance * 80)
-                guard CGFloat(depth) < maxVisible else { continue }
-            }
-
-            minDepth = min(minDepth, depth)
-            maxDepth = max(maxDepth, depth)
-
-            entries.append(LabelEntry(
-                id: id, screenPos: screenPos, nodeData: nodeData,
-                depthFromCam: depth, isSelected: isSelected, isHub: isHub
-            ))
-        }
-
-        entries.sort { $0.depthFromCam < $1.depthFromCam }
-
-        let maxLabels = 80
-        if entries.count > maxLabels {
-            let prioritized = entries.prefix(while: { $0.isSelected || $0.isHub })
-            let rest = entries.dropFirst(prioritized.count)
-            entries = Array(prioritized) + Array(rest.prefix(max(0, maxLabels - prioritized.count)))
-        }
-
-        entries.reverse()
-
-        let depthRange = max(1, maxDepth - minDepth)
-
-        for entry in entries {
-            let importance = CGFloat(max(1, entry.nodeData.importance))
-            let nodeDist = CGFloat(entry.depthFromCam)
-
-            let depthNorm = CGFloat((entry.depthFromCam - minDepth) / depthRange)
-            let depthFade = entry.isSelected ? 1.0 : (1.0 - depthNorm * 0.7)
-
-            let maxVisible: CGFloat = entry.isHub ? 1200 : (200 + importance * 80)
-            let fadeRange: CGFloat = maxVisible * 0.3
-            let fadeT = entry.isSelected ? 1.0 : min(1.0, max(0.0, (maxVisible - nodeDist) / fadeRange))
-
-            let baseSize: CGFloat = entry.isSelected ? 12 : (entry.isHub ? 10 : 8.5)
-            let distScale = CGFloat(400.0 / max(entry.depthFromCam, 50))
-            let fontSize = max(7, min(20, baseSize * pow(distScale, 0.5)))
-
-            let baseOpacity: CGFloat = entry.isSelected ? 0.95 : (entry.isHub ? 0.8 : 0.6)
-            let searchDimmed = scene.renderIsSearchActive && !scene.renderSearchMatchIds.contains(entry.id)
-            let searchFade: CGFloat = searchDimmed ? 0.15 : 1.0
-            let opacity = baseOpacity * fadeT * depthFade * searchFade
-
-            guard opacity > 0.02 else { continue }
-
-            let weight: NSFont.Weight = entry.isSelected || entry.isHub ? .bold : .medium
-            let font = NSFont.monospacedSystemFont(ofSize: fontSize, weight: weight)
-
-            let shadow = NSShadow()
-            shadow.shadowColor = NSColor.black.withAlphaComponent(min(1.0, opacity * 1.5))
-            shadow.shadowBlurRadius = 1.5
-            shadow.shadowOffset = .zero
-
-            let attrs: [NSAttributedString.Key: Any] = [
-                .font: font,
-                .foregroundColor: NSColor.white.withAlphaComponent(opacity),
-                .shadow: shadow,
-            ]
-
-            let text = entry.nodeData.label as NSString
-            let textSize = text.size(withAttributes: attrs)
-
-            let x = entry.screenPos.x - textSize.width / 2
-            let y = entry.screenPos.y - fontSize - 4
-            text.draw(at: CGPoint(x: x, y: y), withAttributes: attrs)
-        }
-    }
-}
-
-/// SwiftUI wrapper — creates the NSView once, then renderTick drives updates directly.
-private struct LabelOverlayRepresentable: NSViewRepresentable {
-    let scene: Graph3DScene
-    let nodes: [NodeData]
-    let hubs: Set<Int64>
-    let selectedNode: Int64?
-
-    func makeNSView(context: Context) -> LabelOverlayNSView {
-        let view = LabelOverlayNSView()
-        view.wantsLayer = true
-        view.layer?.isOpaque = false
-        view.scene = scene
-        scene.labelOverlayView = view
-        return view
-    }
-
-    func updateNSView(_ nsView: LabelOverlayNSView, context: Context) {
-        // Push data that changes with SwiftUI state (selection, node list)
-        nsView.nodeById = Dictionary(nodes.map { ($0.id, $0) }, uniquingKeysWith: { _, last in last })
-        nsView.hubs = hubs
-        nsView.selectedNode = selectedNode
-        // Trigger redraw for selection/data changes from SwiftUI side
-        nsView.needsDisplay = true
-    }
 }
