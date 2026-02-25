@@ -4,6 +4,11 @@ All notable changes to Engram are documented in this file.
 
 > Formerly "ClaudeMemory" — renamed in v0.12.0 to be tool-agnostic.
 
+## [0.12.2] - 2026-02-25
+
+### Fixed
+- **Sparkle auto-update broken** — `sparkle:version` (build number) was hardcoded to `1` for every release, so Sparkle never offered updates. Build number now auto-increments from the previous appcast entry.
+
 ## [0.12.1] - 2026-02-25
 
 ### Changed
