@@ -64,6 +64,7 @@ final class MetalForceCompute {
         projectGroups: [Int],
         topicGroups: [Int],
         chargeStrength: Float,
+        crossChargeMultiplier: Float,
         sameTopicChargeScale: Float,
         sameProjectChargeScale: Float
     ) async -> ChargeResult {
@@ -102,7 +103,7 @@ final class MetalForceCompute {
         let paramPtr = paramBuffer.contents().bindMemory(to: GPUForceParams.self, capacity: 1)
         paramPtr.pointee = GPUForceParams(
             chargeStrength: chargeStrength,
-            crossChargeMultiplier: 3.0,
+            crossChargeMultiplier: crossChargeMultiplier,
             sameTopicChargeScale: sameTopicChargeScale,
             sameProjectChargeScale: sameProjectChargeScale,
             cutoffSq: 500 * 500,
@@ -186,13 +187,14 @@ final class ForceSimulation3D {
     private let crossProjectSpringLength: Float = 400
     private let springStrength: Float = 0.0004
     private let chargeStrength: Float = 500
-    private let sameProjectChargeScale: Float = 0.35
-    private let sameTopicChargeScale: Float = 0.25
+    private let crossChargeMultiplier: Float = 3.0
+    private let sameProjectChargeScale: Float = 1.0   // pre-GPU: no reduction for same-project different-topic
+    private let sameTopicChargeScale: Float = 0.35     // pre-GPU value (was 0.25 post-GPU)
     private let centerStrength: Float = 0.006
-    private let cohesionStrength: Float = 0.004
-    private let centroidRepulsion: Float = 4000
-    private let topicCohesionStrength: Float = 0.005
-    private let topicCentroidRepulsion: Float = 6000
+    private let cohesionStrength: Float = 0.0015       // pre-GPU value (was 0.004 post-GPU)
+    private let centroidRepulsion: Float = 2500         // pre-GPU value (was 4000 post-GPU)
+    private let topicCohesionStrength: Float = 0.009    // pre-GPU value (was 0.005 post-GPU)
+    private let topicCentroidRepulsion: Float = 3500    // pre-GPU value (was 6000 post-GPU)
     private let damping: Float = 0.78
     private let maxSpeed: Float = 12.0
 
@@ -492,7 +494,8 @@ final class ForceSimulation3D {
         let edgeIndices: [(Int, Int)]
         let topicProjectGroup: [Int]
         let alpha: Float, center: SIMD3<Float>
-        let chargeStrength: Float, sameProjectChargeScale: Float, sameTopicChargeScale: Float
+        let chargeStrength: Float, crossChargeMultiplier: Float
+        let sameProjectChargeScale: Float, sameTopicChargeScale: Float
         let centerStrength: Float
         let springLength: Float, crossProjectSpringLength: Float, springStrength: Float
         let cohesionStrength: Float, centroidRepulsion: Float
@@ -516,7 +519,8 @@ final class ForceSimulation3D {
             projectGroup: projectGroup, topicGroup: topicGroup,
             edgeIndices: edgeIndices, topicProjectGroup: topicProjectGroup,
             alpha: alpha, center: center,
-            chargeStrength: chargeStrength, sameProjectChargeScale: sameProjectChargeScale, sameTopicChargeScale: sameTopicChargeScale,
+            chargeStrength: chargeStrength, crossChargeMultiplier: crossChargeMultiplier,
+            sameProjectChargeScale: sameProjectChargeScale, sameTopicChargeScale: sameTopicChargeScale,
             centerStrength: centerStrength,
             springLength: springLength, crossProjectSpringLength: crossProjectSpringLength,
             springStrength: springStrength,
@@ -539,6 +543,7 @@ final class ForceSimulation3D {
                     projectGroups: projGroups,
                     topicGroups: topGroups,
                     chargeStrength: state.chargeStrength,
+                    crossChargeMultiplier: state.crossChargeMultiplier,
                     sameTopicChargeScale: state.sameTopicChargeScale,
                     sameProjectChargeScale: state.sameProjectChargeScale
                 )
@@ -646,7 +651,7 @@ final class ForceSimulation3D {
             }
         }
 
-        // Project centroid forces
+        // Project centroid forces (with non-linear cohesion for stray node handling)
         if hasProjects {
             let groupN = (projectGroup.max() ?? -1) + 1
             if groupN > 0 {
@@ -658,14 +663,38 @@ final class ForceSimulation3D {
                     let g = projectGroup[i]
                     gSumX[g] += x[i]; gSumY[g] += y[i]; gSumZ[g] += z[i]; gCount[g] += 1
                 }
+
+                // Compute per-group 75th percentile radius for non-linear cohesion
+                var gRadii = [[Float]](repeating: [], count: groupN)
                 for i in 0..<n {
                     let g = projectGroup[i]; let cnt = Float(gCount[g])
                     if cnt < 2 { continue }
                     let cx = gSumX[g] / cnt, cy = gSumY[g] / cnt, cz = gSumZ[g] / cnt
-                    fx[i] += (cx - x[i]) * s.cohesionStrength
-                    fy[i] += (cy - y[i]) * s.cohesionStrength
-                    fz[i] += (cz - z[i]) * s.cohesionStrength
+                    let dx = x[i] - cx, dy = y[i] - cy, dz = z[i] - cz
+                    gRadii[g].append(sqrt(dx * dx + dy * dy + dz * dz))
                 }
+                var gRefR = [Float](repeating: 30.0, count: groupN)
+                for g in 0..<groupN {
+                    guard !gRadii[g].isEmpty else { continue }
+                    gRadii[g].sort()
+                    gRefR[g] = max(30.0, gRadii[g][gRadii[g].count * 3 / 4])
+                }
+
+                // Non-linear cohesion: quadratic ramp beyond the cluster's core radius
+                let cohStr = s.cohesionStrength
+                for i in 0..<n {
+                    let g = projectGroup[i]; let cnt = Float(gCount[g])
+                    if cnt < 2 { continue }
+                    let cx = gSumX[g] / cnt, cy = gSumY[g] / cnt, cz = gSumZ[g] / cnt
+                    let dx = cx - x[i], dy = cy - y[i], dz = cz - z[i]
+                    let dist = sqrt(dx * dx + dy * dy + dz * dz)
+                    let ratio = max(1.0, dist / gRefR[g])
+                    let scale = ratio * ratio  // quadratic: 2x beyond edge → 4x force
+                    fx[i] += dx * cohStr * scale
+                    fy[i] += dy * cohStr * scale
+                    fz[i] += dz * cohStr * scale
+                }
+
                 for g1 in 0..<groupN {
                     guard gCount[g1] > 0 else { continue }
                     let c1 = SIMD3<Float>(gSumX[g1], gSumY[g1], gSumZ[g1]) / Float(gCount[g1])
@@ -716,7 +745,7 @@ final class ForceSimulation3D {
 
         // --- Charge repulsion (O(n²)) ---
         let chargeBase = s.chargeStrength
-        let chargeCross = chargeBase * 3.0
+        let chargeCross = chargeBase * s.crossChargeMultiplier
         let chargeSameProject = chargeBase * s.sameProjectChargeScale
         let chargeSameTopic = chargeBase * s.sameTopicChargeScale
         let cutoffSq: Float = 500 * 500
@@ -817,7 +846,7 @@ final class ForceSimulation3D {
             }
         }
 
-        // --- Project centroid forces ---
+        // --- Project centroid forces (with non-linear cohesion) ---
         if hasProjects {
             let groupN = (projectGroup.max() ?? -1) + 1
             if groupN > 0 {
@@ -829,15 +858,38 @@ final class ForceSimulation3D {
                     let g = projectGroup[i]
                     gSumX[g] += x[i]; gSumY[g] += y[i]; gSumZ[g] += z[i]; gCount[g] += 1
                 }
+
+                // Compute per-group 75th percentile radius for non-linear cohesion
+                var gRadii = [[Float]](repeating: [], count: groupN)
+                for i in 0..<n {
+                    let g = projectGroup[i]; let cnt = Float(gCount[g])
+                    if cnt < 2 { continue }
+                    let cx = gSumX[g] / cnt, cy = gSumY[g] / cnt, cz = gSumZ[g] / cnt
+                    let dx = x[i] - cx, dy = y[i] - cy, dz = z[i] - cz
+                    gRadii[g].append(sqrt(dx * dx + dy * dy + dz * dz))
+                }
+                var gRefR = [Float](repeating: 30.0, count: groupN)
+                for g in 0..<groupN {
+                    guard !gRadii[g].isEmpty else { continue }
+                    gRadii[g].sort()
+                    gRefR[g] = max(30.0, gRadii[g][gRadii[g].count * 3 / 4])
+                }
+
+                // Non-linear cohesion: quadratic ramp beyond the cluster's core radius
                 let cohStr = s.cohesionStrength
                 for i in 0..<n {
                     let g = projectGroup[i]; let cnt = Float(gCount[g])
                     if cnt < 2 { continue }
                     let cx = gSumX[g] / cnt, cy = gSumY[g] / cnt, cz = gSumZ[g] / cnt
-                    fx[i] += (cx - x[i]) * cohStr
-                    fy[i] += (cy - y[i]) * cohStr
-                    fz[i] += (cz - z[i]) * cohStr
+                    let dx = cx - x[i], dy = cy - y[i], dz = cz - z[i]
+                    let dist = sqrt(dx * dx + dy * dy + dz * dz)
+                    let ratio = max(1.0, dist / gRefR[g])
+                    let scale = ratio * ratio  // quadratic: 2x beyond edge → 4x force
+                    fx[i] += dx * cohStr * scale
+                    fy[i] += dy * cohStr * scale
+                    fz[i] += dz * cohStr * scale
                 }
+
                 let centRep = s.centroidRepulsion
                 for g1 in 0..<groupN {
                     guard gCount[g1] > 0 else { continue }

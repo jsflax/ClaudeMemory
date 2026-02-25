@@ -685,6 +685,44 @@ final class Graph3DScene {
         #endif
     }
 
+    /// Smoothly drive the camera to a named project's cluster.
+    func driveToProject(_ project: String) {
+        let positions = renderPositions
+        let nodes = renderNodes
+        let nodeById = Dictionary(nodes.map { ($0.id, $0) }, uniquingKeysWith: { _, last in last })
+
+        var pts: [SIMD3<Float>] = []
+        var nodeIds: [Int64] = []
+        for (id, pos) in positions {
+            guard let node = nodeById[id], node.project == project else { continue }
+            pts.append(pos)
+            nodeIds.append(id)
+        }
+        guard !pts.isEmpty else { return }
+
+        // Prefer hub node over centroid
+        let hubId = nodeIds.first(where: { renderHubs.contains($0) })
+        let targetPos: SIMD3<Float>
+        if let hubId, let pos = positions[hubId] {
+            targetPos = pos
+        } else {
+            var sum = SIMD3<Float>.zero
+            for p in pts { sum += p }
+            targetPos = sum / Float(pts.count)
+        }
+
+        // Bounding sphere for orbit radius
+        var maxSpread: Float = 0
+        for p in pts { maxSpread = max(maxSpread, simd_length(p - targetPos)) }
+        orbitRadius = max(min(maxSpread * 0.4, 250), 60)
+
+        // Only set targetCameraPos — cameraTarget lerps toward it for a smooth drive
+        targetCameraPos = targetPos
+
+        teleportCounter += 1
+        teleportLabel = project
+    }
+
     /// Cycle through nodes sorted by distance from camera.
     /// direction: +1 = next farther, -1 = next closer.
     private func cycleNode(current: Int64?, direction: Int,
@@ -1182,6 +1220,9 @@ final class Graph3DScene {
             if isFirstAtlas || framesSinceRegen >= 60 {
                 generateLabelAtlas(nodes: nodes, hubs: hubs, projects: currentProjects)
                 labelAtlasRegenFrame = renderFrameCount
+                // Sync labelAtlasNodeIds to match the comparison source (positions.keys)
+                // to prevent perpetual regen when nodes and positions sets differ.
+                labelAtlasNodeIds = currentNodeIds
             }
         }
         guard labelAtlasTexture != nil else { return }
@@ -1244,8 +1285,10 @@ final class Graph3DScene {
             let verts = raw.bindMemory(to: BatchVertex.self)
             var quadIdx = 0
 
+            let maxQuads = labelBatchCapacity - projectLabelCount
             for (id, pos3D) in allPositions {
-                guard let nodeData = nodeById[id],
+                guard quadIdx < maxQuads,
+                      let nodeData = nodeById[id],
                       let rect = labelAtlasRects[id] else {
                     continue
                 }
@@ -1255,8 +1298,9 @@ final class Graph3DScene {
                 let isHub = hubs.contains(id)
                 let importance = Float(max(1, nodeData.importance))
 
-                // LOD check — same thresholds as old overlay
-                if !isSelected && !expandedChildren.contains(id) {
+                // LOD check — search-matched nodes visible from much further
+                let isSearchMatch = renderIsSearchActive && renderSearchMatchIds.contains(id)
+                if !isSelected && !expandedChildren.contains(id) && !isSearchMatch {
                     let maxVisible: Float = isHub ? 1200 : (200 + importance * 80)
                     guard depth < maxVisible else {
                         // Write 4 degenerate zero vertices
@@ -1453,7 +1497,11 @@ final class Graph3DScene {
             return
         }
 
+        let prevCapacity = nodeBatchCapacity
         ensureNodeBatchMesh(capacity: nodeCount)
+        if nodeBatchCapacity != prevCapacity {
+            frameLog.error("[nodeBatch] ⚠️ CAPACITY GREW: \(prevCapacity) → \(self.nodeBatchCapacity) (nodeCount=\(nodeCount))")
+        }
         guard let mesh = nodeBatchMesh else { return }
 
         let nodeById = Dictionary(nodes.map { ($0.id, $0) }, uniquingKeysWith: { _, last in last })
@@ -1578,16 +1626,20 @@ final class Graph3DScene {
                         attenuationRadius: 2.0 * depthFade + 0.1
                     ))
                 } else {
+                    // Search-matched: distance-independent glow
                     let lightPulse = 1.0 + sin(animationTime * 4.0) * 0.3
                     lightEntity.components.set(PointLightComponent(
                         color: NSColor(red: 0.0, green: 0.9, blue: 1.0, alpha: 1),
-                        intensity: 12000 * depthFade * lightPulse,
-                        attenuationRadius: 1.5 * depthFade + 0.1
+                        intensity: 20000 * lightPulse,
+                        attenuationRadius: 2.5
                     ))
                 }
             }
         }
         let actualNodeCount = idx
+        if actualNodeCount != nodeCount && renderFrameCount % 60 == 0 {
+            frameLog.error("[nodeBatch] ⚠️ MISMATCH: actualNodeCount=\(actualNodeCount) vs positions.count=\(nodeCount) nodes.count=\(nodes.count)")
+        }
 
         // --- CPU stamp: directly write sphere vertices into mesh buffer ---
         // For ~500 nodes × 52 verts = 26K vertices, CPU is faster than GPU dispatch
@@ -2687,7 +2739,7 @@ final class Graph3DScene {
         // LowLevelMesh buffers (double/triple-buffered). This ensures the GPU never
         // renders from a stale or zero-initialized buffer.
         if positionsChanged || selectionChanged || hasGlowing || searchChanged || hasExpansions {
-            meshDirtyFrames = 3
+            meshDirtyFrames = 10
         }
 
         // Scene-level changes that require entity updates (nodes, edges, nebulae).
@@ -2786,8 +2838,9 @@ final class Graph3DScene {
 
         // GPU billboard labels — update when scene changes or camera moves (for LOD/opacity).
         // Billboarding itself is handled by the geometry modifier on GPU.
+        // Must update every frame (no throttle) to avoid stale data in triple-buffered mesh.
         if !Self.DIAG_SKIP_LABEL_BATCH,
-           sceneNeedsUpdate || (cameraMoving && renderFrameCount % 3 == 0) {
+           sceneNeedsUpdate || cameraMoving {
             updateLabelBatch(positions: renderPositions, nodes: renderNodes,
                              hubs: renderHubs, selectedNode: renderSelectedNode)
         }
@@ -2875,6 +2928,7 @@ struct Graph3DView: View {
     let forcePositionSnapshot3D: [Int64: SIMD3<Float>]
     let transitionProgress: CGFloat
     let renderStore: GraphRenderStore
+    @Binding var cameraProjectTarget: String?
 
     @State private var scene = Graph3DScene()
     @State private var scrollMonitor: Any?
@@ -2976,6 +3030,12 @@ struct Graph3DView: View {
                 if newValue == nil {
                     collapseAllHubs()
                 }
+            }
+        }
+        .onChange(of: cameraProjectTarget) { _, project in
+            if let project {
+                scene.driveToProject(project)
+                cameraProjectTarget = nil
             }
         }
     }

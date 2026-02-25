@@ -522,6 +522,7 @@ struct StatsOverlay: View {
     let toggleProject: (String) -> Void
     let toggleRelation: (String) -> Void
     let colorMap: [String: Color]
+    var driveToProject: ((String) -> Void)? = nil
 
     private var dbFileSize: String {
         let dbPath = ProcessInfo.processInfo.environment["CLAUDE_MEMORY_DB"]
@@ -562,20 +563,33 @@ struct StatsOverlay: View {
                 VStack(alignment: .trailing, spacing: 6) {
                     // Project filters
                     ForEach(projects, id: \.self) { project in
-                        Button {
-                            toggleProject(project)
-                        } label: {
-                            HStack(spacing: 6) {
-                                Circle()
-                                    .fill(GraphView.projectColor(for: project, in: colorMap))
-                                    .frame(width: 8, height: 8)
-                                    .opacity(hiddenProjects.contains(project) ? 0.3 : 1.0)
-                                Text(project)
-                                    .font(.system(size: 11, design: .monospaced))
-                                    .strikethrough(hiddenProjects.contains(project))
+                        HStack(spacing: 4) {
+                            if let driveToProject {
+                                Button {
+                                    driveToProject(project)
+                                } label: {
+                                    Image(systemName: "scope")
+                                        .font(.system(size: 10))
+                                }
+                                .buttonStyle(.plain)
+                                .opacity(hiddenProjects.contains(project) ? 0.3 : 0.6)
+                                .help("Fly to \(project)")
                             }
+                            Button {
+                                toggleProject(project)
+                            } label: {
+                                HStack(spacing: 6) {
+                                    Circle()
+                                        .fill(GraphView.projectColor(for: project, in: colorMap))
+                                        .frame(width: 8, height: 8)
+                                        .opacity(hiddenProjects.contains(project) ? 0.3 : 1.0)
+                                    Text(project)
+                                        .font(.system(size: 11, design: .monospaced))
+                                        .strikethrough(hiddenProjects.contains(project))
+                                }
+                            }
+                            .buttonStyle(.plain)
                         }
-                        .buttonStyle(.plain)
                     }
 
                     // Edge type filters (use unfiltered counts so hidden types remain visible)

@@ -51,6 +51,9 @@ void node_surface(realitykit::surface_parameters params)
     float fogOpacity;
     if (stateType > 0.5 && stateType < 1.5) {
         fogOpacity = 1.0;                                     // selected → opaque
+    } else if (stateType > 3.5 && stateType < 4.5) {
+        // search matched → gentle fade, floor at 0.35 so always visible
+        fogOpacity = max(0.35f, 1.0f - fogT * 0.5f);
     } else {
         fogOpacity = max(0.08f, 1.0f - fogT * 0.92f);
     }
@@ -80,9 +83,10 @@ void node_surface(realitykit::surface_parameters params)
         float pulse       = 1.0 + sin(time * 3.5) * 0.3;
         emissiveIntensity = 8.0 * intensity * pulse * depthFade;
     } else if (stateType > 3.5 && stateType < 4.5) {
-        // Search matched — cyan glow
+        // Search matched — bright cyan, gentle depth fade (floor 0.3) for depth cue
         emissiveColor     = half3(0.0, 0.9, 1.0);
-        emissiveIntensity = 4.0 * (1.0 + sin(time * 4.0) * 0.3) * depthFade;
+        float searchFade  = max(0.3f, depthFade);
+        emissiveIntensity = 8.0 * (1.0 + sin(time * 4.0) * 0.3) * searchFade;
     } else {
         // Normal — subtle self-glow matching base color
         emissiveColor     = half3(tint);
@@ -220,9 +224,12 @@ void node_batch_lit_surface(realitykit::surface_parameters params)
     float  depthFade = max(0.0f, 1.0f - fogT * 0.95f);
 
     // ── Fog opacity ────────────────────────────────────────────────────
+    bool isSearchMatched = (stateType > 3.5 && stateType < 4.5);
     float fogOpacity;
     if (stateType > 0.5 && stateType < 1.5) {
         fogOpacity = 1.0;                                     // selected → opaque
+    } else if (isSearchMatched) {
+        fogOpacity = 1.0;                                     // search match → fog-proof
     } else {
         fogOpacity = max(0.08f, 1.0f - fogT * 0.92f);
     }
@@ -245,9 +252,9 @@ void node_batch_lit_surface(realitykit::surface_parameters params)
         emissiveColor     = half3(1.0, 0.85, 0.4);
         float pulse       = 1.0 + sin(time * 3.5) * 0.3;
         emissiveIntensity = 8.0 * intensity * pulse * depthFade;
-    } else if (stateType > 3.5 && stateType < 4.5) {
+    } else if (isSearchMatched) {
         emissiveColor     = half3(0.0, 0.9, 1.0);
-        emissiveIntensity = 4.0 * (1.0 + sin(time * 4.0) * 0.3) * depthFade;
+        emissiveIntensity = 8.0 * (1.0 + sin(time * 4.0) * 0.3);  // no depthFade — visible at any distance
     } else {
         emissiveColor     = half3(baseColor);
         emissiveIntensity = 0.15;

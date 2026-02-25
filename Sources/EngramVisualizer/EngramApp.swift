@@ -47,12 +47,14 @@ struct EngramApp: App {
         // DIAG: force 3D mode for performance testing
         config.dimensionMode = .threeD
 
+        #if ENABLE_ACCOUNT
         // Configure Google Sign-In if client ID is available
         if let googleClientID = ProcessInfo.processInfo.environment["GOOGLE_CLIENT_ID"]
             ?? Bundle.main.object(forInfoDictionaryKey: "GIDClientID") as? String
         {
             GIDSignIn.sharedInstance.configuration = GIDConfiguration(clientID: googleClientID)
         }
+        #endif
 
         Task.detached { CLIInstaller.syncIfNeeded() }
     }
@@ -63,6 +65,7 @@ struct EngramApp: App {
                 .environment(\.lattice, lattice)
                 .environment(config)
                 .frame(minWidth: 800, minHeight: 600)
+                #if ENABLE_ACCOUNT
                 .toolbar {
                     ToolbarItem(placement: .automatic) {
                         HStack(spacing: 12) {
@@ -80,17 +83,20 @@ struct EngramApp: App {
                         .padding(.leading, 8)
                     }
                 }
+                #endif
         }
         .commands {
             CommandGroup(after: .appInfo) {
                 CheckForUpdatesView(updater: updaterController.updater)
             }
+            #if ENABLE_ACCOUNT
             CommandGroup(after: .appInfo) {
                 Button("Account...") {
                     showingAccount = true
                 }
                 .keyboardShortcut(",", modifiers: [.command])
             }
+            #endif
             CommandGroup(after: .saveItem) {
                 Button("Export as PNG…") {
                     Task {

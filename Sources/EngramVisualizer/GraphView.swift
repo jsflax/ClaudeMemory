@@ -129,6 +129,7 @@ struct GraphView: View {
     @State private var forcePositionSnapshot3D: [Int64: SIMD3<Float>] = [:]
     @State private var camera3DState = Camera3DState()
     @State private var renderStore = GraphRenderStore()
+    @State private var cameraProjectTarget: String?
 
     // Glow cleanup timer (1s interval — removes entries older than 4.3s)
     private let glowTimer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
@@ -656,7 +657,7 @@ struct GraphView: View {
             newNodes[pk] = Date()
             let visible = !config.hiddenProjects.contains(node.project) &&
                 (debouncedTimeSliderDate == nil || node.createdAt <= debouncedTimeSliderDate!)
-            if visible {
+            if visible && !cachedVisibleNodeIds.contains(pk) {
                 cachedFilteredNodes.append(node)
                 cachedVisibleNodeIds.insert(pk)
                 renderStore.nodes.append(node)
@@ -1009,7 +1010,8 @@ struct GraphView: View {
             camera3DState: camera3DState,
             forcePositionSnapshot3D: forcePositionSnapshot3D,
             transitionProgress: transitionProgress,
-            renderStore: renderStore
+            renderStore: renderStore,
+            cameraProjectTarget: $cameraProjectTarget
         )
         .transaction { $0.animation = nil }  // prevent overlay animations from resizing the 3D view
     }
@@ -1028,7 +1030,8 @@ struct GraphView: View {
                 allRelationCounts: cachedRelationCounts,
                 toggleProject: toggleProject,
                 toggleRelation: toggleRelation,
-                colorMap: colorMap
+                colorMap: colorMap,
+                driveToProject: config.dimensionMode == .threeD ? { cameraProjectTarget = $0 } : nil
             )
 
             if selectedMemoryId == nil {
@@ -1491,9 +1494,7 @@ struct SearchBarView: View {
             isActive = true
             try? await Task.sleep(for: .milliseconds(150))
             guard !Task.isCancelled else { return }
-            let terms = query.split(separator: " ").map(String.init)
-            guard !terms.isEmpty else { matchIds = []; return }
-            let ftsQuery: TextQuery = .raw(terms.map { "\($0)*" }.joined(separator: " OR "))
+            let ftsQuery: TextQuery = .search(query)
             var ids = Set<Int64>()
             for match in lattice.objects(Memory.self).matching(ftsQuery, on: \.content, limit: 500) {
                 if let pk = match.object.primaryKey { ids.insert(pk) }
