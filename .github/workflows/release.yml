@@ -61,6 +61,8 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           VERSION=${GITHUB_REF_NAME#v}
+          PREV_BUILD=$(grep -o 'sparkle:version="[0-9]*"' appcast.xml | head -1 | grep -o '[0-9]*')
+          BUILD_NUMBER=$(( ${PREV_BUILD:-0} + 1 ))
           xcodebuild archive \
             -project Engram.xcodeproj \
             -scheme Engram \
@@ -73,6 +75,7 @@ jobs:
             CODE_SIGN_STYLE=Manual \
             DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
             MARKETING_VERSION="$VERSION" \
+            CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
             OTHER_CODE_SIGN_FLAGS="--keychain $RUNNER_TEMP/signing.keychain-db"
 
       - name: Export archive to .app
