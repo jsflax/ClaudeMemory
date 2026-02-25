@@ -4,6 +4,27 @@ All notable changes to Engram are documented in this file.
 
 > Formerly "ClaudeMemory" — renamed in v0.12.0 to be tool-agnostic.
 
+## [0.12.1] - 2026-02-25
+
+### Changed
+- **Raw Metal renderer** — replaced RealityKit with a custom MTKView pipeline, eliminating 67.5% main thread blocking in `re::DrawingManager::commitFrameInternal()` and 13.5% VFX lock contention from `ParticleEmitterComponent`
+- **GPU procedural nebulae** — fBm noise billboards rendered entirely in Metal fragment shaders, replacing RealityKit particle emitters
+- **Blinn-Phong lighting** — sphere impostor nodes use analytical normal reconstruction with Blinn-Phong shading tuned for dark-background aesthetic
+- **Opaque rendering** — fog baked into `base_color` in shaders instead of `.transparent` blending, avoiding GPU depth sorting of 55K+ triangles
+- **Search spotlight** — suppressed recall glow on non-matching nodes for cleaner visual contrast
+- **EngramModels library extraction** — core model types (Memory, Edge, Checkpoint, HookState) moved into a separate SPM target; EngramKit re-exports via `@_exported import EngramModels`
+- **Account UI** — Apple and Google Sign-In via `AuthenticationServices` and `GoogleSignIn-iOS`, posting identity tokens to cloud sync backend
+- **Streaming graph load** — batched node loading off main actor for faster initial render
+- **GraphRenderStore** — bypass SwiftUI observation for 3D render data, reducing unnecessary view recomputation
+- **Project labels in 3D view** — project name labels rendered in the 3D scene with tighter clustering
+- Lattice dependency switched from local path to remote URL (`0.4.0`)
+
+### Fixed
+- Node flicker during force simulation convergence
+- FTS5 full-text search query handling
+- GPU compute label batch sizing and edge buffer synchronization
+- Drive-to-project camera animation
+
 ## [0.12.0] - 2026-02-22
 
 ### Changed
@@ -222,6 +243,7 @@ All notable changes to Engram are documented in this file.
 - CI/CD with GitHub Actions on macOS 26 / Swift 6.2
 - Homebrew tap workflow
 
+[0.12.1]: https://github.com/jsflax/Engram/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/jsflax/Engram/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/jsflax/Engram/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/jsflax/Engram/compare/v0.9.1...v0.10.0

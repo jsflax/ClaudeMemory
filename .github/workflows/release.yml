@@ -197,13 +197,21 @@ jobs:
           # Use generated appcast
           cp appcast_staging/appcast.xml appcast.xml
 
+      - name: Extract changelog for release
+        id: changelog
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          BODY=$(awk "/^## \\[${VERSION}\\]/{found=1; next} /^## \\[/{if(found) exit} found{print}" CHANGELOG.md)
+          # Write to file for multi-line handling
+          echo "$BODY" > /tmp/release-body.md
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             engram-macos-arm64.tar.gz
             Engram-*.dmg
-          generate_release_notes: true
+          body_path: /tmp/release-body.md
 
       - name: Commit appcast.xml to main
         if: env.SPARKLE_PRIVATE_KEY != ''

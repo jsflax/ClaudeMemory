@@ -3136,23 +3136,44 @@ struct Graph3DView: View {
     let renderStore: GraphRenderStore
     @Binding var cameraProjectTarget: String?
 
+    /// Feature flag: set to true to use raw Metal renderer instead of RealityKit.
+    static let useMetalRenderer = true
+
     @State private var scene = Graph3DScene()
+    @State private var metalScene: MetalSceneManager?
+    @State private var metalRenderer: MetalGraphRenderer?
     @State private var scrollMonitor: Any?
     @State private var updateClosureCount: UInt64 = 0
 
+    /// Active scene object for input forwarding (Metal or RealityKit).
+    private var activeSceneForInput: AnyObject? {
+        if Self.useMetalRenderer { return metalScene } else { return scene }
+    }
 
     var body: some View {
         GeometryReader { geo in
             ZStack {
-                realityViewContent
-                    .gesture(orbitGesture)
-                    .simultaneousGesture(tapGesture(viewSize: geo.size))
-                    .onGeometryChange(for: CGRect.self) { proxy in
-                        proxy.frame(in: .global)
-                    } action: { frame in
-                        viewFrame = frame
+                Group {
+                    if Self.useMetalRenderer {
+                        metalViewContent
+                            .gesture(metalOrbitGesture)
+                            .simultaneousGesture(metalTapGesture(viewSize: geo.size))
+                    } else {
+                        realityViewContent
+                            .gesture(orbitGesture)
+                            .simultaneousGesture(tapGesture(viewSize: geo.size))
+                    }
+                }
+                .onGeometryChange(for: CGRect.self) { proxy in
+                    proxy.frame(in: .global)
+                } action: { frame in
+                    viewFrame = frame
+                    if Self.useMetalRenderer {
+                        metalScene?.renderViewSize = frame.size
+                    } else {
                         scene.renderViewSize = frame.size
                     }
+                }
 
                 // Center reticle (only when gamepad connected)
                 if GCController.current != nil {
@@ -3160,9 +3181,8 @@ struct Graph3DView: View {
                 }
 
                 // Teleport project label (fades after 2s)
-                // Uses teleportCounter to avoid stomping: each teleport increments
-                // the counter, and the dismiss task only clears if counter hasn't changed.
-                if let label = scene.teleportLabel {
+                if let label = Self.useMetalRenderer ? metalScene?.teleportLabel : scene.teleportLabel {
+                    let counter = Self.useMetalRenderer ? (metalScene?.teleportCounter ?? 0) : scene.teleportCounter
                     Text(label)
                         .font(.system(size: 24, weight: .bold, design: .monospaced))
                         .foregroundStyle(.white.opacity(0.8))
@@ -3171,11 +3191,17 @@ struct Graph3DView: View {
                         .background(.black.opacity(0.5), in: .capsule)
                         .transition(.opacity)
                         .allowsHitTesting(false)
-                        .task(id: scene.teleportCounter) {
-                            let myCounter = scene.teleportCounter
+                        .task(id: counter) {
+                            let myCounter = counter
                             try? await Task.sleep(for: .seconds(2))
-                            if scene.teleportCounter == myCounter {
-                                scene.teleportLabel = nil
+                            if Self.useMetalRenderer {
+                                if metalScene?.teleportCounter == myCounter {
+                                    metalScene?.teleportLabel = nil
+                                }
+                            } else {
+                                if scene.teleportCounter == myCounter {
+                                    scene.teleportLabel = nil
+                                }
                             }
                         }
                 }
@@ -3227,20 +3253,30 @@ struct Graph3DView: View {
             }
         }
         .accessibilityIdentifier("graph-3d-view")
-        .onAppear { installInputMonitor() }
+        .onAppear { if !Self.useMetalRenderer { installInputMonitor() } }
         .onDisappear { removeInputMonitor() }
         .onChange(of: selectedNode) { _, newValue in
-            // SwiftUI → scene: push selection when binding changes from parent
-            if newValue != scene.renderSelectedNode {
-                scene.renderSelectedNode = newValue
-                if newValue == nil {
-                    collapseAllHubs()
+            if Self.useMetalRenderer {
+                if newValue != metalScene?.selectedNode {
+                    metalScene?.selectedNode = newValue
+                    if newValue == nil { collapseAllHubs() }
+                }
+            } else {
+                if newValue != scene.renderSelectedNode {
+                    scene.renderSelectedNode = newValue
+                    if newValue == nil { collapseAllHubs() }
                 }
             }
         }
         .onChange(of: cameraProjectTarget) { _, project in
             if let project {
-                scene.driveToProject(project)
+                if Self.useMetalRenderer {
+                    metalScene?.camera.driveToProject(project, positions: metalScene?.positions ?? [:],
+                                                     nodes: metalScene?.renderStore?.nodes ?? [],
+                                                     hubs: metalScene?.renderStore?.hubs ?? [])
+                } else {
+                    scene.driveToProject(project)
+                }
                 cameraProjectTarget = nil
             }
         }
@@ -3307,13 +3343,131 @@ struct Graph3DView: View {
         .background(Color(red: 0.051, green: 0.067, blue: 0.09))
     }
 
+    // MARK: - Metal Renderer View
+
+    @ViewBuilder
+    private var metalViewContent: some View {
+        if let renderer = metalRenderer {
+            MetalViewRepresentable(renderer: renderer)
+                .onChange(of: layoutMode) { _, _ in pushDataToMetalScene() }
+                .onChange(of: glowingNodes.count) { _, _ in pushDataToMetalScene() }
+                .onChange(of: newNodes.count) { _, _ in pushDataToMetalScene() }
+                .onChange(of: dyingNodes.count) { _, _ in pushDataToMetalScene() }
+                .onChange(of: searchMatchIds) { _, _ in pushDataToMetalScene() }
+                .onChange(of: isSearchActive) { _, _ in pushDataToMetalScene() }
+                .onChange(of: transitionProgress) { _, _ in
+                    metalScene?.forcePositionSnapshot3D = forcePositionSnapshot3D
+                    metalScene?.transitionProgress = transitionProgress
+                }
+        } else {
+            Color(red: 0.051, green: 0.067, blue: 0.09)
+                .onAppear { setupMetalRenderer() }
+        }
+    }
+
+    private func setupMetalRenderer() {
+        guard metalRenderer == nil else { return }
+        guard let r = MetalGraphRenderer(create: true) else { return }
+        metalRenderer = r
+        guard let mgr = MetalSceneManager(renderer: r) else { return }
+        metalScene = mgr
+
+        mgr.simulation3D = simulation3D
+        mgr.embeddingProjection = embeddingProjection
+        mgr.camera3DState = camera3DState
+        mgr.renderStore = renderStore
+        mgr.forcePositionSnapshot3D = forcePositionSnapshot3D
+        mgr.transitionProgress = transitionProgress
+        mgr.selectionCallback = { newSelection in
+            selectedNode = newSelection
+        }
+        pushDataToMetalScene()
+        installInputMonitor()
+    }
+
+    private func pushDataToMetalScene() {
+        guard let ms = metalScene else { return }
+        ms.layoutMode = layoutMode
+        ms.glowingNodes = glowingNodes
+        ms.newNodes = newNodes
+        ms.dyingNodes = dyingNodes
+        ms.semanticClusters3D = semanticClusters3D
+        ms.topicGroups = topicGroups
+        ms.clusters = clusters
+        ms.searchMatchIds = searchMatchIds
+        ms.isSearchActive = isSearchActive
+    }
+
+    // MARK: - Metal Gestures
+
+    @GestureState private var metalDragStart: (azimuth: Float, elevation: Float, camPos: SIMD3<Float>)?
+
+    private var metalOrbitGesture: some Gesture {
+        DragGesture(minimumDistance: 2)
+            .updating($metalDragStart) { value, state, _ in
+                guard let ms = metalScene else { return }
+                if state == nil {
+                    state = ms.captureLookState()
+                }
+                guard let start = state else { return }
+                let sensitivity: Float = 0.005
+                let dw = Float(value.translation.width)
+                let dh = Float(value.translation.height)
+                ms.applyLookDrag(start: start, dx: dw * sensitivity, dy: -dh * sensitivity)
+            }
+            .onEnded { _ in
+                metalScene?.endDrag()
+            }
+    }
+
+    private func metalTapGesture(viewSize: CGSize) -> some Gesture {
+        SpatialTapGesture()
+            .onEnded { value in
+                guard let ms = metalScene else { return }
+                if let nodeId = ms.hitTest(at: value.location, viewSize: viewSize) {
+                    if hubs.contains(nodeId) {
+                        let expanding = !ms.expandedHubs.contains(nodeId)
+                        for hubId in ms.expandedHubs where hubId != nodeId {
+                            ms.toggleHubExpansion(hubId: hubId)
+                            metalPinUnpinHubChildren(hubId: hubId, expanding: false)
+                        }
+                        ms.toggleHubExpansion(hubId: nodeId)
+                        metalPinUnpinHubChildren(hubId: nodeId, expanding: expanding)
+                        selectedNode = nodeId
+                    } else {
+                        metalCollapseAllHubs()
+                        selectedNode = selectedNode == nodeId ? nil : nodeId
+                    }
+                } else {
+                    metalCollapseAllHubs()
+                    selectedNode = nil
+                }
+            }
+    }
+
+    private func metalCollapseAllHubs() {
+        guard let ms = metalScene else { return }
+        for hubId in ms.expandedHubs {
+            ms.toggleHubExpansion(hubId: hubId)
+            metalPinUnpinHubChildren(hubId: hubId, expanding: false)
+        }
+    }
+
+    private func metalPinUnpinHubChildren(hubId: Int64, expanding: Bool) {
+        let children = edges.filter { $0.relation == "part_of" && $0.targetId == hubId }.map(\.sourceId)
+        for childId in children {
+            if expanding { simulation3D.pin(childId) } else { simulation3D.unpin(childId) }
+        }
+    }
+
     // MARK: - Gestures
 
     // MARK: - Reticle (gamepad targeting)
 
     @ViewBuilder
     private var reticleOverlay: some View {
-        let hasTarget = scene.reticleTarget != nil
+        let reticleTarget = Self.useMetalRenderer ? metalScene?.reticleTarget : scene.reticleTarget
+        let hasTarget = reticleTarget != nil
         let nodeById = Dictionary(nodes.map { ($0.id, $0) }, uniquingKeysWith: { _, last in last })
 
         ZStack {
@@ -3344,7 +3498,7 @@ struct Graph3DView: View {
             }
 
             // Target label below reticle
-            if let targetId = scene.reticleTarget, let node = nodeById[targetId] {
+            if let targetId = reticleTarget, let node = nodeById[targetId] {
                 Text(node.label)
                     .font(.system(size: 11, weight: .bold, design: .monospaced))
                     .foregroundStyle(.white.opacity(0.9))
@@ -3386,6 +3540,88 @@ struct Graph3DView: View {
     private static let movementKeys: Set<String> = ["w","a","s","d","i","j","k","l","q","e"]
 
     private func installInputMonitor() {
+        if Self.useMetalRenderer {
+            installMetalInputMonitor()
+        } else {
+            installRealityKitInputMonitor()
+        }
+    }
+
+    private func installMetalInputMonitor() {
+        scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: [.scrollWheel, .magnify, .rotate, .keyDown, .keyUp, .flagsChanged]) { [metalScene] event in
+            guard let ms = metalScene else { return event }
+
+            if event.type == .flagsChanged {
+                if event.modifierFlags.contains(.shift) {
+                    ms.heldKeys.insert("shift")
+                } else {
+                    ms.heldKeys.remove("shift")
+                }
+                return event
+            }
+
+            if event.type == .keyDown || event.type == .keyUp {
+                if let responder = event.window?.firstResponder,
+                   responder is NSTextView || responder is NSTextField {
+                    ms.heldKeys.removeAll()
+                    return event
+                }
+
+                let key = event.charactersIgnoringModifiers?.lowercased() ?? ""
+                let noMods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+                    .subtracting(.shift).isEmpty
+
+                if event.type == .keyDown {
+                    if noMods && Self.movementKeys.contains(key) {
+                        ms.heldKeys.insert(key)
+                        return nil
+                    }
+                    if key == "t" && noMods {
+                        ms.teleportToNextProject(direction: 1)
+                        return nil
+                    }
+                    if key == "r" && noMods {
+                        ms.teleportToNextProject(direction: -1)
+                        return nil
+                    }
+                } else {
+                    if Self.movementKeys.contains(key) {
+                        ms.heldKeys.remove(key)
+                        return nil
+                    }
+                }
+                return event
+            }
+
+            if let contentView = event.window?.contentView {
+                let hitView = contentView.hitTest(event.locationInWindow)
+                if hitView is NSScrollView || hitView?.enclosingScrollView != nil {
+                    return event
+                }
+            }
+            if event.type == .rotate {
+                let sensitivity: Float = 0.02
+                ms.camera.lookRotate(deltaAz: -Float(event.rotation) * sensitivity, deltaEl: 0)
+                return nil
+            }
+            if event.type == .magnify {
+                let amount = Float(event.magnification) * 400
+                guard event.window != nil else {
+                    ms.camera.dolly(amount: amount)
+                    return nil
+                }
+                let locInWindow = event.locationInWindow
+                let nx = Float((locInWindow.x - self.viewFrame.origin.x) / self.viewFrame.width - 0.5) * 2
+                let ny = Float((locInWindow.y - self.viewFrame.origin.y) / self.viewFrame.height - 0.5) * 2
+                ms.camera.dolly(amount: amount, cursorNX: nx, cursorNY: ny)
+                return nil
+            }
+            ms.camera.pan(dx: Float(event.scrollingDeltaX), dy: Float(event.scrollingDeltaY))
+            return nil
+        }
+    }
+
+    private func installRealityKitInputMonitor() {
         scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: [.scrollWheel, .magnify, .rotate, .keyDown, .keyUp, .flagsChanged]) { [scene] event in
             // --- Shift tracking (flagsChanged) ---
             if event.type == .flagsChanged {
@@ -3472,13 +3708,21 @@ struct Graph3DView: View {
             NSEvent.removeMonitor(monitor)
             scrollMonitor = nil
         }
-        scene.heldKeys.removeAll()
+        if Self.useMetalRenderer {
+            metalScene?.heldKeys.removeAll()
+        } else {
+            scene.heldKeys.removeAll()
+        }
     }
 
     private func collapseAllHubs() {
-        for hubId in scene.expandedHubs {
-            scene.toggleHubExpansion(hubId: hubId)
-            pinUnpinHubChildren(hubId: hubId, expanding: false)
+        if Self.useMetalRenderer {
+            metalCollapseAllHubs()
+        } else {
+            for hubId in scene.expandedHubs {
+                scene.toggleHubExpansion(hubId: hubId)
+                pinUnpinHubChildren(hubId: hubId, expanding: false)
+            }
         }
     }
 

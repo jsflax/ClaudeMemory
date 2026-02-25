@@ -1,5 +1,5 @@
 {
-  "originHash" : "0fe93135b8f5c58977fd220dffda4c024e14fc9f01793adb6e487c61d540d091",
+  "originHash" : "b339ea18a9ed3b7b0fdf58724e7345f43991017a6258d650dc27e6b131fde5e5",
   "pins" : [
     {
       "identity" : "appauth-ios",
@@ -116,6 +116,24 @@
       "state" : {
         "revision" : "13e7513b3ba0afa13967daf77af2fb4ad087306c",
         "version" : "4.13.5"
+      }
+    },
+    {
+      "identity" : "lattice",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/jsflax/lattice",
+      "state" : {
+        "revision" : "5320e770c7c95fa32bc9a1bac89ff7655a5511b3",
+        "version" : "0.4.0"
+      }
+    },
+    {
+      "identity" : "latticecore",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/jsflax/LatticeCore.git",
+      "state" : {
+        "revision" : "466e1f742928bf16f2987e884443a5feea62e9e0",
+        "version" : "0.4.0"
       }
     },
     {
@@ -393,8 +411,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/vapor/vapor.git",
       "state" : {
-        "revision" : "6d06e13021c299aa3300986f4eb5bb143d17ac9b",
-        "version" : "4.121.2"
+        "revision" : "a8db2dbda8b3cdc8a61bd35128590bd296e85563",
+        "version" : "4.121.3"
       }
     },
     {

@@ -1,6 +1,12 @@
 // swift-tools-version: 6.2
 
 import PackageDescription
+import Foundation
+
+let bridgingHeader = URL(fileURLWithPath: #filePath)
+    .deletingLastPathComponent()
+    .appendingPathComponent("Sources/EngramVisualizer/EngramVisualizer-Bridging-Header.h")
+    .path
 
 let package = Package(
     name: "Engram",
@@ -11,7 +17,7 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/modelcontextprotocol/swift-sdk.git", from: "0.10.0"),
-        .package(name: "Lattice", path: "../Lattice"),
+        .package(url: "https://github.com/jsflax/lattice", from: "0.4.0"),
         .package(url: "https://github.com/jsflax/SwiftLM.git", branch: "main"),
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.5.0"),
         .package(url: "https://github.com/sparkle-project/Sparkle.git", from: "2.0.0"),
@@ -68,8 +74,11 @@ let package = Package(
             ],
             swiftSettings: [
                 .interoperabilityMode(.Cxx),
+                .unsafeFlags(["-import-objc-header", bridgingHeader]),
             ],
             linkerSettings: [
+                .linkedFramework("Metal"),
+                .linkedFramework("MetalKit"),
                 .linkedFramework("RealityKit"),
             ]
         ),
