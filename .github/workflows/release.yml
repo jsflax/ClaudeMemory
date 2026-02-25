@@ -61,7 +61,7 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           VERSION=${GITHUB_REF_NAME#v}
-          PREV_BUILD=$(grep -o 'sparkle:version="[0-9]*"' appcast.xml | head -1 | grep -o '[0-9]*')
+          PREV_BUILD=$(sed -n 's/.*<sparkle:version>\([0-9]*\)<.*/\1/p' appcast.xml | head -1)
           BUILD_NUMBER=$(( ${PREV_BUILD:-0} + 1 ))
           xcodebuild archive \
             -project Engram.xcodeproj \
