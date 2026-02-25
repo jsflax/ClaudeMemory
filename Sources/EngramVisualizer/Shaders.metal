@@ -367,6 +367,108 @@ kernel void stamp_node_spheres(
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// MARK: - Label Stamp Compute Kernel
+//
+// Stamps 4 billboard quad vertices per label from instance data.
+// Each thread handles one label, writing 48 floats (4 verts × 12 floats).
+// Layout matches BatchVertex: pos(3) + normal(3) + uv(2) + color(4) = 12 floats.
+// ──────────────────────────────────────────────────────────────────────────────
+
+struct LabelInstance {
+    packed_float3 anchor;     // world position (scaled, Y-offset applied)
+    float         halfH;      // base quad height
+    float4        uvRect;     // (u0, v0, u1, v1)
+    float4        color;      // (r, g, b, baseOpacity)
+    float         textAspect; // halfW = halfH * textAspect
+    float         maxVisible; // LOD distance threshold
+    float         forwardBias;// nz for project labels (0.25), 0 for nodes
+    uint          flags;      // bit 0: isSelected, bit 1: isSearchMatch, bit 2: searchDimmed
+};
+
+struct LabelStampParams {
+    packed_float3 cameraPos;
+    float         minDepth;
+    float         depthRange;
+    uint          labelCount;
+};
+
+kernel void stamp_label_quads(
+    device const LabelInstance* instances [[buffer(0)]],
+    constant     LabelStampParams& params [[buffer(1)]],
+    device       float*            output [[buffer(2)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid >= params.labelCount) return;
+
+    LabelInstance inst = instances[tid];
+    float3 anchor = float3(inst.anchor);
+    float3 camPos = float3(params.cameraPos);
+    float  depth  = length(anchor - camPos);
+
+    // LOD cull
+    bool isSelected    = (inst.flags & 1u) != 0;
+    bool isSearchMatch = (inst.flags & 2u) != 0;
+    bool searchDimmed  = (inst.flags & 4u) != 0;
+    bool alwaysVisible = isSelected || isSearchMatch;
+
+    uint base = tid * 48;  // 4 verts × 12 floats each
+
+    if (!alwaysVisible && depth > inst.maxVisible) {
+        // Write degenerate zero vertices
+        for (uint i = 0; i < 48; i++) output[base + i] = 0.0;
+        return;
+    }
+
+    // Opacity computation
+    float depthNorm = (depth - params.minDepth) / max(params.depthRange, 0.001);
+    float depthFade = isSelected ? 1.0 : (1.0 - depthNorm * 0.7);
+    float fadeRange = inst.maxVisible * 0.3;
+    float fadeT     = isSelected ? 1.0 : saturate((inst.maxVisible - depth) / fadeRange);
+    float searchFade = searchDimmed ? 0.15 : 1.0;
+    float opacity = inst.color.w * fadeT * depthFade * searchFade;
+
+    if (opacity < 0.02) {
+        for (uint i = 0; i < 48; i++) output[base + i] = 0.0;
+        return;
+    }
+
+    // Quad dimensions
+    float halfH = inst.halfH;
+    float halfW = halfH * inst.textAspect;
+    float nz    = inst.forwardBias;
+
+    // UV
+    float u0 = inst.uvRect.x, v0 = inst.uvRect.y;
+    float u1 = inst.uvRect.z, v1 = inst.uvRect.w;
+
+    // Color
+    float cr = inst.color.x, cg = inst.color.y, cb = inst.color.z;
+
+    // 4 vertices: TL, TR, BL, BR
+    // Position = anchor (same for all 4), Normal = corner offset
+    // v0 (TL)
+    output[base + 0]  = anchor.x; output[base + 1]  = anchor.y; output[base + 2]  = anchor.z;
+    output[base + 3]  = -halfW;   output[base + 4]  = halfH;    output[base + 5]  = nz;
+    output[base + 6]  = u0;       output[base + 7]  = v0;
+    output[base + 8]  = cr;       output[base + 9]  = cg;       output[base + 10] = cb; output[base + 11] = opacity;
+    // v1 (TR)
+    output[base + 12] = anchor.x; output[base + 13] = anchor.y; output[base + 14] = anchor.z;
+    output[base + 15] = halfW;    output[base + 16] = halfH;    output[base + 17] = nz;
+    output[base + 18] = u1;       output[base + 19] = v0;
+    output[base + 20] = cr;       output[base + 21] = cg;       output[base + 22] = cb; output[base + 23] = opacity;
+    // v2 (BL)
+    output[base + 24] = anchor.x; output[base + 25] = anchor.y; output[base + 26] = anchor.z;
+    output[base + 27] = -halfW;   output[base + 28] = 0.0;      output[base + 29] = nz;
+    output[base + 30] = u0;       output[base + 31] = v1;
+    output[base + 32] = cr;       output[base + 33] = cg;       output[base + 34] = cb; output[base + 35] = opacity;
+    // v3 (BR)
+    output[base + 36] = anchor.x; output[base + 37] = anchor.y; output[base + 38] = anchor.z;
+    output[base + 39] = halfW;    output[base + 40] = 0.0;      output[base + 41] = nz;
+    output[base + 42] = u1;       output[base + 43] = v1;
+    output[base + 44] = cr;       output[base + 45] = cg;       output[base + 46] = cb; output[base + 47] = opacity;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // MARK: - Label Billboard Geometry Modifier
 //
 // Billboard quad: vertex position is the anchor (node world pos), normal carries

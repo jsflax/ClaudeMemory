@@ -62,6 +62,7 @@ final class Graph3DScene {
     // Metal shaders for CustomMaterial — all visual effects run on GPU
     private var metalDevice: MTLDevice?
     private var metalLibrary: MTLLibrary?
+    private var metalCommandQueue: MTLCommandQueue?
     private var edgeSurfaceShader: CustomMaterial.SurfaceShader?
 
     // Batched node rendering — all nodes as a single LowLevelMesh (1 draw call).
@@ -72,15 +73,63 @@ final class Graph3DScene {
     private var nodeBatchCapacity: Int = 0
     private var nodeColorCache: [String: SIMD3<Float>] = [:]
 
-    // Metal compute pipeline for sphere instancing
-    // stamp_node_spheres compute pipeline removed — CPU stamping is faster for <1K nodes
-    // (avoids command buffer encode + submit + fence wait overhead)
-    // sphereTemplateBuffer removed — using sphereTemplateVertices Swift array instead     // template sphere vertices
-    private var sphereTemplateIndices: [UInt32] = [] // template sphere index data
+    // Metal compute pipeline for GPU sphere stamping (stamp_node_spheres kernel)
+    private var stampComputePipeline: MTLComputePipelineState?
+    private var sphereTemplateBuffer: MTLBuffer?     // static GPU buffer: template sphere vertices
+    private var stampInstanceBuffer: MTLBuffer?       // shared GPU buffer: per-node instance data (per-frame)
+    private var stampParamsBuffer: MTLBuffer?          // shared GPU buffer: dispatch parameters
+    private var stampInstanceCapacity: Int = 0         // current instance buffer capacity (node count)
+
+    private var sphereTemplateIndices: [UInt32] = []
     private var sphereTemplateVertices: [(pos: SIMD3<Float>, norm: SIMD3<Float>)] = []
     private var vertsPerSphere: Int = 0
     private var indicesPerSphere: Int = 0
     private var instanceArray: [NodeInstance] = []     // per-node instance data (CPU staging)
+
+    /// GPU sphere vertex for template buffer. Layout matches Metal SphereTemplateVertex.
+    private struct GPUSphereVertex {
+        var px: Float, py: Float, pz: Float
+        var nx: Float, ny: Float, nz: Float
+    }
+
+    /// Dispatch parameters for stamp_node_spheres. Layout matches Metal StampParams.
+    private struct StampParams {
+        var vertsPerNode: UInt32
+        var nodeCount: UInt32
+    }
+
+    // Metal compute pipeline for GPU label quad stamping (stamp_label_quads kernel)
+    private var labelStampPipeline: MTLComputePipelineState?
+    private var labelInstanceBuffer: MTLBuffer?
+    private var labelParamsBuffer: MTLBuffer?
+    private var labelInstanceCapacity: Int = 0
+
+    /// Per-label instance data for the Metal compute stamping kernel (64 bytes).
+    /// Layout matches Metal LabelInstance: packed_float3(12) + float(4) + float4(16) + float4(16) + 4×float(16) = 64.
+    private struct LabelInstance {
+        var ax: Float, ay: Float, az: Float  // anchor (12)
+        var halfH: Float                      // (4)
+        var u0: Float, v0: Float, u1: Float, v1: Float  // uvRect (16)
+        var cr: Float, cg: Float, cb: Float, baseOpacity: Float  // color (16)
+        var textAspect: Float                 // (4)
+        var maxVisible: Float                 // (4)
+        var forwardBias: Float                // (4)
+        var flags: UInt32                     // (4)
+    }  // Total: 64 bytes
+
+    /// Dispatch parameters for stamp_label_quads. Layout matches Metal LabelStampParams.
+    private struct LabelStampParams {
+        var cx: Float, cy: Float, cz: Float  // cameraPos (12)
+        var minDepth: Float                   // (4)
+        var depthRange: Float                 // (4)
+        var labelCount: UInt32                // (4)
+        var _pad0: Float = 0                  // (4) — pad to 28 bytes
+        var _pad1: Float = 0                  // (4) — pad to 32 bytes
+    }
+
+    // Staging buffer for edge batch GPU-synchronized writes
+    private var edgeStagingBuffer: MTLBuffer?
+    private var edgeStagingCapacity: Int = 0
 
     // Point lights for glowing/arriving/search-matched nodes
     private var pointLightEntities: [Int64: Entity] = [:]
@@ -122,6 +171,12 @@ final class Graph3DScene {
     /// Debounce atlas regeneration to prevent flicker from texture/UV mismatch
     /// in RealityKit's triple-buffered LowLevelMesh vertex buffers.
     @ObservationIgnored private var labelAtlasRegenFrame: UInt64 = 0
+    /// LowLevelTexture backing the atlas — allows in-place pixel updates without
+    /// creating a new TextureResource or swapping the material on the entity.
+    /// Material swap was the root cause of label flicker (RealityKit rebuild).
+    @ObservationIgnored private var labelAtlasLLT: LowLevelTexture?
+    @ObservationIgnored private var labelAtlasAllocW: Int = 0  // allocated pixel width
+    @ObservationIgnored private var labelAtlasAllocH: Int = 0  // allocated pixel height
 
     /// 48-byte vertex layout shared by batched nodes and edges.
     private struct BatchVertex {
@@ -276,6 +331,7 @@ final class Graph3DScene {
            let library = device.makeDefaultLibrary() {
             metalDevice = device
             metalLibrary = library
+            metalCommandQueue = device.makeCommandQueue()
             frameLog.error("[setup] Metal device=\(device.name), library functionNames=\(library.functionNames)")
             edgeSurfaceShader = CustomMaterial.SurfaceShader(named: "edge_surface", in: library)
 
@@ -296,13 +352,45 @@ final class Graph3DScene {
                 frameLog.error("[setup] ❌ nodeBatchMaterial FAILED: \(error)")
             }
 
-            // Generate sphere template — stored as Swift array for CPU stamping
+            // Generate sphere template and upload to GPU
             let template = Self.generateSphereTemplate(segments: 16, rings: 10)
             vertsPerSphere = template.vertices.count
             indicesPerSphere = template.indices.count
             sphereTemplateIndices = template.indices
             sphereTemplateVertices = template.vertices
             frameLog.error("[setup] sphere template: \(self.vertsPerSphere) verts, \(self.indicesPerSphere) indices")
+
+            // Create compute pipeline for GPU vertex stamping
+            if let stampFn = library.makeFunction(name: "stamp_node_spheres"),
+               let pipeline = try? device.makeComputePipelineState(function: stampFn) {
+                stampComputePipeline = pipeline
+
+                // Upload sphere template to static GPU buffer
+                var gpuVerts = template.vertices.map { tv in
+                    GPUSphereVertex(px: tv.0.x, py: tv.0.y, pz: tv.0.z,
+                                    nx: tv.1.x, ny: tv.1.y, nz: tv.1.z)
+                }
+                let templateBytes = MemoryLayout<GPUSphereVertex>.stride * gpuVerts.count
+                sphereTemplateBuffer = gpuVerts.withUnsafeMutableBufferPointer { ptr in
+                    device.makeBuffer(bytes: ptr.baseAddress!, length: templateBytes, options: .storageModeShared)
+                }
+
+                // Pre-allocate params buffer (reused every frame)
+                stampParamsBuffer = device.makeBuffer(length: MemoryLayout<StampParams>.stride, options: .storageModeShared)
+                frameLog.error("[setup] ✅ stamp_node_spheres compute pipeline created")
+            } else {
+                frameLog.error("[setup] ❌ stamp_node_spheres compute pipeline FAILED — falling back to CPU stamping")
+            }
+
+            // Create compute pipeline for GPU label quad stamping
+            if let labelFn = library.makeFunction(name: "stamp_label_quads"),
+               let pipeline = try? device.makeComputePipelineState(function: labelFn) {
+                labelStampPipeline = pipeline
+                labelParamsBuffer = device.makeBuffer(length: MemoryLayout<LabelStampParams>.stride, options: .storageModeShared)
+                frameLog.error("[setup] ✅ stamp_label_quads compute pipeline created")
+            } else {
+                frameLog.error("[setup] ❌ stamp_label_quads compute pipeline FAILED")
+            }
 
             // Edge batch material
             if let surf = edgeSurfaceShader {
@@ -982,7 +1070,9 @@ final class Graph3DScene {
 
     /// Generate a texture atlas containing all node labels and project labels.
     /// Two-pass: first measures all label sizes to compute exact atlas height, then draws.
-    /// Returns the atlas texture resource; populates `labelAtlasRects` and `projectLabelAtlasRects`.
+    /// Uses LowLevelTexture for in-place pixel updates — avoids material swap on the entity
+    /// which was the root cause of label flicker (RealityKit rebuilds on material assignment).
+    /// Material swap only happens on first creation or rare atlas size increase.
     private func generateLabelAtlas(nodes: [NodeData], hubs: Set<Int64>, projects: Set<String>) {
         let atlasW = 4096
         let padding: CGFloat = 4
@@ -1025,17 +1115,34 @@ final class Graph3DScene {
             cursorX += s.width + padding; rowHeight = max(rowHeight, s.height)
         }
         let neededH = Int(ceil(cursorY + rowHeight + padding))
-        let atlasH = max(512, neededH + 32)  // small margin
-        labelAtlasAspectCorrection = Float(atlasW) / (2.0 * Float(atlasH))
 
         let scale = 2  // retina
-        let pixelW = atlasW * scale
-        let pixelH = atlasH * scale
+        let neededPixelW = atlasW * scale
+        let neededPixelH = max(512, neededH + 32) * scale
 
+        // Determine if existing LowLevelTexture can be reused or needs (re)creation.
+        // Over-allocate height (2x or min 2048pt) to minimize rare material-swap resizes.
+        let needsNewLLT = labelAtlasLLT == nil
+            || neededPixelW > labelAtlasAllocW
+            || neededPixelH > labelAtlasAllocH
+
+        if needsNewLLT {
+            let allocH = max(neededPixelH, 2048 * scale)
+            labelAtlasAllocW = neededPixelW
+            labelAtlasAllocH = allocH
+        }
+
+        // Use allocated dimensions for UV computation so UVs map correctly
+        // into the (potentially larger) LowLevelTexture.
+        let uvAtlasW = labelAtlasAllocW / scale
+        let uvAtlasH = labelAtlasAllocH / scale
+        labelAtlasAspectCorrection = Float(uvAtlasW) / (2.0 * Float(uvAtlasH))
+
+        // CGContext at full allocated pixel size (matches LLT dimensions)
         let colorSpace = CGColorSpaceCreateDeviceRGB()
         guard let ctx = CGContext(
-            data: nil, width: pixelW, height: pixelH,
-            bitsPerComponent: 8, bytesPerRow: pixelW * 4,
+            data: nil, width: labelAtlasAllocW, height: labelAtlasAllocH,
+            bitsPerComponent: 8, bytesPerRow: labelAtlasAllocW * 4,
             space: colorSpace,
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
         ) else {
@@ -1044,17 +1151,17 @@ final class Graph3DScene {
         }
 
         // Flip for correct text rendering (Core Graphics is bottom-up)
-        ctx.translateBy(x: 0, y: CGFloat(pixelH))
+        ctx.translateBy(x: 0, y: CGFloat(labelAtlasAllocH))
         ctx.scaleBy(x: CGFloat(scale), y: CGFloat(-scale))
 
-        // Drawing pass — node labels
+        // Drawing pass — node labels (UVs relative to allocated atlas size)
         var rects: [Int64: (u0: Float, v0: Float, u1: Float, v1: Float)] = [:]
         cursorX = 2; cursorY = 0; rowHeight = 0
 
         for (i, node) in nodes.enumerated() {
             let s = nodeSizes[i]
             if cursorX + s.width > CGFloat(atlasW) { cursorX = 2; cursorY += rowHeight + padding; rowHeight = 0 }
-            if cursorY + s.height > CGFloat(atlasH) { break }
+            if cursorY + s.height > CGFloat(uvAtlasH) { break }
 
             let isHub = hubs.contains(node.id)
             let weight: NSFont.Weight = isHub ? .bold : .medium
@@ -1068,8 +1175,8 @@ final class Graph3DScene {
             NSGraphicsContext.restoreGraphicsState()
 
             rects[node.id] = (
-                Float(cursorX) / Float(atlasW), Float(cursorY) / Float(atlasH),
-                Float(cursorX + s.width) / Float(atlasW), Float(cursorY + s.height) / Float(atlasH)
+                Float(cursorX) / Float(uvAtlasW), Float(cursorY) / Float(uvAtlasH),
+                Float(cursorX + s.width) / Float(uvAtlasW), Float(cursorY + s.height) / Float(uvAtlasH)
             )
             cursorX += s.width + padding; rowHeight = max(rowHeight, s.height)
         }
@@ -1081,7 +1188,7 @@ final class Graph3DScene {
         for (i, project) in sortedProjects.enumerated() {
             let s = projSizes[i]
             if cursorX + s.width > CGFloat(atlasW) { cursorX = 2; cursorY += rowHeight + padding; rowHeight = 0 }
-            if cursorY + s.height > CGFloat(atlasH) { break }
+            if cursorY + s.height > CGFloat(uvAtlasH) { break }
 
             let drawPoint = CGPoint(x: cursorX + padding, y: cursorY + padding * 0.5)
             NSGraphicsContext.saveGraphicsState()
@@ -1090,36 +1197,102 @@ final class Graph3DScene {
             NSGraphicsContext.restoreGraphicsState()
 
             projRects[project] = (
-                Float(cursorX) / Float(atlasW), Float(cursorY) / Float(atlasH),
-                Float(cursorX + s.width) / Float(atlasW), Float(cursorY + s.height) / Float(atlasH)
+                Float(cursorX) / Float(uvAtlasW), Float(cursorY) / Float(uvAtlasH),
+                Float(cursorX + s.width) / Float(uvAtlasW), Float(cursorY + s.height) / Float(uvAtlasH)
             )
             cursorX += s.width + padding; rowHeight = max(rowHeight, s.height)
         }
 
-        guard let cgImage = ctx.makeImage() else {
-            frameLog.error("[labelAtlas] ❌ CGImage creation failed")
+        // Get raw pixel data from CGContext
+        guard let pixelData = ctx.data else {
+            frameLog.error("[labelAtlas] ❌ CGContext data is nil")
             return
         }
-        guard let texture = try? TextureResource.generate(from: cgImage, options: .init(semantic: .raw)) else {
-            frameLog.error("[labelAtlas] ❌ TextureResource generation failed")
+        let bytesPerRow = labelAtlasAllocW * 4
+
+        // Helper: blit CPU pixel data into a private-storage MTLTexture via staging buffer.
+        func blitPixelData(to llt: LowLevelTexture, device: MTLDevice, queue: MTLCommandQueue,
+                           data: UnsafeRawPointer, width: Int, height: Int, bytesPerRow: Int) -> Bool {
+            let totalBytes = bytesPerRow * height
+            guard let staging = device.makeBuffer(bytes: data, length: totalBytes, options: .storageModeShared),
+                  let cmdBuf = queue.makeCommandBuffer() else { return false }
+            let dstTexture = llt.replace(using: cmdBuf)
+            guard let blit = cmdBuf.makeBlitCommandEncoder() else { cmdBuf.commit(); return false }
+            blit.copy(
+                from: staging, sourceOffset: 0, sourceBytesPerRow: bytesPerRow, sourceBytesPerImage: totalBytes,
+                sourceSize: MTLSize(width: width, height: height, depth: 1),
+                to: dstTexture, destinationSlice: 0, destinationLevel: 0, destinationOrigin: MTLOrigin()
+            )
+            blit.endEncoding()
+            cmdBuf.commit()
+            return true
+        }
+
+        guard let device = metalDevice, let queue = metalCommandQueue else {
+            frameLog.error("[labelAtlas] ❌ Metal device or command queue unavailable")
             return
         }
 
-        labelAtlasTexture = texture
+        if needsNewLLT {
+            // Create new LowLevelTexture + TextureResource + material swap (rare)
+            let allocW = self.labelAtlasAllocW
+            let allocH = self.labelAtlasAllocH
+            let desc = LowLevelTexture.Descriptor(
+                textureType: .type2D,
+                pixelFormat: .rgba8Unorm,
+                width: allocW,
+                height: allocH,
+                mipmapLevelCount: 1,
+                textureUsage: [.shaderRead]
+            )
+
+            guard let llt = try? LowLevelTexture(descriptor: desc) else {
+                frameLog.error("[labelAtlas] ❌ LowLevelTexture creation failed")
+                return
+            }
+
+            guard blitPixelData(to: llt, device: device, queue: queue,
+                                data: pixelData, width: allocW, height: allocH, bytesPerRow: bytesPerRow) else {
+                frameLog.error("[labelAtlas] ❌ blit to new LLT failed")
+                return
+            }
+
+            guard let textureResource = try? TextureResource(from: llt) else {
+                frameLog.error("[labelAtlas] ❌ TextureResource from LowLevelTexture failed")
+                return
+            }
+
+            labelAtlasLLT = llt
+            labelAtlasTexture = textureResource
+
+            // Material swap — only on first creation or rare resize
+            if var mat = labelBatchMaterial {
+                mat.custom.texture = .init(CustomMaterial.Texture(textureResource))
+                labelBatchMaterial = mat
+                labelBatchEntity?.model?.materials = [mat]
+            }
+
+            frameLog.error("[labelAtlas] ✅ NEW LLT: \(rects.count) node + \(projRects.count) project labels, alloc=\(allocW/scale)×\(allocH/scale), needed=\(atlasW)×\(neededPixelH/scale)")
+        } else {
+            // In-place update — NO material swap, no entity rebuild.
+            guard let llt = labelAtlasLLT else { return }
+            let allocW = self.labelAtlasAllocW
+            let allocH = self.labelAtlasAllocH
+
+            guard blitPixelData(to: llt, device: device, queue: queue,
+                                data: pixelData, width: allocW, height: allocH, bytesPerRow: bytesPerRow) else {
+                frameLog.error("[labelAtlas] ❌ blit to existing LLT failed")
+                return
+            }
+
+            frameLog.error("[labelAtlas] ✅ IN-PLACE update: \(rects.count) node + \(projRects.count) project labels")
+        }
+
         labelAtlasRects = rects
         projectLabelAtlasRects = projRects
         labelAtlasNodeIds = Set(nodes.map(\.id))
         labelAtlasHubIds = hubs
         labelAtlasProjects = projects
-
-        // Update material texture binding
-        if var mat = labelBatchMaterial {
-            mat.custom.texture = .init(CustomMaterial.Texture(texture))
-            labelBatchMaterial = mat
-            labelBatchEntity?.model?.materials = [mat]
-        }
-
-        frameLog.error("[labelAtlas] ✅ atlas generated: \(rects.count) node + \(projRects.count) project labels, \(atlasW)×\(atlasH), cursorY=\(cursorY) projects=\(projects.sorted())")
     }
 
     /// Create or resize the LowLevelMesh for batched label rendering.
@@ -1281,179 +1454,146 @@ final class Graph3DScene {
         }
         let depthRange = max(1.0, maxDepth - minDepth)
 
-        mesh.withUnsafeMutableBytes(bufferIndex: 0) { raw in
-            let verts = raw.bindMemory(to: BatchVertex.self)
-            var quadIdx = 0
-
-            let maxQuads = labelBatchCapacity - projectLabelCount
-            for (id, pos3D) in allPositions {
-                guard quadIdx < maxQuads,
-                      let nodeData = nodeById[id],
-                      let rect = labelAtlasRects[id] else {
-                    continue
-                }
-
-                let depth = simd_length(pos3D - camPos)
-                let isSelected = id == selectedNode
-                let isHub = hubs.contains(id)
-                let importance = Float(max(1, nodeData.importance))
-
-                // LOD check — search-matched nodes visible from much further
-                let isSearchMatch = renderIsSearchActive && renderSearchMatchIds.contains(id)
-                if !isSelected && !expandedChildren.contains(id) && !isSearchMatch {
-                    let maxVisible: Float = isHub ? 1200 : (200 + importance * 80)
-                    guard depth < maxVisible else {
-                        // Write 4 degenerate zero vertices
-                        let base = quadIdx * 4
-                        for c in 0..<4 {
-                            verts[base + c] = BatchVertex(px: 0, py: 0, pz: 0, nx: 0, ny: 0, nz: 0, u: 0, v: 0, cr: 0, cg: 0, cb: 0, ca: 0)
-                        }
-                        quadIdx += 1
-                        continue
-                    }
-                }
-
-                // Opacity — same formula as old overlay
-                let depthNorm = (depth - minDepth) / depthRange
-                let depthFade: Float = isSelected ? 1.0 : (1.0 - depthNorm * 0.7)
-
-                let maxVisible: Float = isHub ? 1200 : (200 + importance * 80)
-                let fadeRange = maxVisible * 0.3
-                let fadeT: Float = isSelected ? 1.0 : min(1.0, max(0.0, (maxVisible - depth) / fadeRange))
-
-                let baseOpacity: Float = isSelected ? 0.95 : (isHub ? 0.8 : 0.6)
-                let searchDimmed = renderIsSearchActive && !renderSearchMatchIds.contains(id)
-                let searchFade: Float = searchDimmed ? 0.15 : 1.0
-                let opacity = baseOpacity * fadeT * depthFade * searchFade
-
-                if opacity < 0.02 {
-                    let base = quadIdx * 4
-                    for c in 0..<4 {
-                        verts[base + c] = BatchVertex(px: 0, py: 0, pz: 0, nx: 0, ny: 0, nz: 0, u: 0, v: 0, cr: 0, cg: 0, cb: 0, ca: 0)
-                    }
-                    quadIdx += 1
-                    continue
-                }
-
-                // Quad dimensions — halfH from node type, halfW from text aspect ratio
-                let halfH: Float = isSelected ? 0.025 : (isHub ? 0.022 : 0.018)
-                let textAspect = (rect.u1 - rect.u0) / max(0.001, rect.v1 - rect.v0) * aspectCorr
-                let halfW = halfH * textAspect
-
-                // Anchor position: node world pos scaled + Y offset above sphere
-                let anchor = pos3D * sf + SIMD3<Float>(0, nodeRadius * 1.8, 0)
-
-                // Corners: TL(0), TR(1), BL(2), BR(3)
-                // normal carries pre-multiplied billboard offset (cx*halfW, cy*halfH, 0)
-                let base = quadIdx * 4
-
-                // v0 = TL: corner (-1, +1)
-                verts[base] = BatchVertex(
-                    px: anchor.x, py: anchor.y, pz: anchor.z,
-                    nx: -halfW, ny: halfH, nz: 0,
-                    u: rect.u0, v: rect.v0,
-                    cr: 1, cg: 1, cb: 1, ca: opacity)
-                // v1 = TR: corner (+1, +1)
-                verts[base + 1] = BatchVertex(
-                    px: anchor.x, py: anchor.y, pz: anchor.z,
-                    nx: halfW, ny: halfH, nz: 0,
-                    u: rect.u1, v: rect.v0,
-                    cr: 1, cg: 1, cb: 1, ca: opacity)
-                // v2 = BL: corner (-1, 0)
-                verts[base + 2] = BatchVertex(
-                    px: anchor.x, py: anchor.y, pz: anchor.z,
-                    nx: -halfW, ny: 0, nz: 0,
-                    u: rect.u0, v: rect.v1,
-                    cr: 1, cg: 1, cb: 1, ca: opacity)
-                // v3 = BR: corner (+1, 0)
-                verts[base + 3] = BatchVertex(
-                    px: anchor.x, py: anchor.y, pz: anchor.z,
-                    nx: halfW, ny: 0, nz: 0,
-                    u: rect.u1, v: rect.v1,
-                    cr: 1, cg: 1, cb: 1, ca: opacity)
-
-                quadIdx += 1
-            }
-
-            // Project labels — larger quads floating above each project cluster
-            let projCentroids = projectCentroids
-            let projAtlasRects = projectLabelAtlasRects
-            for (project, centroidData) in projCentroids {
-                guard let rect = projAtlasRects[project] else { continue }
-
-                // Position label above the topmost node in the cluster, not at centroid
-                let labelY = centroidData.maxY * sf + 0.15  // above highest node
-                let anchor = SIMD3<Float>(centroidData.centroid.x * sf, labelY, centroidData.centroid.z * sf)
-                let depth = simd_length(centroidData.centroid - camPos)
-
-                // LOD — visible from much farther than node labels
-                let maxVisible: Float = 12000
-                guard depth < maxVisible else {
-                    let base = quadIdx * 4
-                    for c in 0..<4 {
-                        verts[base + c] = BatchVertex(px: 0, py: 0, pz: 0, nx: 0, ny: 0, nz: 0, u: 0, v: 0, cr: 0, cg: 0, cb: 0, ca: 0)
-                    }
-                    quadIdx += 1
-                    continue
-                }
-
-                let fadeRange = maxVisible * 0.3
-                let fadeT = min(1.0, max(0.0, (maxVisible - depth) / fadeRange))
-                let opacity: Float = 0.9 * fadeT
-
-                if opacity < 0.02 {
-                    let base = quadIdx * 4
-                    for c in 0..<4 {
-                        verts[base + c] = BatchVertex(px: 0, py: 0, pz: 0, nx: 0, ny: 0, nz: 0, u: 0, v: 0, cr: 0, cg: 0, cb: 0, ca: 0)
-                    }
-                    quadIdx += 1
-                    continue
-                }
-
-                // ~7x node label size for prominent project labels
-                let halfH: Float = 0.15
-                let textAspect = (rect.u1 - rect.u0) / max(0.001, rect.v1 - rect.v0) * aspectCorr
-                let halfW = halfH * textAspect
-
-                // Pre-computed project color
-                let color = projectColors[project] ?? SIMD3<Float>(1, 1, 1)
-
-                // nz encodes forward bias toward camera (rendered in front of nodes and edges)
-                let fwd: Float = 0.25
-                let base = quadIdx * 4
-                verts[base] = BatchVertex(
-                    px: anchor.x, py: anchor.y, pz: anchor.z,
-                    nx: -halfW, ny: halfH, nz: fwd,
-                    u: rect.u0, v: rect.v0,
-                    cr: color.x, cg: color.y, cb: color.z, ca: opacity)
-                verts[base + 1] = BatchVertex(
-                    px: anchor.x, py: anchor.y, pz: anchor.z,
-                    nx: halfW, ny: halfH, nz: fwd,
-                    u: rect.u1, v: rect.v0,
-                    cr: color.x, cg: color.y, cb: color.z, ca: opacity)
-                verts[base + 2] = BatchVertex(
-                    px: anchor.x, py: anchor.y, pz: anchor.z,
-                    nx: -halfW, ny: 0, nz: fwd,
-                    u: rect.u0, v: rect.v1,
-                    cr: color.x, cg: color.y, cb: color.z, ca: opacity)
-                verts[base + 3] = BatchVertex(
-                    px: anchor.x, py: anchor.y, pz: anchor.z,
-                    nx: halfW, ny: 0, nz: fwd,
-                    u: rect.u1, v: rect.v1,
-                    cr: color.x, cg: color.y, cb: color.z, ca: opacity)
-
-                quadIdx += 1
-            }
-
-            // Zero remaining vertices
-            let totalUsed = quadIdx * 4
-            let totalCapacity = labelBatchCapacity * 4
-            if totalUsed < totalCapacity {
-                for i in totalUsed..<totalCapacity {
-                    verts[i] = BatchVertex(px: 0, py: 0, pz: 0, nx: 0, ny: 0, nz: 0, u: 0, v: 0, cr: 0, cg: 0, cb: 0, ca: 0)
-                }
-            }
+        // --- GPU stamp: Metal compute kernel writes label quad vertices into mesh buffer ---
+        // ~500 labels × 64 bytes = ~32KB instance upload (vs 96KB of vertex data previously).
+        // Uses LowLevelMesh.replace(bufferIndex:using:) for synchronized triple-buffer writes.
+        guard let queue = metalCommandQueue,
+              let pipeline = labelStampPipeline,
+              let paramsBuf = labelParamsBuffer,
+              let cmdBuf = queue.makeCommandBuffer() else {
+            frameLog.error("[labelBatch] ❌ GPU stamp unavailable — skipping frame")
+            return
         }
+
+        // Build instance array on CPU
+        let totalLabelCapacity = labelBatchCapacity
+        let maxNodeLabels = totalLabelCapacity - projectLabelCount
+        var instances = [LabelInstance]()
+        instances.reserveCapacity(min(allPositions.count + projectLabelCount, totalLabelCapacity))
+
+        for (id, pos3D) in allPositions {
+            guard instances.count < maxNodeLabels,
+                  let nodeData = nodeById[id],
+                  let rect = labelAtlasRects[id] else {
+                continue
+            }
+
+            let isSelected = id == selectedNode
+            let isHub = hubs.contains(id)
+            let importance = Float(max(1, nodeData.importance))
+            let isSearchMatch = renderIsSearchActive && renderSearchMatchIds.contains(id)
+            let searchDimmed = renderIsSearchActive && !renderSearchMatchIds.contains(id)
+
+            let maxVisible: Float = (isSelected || expandedChildren.contains(id) || isSearchMatch)
+                ? .greatestFiniteMagnitude
+                : (isHub ? 1200 : (200 + importance * 80))
+
+            let baseOpacity: Float = isSelected ? 0.95 : (isHub ? 0.8 : 0.6)
+            let halfH: Float = isSelected ? 0.025 : (isHub ? 0.022 : 0.018)
+            let textAspect = (rect.u1 - rect.u0) / max(0.001, rect.v1 - rect.v0) * aspectCorr
+
+            // Anchor position: node world pos scaled + Y offset above sphere
+            let anchor = pos3D * sf + SIMD3<Float>(0, nodeRadius * 1.8, 0)
+
+            var flags: UInt32 = 0
+            if isSelected { flags |= 1 }
+            if isSearchMatch { flags |= 2 }
+            if searchDimmed { flags |= 4 }
+
+            instances.append(LabelInstance(
+                ax: anchor.x, ay: anchor.y, az: anchor.z,
+                halfH: halfH,
+                u0: rect.u0, v0: rect.v0, u1: rect.u1, v1: rect.v1,
+                cr: 1, cg: 1, cb: 1, baseOpacity: baseOpacity,
+                textAspect: textAspect,
+                maxVisible: maxVisible,
+                forwardBias: 0,
+                flags: flags
+            ))
+        }
+
+        // Project labels — larger quads floating above each project cluster
+        for (project, centroidData) in projectCentroids {
+            guard let rect = projectLabelAtlasRects[project] else { continue }
+
+            let labelY = centroidData.maxY * sf + 0.15
+            let anchor = SIMD3<Float>(centroidData.centroid.x * sf, labelY, centroidData.centroid.z * sf)
+            let color = projectColors[project] ?? SIMD3<Float>(1, 1, 1)
+            let textAspect = (rect.u1 - rect.u0) / max(0.001, rect.v1 - rect.v0) * aspectCorr
+
+            instances.append(LabelInstance(
+                ax: anchor.x, ay: anchor.y, az: anchor.z,
+                halfH: 0.15,
+                u0: rect.u0, v0: rect.v0, u1: rect.u1, v1: rect.v1,
+                cr: color.x, cg: color.y, cb: color.z, baseOpacity: 0.9,
+                textAspect: textAspect,
+                maxVisible: 12000,
+                forwardBias: 0.25,
+                flags: 0
+            ))
+        }
+
+        let actualLabelCount = instances.count
+
+        // Ensure instance GPU buffer is large enough
+        if labelInstanceCapacity < actualLabelCount {
+            let newCap = max(actualLabelCount * 2, 512)
+            labelInstanceBuffer = metalDevice?.makeBuffer(
+                length: newCap * MemoryLayout<LabelInstance>.stride,
+                options: .storageModeShared
+            )
+            labelInstanceCapacity = newCap
+        }
+        guard let instanceBuf = labelInstanceBuffer else { return }
+
+        // Upload instance data to shared GPU buffer
+        instances.withUnsafeBufferPointer { ptr in
+            guard let base = ptr.baseAddress else { return }
+            instanceBuf.contents().copyMemory(
+                from: base,
+                byteCount: actualLabelCount * MemoryLayout<LabelInstance>.stride
+            )
+        }
+
+        // Set dispatch parameters — camera pos in scaled world coords for depth calc
+        let scaledCamPos = camPos * sf
+        let paramsPtr = paramsBuf.contents().bindMemory(to: LabelStampParams.self, capacity: 1)
+        paramsPtr.pointee = LabelStampParams(
+            cx: scaledCamPos.x, cy: scaledCamPos.y, cz: scaledCamPos.z,
+            minDepth: minDepth * sf, depthRange: depthRange * sf,
+            labelCount: UInt32(actualLabelCount)
+        )
+
+        // Get writable output buffer — synchronized with RealityKit's triple-buffering
+        let outputBuf = mesh.replace(bufferIndex: 0, using: cmdBuf)
+
+        // Encode compute dispatch
+        guard let encoder = cmdBuf.makeComputeCommandEncoder() else {
+            cmdBuf.commit()
+            return
+        }
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(instanceBuf, offset: 0, index: 0)
+        encoder.setBuffer(paramsBuf, offset: 0, index: 1)
+        encoder.setBuffer(outputBuf, offset: 0, index: 2)
+
+        let threadgroupSize = min(pipeline.maxTotalThreadsPerThreadgroup, 256)
+        let threadgroups = (actualLabelCount + threadgroupSize - 1) / threadgroupSize
+        encoder.dispatchThreadgroups(
+            MTLSize(width: threadgroups, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: threadgroupSize, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+
+        // Zero stale vertices beyond actualLabelCount to prevent ghost rendering
+        let writtenBytes = actualLabelCount * 4 * 48  // 4 verts × 48 bytes per BatchVertex
+        let totalBytes = labelBatchCapacity * 4 * 48
+        if writtenBytes < totalBytes, let blit = cmdBuf.makeBlitCommandEncoder() {
+            blit.fill(buffer: outputBuf, range: writtenBytes..<totalBytes, value: 0)
+            blit.endEncoding()
+        }
+
+        cmdBuf.commit()
 
         // Capacity-based recovery (same pattern as node/edge)
         let capacityIndexCount = labelBatchCapacity * 6
@@ -1641,46 +1781,80 @@ final class Graph3DScene {
             frameLog.error("[nodeBatch] ⚠️ MISMATCH: actualNodeCount=\(actualNodeCount) vs positions.count=\(nodeCount) nodes.count=\(nodes.count)")
         }
 
-        // --- CPU stamp: directly write sphere vertices into mesh buffer ---
-        // For ~500 nodes × 52 verts = 26K vertices, CPU is faster than GPU dispatch
-        // overhead (command buffer encode + submit + fence wait).
-        let templateVerts = sphereTemplateVertices
+        // --- GPU stamp: Metal compute kernel writes sphere vertices into mesh buffer ---
+        // ~500 nodes × 146 verts = 73K vertices stamped in parallel on GPU.
+        // CPU only uploads ~16KB of instance data (vs 3.4MB of vertex data previously).
+        // Uses LowLevelMesh.replace(bufferIndex:using:) for synchronized triple-buffer writes.
         let vps = vertsPerSphere
-        let instances = instanceArray
-        mesh.withUnsafeMutableBytes(bufferIndex: 0) { raw in
-            let outPtr = raw.baseAddress!.assumingMemoryBound(to: Float.self)
-            for nodeIdx in 0..<actualNodeCount {
-                let inst = instances[nodeIdx]
-                let instPos = SIMD3<Float>(inst.px, inst.py, inst.pz)
-                let scale = inst.scale
-                let cr = inst.cr, cg = inst.cg, cb = inst.cb, packed = inst.packed
-                for vertIdx in 0..<vps {
-                    let tv = templateVerts[vertIdx]
-                    let wp = instPos + tv.pos * scale
-                    let base = (nodeIdx * vps + vertIdx) * 12
-                    outPtr[base + 0]  = wp.x
-                    outPtr[base + 1]  = wp.y
-                    outPtr[base + 2]  = wp.z
-                    outPtr[base + 3]  = tv.norm.x
-                    outPtr[base + 4]  = tv.norm.y
-                    outPtr[base + 5]  = tv.norm.z
-                    outPtr[base + 6]  = 0  // uv0.x (reserved — nonzero causes lit pipeline artifacts)
-                    outPtr[base + 7]  = 0
-                    outPtr[base + 8]  = cr
-                    outPtr[base + 9]  = cg
-                    outPtr[base + 10] = cb
-                    outPtr[base + 11] = packed
-                }
-            }
-            // Zero stale vertices beyond actualNodeCount to prevent ghost rendering.
-            // Part indexCount covers full capacity, so unwritten slots must be degenerate.
-            let writtenFloats = actualNodeCount * vps * 12
-            let capacityFloats = nodeBatchCapacity * vps * 12
-            if writtenFloats < capacityFloats {
-                let startPtr = outPtr + writtenFloats
-                startPtr.update(repeating: 0, count: capacityFloats - writtenFloats)
-            }
+        guard let queue = metalCommandQueue,
+              let pipeline = stampComputePipeline,
+              let templateBuf = sphereTemplateBuffer,
+              let paramsBuf = stampParamsBuffer,
+              let cmdBuf = queue.makeCommandBuffer() else {
+            frameLog.error("[nodeBatch] ❌ GPU stamp unavailable — skipping frame")
+            return
         }
+
+        // Ensure instance GPU buffer is large enough
+        if stampInstanceCapacity < actualNodeCount {
+            let newCap = max(actualNodeCount * 2, 512)
+            stampInstanceBuffer = metalDevice?.makeBuffer(
+                length: newCap * MemoryLayout<NodeInstance>.stride,
+                options: .storageModeShared
+            )
+            stampInstanceCapacity = newCap
+        }
+        guard let instanceBuf = stampInstanceBuffer else { return }
+
+        // Upload instance data to shared GPU buffer
+        instanceArray.withUnsafeBufferPointer { ptr in
+            guard let base = ptr.baseAddress else { return }
+            instanceBuf.contents().copyMemory(
+                from: base,
+                byteCount: actualNodeCount * MemoryLayout<NodeInstance>.stride
+            )
+        }
+
+        // Set dispatch parameters
+        let paramsPtr = paramsBuf.contents().bindMemory(to: StampParams.self, capacity: 1)
+        paramsPtr.pointee = StampParams(
+            vertsPerNode: UInt32(vps),
+            nodeCount: UInt32(actualNodeCount)
+        )
+
+        // Get writable output buffer — synchronized with RealityKit's triple-buffering
+        let outputBuf = mesh.replace(bufferIndex: 0, using: cmdBuf)
+
+        // Encode compute dispatch
+        guard let encoder = cmdBuf.makeComputeCommandEncoder() else {
+            cmdBuf.commit()
+            return
+        }
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(templateBuf, offset: 0, index: 0)
+        encoder.setBuffer(instanceBuf, offset: 0, index: 1)
+        encoder.setBuffer(paramsBuf, offset: 0, index: 2)
+        encoder.setBuffer(outputBuf, offset: 0, index: 3)
+
+        let totalVerts = actualNodeCount * vps
+        let threadgroupSize = min(pipeline.maxTotalThreadsPerThreadgroup, 256)
+        let threadgroups = (totalVerts + threadgroupSize - 1) / threadgroupSize
+        encoder.dispatchThreadgroups(
+            MTLSize(width: threadgroups, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: threadgroupSize, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+
+        // Zero stale vertices beyond actualNodeCount to prevent ghost rendering.
+        // Part indexCount covers full capacity, so unwritten slots must be degenerate.
+        let writtenBytes = actualNodeCount * vps * 48  // 48 bytes per BatchVertex
+        let totalBytes = nodeBatchCapacity * vps * 48
+        if writtenBytes < totalBytes, let blit = cmdBuf.makeBlitCommandEncoder() {
+            blit.fill(buffer: outputBuf, range: writtenBytes..<totalBytes, value: 0)
+            blit.endEncoding()
+        }
+
+        cmdBuf.commit()
 
         // Use capacity-based index count — parts.replaceAll only fires when recovering
         // from the zero-guard (which clears parts and sets lastNodePartIndexCount=0).
@@ -1835,110 +2009,133 @@ final class Graph3DScene {
             nodeRadii[node.id] = baseR * (1.0 + Float(importance - 1) * 0.08)
         }
 
-        var actualEdges = 0
-
-        mesh.withUnsafeMutableBytes(bufferIndex: 0) { raw in
-            let vertices = raw.bindMemory(to: BatchVertex.self)
-            var vi = 0
-
-            for edge in edges {
-                guard let from = positions[edge.sourceId],
-                      let to = positions[edge.targetId] else {
-                    // Degenerate: write 12 zero vertices (cylinder has 12 verts)
-                    let zero = BatchVertex(px: 0, py: 0, pz: 0, nx: 0, ny: 1, nz: 0,
-                                               u: 0, v: 0, cr: 0, cg: 0, cb: 0, ca: 0)
-                    for _ in 0..<12 { vertices[vi] = zero; vi += 1 }
-                    continue
-                }
-
-                let p1 = from * scaleFactor
-                let p2 = to * scaleFactor
-                let delta = p2 - p1
-                let length = simd_length(delta)
-
-                // Inset endpoints by node radii so edges stop at sphere surfaces
-                let r1 = nodeRadii[edge.sourceId] ?? nodeRadius
-                let r2 = nodeRadii[edge.targetId] ?? nodeRadius
-                guard length > r1 + r2 else {
-                    // Edge too short — nodes overlap, write 12 degenerate vertices
-                    let zero = BatchVertex(px: 0, py: 0, pz: 0, nx: 0, ny: 1, nz: 0,
-                                               u: 0, v: 0, cr: 0, cg: 0, cb: 0, ca: 0)
-                    for _ in 0..<12 { vertices[vi] = zero; vi += 1 }
-                    continue
-                }
-
-                let dir = delta / length
-                let p1inset = p1 + dir * r1
-                let p2inset = p2 - dir * r2
-
-                // Build perpendicular basis vectors for cylinder cross-section
-                let basisUp: SIMD3<Float> = abs(dir.y) < 0.99 ? SIMD3(0, 1, 0) : SIMD3(1, 0, 0)
-                let basisRight = simd_normalize(cross(dir, basisUp))
-                let basisForward = simd_normalize(cross(basisRight, dir))
-
-                let connected = edge.sourceId == selectedNode || edge.targetId == selectedNode
-                let radius = connected ? edgeRadius * 2.5 : edgeRadius * 1.3
-
-                // State encoding for shader
-                let searchDimmed = renderIsSearchActive
-                    && !renderSearchMatchIds.contains(edge.sourceId)
-                    && !renderSearchMatchIds.contains(edge.targetId)
-                let state: Float
-                if connected { state = 1 }
-                else if searchDimmed { state = 2 }
-                else if isSemanticMode { state = 3 }
-                else { state = 0 }
-
-                // Per-edge color
-                let color: SIMD3<Float>
-                if connected {
-                    color = SIMD3<Float>(1, 1, 1)
-                } else {
-                    color = edgeColorFloat3(for: nodeProject[edge.sourceId], colorMap: colorMap)
-                }
-
-                // Cylinder: 12 vertices (bottom ring 0..5, top ring 6..11)
-                // Bottom ring at p1inset
-                for seg in 0..<6 {
-                    let angle = Float(seg) * (.pi * 2 / 6)
-                    let c = cos(angle), s = sin(angle)
-                    let offset = (basisRight * c + basisForward * s) * radius
-                    let normal = simd_normalize(basisRight * c + basisForward * s)
-                    let bp = p1inset + offset
-                    vertices[vi] = BatchVertex(px: bp.x, py: bp.y, pz: bp.z,
-                                                   nx: normal.x, ny: normal.y, nz: normal.z,
-                                                   u: state, v: 0,
-                                                   cr: color.x, cg: color.y, cb: color.z, ca: 1)
-                    vi += 1
-                }
-                // Top ring at p2inset
-                for seg in 0..<6 {
-                    let angle = Float(seg) * (.pi * 2 / 6)
-                    let c = cos(angle), s = sin(angle)
-                    let offset = (basisRight * c + basisForward * s) * radius
-                    let normal = simd_normalize(basisRight * c + basisForward * s)
-                    let tp = p2inset + offset
-                    vertices[vi] = BatchVertex(px: tp.x, py: tp.y, pz: tp.z,
-                                                   nx: normal.x, ny: normal.y, nz: normal.z,
-                                                   u: state, v: 1,
-                                                   cr: color.x, cg: color.y, cb: color.z, ca: 1)
-                    vi += 1
-                }
-                actualEdges += 1
-            }
-
-            // Zero stale vertices beyond actual edges to prevent ghost rendering.
-            let vertsPerEdge = 12
-            let writtenVerts = actualEdges * vertsPerEdge
-            let capacityVerts = edgeBatchCapacity * vertsPerEdge
-            if writtenVerts < capacityVerts {
-                let zero = BatchVertex(px: 0, py: 0, pz: 0, nx: 0, ny: 1, nz: 0,
-                                       u: 0, v: 0, cr: 0, cg: 0, cb: 0, ca: 0)
-                for i in writtenVerts..<capacityVerts {
-                    vertices[i] = zero
-                }
-            }
+        // --- GPU-synchronized edge buffer write using replace+blit pattern ---
+        // Uses staging MTLBuffer for CPU vertex generation, then blit-copies to the
+        // RealityKit-managed output buffer via LowLevelMesh.replace(bufferIndex:using:).
+        // This eliminates flicker from replaceUnsafeMutableBytes synchronization gaps.
+        guard let queue = metalCommandQueue,
+              let cmdBuf = queue.makeCommandBuffer() else {
+            frameLog.error("[edgeBatch] ❌ Metal queue unavailable — skipping frame")
+            return
         }
+
+        let vertsPerEdge = 12
+        let bytesPerVertex = 48  // sizeof(BatchVertex)
+        let totalStagingVerts = edgeBatchCapacity * vertsPerEdge
+        let totalStagingBytes = totalStagingVerts * bytesPerVertex
+
+        // Ensure staging buffer is large enough
+        if edgeStagingCapacity < edgeBatchCapacity {
+            edgeStagingBuffer = metalDevice?.makeBuffer(
+                length: totalStagingBytes,
+                options: .storageModeShared
+            )
+            edgeStagingCapacity = edgeBatchCapacity
+        }
+        guard let stagingBuf = edgeStagingBuffer else { return }
+
+        // CPU-fill staging buffer with edge cylinder geometry
+        var actualEdges = 0
+        let vertices = stagingBuf.contents().bindMemory(to: BatchVertex.self, capacity: totalStagingVerts)
+        var vi = 0
+
+        for edge in edges {
+            guard let from = positions[edge.sourceId],
+                  let to = positions[edge.targetId] else {
+                let zero = BatchVertex(px: 0, py: 0, pz: 0, nx: 0, ny: 1, nz: 0,
+                                           u: 0, v: 0, cr: 0, cg: 0, cb: 0, ca: 0)
+                for _ in 0..<12 { vertices[vi] = zero; vi += 1 }
+                continue
+            }
+
+            let p1 = from * scaleFactor
+            let p2 = to * scaleFactor
+            let delta = p2 - p1
+            let length = simd_length(delta)
+
+            let r1 = nodeRadii[edge.sourceId] ?? nodeRadius
+            let r2 = nodeRadii[edge.targetId] ?? nodeRadius
+            guard length > r1 + r2 else {
+                let zero = BatchVertex(px: 0, py: 0, pz: 0, nx: 0, ny: 1, nz: 0,
+                                           u: 0, v: 0, cr: 0, cg: 0, cb: 0, ca: 0)
+                for _ in 0..<12 { vertices[vi] = zero; vi += 1 }
+                continue
+            }
+
+            let dir = delta / length
+            let p1inset = p1 + dir * r1
+            let p2inset = p2 - dir * r2
+
+            let basisUp: SIMD3<Float> = abs(dir.y) < 0.99 ? SIMD3(0, 1, 0) : SIMD3(1, 0, 0)
+            let basisRight = simd_normalize(cross(dir, basisUp))
+            let basisForward = simd_normalize(cross(basisRight, dir))
+
+            let connected = edge.sourceId == selectedNode || edge.targetId == selectedNode
+            let radius = connected ? edgeRadius * 2.5 : edgeRadius * 1.3
+
+            let searchDimmed = renderIsSearchActive
+                && !renderSearchMatchIds.contains(edge.sourceId)
+                && !renderSearchMatchIds.contains(edge.targetId)
+            let state: Float
+            if connected { state = 1 }
+            else if searchDimmed { state = 2 }
+            else if isSemanticMode { state = 3 }
+            else { state = 0 }
+
+            let color: SIMD3<Float>
+            if connected {
+                color = SIMD3<Float>(1, 1, 1)
+            } else {
+                color = edgeColorFloat3(for: nodeProject[edge.sourceId], colorMap: colorMap)
+            }
+
+            // Cylinder: 12 vertices (bottom ring 0..5, top ring 6..11)
+            for seg in 0..<6 {
+                let angle = Float(seg) * (.pi * 2 / 6)
+                let c = cos(angle), s = sin(angle)
+                let offset = (basisRight * c + basisForward * s) * radius
+                let normal = simd_normalize(basisRight * c + basisForward * s)
+                let bp = p1inset + offset
+                vertices[vi] = BatchVertex(px: bp.x, py: bp.y, pz: bp.z,
+                                               nx: normal.x, ny: normal.y, nz: normal.z,
+                                               u: state, v: 0,
+                                               cr: color.x, cg: color.y, cb: color.z, ca: 1)
+                vi += 1
+            }
+            for seg in 0..<6 {
+                let angle = Float(seg) * (.pi * 2 / 6)
+                let c = cos(angle), s = sin(angle)
+                let offset = (basisRight * c + basisForward * s) * radius
+                let normal = simd_normalize(basisRight * c + basisForward * s)
+                let tp = p2inset + offset
+                vertices[vi] = BatchVertex(px: tp.x, py: tp.y, pz: tp.z,
+                                               nx: normal.x, ny: normal.y, nz: normal.z,
+                                               u: state, v: 1,
+                                               cr: color.x, cg: color.y, cb: color.z, ca: 1)
+                vi += 1
+            }
+            actualEdges += 1
+        }
+
+        // Get writable output buffer — synchronized with RealityKit's triple-buffering
+        let outputBuf = mesh.replace(bufferIndex: 0, using: cmdBuf)
+
+        // Blit copy from staging to output
+        let writtenBytes = vi * bytesPerVertex
+        if let blit = cmdBuf.makeBlitCommandEncoder() {
+            if writtenBytes > 0 {
+                blit.copy(from: stagingBuf, sourceOffset: 0,
+                          to: outputBuf, destinationOffset: 0,
+                          size: writtenBytes)
+            }
+            // Zero stale vertices beyond actual edges to prevent ghost rendering
+            if writtenBytes < totalStagingBytes {
+                blit.fill(buffer: outputBuf, range: writtenBytes..<totalStagingBytes, value: 0)
+            }
+            blit.endEncoding()
+        }
+
+        cmdBuf.commit()
 
         // Use capacity-based index count — parts.replaceAll only fires when recovering
         // from the zero-guard (which clears parts and sets lastEdgePartIndexCount=0).
@@ -2244,12 +2441,18 @@ final class Graph3DScene {
     }
 
     func clearAll() {
-        // Clear batched node mesh
+        // Clear batched node mesh + GPU stamp buffers
         nodeBatchEntity?.removeFromParent()
         nodeBatchEntity = nil
         nodeBatchMesh = nil
         nodeBatchCapacity = 0
         nodeColorCache.removeAll()
+        stampInstanceBuffer = nil
+        stampInstanceCapacity = 0
+        labelInstanceBuffer = nil
+        labelInstanceCapacity = 0
+        edgeStagingBuffer = nil
+        edgeStagingCapacity = 0
         // Clear point lights
         for (_, entity) in pointLightEntities { entity.removeFromParent() }
         pointLightEntities.removeAll()
@@ -2269,6 +2472,9 @@ final class Graph3DScene {
         labelBatchMesh = nil
         labelBatchCapacity = 0
         labelAtlasTexture = nil
+        labelAtlasLLT = nil
+        labelAtlasAllocW = 0
+        labelAtlasAllocH = 0
         labelAtlasRects.removeAll()
         projectLabelAtlasRects.removeAll()
         labelAtlasNodeIds.removeAll()
@@ -2772,8 +2978,9 @@ final class Graph3DScene {
         let t0 = CFAbsoluteTimeGetCurrent()
         var msExpand = 0.0, msNodes = 0.0, msEdges = 0.0, msNeb = 0.0, msFlow = 0.0
 
-        // Only do entity updates when scene state changed — camera orbit is free
-        // because GPU shaders compute fog/emissive from camera distance autonomously.
+        // Write node/edge/nebula data when scene state changed.
+        // Node batch uses LowLevelMesh.replace(bufferIndex:using:) for GPU compute —
+        // properly synchronized with RealityKit's triple-buffering, no keep-alive needed.
         if sceneNeedsUpdate {
             // Hub expansion animation (before node/edge updates so positions are current)
             updateExpansions(dt: dtSec)
@@ -2797,8 +3004,7 @@ final class Graph3DScene {
             }
 
             // Batched edge mesh: rebuild when positions, selection, or search changes.
-            // Also re-write during dirty flush frames to flush all internal LowLevelMesh buffers.
-            // Camera movement does NOT require rebuild — GPU shader handles fog/pulse.
+            // meshDirtyFrames flushes all triple-buffers after state changes.
             if !Self.DIAG_SKIP_EDGE_BATCH,
                positionsChanged || selectionChanged || searchChanged || hasExpansions || meshDirtyFrames > 0 {
                 updateEdgeBatch(
