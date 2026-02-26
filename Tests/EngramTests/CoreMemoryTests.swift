@@ -529,30 +529,19 @@ import Foundation
     #expect(text(from: statsB).contains("Total memories: 1"))
 }
 
-@Test func remember_conflictDetection_noEmbedding() async throws {
+@Test func remember_failsWithoutEmbeddingModel() async throws {
     let path = FileManager.default.temporaryDirectory
         .appending(path: "claude-memory-test-\(UUID().uuidString).sqlite")
     let lattice = try Lattice(Memory.self, Edge.self, Checkpoint.self, HookState.self, configuration: .init(fileURL: path))
     let embedder = EmbeddingService(modelPath: "/nonexistent/path")
     let tools = MemoryTools(lattice: lattice, embedder: embedder)
 
-    let r1 = try await tools.handle(CallTool.Parameters(
-        name: "remember",
-        arguments: ["content": .string("Some important fact")]
-    ))
-    #expect(text(from: r1).contains("Stored memory"))
-
-    let r2 = try await tools.handle(CallTool.Parameters(
-        name: "remember",
-        arguments: ["content": .string("Some important fact")]
-    ))
-    #expect(text(from: r2).contains("Stored memory"))
-
-    let stats = try await tools.handle(CallTool.Parameters(
-        name: "stats",
-        arguments: nil
-    ))
-    #expect(text(from: stats).contains("Total memories: 2"))
+    await #expect(throws: MCPError.self) {
+        _ = try await tools.handle(CallTool.Parameters(
+            name: "remember",
+            arguments: ["content": .string("Some important fact")]
+        ))
+    }
 }
 
 @Test func remember_conflictDetection_lowTermOverlap_allows() async throws {
@@ -1212,25 +1201,20 @@ import Foundation
     #expect(output.contains("fts5:"))
 }
 
-@Test func recall_fts5_degraded_noEmbeddings() async throws {
+@Test func recall_fts5_degraded_noEmbeddings_failsOnRemember() async throws {
     let path = FileManager.default.temporaryDirectory
         .appending(path: "claude-memory-test-\(UUID().uuidString).sqlite")
     let lattice = try Lattice(Memory.self, Edge.self, Checkpoint.self, HookState.self, configuration: .init(fileURL: path))
     let embedder = EmbeddingService()
     let tools = MemoryTools(lattice: lattice, embedder: embedder)
 
-    _ = try await tools.handle(CallTool.Parameters(
-        name: "remember",
-        arguments: ["content": .string("The parseJSON function handles deserialization of API responses")]
-    ))
-
-    let result = try await tools.handle(CallTool.Parameters(
-        name: "recall",
-        arguments: ["query": .string("parseJSON deserialization")]
-    ))
-    let output = text(from: result)
-    #expect(output.contains("parseJSON"))
-    #expect(output.contains("fts5:"))
+    // Without embedding model, remember should fail rather than store empty vectors
+    await #expect(throws: MCPError.self) {
+        _ = try await tools.handle(CallTool.Parameters(
+            name: "remember",
+            arguments: ["content": .string("The parseJSON function handles deserialization of API responses")]
+        ))
+    }
 }
 
 @Test func recall_fts5_rankInOutput() async throws {
