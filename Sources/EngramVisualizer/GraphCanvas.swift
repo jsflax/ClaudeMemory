@@ -4,22 +4,33 @@ import EngramKit
 // MARK: - File-level helpers
 
 func extractLabel(content: String, topic: String) -> String {
+    let maxLen = 30
     if let headerRange = content.range(of: #"^#{1,3}\s+"#, options: .regularExpression) {
         let title = content[headerRange.upperBound...].prefix(while: { $0 != "\n" })
-        return truncateLabel(String(title), to: 30)
+        return truncateLabel(String(title), to: maxLen)
     }
     if content.hasPrefix("**"), let end = content.dropFirst(2).range(of: "**") {
         let title = content[content.index(content.startIndex, offsetBy: 2)..<end.lowerBound]
-        return truncateLabel(String(title), to: 30)
+        return truncateLabel(String(title), to: maxLen)
     }
     if let colon = content.firstIndex(of: ":"),
-       content.distance(from: content.startIndex, to: colon) < 30 {
+       content.distance(from: content.startIndex, to: colon) < maxLen {
         return String(content[..<colon])
     }
     let firstLine = String(content.prefix(while: { $0 != "\n" }))
-    if firstLine.count <= 30 { return firstLine }
-    if topic != "general" { return "\(topic): \(truncateLabel(firstLine, to: 22))" }
-    return truncateLabel(firstLine, to: 30)
+    if firstLine.count <= maxLen { return firstLine }
+    if topic != "general" {
+        let combined = "\(topic): \(firstLine)"
+        if combined.count <= maxLen { return combined }
+        // Topic fits — truncate content only
+        if topic.count + 2 + 5 <= maxLen {
+            return "\(topic): \(truncateLabel(firstLine, to: maxLen - topic.count - 2))"
+        }
+        // Topic too long — truncate both
+        let prefix = truncateLabel(topic, to: 12)
+        return "\(prefix): \(truncateLabel(firstLine, to: maxLen - prefix.count - 2))"
+    }
+    return truncateLabel(firstLine, to: maxLen)
 }
 
 func truncateLabel(_ text: String, to maxLen: Int) -> String {

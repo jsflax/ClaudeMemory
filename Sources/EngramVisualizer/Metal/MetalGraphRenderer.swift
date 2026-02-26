@@ -215,7 +215,11 @@ final class MetalGraphRenderer: NSObject {
     // MARK: - Depth Texture
 
     private func rebuildDepthTexture(width: Int, height: Int) {
-        guard width > 0, height > 0 else { return }
+        // Apple Silicon max 2D texture dimension is 16384
+        guard width > 0, height > 0, width <= 16384, height <= 16384 else {
+            renderLog.warning("[MetalGraphRenderer] rebuildDepthTexture rejected: \(width)x\(height)")
+            return
+        }
         let desc = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .depth32Float,
             width: width, height: height,

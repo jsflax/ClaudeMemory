@@ -4,6 +4,16 @@ All notable changes to Engram are documented in this file.
 
 > Formerly "ClaudeMemory" — renamed in v0.12.0 to be tool-agnostic.
 
+## [0.12.4] - 2026-02-26
+
+### Fixed
+- **Label atlas crash on large graphs** — `renderLabelAtlas` created textures exceeding Metal's 16384px max dimension when users had many memories with long labels (e.g. height 22774). Atlas now falls back to 1x scale when 2x would overflow, with a hard cap at 16384.
+- **Label truncation overflow** — `extractLabel` topic-prefix path could produce 50+ character labels (e.g. `"visualizer-3d-rendering-core: ..."`) when topic names were long, wasting atlas row space. Labels now intelligently budget between topic and content, capped at 30 chars total.
+- **Atlas texture storage mode** — changed from `.managed` to `.shared` (correct for Apple Silicon unified memory)
+
+### Changed
+- **Sparkle signing** — replaced `--deep` codesign with explicit bottom-up signing of XPC services, fixing App Management TCC prompt on macOS Ventura+
+
 ## [0.12.3] - 2026-02-26
 
 ### Fixed
@@ -262,6 +272,7 @@ All notable changes to Engram are documented in this file.
 - CI/CD with GitHub Actions on macOS 26 / Swift 6.2
 - Homebrew tap workflow
 
+[0.12.4]: https://github.com/jsflax/Engram/compare/v0.12.3...v0.12.4
 [0.12.3]: https://github.com/jsflax/Engram/compare/v0.12.2...v0.12.3
 [0.12.2]: https://github.com/jsflax/Engram/compare/v0.12.1...v0.12.2
 [0.12.1]: https://github.com/jsflax/Engram/compare/v0.12.0...v0.12.1

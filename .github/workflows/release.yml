@@ -109,21 +109,29 @@ jobs:
           cp -R .build/release/SwiftLM_SwiftLM.bundle "$CLI_DIR/"
           cp agents/*.md "$AGENTS_DIR/"
 
-          # Sign CLI binaries with Developer ID, hardened runtime, and timestamp
-          for bin in "$CLI_DIR/memory" "$CLI_DIR/memory-hooks"; do
+          sign() {
             codesign --force --sign "Developer ID Application" \
               --keychain "$RUNNER_TEMP/signing.keychain-db" \
-              --options runtime \
-              --timestamp \
-              "$bin"
+              --options runtime --timestamp "$1"
+          }
+
+          # Sign CLI binaries
+          for bin in "$CLI_DIR/memory" "$CLI_DIR/memory-hooks"; do
+            sign "$bin"
           done
 
-          # Re-codesign the entire .app since contents changed
-          codesign --deep --force --sign "Developer ID Application" \
-            --keychain "$RUNNER_TEMP/signing.keychain-db" \
-            --options runtime \
-            --timestamp \
-            "$APP"
+          # Sign Sparkle components bottom-up (--deep is deprecated and unreliable
+          # for nested XPC services — causes TeamIdentifier=not set on Installer.xpc,
+          # which triggers the App Management permission prompt on macOS Ventura+)
+          SPARKLE="$APP/Contents/Frameworks/Sparkle.framework"
+          for xpc in "$SPARKLE/Versions/B/XPCServices/"*.xpc; do
+            sign "$xpc"
+          done
+          sign "$SPARKLE/Versions/B/Autoupdate"
+          sign "$SPARKLE"
+
+          # Re-codesign the .app (no --deep)
+          sign "$APP"
 
       - name: Create DMG
         if: env.DEVELOPER_ID_CERT_BASE64 != ''

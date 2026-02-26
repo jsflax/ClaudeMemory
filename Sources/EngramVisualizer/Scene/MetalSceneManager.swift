@@ -798,9 +798,12 @@ final class MetalSceneManager {
         }
         let neededH = Int(ceil(cursorY + rowHeight + padding))
 
-        let scale = 2
+        // Fall back to 1x scale if 2x would exceed Metal's max texture dimension (16384).
+        // Labels that still don't fit are gracefully skipped (break guards in drawing loops).
+        let maxDim = 16384
+        let scale = (max(512, neededH + 32) * 2 <= maxDim) ? 2 : 1
         let allocW = atlasW * scale
-        let allocH = max(512, neededH + 32) * scale
+        let allocH = min(max(512, neededH + 32) * scale, maxDim)
 
         let uvAtlasW = allocW / scale
         let uvAtlasH = allocH / scale
@@ -869,6 +872,12 @@ final class MetalSceneManager {
         guard let pixelData = ctx.data else { return nil }
         let bytesPerRow = allocW * 4
 
+        // Validate dimensions before Metal texture creation (max 16384 on Apple Silicon)
+        guard allocW > 0, allocH > 0, allocW <= 16384, allocH <= 16384 else {
+            frameLog.error("[labelAtlas] invalid texture dimensions: \(allocW)x\(allocH)")
+            return nil
+        }
+
         let texDesc = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .rgba8Unorm,
             width: allocW,
@@ -876,7 +885,7 @@ final class MetalSceneManager {
             mipmapped: false
         )
         texDesc.usage = [.shaderRead]
-        texDesc.storageMode = .managed
+        texDesc.storageMode = .shared
 
         guard let texture = device.makeTexture(descriptor: texDesc) else { return nil }
         texture.replace(
