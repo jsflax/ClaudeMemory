@@ -138,7 +138,13 @@ HOOKS_CONFIG='{
 
 if [ -f "$SETTINGS_FILE" ]; then
     if command -v jq &>/dev/null; then
-        jq -s '.[0] * .[1] | .hooks |= del(.PreToolUse)' "$SETTINGS_FILE" <(echo "$HOOKS_CONFIG") > "$SETTINGS_FILE.tmp"
+        # Merge hooks (overwrite ours, preserve user-added), append permission if missing, remove stale PreToolUse
+        jq -s '
+            (.[0] // {}) as $existing | (.[1] // {}) as $new |
+            $existing * $new |
+            .permissions.allow = (($existing.permissions.allow // []) + ($new.permissions.allow // []) | unique) |
+            .hooks |= del(.PreToolUse)
+        ' "$SETTINGS_FILE" <(echo "$HOOKS_CONFIG") > "$SETTINGS_FILE.tmp"
         mv "$SETTINGS_FILE.tmp" "$SETTINGS_FILE"
         echo "Merged hooks into $SETTINGS_FILE"
     else
@@ -152,6 +158,7 @@ else
 fi
 
 # Add user-level instruction to always use memory MCP
+# Canonical source: Sources/EngramKit/InstallConfig.swift — keep in sync
 CLAUDE_MD="$HOME/.claude/CLAUDE.md"
 MEMORY_BLOCK='# Memory
 

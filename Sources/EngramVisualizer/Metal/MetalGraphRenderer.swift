@@ -27,9 +27,10 @@ final class MetalGraphRenderer: NSObject {
     var opaqueDepthState: MTLDepthStencilState!
     var transparentDepthState: MTLDepthStencilState!
 
-    // Compute pipelines (existing kernels, unchanged)
+    // Compute pipelines
     var stampNodePipeline: MTLComputePipelineState!
     var stampLabelPipeline: MTLComputePipelineState!
+    var stampEdgePipeline: MTLComputePipelineState!
 
     // Depth texture
     var depthTexture: MTLTexture?
@@ -53,7 +54,11 @@ final class MetalGraphRenderer: NSObject {
     // Edge batch buffers
     var edgeVertexBuffer: MTLBuffer?
     var edgeIndexBuffer: MTLBuffer?
+    var edgeInstanceBuffer: MTLBuffer?
+    var edgeStampParamsBuffer: MTLBuffer?
     var edgeVertexCapacity: Int = 0
+    var edgeInstanceCapacity: Int = 0
+    var actualEdgeCount: Int = 0
     var actualEdgeVertexCount: Int = 0
 
     // Label batch buffers
@@ -120,6 +125,7 @@ final class MetalGraphRenderer: NSObject {
 
         nodeStampParamsBuffer = device.makeBuffer(length: MemoryLayout<StampParams>.stride, options: .storageModeShared)
         labelStampParamsBuffer = device.makeBuffer(length: MemoryLayout<LabelStampParams>.stride, options: .storageModeShared)
+        edgeStampParamsBuffer = device.makeBuffer(length: MemoryLayout<EdgeStampParams>.stride, options: .storageModeShared)
 
         renderLog.info("[MetalGraphRenderer] Initialized with device: \(device.name)")
     }
@@ -146,6 +152,9 @@ final class MetalGraphRenderer: NSObject {
         }
         if let fn = library.makeFunction(name: "stamp_label_quads") {
             stampLabelPipeline = try? device.makeComputePipelineState(function: fn)
+        }
+        if let fn = library.makeFunction(name: "stamp_edge_cylinders") {
+            stampEdgePipeline = try? device.makeComputePipelineState(function: fn)
         }
     }
 
@@ -206,6 +215,7 @@ final class MetalGraphRenderer: NSObject {
     // MARK: - Depth Texture
 
     private func rebuildDepthTexture(width: Int, height: Int) {
+        guard width > 0, height > 0 else { return }
         let desc = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .depth32Float,
             width: width, height: height,
@@ -263,37 +273,47 @@ final class MetalGraphRenderer: NSObject {
         let vertsPerEdge = 12
         let indicesPerEdge = 36
         let needed = max(edgeCount * 2, 2048)
-        guard needed > edgeVertexCapacity else { return }
 
-        let totalVerts = needed * vertsPerEdge
-        let totalIndices = needed * indicesPerEdge
+        if needed > edgeVertexCapacity {
+            let totalVerts = needed * vertsPerEdge
+            let totalIndices = needed * indicesPerEdge
 
-        edgeVertexBuffer = device.makeBuffer(
-            length: totalVerts * MemoryLayout<BatchVertex>.stride,
-            options: .storageModeShared
-        )
+            edgeVertexBuffer = device.makeBuffer(
+                length: totalVerts * MemoryLayout<BatchVertex>.stride,
+                options: .storageModeShared
+            )
 
-        let indexBytes = totalIndices * MemoryLayout<UInt32>.stride
-        edgeIndexBuffer = device.makeBuffer(length: indexBytes, options: .storageModeShared)
-        if let buf = edgeIndexBuffer {
-            let indices = buf.contents().bindMemory(to: UInt32.self, capacity: totalIndices)
-            for i in 0..<needed {
-                let vBase = UInt32(i * 12)
-                let iBase = i * 36
-                for seg in 0..<6 {
-                    let next = (seg + 1) % 6
-                    let b0 = vBase + UInt32(seg)
-                    let b1 = vBase + UInt32(next)
-                    let t0 = vBase + UInt32(seg + 6)
-                    let t1 = vBase + UInt32(next + 6)
-                    let idx = iBase + seg * 6
-                    indices[idx]     = b0; indices[idx + 1] = t0; indices[idx + 2] = t1
-                    indices[idx + 3] = b0; indices[idx + 4] = t1; indices[idx + 5] = b1
+            let indexBytes = totalIndices * MemoryLayout<UInt32>.stride
+            edgeIndexBuffer = device.makeBuffer(length: indexBytes, options: .storageModeShared)
+            if let buf = edgeIndexBuffer {
+                let indices = buf.contents().bindMemory(to: UInt32.self, capacity: totalIndices)
+                for i in 0..<needed {
+                    let vBase = UInt32(i * 12)
+                    let iBase = i * 36
+                    for seg in 0..<6 {
+                        let next = (seg + 1) % 6
+                        let b0 = vBase + UInt32(seg)
+                        let b1 = vBase + UInt32(next)
+                        let t0 = vBase + UInt32(seg + 6)
+                        let t1 = vBase + UInt32(next + 6)
+                        let idx = iBase + seg * 6
+                        indices[idx]     = b0; indices[idx + 1] = t0; indices[idx + 2] = t1
+                        indices[idx + 3] = b0; indices[idx + 4] = t1; indices[idx + 5] = b1
+                    }
                 }
             }
+
+            edgeVertexCapacity = needed
         }
 
-        edgeVertexCapacity = needed
+        // Instance buffer for GPU compute stamp
+        if needed > edgeInstanceCapacity {
+            edgeInstanceBuffer = device.makeBuffer(
+                length: needed * MemoryLayout<EdgeInstance>.stride,
+                options: .storageModeShared
+            )
+            edgeInstanceCapacity = needed
+        }
     }
 
     func ensureLabelBuffers(labelCount: Int) {
@@ -376,6 +396,52 @@ final class MetalGraphRenderer: NSObject {
             blit.fill(buffer: outputBuf, range: writtenBytes..<totalBytes, value: 0)
             blit.endEncoding()
         }
+    }
+
+    // MARK: - Stamp Edges (GPU Compute)
+
+    func stampEdges(commandBuffer: MTLCommandBuffer) {
+        guard actualEdgeCount > 0,
+              let pipeline = stampEdgePipeline,
+              let instanceBuf = edgeInstanceBuffer,
+              let paramsBuf = edgeStampParamsBuffer,
+              let outputBuf = edgeVertexBuffer else { return }
+
+        let vertsPerEdge: UInt32 = 12
+
+        // Set params
+        let paramsPtr = paramsBuf.contents().bindMemory(to: EdgeStampParams.self, capacity: 1)
+        paramsPtr.pointee = EdgeStampParams(
+            vertsPerEdge: vertsPerEdge,
+            edgeCount: UInt32(actualEdgeCount)
+        )
+
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(instanceBuf, offset: 0, index: 0)
+        encoder.setBuffer(paramsBuf, offset: 0, index: 1)
+        encoder.setBuffer(outputBuf, offset: 0, index: 2)
+
+        let totalVerts = actualEdgeCount * Int(vertsPerEdge)
+        let threadgroupSize = min(pipeline.maxTotalThreadsPerThreadgroup, 256)
+        let threadgroups = (totalVerts + threadgroupSize - 1) / threadgroupSize
+        encoder.dispatchThreadgroups(
+            MTLSize(width: threadgroups, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: threadgroupSize, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+
+        // Zero stale vertices
+        let bvStride = MemoryLayout<BatchVertex>.stride
+        let writtenBytes = totalVerts * bvStride
+        let totalBytes = edgeVertexCapacity * Int(vertsPerEdge) * bvStride
+        if writtenBytes < totalBytes, let blit = commandBuffer.makeBlitCommandEncoder() {
+            blit.fill(buffer: outputBuf, range: writtenBytes..<totalBytes, value: 0)
+            blit.endEncoding()
+        }
+
+        // Update vertex count for draw call
+        actualEdgeVertexCount = totalVerts
     }
 
     // MARK: - Stamp Labels (GPU Compute)
@@ -496,6 +562,8 @@ extension MetalGraphRenderer: MTKViewDelegate {
         bufferPool.waitForNextFrame()
 
         guard let drawable = view.currentDrawable,
+              drawable.texture.width > 0,
+              drawable.texture.height > 0,
               let renderPassDesc = view.currentRenderPassDescriptor,
               let commandBuffer = commandQueue.makeCommandBuffer() else {
             bufferPool.signalFrameComplete()
@@ -531,8 +599,9 @@ extension MetalGraphRenderer: MTKViewDelegate {
         bufferPool.updateFrameUniforms(frameUniforms)
         bufferPool.updateLightingUniforms(lightingUniforms)
 
-        // GPU compute: stamp node spheres + label quads
+        // GPU compute: stamp node spheres, edge cylinders, label quads
         stampNodes(commandBuffer: commandBuffer)
+        stampEdges(commandBuffer: commandBuffer)
         stampLabels(commandBuffer: commandBuffer)
 
         // Render pass

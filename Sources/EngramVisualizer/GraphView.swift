@@ -5,6 +5,7 @@ import EngramKit
 import UniformTypeIdentifiers
 import AppKit
 import simd
+import UserNotifications
 
 typealias MemoryEdge = EngramKit.Edge
 
@@ -88,6 +89,7 @@ struct GraphView: View {
     @State private var cachedFilteredNodes: [NodeData] = []
     @State private var cachedHubs: Set<Int64> = []
     @State private var cachedFilteredEdges: [EdgeData] = []
+    @State private var cachedFilteredEdgeIds: Set<Int64> = []
 
     // Cached derived data — recomputed only when filtered data changes (not every body eval)
     @State private var cachedProjectColorMap: [String: Color] = [:]
@@ -113,6 +115,13 @@ struct GraphView: View {
     @State private var timeSliderDate: Date?
     @State private var debouncedTimeSliderDate: Date?
     @State private var isTimelinePlaying: Bool = false
+
+    // Sidebar (hover-to-peek, click-to-pin)
+    @State private var sidebarPinned: Bool = false
+    @State private var sidebarPeeking: Bool = false
+    @State private var sidebarHideTask: Task<Void, Never>?
+    @Environment(AccountService.self) private var accountService
+    private var sidebarVisible: Bool { sidebarPinned || sidebarPeeking }
 
     // Minimap PiP
     @State private var minimapDetached: Bool = false
@@ -609,8 +618,9 @@ struct GraphView: View {
                 let otherId = edge.sourceId == nd.id ? edge.targetId : edge.sourceId
                 guard cachedVisibleNodeIds.contains(otherId) else { continue }
                 guard !hiddenRelations.contains(edge.relation) else { continue }
-                if !cachedFilteredEdges.contains(where: { $0.id == edge.id }) {
+                if !cachedFilteredEdgeIds.contains(edge.id) {
                     cachedFilteredEdges.append(edge)
+                    cachedFilteredEdgeIds.insert(edge.id)
                     renderStore.edges.append(edge)
                     simulation.addEdge(from: edge.sourceId, to: edge.targetId)
                     if is3D {
@@ -655,6 +665,9 @@ struct GraphView: View {
             )
             allNodes[pk] = node
             newNodes[pk] = Date()
+            if !isInitialLoad && config.notificationsEnabled {
+                sendMemoryNotification(title: "[\(memory.project)] New memory", body: node.label, id: pk)
+            }
             let visible = !config.hiddenProjects.contains(node.project) &&
                 (debouncedTimeSliderDate == nil || node.createdAt <= debouncedTimeSliderDate!)
             if visible && !cachedVisibleNodeIds.contains(pk) {
@@ -666,27 +679,26 @@ struct GraphView: View {
                 if config.dimensionMode == .threeD {
                     simulation3D.addNode(pk, project: node.project, topic: node.topic)
                 }
-                // Add edges for this node from existing edge data
+                // Add edges for this node from existing edge data (O(degree) via adjacency index)
                 let nodeIds = cachedVisibleNodeIds
-                for edge in allEdges.values {
-                    if (edge.sourceId == pk || edge.targetId == pk) &&
-                       nodeIds.contains(edge.sourceId) && nodeIds.contains(edge.targetId) &&
-                       !config.hiddenRelations.contains(edge.relation) {
-                        simulation.addEdge(from: edge.sourceId, to: edge.targetId)
-                        if config.dimensionMode == .threeD {
-                            simulation3D.addEdge(from: edge.sourceId, to: edge.targetId)
-                        }
-                        if !cachedFilteredEdges.contains(where: { $0.id == edge.id }) {
-                            cachedFilteredEdges.append(edge)
-                            renderStore.edges.append(edge)
-                        }
+                for edge in edgesByNode[pk] ?? [] {
+                    let otherId = edge.sourceId == pk ? edge.targetId : edge.sourceId
+                    guard nodeIds.contains(otherId),
+                          !config.hiddenRelations.contains(edge.relation) else { continue }
+                    simulation.addEdge(from: edge.sourceId, to: edge.targetId)
+                    if config.dimensionMode == .threeD {
+                        simulation3D.addEdge(from: edge.sourceId, to: edge.targetId)
                     }
-                }
-                // Check if this new node is a hub target (any part_of edges point to it)
-                for edge in allEdges.values where edge.relation == "part_of" && edge.targetId == pk {
-                    cachedHubs.insert(pk)
-                    renderStore.hubs.insert(pk)
-                    break
+                    if !cachedFilteredEdgeIds.contains(edge.id) {
+                        cachedFilteredEdges.append(edge)
+                        cachedFilteredEdgeIds.insert(edge.id)
+                        renderStore.edges.append(edge)
+                    }
+                    // Check if edge makes this node a hub target
+                    if edge.relation == "part_of" && edge.targetId == pk {
+                        cachedHubs.insert(pk)
+                        renderStore.hubs.insert(pk)
+                    }
                 }
                 // Assign color for previously unseen project
                 if cachedProjectColorMap[node.project] == nil && node.project != "global" {
@@ -740,6 +752,9 @@ struct GraphView: View {
             }
 
         case .delete(let pk):
+            if !isInitialLoad && config.notificationsEnabled, let node = allNodes[pk] {
+                sendMemoryNotification(title: "[\(node.project)] Memory removed", body: node.label, id: pk)
+            }
             // Snapshot dying node for fade-out animation before removal
             if let node = allNodes[pk], let pos = simulation.positions[pk] {
                 dyingNodes[pk] = DyingNode(
@@ -752,7 +767,9 @@ struct GraphView: View {
             glowingNodes.removeValue(forKey: pk)
             newNodes.removeValue(forKey: pk)
             cachedFilteredNodes.removeAll { $0.id == pk }
+            let removedEdgeIds = Set(cachedFilteredEdges.filter { $0.sourceId == pk || $0.targetId == pk }.map(\.id))
             cachedFilteredEdges.removeAll { $0.sourceId == pk || $0.targetId == pk }
+            cachedFilteredEdgeIds.subtract(removedEdgeIds)
             cachedVisibleNodeIds.remove(pk)
             simulation.removeNode(pk)
             cachedHubs.remove(pk)
@@ -782,6 +799,7 @@ struct GraphView: View {
             if nodeIds.contains(data.sourceId) && nodeIds.contains(data.targetId) &&
                !config.hiddenRelations.contains(data.relation) {
                 cachedFilteredEdges.append(data)
+                cachedFilteredEdgeIds.insert(data.id)
                 renderStore.edges.append(data)
                 simulation.addEdge(from: data.sourceId, to: data.targetId)
                 if config.dimensionMode == .threeD {
@@ -808,6 +826,7 @@ struct GraphView: View {
             if let old = allEdges[pk] {
                 simulation.removeEdge(from: old.sourceId, to: old.targetId)
                 cachedFilteredEdges.removeAll { $0.id == pk }
+                cachedFilteredEdgeIds.remove(pk)
                 renderStore.edges.removeAll { $0.id == pk }
                 edgesByNode[old.sourceId]?.removeAll { $0.id == pk }
                 edgesByNode[old.targetId]?.removeAll { $0.id == pk }
@@ -833,6 +852,7 @@ struct GraphView: View {
             nodeIds.contains(edge.sourceId) && nodeIds.contains(edge.targetId) &&
             !config.hiddenRelations.contains(edge.relation)
         }
+        cachedFilteredEdgeIds = Set(cachedFilteredEdges.map(\.id))
         recomputeDerivedData()
         syncRenderStore()
     }
@@ -898,11 +918,12 @@ struct GraphView: View {
                 }
                 .onChange(of: allNodes.count) { oldCount, newCount in
                     guard newCount != oldCount, !isInitialLoad else { return }
-                    guard config.soundEnabled else { return }
-                    let sound = newCount > oldCount
-                        ? "/System/Library/Sounds/Funk.aiff"
-                        : "/System/Library/Sounds/Bottle.aiff"
-                    NSSound(contentsOf: URL(fileURLWithPath: sound), byReference: true)?.play()
+                    if config.soundEnabled {
+                        let sound = newCount > oldCount
+                            ? "/System/Library/Sounds/Funk.aiff"
+                            : "/System/Library/Sounds/Bottle.aiff"
+                        NSSound(contentsOf: URL(fileURLWithPath: sound), byReference: true)?.play()
+                    }
                 }
                 // hiddenProjects changes handled surgically in toggleProject()
                 .onChange(of: config.hiddenRelations) { _, _ in
@@ -961,7 +982,91 @@ struct GraphView: View {
             }
             graphOverlays(size: size, colorMap: colorMap)
             detailPanel(size: size, colorMap: colorMap)
+            sidebarLayer(colorMap: colorMap)
         }
+    }
+
+    // MARK: - Sidebar Layer (hover-to-peek, click-to-pin)
+
+    @ViewBuilder
+    private func sidebarLayer(colorMap: [String: Color]) -> some View {
+        // Hover zone: only covers the sidebar + toggle button, not the full window
+        HStack(alignment: .top, spacing: 0) {
+            // Sidebar panel
+            if sidebarVisible {
+                SidebarView(
+                    projects: uniqueProjects(),
+                    colorMap: colorMap,
+                    allRelationCounts: cachedRelationCounts,
+                    visibleMemoryCount: cachedVisibleNodeIds.count,
+                    visibleEdgeCount: cachedFilteredEdges.count,
+                    totalMemories: allNodes.count,
+                    projectionState: embeddingProjection.state,
+                    toggleProject: toggleProject,
+                    toggleRelation: toggleRelation,
+                    switchLayoutMode: { mode in
+                        switchLayoutMode(to: mode, viewSize: NSApp.keyWindow?.frame.size ?? CGSize(width: 800, height: 600))
+                    },
+                    switchDimensionMode: { mode in
+                        switchDimensionMode(to: mode, viewSize: NSApp.keyWindow?.frame.size ?? CGSize(width: 800, height: 600))
+                    },
+                    driveToProject: config.dimensionMode == .threeD ? { cameraProjectTarget = $0 } : nil,
+                    accountService: accountService
+                )
+                .transition(.move(edge: .leading).combined(with: .opacity))
+            }
+
+            // Toggle button
+            VStack {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        sidebarPinned.toggle()
+                        if sidebarPinned {
+                            sidebarHideTask?.cancel()
+                            sidebarPeeking = false
+                        }
+                    }
+                } label: {
+                    Image(systemName: "sidebar.left")
+                        .font(.system(size: 13))
+                        .foregroundStyle(.white.opacity(sidebarPinned ? 0.9 : 0.5))
+                        .frame(width: 28, height: 28)
+                        .background(
+                            RoundedRectangle(cornerRadius: 6)
+                                .fill(.white.opacity(sidebarPinned ? 0.12 : 0.05))
+                        )
+                }
+                .buttonStyle(.plain)
+                .help(sidebarPinned ? "Unpin sidebar" : "Pin sidebar")
+                Spacer()
+            }
+            .frame(width: 44)
+            .padding(.top, 38)
+        }
+        .fixedSize(horizontal: true, vertical: false)
+        .frame(maxHeight: .infinity, alignment: .top)
+        .contentShape(Rectangle())
+        .onHover { hovering in
+            if hovering {
+                sidebarHideTask?.cancel()
+                if !sidebarPinned && !sidebarPeeking {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        sidebarPeeking = true
+                    }
+                }
+            } else if !sidebarPinned {
+                sidebarHideTask?.cancel()
+                sidebarHideTask = Task { @MainActor in
+                    try? await Task.sleep(for: .milliseconds(300))
+                    guard !Task.isCancelled else { return }
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        sidebarPeeking = false
+                    }
+                }
+            }
+        }
+        // Push to left edge of the ZStack
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private func graphCanvas(colorMap: [String: Color]) -> some View {
@@ -1018,22 +1123,8 @@ struct GraphView: View {
 
     @ViewBuilder
     private func graphOverlays(size: CGSize, colorMap: [String: Color]) -> some View {
-        // Right column: stats + activity log
+        // Right column: activity log
         VStack(alignment: .trailing, spacing: 8) {
-            StatsOverlay(
-                visibleMemoryCount: cachedVisibleNodeIds.count,
-                visibleEdgeCount: cachedFilteredEdges.count,
-                totalMemories: allNodes.count,
-                hiddenProjects: config.hiddenProjects,
-                hiddenRelations: config.hiddenRelations,
-                projects: uniqueProjects(),
-                allRelationCounts: cachedRelationCounts,
-                toggleProject: toggleProject,
-                toggleRelation: toggleRelation,
-                colorMap: colorMap,
-                driveToProject: config.dimensionMode == .threeD ? { cameraProjectTarget = $0 } : nil
-            )
-
             if selectedMemoryId == nil {
                 ActivityLogPanel(
                     nodes: cachedFilteredNodes,
@@ -1049,33 +1140,19 @@ struct GraphView: View {
         .frame(maxWidth: .infinity, alignment: .trailing)
         .animation(.easeInOut(duration: 0.25), value: selectedMemoryId == nil)
 
+        // Top bar: search (offset right to clear sidebar toggle + traffic lights)
         VStack {
             HStack {
+                Spacer().frame(width: 80) // clear traffic lights + sidebar toggle
                 SearchBarView(
                     matchIds: $searchMatchIds,
                     isActive: $isSearchActive,
                     lattice: lattice
                 )
-                SoundToggleButton()
-                LayoutModePicker(
-                    mode: config.layoutMode,
-                    projectionState: embeddingProjection.state,
-                    onModeChange: { mode in
-                        switchLayoutMode(to: mode, viewSize: NSApp.keyWindow?.frame.size ?? CGSize(width: 800, height: 600))
-                    }
-                )
-                DimensionToggle(
-                    mode: config.dimensionMode,
-                    onModeChange: { mode in
-                        switchDimensionMode(to: mode, viewSize: NSApp.keyWindow?.frame.size ?? CGSize(width: 800, height: 600))
-                    }
-                )
-                if config.layoutMode == .embedding && embeddingProjection.state == .ready && config.dimensionMode == .twoD {
-                    VoidToggleButton(showVoids: Bindable(config).showVoids)
-                }
                 Spacer()
             }
-            .padding(12)
+            .padding(.top, 8)
+            .padding(.horizontal, 12)
             Spacer()
         }
 
@@ -1251,7 +1328,9 @@ struct GraphView: View {
         let removedIds = Set(cachedFilteredNodes.filter { $0.project == project }.map(\.id))
         guard !removedIds.isEmpty else { return }
         cachedFilteredNodes.removeAll { $0.project == project }
+        let removedEdgeIds2 = Set(cachedFilteredEdges.filter { removedIds.contains($0.sourceId) || removedIds.contains($0.targetId) }.map(\.id))
         cachedFilteredEdges.removeAll { removedIds.contains($0.sourceId) || removedIds.contains($0.targetId) }
+        cachedFilteredEdgeIds.subtract(removedEdgeIds2)
         cachedVisibleNodeIds.subtract(removedIds)
         for id in removedIds { simulation.removeNode(id) }
         clusterGroups = clusterGroups.compactMap { cluster in
@@ -1277,9 +1356,10 @@ struct GraphView: View {
         let newEdges = allEdges.values.filter { edge in
             allVisibleIds.contains(edge.sourceId) && allVisibleIds.contains(edge.targetId) &&
             !config.hiddenRelations.contains(edge.relation) &&
-            !cachedFilteredEdges.contains(where: { $0.id == edge.id })
+            !cachedFilteredEdgeIds.contains(edge.id)
         }
         cachedFilteredEdges.append(contentsOf: newEdges)
+        cachedFilteredEdgeIds.formUnion(newEdges.map(\.id))
 
         for node in newNodes {
             simulation.addNode(node.id, project: node.project, topic: node.topic)
@@ -1361,6 +1441,21 @@ struct GraphView: View {
     /// Look up a project's color from a pre-built map. Falls back to gray for unknown projects.
     static func projectColor(for project: String, in colorMap: [String: Color]) -> Color {
         colorMap[project] ?? .gray
+    }
+
+    private func sendMemoryNotification(title: String, body: String, id: Int64) {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.userInfo = ["memoryId": id]
+        let request = UNNotificationRequest(
+            identifier: "memory-\(id)-\(UUID().uuidString)",
+            content: content,
+            trigger: nil
+        )
+        Task {
+            try? await UNUserNotificationCenter.current().add(request)
+        }
     }
 
 }

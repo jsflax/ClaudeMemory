@@ -1,5 +1,16 @@
 import Foundation
 
+/// Rotate a log file if it exceeds `maxBytes`. Keeps one `.1` backup.
+func rotateFileIfNeeded(_ path: String, maxBytes: Int = 256 * 1024) {
+    let fm = FileManager.default
+    guard let attrs = try? fm.attributesOfItem(atPath: path),
+          let size = attrs[.size] as? Int,
+          size > maxBytes else { return }
+    let backup = path + ".1"
+    try? fm.removeItem(atPath: backup)
+    try? fm.moveItem(atPath: path, toPath: backup)
+}
+
 /// Spawn a `claude` CLI subprocess as a fire-and-forget background process.
 ///
 /// Uses `/bin/sh -c` with shell redirection to capture output to a log file.
@@ -24,6 +35,8 @@ func spawnClaudeSubprocess(
 ) throws {
     let escapedPrompt = prompt.replacingOccurrences(of: "'", with: "'\\''")
     let escapedSystemPrompt = systemPrompt.replacingOccurrences(of: "'", with: "'\\''")
+
+    rotateFileIfNeeded(logPath)
 
     let shellCommand = """
     echo '===== started at '\\''\(ISO8601DateFormatter().string(from: Date()))'\\'' =====' >> '\(logPath)' && \

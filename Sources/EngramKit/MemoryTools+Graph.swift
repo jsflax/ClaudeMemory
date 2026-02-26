@@ -206,14 +206,15 @@ extension MemoryTools {
         return total
     }
 
-    /// BFS graph traversal from a set of starting memory IDs, returning connected memories.
-    func traverseGraph(from startIds: Set<Int64>, depth: Int, excludeIds: Set<Int64>) -> [Memory] {
+    /// BFS graph traversal from a set of starting memory IDs, returning connected memories
+    /// annotated with the depth at which they were discovered.
+    func traverseGraph(from startIds: Set<Int64>, depth: Int, excludeIds: Set<Int64>) -> [(memory: Memory, depth: Int)] {
         var visited = excludeIds
         var frontier = startIds
-        var result: [Memory] = []
+        var result: [(memory: Memory, depth: Int)] = []
         let now = Date()
 
-        for _ in stride(from: 1, through: depth, by: 1) {
+        for d in stride(from: 1, through: depth, by: 1) {
             var nextFrontier = Set<Int64>()
             for nodeId in frontier {
                 // Outgoing edges
@@ -234,7 +235,7 @@ extension MemoryTools {
             // Fetch the memories for the next frontier
             for id in nextFrontier {
                 if let mem = lattice.objects(Memory.self).where({ $0.primaryKey == id && $0.expiresAt > now }).first {
-                    result.append(mem)
+                    result.append((memory: mem, depth: d))
                 }
             }
             frontier = nextFrontier

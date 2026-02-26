@@ -1502,7 +1502,7 @@ import Foundation
 
     _ = try await tools.handle(CallTool.Parameters(
         name: "connect",
-        arguments: ["from": .int(id1), "to": .int(id2), "relation": .string("relates_to")]
+        arguments: ["from": .int(id1), "to": .int(id2), "relation": .string("part_of")]
     ))
 
     let result = try await tools.handle(CallTool.Parameters(
@@ -1515,6 +1515,7 @@ import Foundation
     ))
     let output = text(from: result)
     #expect(output.contains("JWT"))
+    // Structural edge (part_of) always surfaces connected memories
     #expect(output.contains("Connected (graph traversal"))
     #expect(output.contains("PostgreSQL"))
 }

@@ -83,6 +83,11 @@ final class MetalSceneManager {
     // Node instance staging
     private var instanceArray: [NodeInstance] = []
 
+    // Cached per-node data rebuilt only on topology change
+    private var cachedNodeRadii: [Int64: Float] = [:]
+    private var cachedNodeProject: [Int64: String] = [:]
+    private var lastTopologyNodeCount: Int = 0
+
     // Label atlas state
     var labelAtlasRects: [Int64: (u0: Float, v0: Float, u1: Float, v1: Float)] = [:]
     var projectLabelAtlasRects: [String: (u0: Float, v0: Float, u1: Float, v1: Float)] = [:]
@@ -94,6 +99,7 @@ final class MetalSceneManager {
     private var labelAtlasAllocW: Int = 0
     private var labelAtlasAllocH: Int = 0
     private var labelAtlasRegenFrame: UInt64 = 0
+    private var isAtlasGenerating = false
 
     // View properties
     var renderViewSize: CGSize = .zero
@@ -101,6 +107,8 @@ final class MetalSceneManager {
     private let scaleFactor: Float = 1.0 / 200.0
     private let nodeRadius: Float = 0.04
     private let edgeRadius: Float = 0.004
+
+    // Precomputed cylinder trig (6-sided) — avoids 12 sin/cos per edge per frame
 
     private var renderNodes: [NodeData] { renderStore?.nodes ?? [] }
     private var renderEdges: [EdgeData] { renderStore?.edges ?? [] }
@@ -197,14 +205,17 @@ final class MetalSceneManager {
             lastColorMapVersion = version
         }
 
-        // Determine update needs
+        // Determine update needs — split geometry changes from visual-only changes
+        // to avoid running expensive edge/nebula packing for glow animations.
         let positionsChanged = didUpdatePositions
         let selectionChanged = selectedNode != lastSelectedNode
         let searchChanged = isSearchActive != lastSearchActive || searchMatchIds != lastSearchMatchIds
         let hasExpansions = !expandedHubs.isEmpty
         let cameraMoving = camera.isMoving
         let hasInput = !heldKeys.isEmpty
-        let sceneNeedsUpdate = positionsChanged || selectionChanged || searchChanged || hasExpansions || !glowingNodes.isEmpty || !newNodes.isEmpty || !dyingNodes.isEmpty
+        let geometryChanged = positionsChanged || selectionChanged || searchChanged || hasExpansions
+        let visualOnlyChanged = !glowingNodes.isEmpty || !newNodes.isEmpty || !dyingNodes.isEmpty
+        let sceneNeedsUpdate = geometryChanged || visualOnlyChanged
 
         let isActive = sceneNeedsUpdate || cameraMoving || hasInput
 
@@ -219,8 +230,20 @@ final class MetalSceneManager {
         if sceneNeedsUpdate {
             updateExpansions(dt: dt)
             packNodeInstances()
-            packEdgeVertices()
-            updateNebulae()
+
+            // Edge and nebula packing only needed when geometry changed
+            // (positions, selection, search), not for glow/arrival visual-only changes.
+            if geometryChanged {
+                // Edge instance packing is now lightweight (48 bytes/edge) — GPU stamp
+                // kernel handles all cylinder geometry. No throttle needed.
+                packEdgeVertices()
+
+                // Nebulae are still CPU-packed; throttle during position-only convergence.
+                let positionOnly = positionsChanged && !selectionChanged && !searchChanged && !hasExpansions
+                if !positionOnly || renderFrameCount % 6 == 0 {
+                    updateNebulae()
+                }
+            }
 
             if selectedNode != nil || renderer.actualFlowParticleCount > 0 {
                 flowParticles.update(
@@ -260,10 +283,9 @@ final class MetalSceneManager {
             return
         }
 
-        let nodes = renderNodes
         let hubs = renderHubs
         let colorMap = renderColorMap
-        let nodeById = Dictionary(nodes.map { ($0.id, $0) }, uniquingKeysWith: { _, last in last })
+        let nodeById = renderStore?.nodeById ?? [:]
         let now = Date()
 
         if instanceArray.count < nodeCount {
@@ -418,6 +440,7 @@ final class MetalSceneManager {
         let edges = renderEdges
         let edgeCount = edges.count
         guard edgeCount > 0 else {
+            renderer.actualEdgeCount = 0
             renderer.actualEdgeVertexCount = 0
             return
         }
@@ -426,53 +449,45 @@ final class MetalSceneManager {
         let hubs = renderHubs
         let colorMap = renderColorMap
         let isSemanticMode = layoutMode == .embedding
-        let nodeProject: [Int64: String] = Dictionary(
-            nodes.map { ($0.id, $0.project) }, uniquingKeysWith: { _, last in last }
-        )
 
-        var nodeRadii: [Int64: Float] = [:]
-        for node in nodes {
-            let isHub = hubs.contains(node.id)
-            let importance = max(1, node.importance)
-            let baseR: Float = isHub ? nodeRadius * 1.6 : nodeRadius
-            nodeRadii[node.id] = baseR * (1.0 + Float(importance - 1) * 0.08)
+        // Rebuild cached per-node data only when topology changes
+        if nodes.count != lastTopologyNodeCount {
+            cachedNodeProject.removeAll(keepingCapacity: true)
+            cachedNodeRadii.removeAll(keepingCapacity: true)
+            for node in nodes {
+                cachedNodeProject[node.id] = node.project
+                let isHub = hubs.contains(node.id)
+                let importance = max(1, node.importance)
+                let baseR: Float = isHub ? nodeRadius * 1.6 : nodeRadius
+                cachedNodeRadii[node.id] = baseR * (1.0 + Float(importance - 1) * 0.08)
+            }
+            lastTopologyNodeCount = nodes.count
         }
+        let nodeProject = cachedNodeProject
 
-        let vertsPerEdge = 12
         renderer.ensureEdgeBuffers(edgeCount: edgeCount)
-        guard let edgeBuf = renderer.edgeVertexBuffer else { return }
+        guard let instanceBuf = renderer.edgeInstanceBuffer else { return }
 
-        let vertices = edgeBuf.contents().bindMemory(to: BatchVertex.self, capacity: edgeCount * vertsPerEdge)
-        var vi = 0
+        let instances = instanceBuf.contents().bindMemory(to: EdgeInstance.self, capacity: edgeCount)
+        let nodeRadii = cachedNodeRadii
+        var ei = 0
 
         for edge in edges {
             guard let from = positions[edge.sourceId],
-                  let to = positions[edge.targetId] else {
-                let zero = BatchVertex(position: .zero, normal: SIMD3<Float>(0, 1, 0), uv: .zero, color: .zero)
-                for _ in 0..<12 { vertices[vi] = zero; vi += 1 }
-                continue
-            }
+                  let to = positions[edge.targetId] else { continue }
 
             let p1 = from * scaleFactor
             let p2 = to * scaleFactor
             let delta = p2 - p1
-            let length = simd_length(delta)
+            let len = simd_length(delta)
 
             let r1 = nodeRadii[edge.sourceId] ?? nodeRadius
             let r2 = nodeRadii[edge.targetId] ?? nodeRadius
-            guard length > r1 + r2 else {
-                let zero = BatchVertex(position: .zero, normal: SIMD3<Float>(0, 1, 0), uv: .zero, color: .zero)
-                for _ in 0..<12 { vertices[vi] = zero; vi += 1 }
-                continue
-            }
+            guard len > r1 + r2 else { continue }
 
-            let dir = delta / length
+            let dir = delta / len
             let p1inset = p1 + dir * r1
             let p2inset = p2 - dir * r2
-
-            let basisUp: SIMD3<Float> = abs(dir.y) < 0.99 ? SIMD3(0, 1, 0) : SIMD3(1, 0, 0)
-            let basisRight = simd_normalize(cross(dir, basisUp))
-            let basisForward = simd_normalize(cross(basisRight, dir))
 
             let connected = edge.sourceId == selectedNode || edge.targetId == selectedNode
             let radius = connected ? edgeRadius * 2.5 : edgeRadius * 1.3
@@ -493,32 +508,17 @@ final class MetalSceneManager {
                 color = edgeColorFloat3(for: nodeProject[edge.sourceId], colorMap: colorMap)
             }
 
-            // Cylinder: 6 bottom ring + 6 top ring
-            for seg in 0..<6 {
-                let angle = Float(seg) * (.pi * 2 / 6)
-                let c = cos(angle), s = sin(angle)
-                let offset = (basisRight * c + basisForward * s) * radius
-                let normal = simd_normalize(basisRight * c + basisForward * s)
-                let bp = p1inset + offset
-                vertices[vi] = BatchVertex(position: bp, normal: normal,
-                                           uv: SIMD2<Float>(state, 0),
-                                           color: SIMD4<Float>(color.x, color.y, color.z, 1))
-                vi += 1
-            }
-            for seg in 0..<6 {
-                let angle = Float(seg) * (.pi * 2 / 6)
-                let c = cos(angle), s = sin(angle)
-                let offset = (basisRight * c + basisForward * s) * radius
-                let normal = simd_normalize(basisRight * c + basisForward * s)
-                let tp = p2inset + offset
-                vertices[vi] = BatchVertex(position: tp, normal: normal,
-                                           uv: SIMD2<Float>(state, 1),
-                                           color: SIMD4<Float>(color.x, color.y, color.z, 1))
-                vi += 1
-            }
+            instances[ei] = EdgeInstance(
+                sourcePos: p1inset,
+                radius: radius,
+                targetPos: p2inset,
+                state: state,
+                color: SIMD4<Float>(color.x, color.y, color.z, 1)
+            )
+            ei += 1
         }
 
-        renderer.actualEdgeVertexCount = vi
+        renderer.actualEdgeCount = ei
     }
 
     // MARK: - Label Instance Packing
@@ -541,7 +541,13 @@ final class MetalSceneManager {
             let isFirstAtlas = renderer.labelAtlasTexture == nil
             let framesSinceRegen = renderFrameCount &- labelAtlasRegenFrame
             if isFirstAtlas || framesSinceRegen >= 60 {
-                generateLabelAtlas(nodes: nodes, hubs: hubs, projects: currentProjects)
+                if isFirstAtlas {
+                    // First atlas must be synchronous — nothing to show until it's ready
+                    generateLabelAtlas(nodes: nodes, hubs: hubs, projects: currentProjects)
+                } else if !isAtlasGenerating {
+                    // Subsequent rebuilds run async — old atlas stays visible until new one is ready
+                    dispatchAtlasRegen(nodes: nodes, hubs: hubs, projects: currentProjects)
+                }
                 labelAtlasRegenFrame = renderFrameCount
                 labelAtlasNodeIds = currentNodeIds
             }
@@ -692,7 +698,67 @@ final class MetalSceneManager {
 
     // MARK: - Label Atlas Generation (MTLTexture)
 
+    private struct AtlasLabelEntry: Sendable {
+        let id: Int64; let label: String; let isHub: Bool
+    }
+
+    private struct AtlasResult: @unchecked Sendable {
+        let texture: MTLTexture
+        let nodeRects: [Int64: (u0: Float, v0: Float, u1: Float, v1: Float)]
+        let projectRects: [String: (u0: Float, v0: Float, u1: Float, v1: Float)]
+        let aspectCorrection: Float
+        let allocW: Int; let allocH: Int
+    }
+
+    /// Synchronous atlas generation (used for the first atlas only).
     private func generateLabelAtlas(nodes: [NodeData], hubs: Set<Int64>, projects: Set<String>) {
+        let entries = nodes.map { AtlasLabelEntry(id: $0.id, label: $0.label, isHub: hubs.contains($0.id)) }
+        guard let result = Self.renderLabelAtlas(
+            entries: entries, sortedProjects: projects.sorted(), device: renderer.device
+        ) else { return }
+        applyAtlasResult(result, nodeIds: Set(nodes.map(\.id)), hubs: hubs, projects: projects)
+        frameLog.info("[labelAtlas] \(result.nodeRects.count) node + \(result.projectRects.count) project labels, \(result.allocW/2)x\(result.allocH/2)")
+    }
+
+    /// Dispatch label atlas regeneration to a background thread. Old atlas stays visible until complete.
+    private func dispatchAtlasRegen(nodes: [NodeData], hubs: Set<Int64>, projects: Set<String>) {
+        isAtlasGenerating = true
+        let entries = nodes.map { AtlasLabelEntry(id: $0.id, label: $0.label, isHub: hubs.contains($0.id)) }
+        let sortedProjects = projects.sorted()
+        let device = renderer.device
+        let capturedNodeIds = Set(nodes.map(\.id))
+        let capturedHubs = hubs
+        let capturedProjects = projects
+
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let result = Self.renderLabelAtlas(entries: entries, sortedProjects: sortedProjects, device: device)
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                if let result {
+                    self.applyAtlasResult(result, nodeIds: capturedNodeIds, hubs: capturedHubs, projects: capturedProjects)
+                    frameLog.info("[labelAtlas] async regen: \(result.nodeRects.count) node + \(result.projectRects.count) project labels")
+                }
+                self.isAtlasGenerating = false
+            }
+        }
+    }
+
+    private func applyAtlasResult(_ result: AtlasResult, nodeIds: Set<Int64>, hubs: Set<Int64>, projects: Set<String>) {
+        renderer.labelAtlasTexture = result.texture
+        labelAtlasRects = result.nodeRects
+        projectLabelAtlasRects = result.projectRects
+        labelAtlasAspectCorrection = result.aspectCorrection
+        labelAtlasAllocW = result.allocW
+        labelAtlasAllocH = result.allocH
+        labelAtlasNodeIds = nodeIds
+        labelAtlasHubIds = hubs
+        labelAtlasProjects = projects
+    }
+
+    /// Pure rendering work — can run on any thread. CoreText (via NSString.draw) is thread-safe.
+    nonisolated private static func renderLabelAtlas(
+        entries: [AtlasLabelEntry], sortedProjects: [String], device: MTLDevice
+    ) -> AtlasResult? {
         let atlasW = 4096
         let padding: CGFloat = 4
         let fontSize: CGFloat = 28
@@ -700,19 +766,17 @@ final class MetalSceneManager {
 
         struct LabelSize { let width: CGFloat; let height: CGFloat }
         var nodeSizes: [LabelSize] = []
-        nodeSizes.reserveCapacity(nodes.count)
-        for node in nodes {
-            let isHub = hubs.contains(node.id)
-            let weight: NSFont.Weight = isHub ? .bold : .medium
+        nodeSizes.reserveCapacity(entries.count)
+        for entry in entries {
+            let weight: NSFont.Weight = entry.isHub ? .bold : .medium
             let font = NSFont.monospacedSystemFont(ofSize: fontSize, weight: weight)
             let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: NSColor.white]
-            let size = (node.label as NSString).size(withAttributes: attrs)
+            let size = (entry.label as NSString).size(withAttributes: attrs)
             nodeSizes.append(LabelSize(width: ceil(size.width) + padding * 2, height: ceil(size.height) + padding))
         }
 
         let projFont = NSFont.systemFont(ofSize: projFontSize, weight: .bold)
         let projAttrs: [NSAttributedString.Key: Any] = [.font: projFont, .foregroundColor: NSColor.white]
-        let sortedProjects = projects.sorted()
         var projSizes: [LabelSize] = []
         for project in sortedProjects {
             let size = (project as NSString).size(withAttributes: projAttrs)
@@ -740,9 +804,7 @@ final class MetalSceneManager {
 
         let uvAtlasW = allocW / scale
         let uvAtlasH = allocH / scale
-        labelAtlasAspectCorrection = Float(uvAtlasW) / (2.0 * Float(uvAtlasH))
-        labelAtlasAllocW = allocW
-        labelAtlasAllocH = allocH
+        let aspectCorrection = Float(uvAtlasW) / (2.0 * Float(uvAtlasH))
 
         let colorSpace = CGColorSpaceCreateDeviceRGB()
         guard let ctx = CGContext(
@@ -750,7 +812,7 @@ final class MetalSceneManager {
             bitsPerComponent: 8, bytesPerRow: allocW * 4,
             space: colorSpace,
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else { return }
+        ) else { return nil }
 
         ctx.translateBy(x: 0, y: CGFloat(allocH))
         ctx.scaleBy(x: CGFloat(scale), y: CGFloat(-scale))
@@ -759,23 +821,22 @@ final class MetalSceneManager {
         var rects: [Int64: (u0: Float, v0: Float, u1: Float, v1: Float)] = [:]
         cursorX = 2; cursorY = 0; rowHeight = 0
 
-        for (i, node) in nodes.enumerated() {
+        for (i, entry) in entries.enumerated() {
             let s = nodeSizes[i]
             if cursorX + s.width > CGFloat(atlasW) { cursorX = 2; cursorY += rowHeight + padding; rowHeight = 0 }
             if cursorY + s.height > CGFloat(uvAtlasH) { break }
 
-            let isHub = hubs.contains(node.id)
-            let weight: NSFont.Weight = isHub ? .bold : .medium
+            let weight: NSFont.Weight = entry.isHub ? .bold : .medium
             let font = NSFont.monospacedSystemFont(ofSize: fontSize, weight: weight)
             let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: NSColor.white]
 
             let drawPoint = CGPoint(x: cursorX + padding, y: cursorY + padding * 0.5)
             NSGraphicsContext.saveGraphicsState()
             NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx, flipped: true)
-            (node.label as NSString).draw(at: drawPoint, withAttributes: attrs)
+            (entry.label as NSString).draw(at: drawPoint, withAttributes: attrs)
             NSGraphicsContext.restoreGraphicsState()
 
-            rects[node.id] = (
+            rects[entry.id] = (
                 Float(cursorX) / Float(uvAtlasW), Float(cursorY) / Float(uvAtlasH),
                 Float(cursorX + s.width) / Float(uvAtlasW), Float(cursorY + s.height) / Float(uvAtlasH)
             )
@@ -805,7 +866,7 @@ final class MetalSceneManager {
         }
 
         // Create MTLTexture from CGContext
-        guard let pixelData = ctx.data else { return }
+        guard let pixelData = ctx.data else { return nil }
         let bytesPerRow = allocW * 4
 
         let texDesc = MTLTextureDescriptor.texture2DDescriptor(
@@ -817,7 +878,7 @@ final class MetalSceneManager {
         texDesc.usage = [.shaderRead]
         texDesc.storageMode = .managed
 
-        guard let texture = renderer.device.makeTexture(descriptor: texDesc) else { return }
+        guard let texture = device.makeTexture(descriptor: texDesc) else { return nil }
         texture.replace(
             region: MTLRegion(origin: MTLOrigin(), size: MTLSize(width: allocW, height: allocH, depth: 1)),
             mipmapLevel: 0,
@@ -825,14 +886,10 @@ final class MetalSceneManager {
             bytesPerRow: bytesPerRow
         )
 
-        renderer.labelAtlasTexture = texture
-        labelAtlasRects = rects
-        projectLabelAtlasRects = projRects
-        labelAtlasNodeIds = Set(nodes.map(\.id))
-        labelAtlasHubIds = hubs
-        labelAtlasProjects = projects
-
-        frameLog.info("[labelAtlas] \(rects.count) node + \(projRects.count) project labels, \(allocW/scale)x\(allocH/scale)")
+        return AtlasResult(
+            texture: texture, nodeRects: rects, projectRects: projRects,
+            aspectCorrection: aspectCorrection, allocW: allocW, allocH: allocH
+        )
     }
 
     // MARK: - Nebulae

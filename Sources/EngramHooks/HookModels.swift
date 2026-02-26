@@ -179,6 +179,7 @@ func hookLog(_ message: String) {
     FileHandle.standardError.write(Data(line.utf8))
 
     let logPath = NSHomeDirectory() + "/.claude/hooks.log"
+    rotateFileIfNeeded(logPath)
     let timestamp = ISO8601DateFormatter().string(from: Date())
     let logLine = "\(timestamp) \(line)"
     if let fh = FileHandle(forWritingAtPath: logPath) {

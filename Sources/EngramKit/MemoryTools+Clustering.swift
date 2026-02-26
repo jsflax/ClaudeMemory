@@ -214,10 +214,10 @@ extension MemoryTools {
         }()
 
         // Generate embedding for summary
-        var embeddingVec = Vector<Float>([])
-        if let floats = try await embedder.embed(text: a.content) {
-            embeddingVec = Vector<Float>(floats)
+        guard let floats = try await embedder.embed(text: a.content) else {
+            throw MCPError.internalError("Embedding model unavailable — cannot consolidate memories without a vector. Check that the CoreML model is bundled correctly.")
         }
+        let embeddingVec = Vector<Float>(floats)
 
         // Create summary memory
         let summary = Memory(

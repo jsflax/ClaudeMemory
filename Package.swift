@@ -17,7 +17,7 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/modelcontextprotocol/swift-sdk.git", from: "0.10.0"),
-        .package(url: "https://github.com/jsflax/lattice", from: "0.4.0"),
+        .package(url: "https://github.com/jsflax/lattice", from: "0.4.1"),
         .package(url: "https://github.com/jsflax/SwiftLM.git", branch: "main"),
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.5.0"),
         .package(url: "https://github.com/sparkle-project/Sparkle.git", from: "2.0.0"),
@@ -50,6 +50,7 @@ let package = Package(
             ],
             linkerSettings: [
                 .linkedFramework("Accelerate"),
+                .linkedFramework("NaturalLanguage"),
             ]
         ),
         .executableTarget(
@@ -71,6 +72,9 @@ let package = Package(
                 .product(name: "Sparkle", package: "Sparkle"),
                 .product(name: "GoogleSignIn", package: "GoogleSignIn-iOS"),
                 .product(name: "GoogleSignInSwift", package: "GoogleSignIn-iOS"),
+            ],
+            resources: [
+                .copy("Resources/under_construction.png"),
             ],
             swiftSettings: [
                 .interoperabilityMode(.Cxx),

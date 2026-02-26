@@ -104,6 +104,21 @@ struct LabelStampParams {
     float        _pad1;
 };
 
+// Per-edge instance data for stamp_edge_cylinders compute kernel (48 bytes).
+struct EdgeInstance {
+    simd_float3 sourcePos;   // 12  world-space endpoint
+    float       radius;      //  4  cylinder radius
+    simd_float3 targetPos;   // 12  world-space endpoint
+    float       state;       //  4  edge visual state (0=normal, 1=connected, 2=dimmed, 3=semantic)
+    simd_float4 color;       // 16  (r, g, b, 1)
+};                           // Total: 48 bytes
+
+// Edge stamp kernel dispatch parameters.
+struct EdgeStampParams {
+    unsigned int vertsPerEdge;   // always 12 (6-sided hexagonal cylinder)
+    unsigned int edgeCount;
+};
+
 // Nebula billboard vertex (used by NebulaFogSystem).
 struct NebulaQuadVertex {
     simd_float3 position;    // billboard center (world space)

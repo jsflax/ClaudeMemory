@@ -207,6 +207,10 @@ final class ForceSimulation3D {
     private var postAlphaDispatches = 0
     private let maxPostAlphaDispatches = 60  // ~3s of post-alpha polish — gives cohesion forces time to pull same-project nodes together
 
+    /// Set by addNode/addEdge, drained by tick(). Coalesces multiple topology changes
+    /// between frames into a single alpha bump instead of one per call.
+    private var hasPendingTopologyChanges = false
+
     /// Metal compute for GPU-accelerated charge force calculation.
     private var metalForceCompute: MetalForceCompute? = MetalForceCompute()
 
@@ -354,9 +358,7 @@ final class ForceSimulation3D {
         }
 
         storedFx.append(0); storedFy.append(0); storedFz.append(0)
-        alpha = max(alpha, 0.05)
-        topologyVersion &+= 1
-        isSettled = false; settledFrameCount = 0
+        hasPendingTopologyChanges = true
         rebuildPositions()
     }
 
@@ -365,9 +367,7 @@ final class ForceSimulation3D {
         guard let si = idToIndex[source], let ti = idToIndex[target] else { return }
         guard !edgeIndices.contains(where: { $0.0 == si && $0.1 == ti }) else { return }
         edgeIndices.append((si, ti))
-        alpha = max(alpha, 0.05)
-        topologyVersion &+= 1
-        isSettled = false; settledFrameCount = 0
+        hasPendingTopologyChanges = true
     }
 
     /// Write external positions (e.g. from 2D positions + z jitter) into internal arrays.
@@ -418,6 +418,17 @@ final class ForceSimulation3D {
             return
         }
 
+        // Coalesce topology changes: single alpha bump per tick regardless of how many
+        // addNode/addEdge calls arrived since the last tick.
+        if hasPendingTopologyChanges {
+            hasPendingTopologyChanges = false
+            alpha = max(alpha, 0.05)
+            topologyVersion &+= 1
+            isSettled = false
+            settledFrameCount = 0
+            postAlphaDispatches = 0
+        }
+
         // Fast path: when settled, skip all work (no integration, no sync, no force dispatch)
         if isSettled { return }
 
@@ -425,7 +436,18 @@ final class ForceSimulation3D {
         if let result = pendingForces.withLock({ value -> ForceResult? in
             let r = value; value = nil; return r
         }) {
-            storedFx = result.fx; storedFy = result.fy; storedFz = result.fz
+            // Blend old → new forces to avoid acceleration discontinuity.
+            // Without blending, forceAge reset causes a ~64% jump in applied magnitude.
+            let blend: Float = 0.65
+            if storedFx.count == result.fx.count {
+                for i in 0..<result.fx.count {
+                    storedFx[i] = storedFx[i] * (1 - blend) + result.fx[i] * blend
+                    storedFy[i] = storedFy[i] * (1 - blend) + result.fy[i] * blend
+                    storedFz[i] = storedFz[i] * (1 - blend) + result.fz[i] * blend
+                }
+            } else {
+                storedFx = result.fx; storedFy = result.fy; storedFz = result.fz
+            }
             forceAge = 2
             tickInFlight = false
         }

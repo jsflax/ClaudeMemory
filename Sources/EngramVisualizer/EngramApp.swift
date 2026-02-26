@@ -5,6 +5,7 @@ import GoogleSignIn
 import UniformTypeIdentifiers
 import ScreenCaptureKit
 import Sparkle
+import UserNotifications
 
 @main
 struct EngramApp: App {
@@ -12,13 +13,32 @@ struct EngramApp: App {
     let config: VisualizerConfig
     private let updaterController: SPUStandardUpdaterController
     @State private var accountService = AccountService()
-    @State private var showingAccount = false
 
     #if SWIFT_PACKAGE && os(macOS)
-    private final class Delegate: NSObject, NSApplicationDelegate {
+    private final class Delegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
         func applicationDidFinishLaunching(_ notification: Notification) {
             NSApp.setActivationPolicy(.regular)
             NSApp.activate(ignoringOtherApps: true)
+            UNUserNotificationCenter.current().delegate = self
+        }
+
+        /// Tapping a notification activates the existing window instead of opening a new instance.
+        nonisolated func userNotificationCenter(
+            _ center: UNUserNotificationCenter,
+            didReceive response: UNNotificationResponse
+        ) async {
+            await MainActor.run {
+                NSApp.activate(ignoringOtherApps: true)
+                (NSApp.keyWindow ?? NSApp.orderedWindows.first)?.makeKeyAndOrderFront(nil)
+            }
+        }
+
+        /// Allow notifications to show even when the app is in the foreground.
+        nonisolated func userNotificationCenter(
+            _ center: UNUserNotificationCenter,
+            willPresent notification: UNNotification
+        ) async -> UNNotificationPresentationOptions {
+            [.banner]
         }
     }
 
@@ -64,39 +84,15 @@ struct EngramApp: App {
             GraphView()
                 .environment(\.lattice, lattice)
                 .environment(config)
+                .environment(accountService)
                 .frame(minWidth: 800, minHeight: 600)
-                #if ENABLE_ACCOUNT
-                .toolbar {
-                    ToolbarItem(placement: .automatic) {
-                        HStack(spacing: 12) {
-                            SyncStatusView(accountService: accountService)
-
-                            Button {
-                                showingAccount.toggle()
-                            } label: {
-                                Image(systemName: "person.circle")
-                            }
-                            .popover(isPresented: $showingAccount) {
-                                AccountView(accountService: accountService)
-                            }
-                        }
-                        .padding(.leading, 8)
-                    }
-                }
-                #endif
+                .ignoresSafeArea()
         }
+        .windowStyle(.hiddenTitleBar)
         .commands {
             CommandGroup(after: .appInfo) {
                 CheckForUpdatesView(updater: updaterController.updater)
             }
-            #if ENABLE_ACCOUNT
-            CommandGroup(after: .appInfo) {
-                Button("Account...") {
-                    showingAccount = true
-                }
-                .keyboardShortcut(",", modifiers: [.command])
-            }
-            #endif
             CommandGroup(after: .saveItem) {
                 Button("Export as PNG…") {
                     Task {

@@ -9,4 +9,5 @@ final class VisualizerConfig {
     var dimensionMode: DimensionMode = .threeD
     var showVoids: Bool = false
     var soundEnabled: Bool = false
+    var notificationsEnabled: Bool = false
 }

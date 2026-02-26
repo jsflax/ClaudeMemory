@@ -555,6 +555,68 @@ kernel void stamp_label_quads(
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// MARK: - Compute: Stamp Edge Cylinders
+//
+// Each thread handles one vertex of one edge's cylinder (12 verts per edge).
+// Reads EdgeInstance, writes BatchVertex with hexagonal cylinder geometry.
+// ──────────────────────────────────────────────────────────────────────────────
+
+constant float kCylCos[6] = { 1.0, 0.5, -0.5, -1.0, -0.5, 0.5 };
+constant float kCylSin[6] = { 0.0, 0.866025403784, 0.866025403784, 0.0, -0.866025403784, -0.866025403784 };
+
+kernel void stamp_edge_cylinders(
+    device const EdgeInstance*  instances [[buffer(0)]],
+    constant     EdgeStampParams& params  [[buffer(1)]],
+    device       BatchVertex*   output    [[buffer(2)]],
+    uint tid [[thread_position_in_grid]])
+{
+    uint totalVerts = params.edgeCount * params.vertsPerEdge;
+    if (tid >= totalVerts) return;
+
+    uint edgeIdx = tid / params.vertsPerEdge;
+    uint vertIdx = tid % params.vertsPerEdge;
+
+    EdgeInstance inst = instances[edgeIdx];
+    float3 p1 = inst.sourcePos;  // already inset by CPU
+    float3 p2 = inst.targetPos;  // already inset by CPU
+    float3 delta = p2 - p1;
+    float  len = length(delta);
+
+    // Degenerate edge — collapse to zero
+    if (len < 0.0001) {
+        BatchVertex bv;
+        bv.position = float3(0); bv.normal = float3(0, 1, 0);
+        bv.uv = float2(0); bv.color = float4(0);
+        output[tid] = bv;
+        return;
+    }
+
+    float3 dir = delta / len;
+
+    // Basis vectors for the cylinder cross-section
+    float3 basisUp = abs(dir.y) < 0.99 ? float3(0, 1, 0) : float3(1, 0, 0);
+    float3 basisRight   = normalize(cross(dir, basisUp));
+    float3 basisForward = normalize(cross(basisRight, dir));
+
+    // Which segment (0-5) and which ring (bottom=0, top=1)
+    uint seg  = vertIdx % 6;
+    uint ring = vertIdx / 6;  // 0 = bottom ring, 1 = top ring
+
+    float c = kCylCos[seg];
+    float s = kCylSin[seg];
+    float3 offset = (basisRight * c + basisForward * s) * inst.radius;
+    float3 normal = normalize(basisRight * c + basisForward * s);
+    float3 pos = (ring == 0) ? (p1 + offset) : (p2 + offset);
+
+    BatchVertex bv;
+    bv.position = pos;
+    bv.normal = normal;
+    bv.uv = float2(inst.state, float(ring));
+    bv.color = inst.color;
+    output[tid] = bv;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // MARK: - Flow Particle Shaders (transparent, soft circle billboard)
 // ──────────────────────────────────────────────────────────────────────────────
 

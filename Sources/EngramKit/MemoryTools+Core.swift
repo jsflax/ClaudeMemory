@@ -1,6 +1,7 @@
 import Lattice
 import MCP
 import Foundation
+import NaturalLanguage
 
 // MARK: - Direct Access (for hooks)
 
@@ -23,6 +24,53 @@ extension MemoryTools {
         default:
             return nil
         }
+    }
+}
+
+// MARK: - Content Word Extraction
+
+extension MemoryTools {
+    /// POS tags to drop from queries — function words that add noise to FTS5 search.
+    /// Language-agnostic: NLTagger assigns these tags regardless of input language.
+    private static let dropTags: Set<NLTag> = [
+        .determiner, .pronoun, .preposition, .conjunction, .particle,
+    ]
+
+    /// Extract content words from a query using NLTagger POS tagging.
+    /// Drops determiners, pronouns, prepositions, conjunctions, and particles.
+    /// Keeps nouns, verbs (including auxiliaries), adjectives, adverbs, and
+    /// unknown/technical terms. Auxiliary verbs that slip through are acceptable —
+    /// the vector search handles ranking regardless, and POS filtering catches
+    /// the highest-noise function words across all languages.
+    ///
+    /// Falls back to all whitespace-split words if no content words survive.
+    public static func extractContentWords(from query: String) -> [String] {
+        guard !query.isEmpty else { return [] }
+
+        let tagger = NLTagger(tagSchemes: [.lexicalClass])
+        tagger.string = query
+
+        var contentWords: [String] = []
+        tagger.enumerateTags(
+            in: query.startIndex..<query.endIndex,
+            unit: .word,
+            scheme: .lexicalClass
+        ) { tag, range in
+            // Skip tokens with no tag (whitespace, punctuation)
+            guard let tag else { return true }
+            // Drop known function-word POS tags
+            if Self.dropTags.contains(tag) { return true }
+            // Keep everything else: nouns, verbs, adjectives, adverbs, unknown terms
+            let word = String(query[range]).trimmingCharacters(in: .whitespaces)
+            if !word.isEmpty { contentWords.append(word) }
+            return true
+        }
+
+        // Fall back to raw split if NLTagger stripped everything
+        if contentWords.isEmpty {
+            return query.split(separator: " ").map(String.init)
+        }
+        return contentWords
     }
 }
 
@@ -90,10 +138,10 @@ extension MemoryTools {
             importance = 0
         }
 
-        var embeddingVec = Vector<Float>([])
-        if let floats = try await embedder.embed(text: content) {
-            embeddingVec = Vector<Float>(floats)
+        guard let floats = try await embedder.embed(text: content) else {
+            throw MCPError.internalError("Embedding model unavailable — cannot store memory without a vector. Check that the CoreML model is bundled correctly.")
         }
+        let embeddingVec = Vector<Float>(floats)
 
         // Conflict detection + auto-connect candidate gathering
         // Search is done outside the force guard so auto-connect candidates survive force=true
@@ -364,8 +412,10 @@ extension MemoryTools {
             results = results.where { $0.createdAt <= beforeDate }
         }
 
-        // FTS5 query: use anyOf so any matching term qualifies
-        let ftsQuery: TextQuery = ._anyOf(query.split(separator: " ").map(String.init))
+        // FTS5 query: extract content words via NLTagger, fall back to raw split
+        let contentWords = Self.extractContentWords(from: query)
+        let ftsTerms = contentWords.isEmpty ? query.split(separator: " ").map(String.init) : contentWords
+        let ftsQuery: TextQuery = ._anyOf(ftsTerms)
 
         // Semantic search with vector similarity
         if let queryEmbedding = try await embedder.embed(text: query) {
@@ -412,7 +462,13 @@ extension MemoryTools {
                 let daysSinceAccess = now.timeIntervalSince(m.lastAccessedAt) / 86400.0
                 let recencyBoost = 1.0 - 0.1 * exp(-daysSinceAccess / 30.0)
 
-                let distance = cosine * projectBoost * frequencyBoost * importanceBoost * recencyBoost
+                // Staleness penalty — never-accessed memories older than 14 days rank lower (up to 20%)
+                let daysSinceCreation = now.timeIntervalSince(m.createdAt) / 86400.0
+                let stalenessPenalty: Double = (m.accessCount == 0 && daysSinceCreation > 14.0)
+                    ? 1.0 + min((daysSinceCreation - 14.0) / 180.0 * 0.20, 0.20)
+                    : 1.0
+
+                let distance = cosine * projectBoost * frequencyBoost * importanceBoost * recencyBoost * stalenessPenalty
                 return (object: m, distance: distance, ftsRank: match.distances["content"])
             }
 
@@ -450,21 +506,44 @@ extension MemoryTools {
 
             var output = lines.joined(separator: "\n\n")
 
+            // Knowledge gap detection — signal when recall results are weak
+            let avgDistance = filtered.map(\.distance).reduce(0, +) / Double(max(filtered.count, 1))
+            if avgDistance > 0.07 {
+                output = "⚠️ Weak recall (avg distance: \(String(format: "%.3f", avgDistance)), count: \(filtered.count)). Results may not be closely related to the query.\n\n" + output
+            }
+
             // Graph traversal when depth > 0
             if depth > 0 {
                 let recalledIds = Set(filtered.compactMap { $0.object.primaryKey })
-                let connected = traverseGraph(from: recalledIds, depth: depth, excludeIds: recalledIds)
+                let allConnected = traverseGraph(from: recalledIds, depth: depth, excludeIds: recalledIds)
+                // Filter connected memories by relevance to query.
+                // Structural edges (part_of, derived_from, supersedes) always pass through.
+                // Loose edges (relates_to, contradicts) require semantic proximity.
+                let queryVec = Vector<Float>(queryEmbedding)
+                let structuralRelations: Set<String> = ["part_of", "derived_from", "supersedes"]
+                let connected = allConnected.filter { mem in
+                    guard let memId = mem.memory.primaryKey else { return false }
+                    // Check if any edge connecting this memory to a recalled memory is structural
+                    let hasStructuralEdge = lattice.objects(Edge.self)
+                        .where { ($0.sourceId == memId || $0.targetId == memId) }
+                        .contains { structuralRelations.contains($0.relation) }
+                    if hasStructuralEdge { return true }
+                    // Loose edges: filter by cosine distance to query
+                    guard mem.memory.embedding.dimensions > 0 else { return false }
+                    return Double(mem.memory.embedding.cosineDistance(to: queryVec)) <= 0.15
+                }
                 if !connected.isEmpty {
                     output += "\n\n--- Connected (graph traversal, depth: \(depth)) ---"
                     let connNow = Date()
                     // Track all known IDs (recalled + connected so far) for edge lookup at depth>1
                     var knownIds = recalledIds
                     for mem in connected {
-                        guard let memId = mem.primaryKey else { continue }
-                        mem.lastAccessedAt = connNow
-                        mem.accessCount += 1
+                        let m = mem.memory
+                        guard let memId = m.primaryKey else { continue }
+                        m.lastAccessedAt = connNow
+                        m.accessCount += 1
 
-                        let expires = mem.expiresAt == .distantFuture ? "" : ", expires: \(Self.dateFormatter.string(from: mem.expiresAt))"
+                        let expires = m.expiresAt == .distantFuture ? "" : ", expires: \(Self.dateFormatter.string(from: m.expiresAt))"
 
                         // Look up the edge relation connecting this memory to any known memory
                         var edgeInfo = ""
@@ -476,15 +555,15 @@ extension MemoryTools {
                         knownIds.insert(memId)
 
                         // Small memories shown in full; large ones get a compact preview
-                        if mem.content.count <= 500 {
-                            output += "\n\n[id:\(memId)] [\(mem.project)/\(mem.topic)]\(expires)\(edgeInfo) \(mem.content)"
+                        if m.content.count <= 500 {
+                            output += "\n\n[id:\(memId)] [\(m.project)/\(m.topic)]\(expires)\(edgeInfo) \(m.content)"
                         } else {
-                            let firstLine = mem.content.split(separator: "\n", maxSplits: 1).first.map(String.init) ?? mem.content
+                            let firstLine = m.content.split(separator: "\n", maxSplits: 1).first.map(String.init) ?? m.content
                             let preview = String(firstLine.prefix(120))
-                            let charCount = mem.content.count
-                            let sectionCount = mem.content.components(separatedBy: "\n").filter { $0.hasPrefix("## ") || $0.hasPrefix("### ") }.count
+                            let charCount = m.content.count
+                            let sectionCount = m.content.components(separatedBy: "\n").filter { $0.hasPrefix("## ") || $0.hasPrefix("### ") }.count
                             let sizeInfo = sectionCount > 0 ? "\(sectionCount) sections, \(charCount) chars" : "\(charCount) chars"
-                            output += "\n\n[id:\(memId)] [\(mem.project)/\(mem.topic)] (\(sizeInfo)\(expires))\(edgeInfo) \(preview)\(charCount > 120 ? "..." : "")"
+                            output += "\n\n[id:\(memId)] [\(m.project)/\(m.topic)] (\(sizeInfo)\(expires))\(edgeInfo) \(preview)\(charCount > 120 ? "..." : "")"
                         }
                     }
                 }
@@ -758,10 +837,10 @@ extension MemoryTools {
         let project = a.project ?? sources[0].project
 
         // Embed the merged content
-        var embeddingVec = Vector<Float>([])
-        if let floats = try await embedder.embed(text: content) {
-            embeddingVec = Vector<Float>(floats)
+        guard let floats = try await embedder.embed(text: content) else {
+            throw MCPError.internalError("Embedding model unavailable — cannot merge memories without a vector. Check that the CoreML model is bundled correctly.")
         }
+        let embeddingVec = Vector<Float>(floats)
 
         // Create merged memory
         let merged = Memory(content: content, topic: topic, project: project, source: "merged", embedding: embeddingVec)

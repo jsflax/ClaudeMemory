@@ -17,6 +17,10 @@ struct MetalViewRepresentable: NSViewRepresentable {
 
     let renderer: MetalGraphRenderer
 
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
     func makeNSView(context: Context) -> MTKView {
         let mtkView = FocusableMTKView()
         mtkView.device = renderer.device
@@ -27,10 +31,31 @@ struct MetalViewRepresentable: NSViewRepresentable {
         mtkView.delegate = renderer
         mtkView.isPaused = false
         mtkView.enableSetNeedsDisplay = false
+        context.coordinator.observeMinimize(for: mtkView)
         return mtkView
     }
 
     func updateNSView(_ nsView: MTKView, context: Context) {
         // Nothing to do — renderer drives the loop via MTKViewDelegate
+    }
+
+    final class Coordinator {
+        private var observers: [NSObjectProtocol] = []
+
+        func observeMinimize(for view: MTKView) {
+            let nc = NotificationCenter.default
+            observers.append(nc.addObserver(forName: NSWindow.didMiniaturizeNotification, object: nil, queue: .main) { [weak view] n in
+                guard let view, n.object as? NSWindow === view.window else { return }
+                view.isPaused = true
+            })
+            observers.append(nc.addObserver(forName: NSWindow.didDeminiaturizeNotification, object: nil, queue: .main) { [weak view] n in
+                guard let view, n.object as? NSWindow === view.window else { return }
+                view.isPaused = false
+            })
+        }
+
+        deinit {
+            observers.forEach { NotificationCenter.default.removeObserver($0) }
+        }
     }
 }

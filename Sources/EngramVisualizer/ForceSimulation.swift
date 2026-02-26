@@ -53,6 +53,10 @@ final class ForceSimulation: ObservableObject {
     private var forceAge: Int = 100  // frames since last force computation; starts high so zero-forces aren't amplified
     private var topologyVersion: UInt64 = 0
 
+    /// Set by addNode/addEdge, drained by tick(). Coalesces multiple topology changes
+    /// between frames into a single alpha bump instead of one per call.
+    private var hasPendingTopologyChanges = false
+
     var center: CGPoint = CGPoint(x: 400, y: 300)
     var isActive: Bool = true
 
@@ -158,8 +162,7 @@ final class ForceSimulation: ObservableObject {
         nodeTopic[id] = topic
         prevTopicGroup = topicGroup
 
-        alpha = max(alpha, 0.05)
-        topologyVersion &+= 1
+        hasPendingTopologyChanges = true
         rebuildPositions()
     }
 
@@ -198,8 +201,7 @@ final class ForceSimulation: ObservableObject {
         nodeTopic.removeValue(forKey: id)
         prevTopicGroup = topicGroup
 
-        alpha = max(alpha, 0.05)
-        topologyVersion &+= 1
+        hasPendingTopologyChanges = true
         rebuildPositions()
     }
 
@@ -207,15 +209,13 @@ final class ForceSimulation: ObservableObject {
         guard let si = idToIndex[sourceId], let ti = idToIndex[targetId] else { return }
         if edgeIndices.contains(where: { $0 == (si, ti) }) { return }
         edgeIndices.append((si, ti))
-        alpha = max(alpha, 0.03)
-        topologyVersion &+= 1
+        hasPendingTopologyChanges = true
     }
 
     func removeEdge(from sourceId: Int64, to targetId: Int64) {
         guard let si = idToIndex[sourceId], let ti = idToIndex[targetId] else { return }
         edgeIndices.removeAll { $0 == (si, ti) }
-        alpha = max(alpha, 0.03)
-        topologyVersion &+= 1
+        hasPendingTopologyChanges = true
     }
 
     // MARK: - Full graph reconciliation
@@ -388,6 +388,14 @@ final class ForceSimulation: ObservableObject {
     /// then dispatches async O(n²) force recomputation when the pipeline is idle.
     func tick() {
         guard isActive else { return }
+
+        // Coalesce topology changes: single alpha bump per tick regardless of how many
+        // addNode/addEdge calls arrived since the last tick.
+        if hasPendingTopologyChanges {
+            hasPendingTopologyChanges = false
+            alpha = max(alpha, 0.05)
+            topologyVersion &+= 1
+        }
 
         let n = ids.count
         guard n > 1 else {
