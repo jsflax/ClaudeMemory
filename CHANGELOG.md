@@ -4,6 +4,20 @@ All notable changes to Engram are documented in this file.
 
 > Formerly "ClaudeMemory" — renamed in v0.12.0 to be tool-agnostic.
 
+## [0.12.3] - 2026-02-26
+
+### Fixed
+- **Metal crash on minimize** — MTKView continued rendering at 60fps when the window was minimized, producing zero-dimension drawables that triggered a Metal validation SIGABRT. Added dimension guards and pause/resume on minimize/deminiaturize.
+- **Empty embedding SIGTRAP** — `remember`, `merge`, and `consolidate` silently stored `Vector<Float>([])` when the CoreML embedding model failed to load. Later `recall` with a valid query vector hit a dimension mismatch in sqlite-vec, causing an uncatchable SIGTRAP in LatticeCore. These operations now fail with a clear error instead of storing empty vectors.
+
+### Improved
+- **Recall quality** — NLTagger POS-based content-word extraction for FTS queries (drops determiners, pronouns, prepositions), staleness penalty for never-accessed memories older than 14 days, weak-recall warning when average distance > 0.07, and graph traversal now filters connected memories by semantic relevance to the query
+- **GPU compute edge stamping** — edge cylinder geometry now stamped via Metal compute kernel, matching the existing node sphere pipeline
+- **Log rotation** — hooks, session-learner, and maintenance logs rotate at 256KB with one `.1` backup
+
+### Added
+- **Sidebar view** — new left-side panel for graph controls and navigation
+
 ## [0.12.2] - 2026-02-25
 
 ### Fixed
@@ -248,6 +262,8 @@ All notable changes to Engram are documented in this file.
 - CI/CD with GitHub Actions on macOS 26 / Swift 6.2
 - Homebrew tap workflow
 
+[0.12.3]: https://github.com/jsflax/Engram/compare/v0.12.2...v0.12.3
+[0.12.2]: https://github.com/jsflax/Engram/compare/v0.12.1...v0.12.2
 [0.12.1]: https://github.com/jsflax/Engram/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/jsflax/Engram/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/jsflax/Engram/compare/v0.10.0...v0.11.0
