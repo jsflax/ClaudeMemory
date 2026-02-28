@@ -153,7 +153,7 @@ final class MetalForceCompute {
 @MainActor
 final class ForceSimulation3D {
     // SoA layout for cache-friendly iteration
-    private var ids: [Int64] = []
+    private var ids: [UUID] = []
     private var x: [Float] = []
     private var y: [Float] = []
     private var z: [Float] = []
@@ -161,7 +161,7 @@ final class ForceSimulation3D {
     private var vy: [Float] = []
     private var vz: [Float] = []
     private var pinned: [Bool] = []
-    private var idToIndex: [Int64: Int] = [:]
+    private var idToIndex: [UUID: Int] = [:]
     private var edgeIndices: [(Int, Int)] = []
     private var projectGroup: [Int] = []
     private var topicGroup: [Int] = []
@@ -180,7 +180,7 @@ final class ForceSimulation3D {
     /// Using OSAllocatedUnfairLock for safe cross-isolation handoff without MainActor hop.
     private let pendingForces = OSAllocatedUnfairLock<ForceResult?>(initialState: nil)
 
-    private(set) var positions: [Int64: SIMD3<Float>] = [:]
+    private(set) var positions: [UUID: SIMD3<Float>] = [:]
 
     // Force parameters (tuned for 3D — slightly stronger since space is larger)
     private let springLength: Float = 240
@@ -199,16 +199,15 @@ final class ForceSimulation3D {
     private let maxSpeed: Float = 12.0
 
     private var alpha: Float = 1.0
-    private let alphaDecay: Float = 0.995  // ~920 frames (~15s) to floor — more force iterations before convergence
+    private let alphaDecay: Float = 0.995
     private let alphaFloor: Float = 0.01
     private var tickInFlight = false
     private var forceAge: Int = 100
+    private var smoothedAttenuation: Float = 0.001
     private var topologyVersion: UInt64 = 0
-    private var postAlphaDispatches = 0
-    private let maxPostAlphaDispatches = 60  // ~3s of post-alpha polish — gives cohesion forces time to pull same-project nodes together
 
     /// Set by addNode/addEdge, drained by tick(). Coalesces multiple topology changes
-    /// between frames into a single alpha bump instead of one per call.
+    /// into a single wake per tick instead of one per call.
     private var hasPendingTopologyChanges = false
 
     /// Metal compute for GPU-accelerated charge force calculation.
@@ -217,8 +216,8 @@ final class ForceSimulation3D {
     var center: SIMD3<Float> = .zero
     var isActive: Bool = true
 
-    /// True when the simulation has converged (alpha at floor, velocities near-zero).
-    /// When settled, tick() skips syncPositions and force dispatch to save CPU.
+    /// True when the simulation has converged (velocities near-zero for 30 consecutive frames).
+    /// When settled, tick() skips force dispatch and position sync to save CPU/GPU.
     private(set) var isSettled = false
     private var settledFrameCount = 0
 
@@ -228,22 +227,20 @@ final class ForceSimulation3D {
 
     /// Wake the simulation from settled state (e.g. after topology change or user interaction).
     func wake() {
-        alpha = max(alpha, 0.3)
         isSettled = false
         settledFrameCount = 0
-        postAlphaDispatches = 0
         forceAge = 2
     }
 
     // MARK: - Graph Management
 
-    func updateGraph(nodeIds: Set<Int64>, edges: [(Int64, Int64)],
-                     projectForNode: [Int64: String] = [:], topicForNode: [Int64: String] = [:]) {
+    func updateGraph(nodeIds: Set<UUID>, edges: [(UUID, UUID)],
+                     projectForNode: [UUID: String] = [:], topicForNode: [UUID: String] = [:]) {
         // Remove nodes no longer in the graph
         var keep = [Bool](repeating: false, count: ids.count)
         for (i, id) in ids.enumerated() { keep[i] = nodeIds.contains(id) }
 
-        var newIds: [Int64] = []
+        var newIds: [UUID] = []
         var newX: [Float] = [], newY: [Float] = [], newZ: [Float] = []
         var newVx: [Float] = [], newVy: [Float] = [], newVz: [Float] = []
         var newPinned: [Bool] = []
@@ -316,14 +313,14 @@ final class ForceSimulation3D {
         storedFy = [Float](repeating: 0, count: ids.count)
         storedFz = [Float](repeating: 0, count: ids.count)
 
-        alpha = max(alpha, 0.05)
         topologyVersion &+= 1
         isSettled = false; settledFrameCount = 0
+        forceAge = 2
         rebuildPositions()
     }
 
     /// Surgically insert a single node without rebuilding the entire graph.
-    func addNode(_ id: Int64, project: String, topic: String) {
+    func addNode(_ id: UUID, project: String, topic: String) {
         guard idToIndex[id] == nil else { return }
         let angle = Float.random(in: 0...(2 * .pi))
         let phi = Float.random(in: -.pi/2...(.pi/2))
@@ -363,7 +360,7 @@ final class ForceSimulation3D {
     }
 
     /// Surgically insert a single edge without rebuilding the entire graph.
-    func addEdge(from source: Int64, to target: Int64) {
+    func addEdge(from source: UUID, to target: UUID) {
         guard let si = idToIndex[source], let ti = idToIndex[target] else { return }
         guard !edgeIndices.contains(where: { $0.0 == si && $0.1 == ti }) else { return }
         edgeIndices.append((si, ti))
@@ -371,7 +368,7 @@ final class ForceSimulation3D {
     }
 
     /// Write external positions (e.g. from 2D positions + z jitter) into internal arrays.
-    func setPositions(_ positions: [Int64: SIMD3<Float>]) {
+    func setPositions(_ positions: [UUID: SIMD3<Float>]) {
         for (id, point) in positions {
             guard let i = idToIndex[id] else { continue }
             x[i] = point.x; y[i] = point.y; z[i] = point.z
@@ -388,20 +385,20 @@ final class ForceSimulation3D {
     // MARK: - Pinning (for node expansion)
 
     /// Pin a node so the force simulation won't move it.
-    func pin(_ id: Int64) {
+    func pin(_ id: UUID) {
         guard let i = idToIndex[id] else { return }
         pinned[i] = true
         vx[i] = 0; vy[i] = 0; vz[i] = 0
     }
 
     /// Unpin a node so the force simulation resumes moving it.
-    func unpin(_ id: Int64) {
+    func unpin(_ id: UUID) {
         guard let i = idToIndex[id] else { return }
         pinned[i] = false
     }
 
     /// Set a node's position directly and zero its velocity.
-    func setPosition(_ id: Int64, to pos: SIMD3<Float>) {
+    func setPosition(_ id: UUID, to pos: SIMD3<Float>) {
         guard let i = idToIndex[id] else { return }
         x[i] = pos.x; y[i] = pos.y; z[i] = pos.z
         vx[i] = 0; vy[i] = 0; vz[i] = 0
@@ -418,15 +415,13 @@ final class ForceSimulation3D {
             return
         }
 
-        // Coalesce topology changes: single alpha bump per tick regardless of how many
+        // Coalesce topology changes into a single wake per tick regardless of how many
         // addNode/addEdge calls arrived since the last tick.
         if hasPendingTopologyChanges {
             hasPendingTopologyChanges = false
-            alpha = max(alpha, 0.05)
             topologyVersion &+= 1
             isSettled = false
             settledFrameCount = 0
-            postAlphaDispatches = 0
         }
 
         // Fast path: when settled, skip all work (no integration, no sync, no force dispatch)
@@ -453,7 +448,9 @@ final class ForceSimulation3D {
         }
 
         let hasForcesComputed = storedFx.count == n
-        let attenuation = pow(damping, Float(forceAge))
+        let rawAttenuation = pow(damping, Float(forceAge))
+        smoothedAttenuation += (rawAttenuation - smoothedAttenuation) * 0.1
+        let attenuation = smoothedAttenuation
         forceAge += 1
 
         var maxSpeedSq: Float = 0
@@ -477,11 +474,8 @@ final class ForceSimulation3D {
         alpha = max(alpha * alphaDecay, alphaFloor)
         lastMaxSpeedSq = maxSpeedSq
 
-        // Settle detection: alpha at floor AND all nodes nearly stationary AND
-        // post-alpha dispatches exhausted. Without the last condition, the sim
-        // would settle mid-convergence while extra force iterations are still pending.
-        if hasForcesComputed && alpha <= alphaFloor * 1.01 && maxSpeedSq < 0.01
-            && postAlphaDispatches >= maxPostAlphaDispatches {
+        // Settle detection: all nodes nearly stationary for 30 consecutive frames.
+        if hasForcesComputed && maxSpeedSq < 0.01 {
             settledFrameCount += 1
             if settledFrameCount >= 30 {
                 isSettled = true
@@ -494,16 +488,9 @@ final class ForceSimulation3D {
 
         syncPositions()
 
-        // Dispatch new forces while alpha is above the floor, plus extra iterations
-        // after alpha converges to let nodes reach proper equilibrium.
+        // Dispatch force computation whenever the pipeline is idle.
         if !tickInFlight {
-            if alpha > alphaFloor * 1.01 {
-                postAlphaDispatches = 0
-                dispatchForceComputation()
-            } else if postAlphaDispatches < maxPostAlphaDispatches {
-                postAlphaDispatches += 1
-                dispatchForceComputation()
-            }
+            dispatchForceComputation()
         }
     }
 

@@ -33,7 +33,7 @@ struct KnowledgeVoid: Identifiable {
 
 struct SemanticCluster: Identifiable {
     let id = UUID()
-    let nodeIds: [Int64]
+    let nodeIds: [UUID]
     let centroid: CGPoint
     let hullPoints: [CGPoint]  // convex hull for drawing
     let label: String          // dominant topics/projects
@@ -43,7 +43,7 @@ struct SemanticCluster: Identifiable {
 
 struct SemanticCluster3D: Identifiable {
     let id = UUID()
-    let nodeIds: [Int64]
+    let nodeIds: [UUID]
     let centroid: SIMD3<Float>
     let boundingRadius: Float
     let label: String
@@ -56,22 +56,22 @@ struct SemanticCluster3D: Identifiable {
 @MainActor
 final class EmbeddingProjection {
     private(set) var state: ProjectionState = .idle
-    private(set) var projectedPositions: [Int64: CGPoint] = [:]
-    private(set) var projectedPositions3D: [Int64: SIMD3<Float>] = [:]
+    private(set) var projectedPositions: [UUID: CGPoint] = [:]
+    private(set) var projectedPositions3D: [UUID: SIMD3<Float>] = [:]
     private(set) var knowledgeVoids: [KnowledgeVoid] = []
     private(set) var semanticClusters: [SemanticCluster] = []
     private(set) var semanticClusters3D: [SemanticCluster3D] = []
 
     /// Raw 384-dim embeddings, cached from Lattice
-    private var embeddings: [Int64: [Float]] = [:]
+    private var embeddings: [UUID: [Float]] = [:]
 
     /// Track which node IDs were projected so we know when to re-project
-    private var projectedNodeIds: Set<Int64> = []
+    private var projectedNodeIds: Set<UUID> = []
 
     /// Target positions from the latest t-SNE emission — frame-level interpolation
     /// lerps projectedPositions toward these each frame for smooth animation.
-    private var targetPositions: [Int64: CGPoint] = [:]
-    private var targetPositions3D: [Int64: SIMD3<Float>] = [:]
+    private var targetPositions: [UUID: CGPoint] = [:]
+    private var targetPositions3D: [UUID: SIMD3<Float>] = [:]
 
     /// Whether the 3D lerp animation has converged (no pending targets).
     var is3DAnimationSettled: Bool { targetPositions3D.isEmpty }
@@ -79,7 +79,7 @@ final class EmbeddingProjection {
     /// Authoritative positions for cluster/void detection. Uses targetPositions (the true
     /// final t-SNE result) when available, so hulls are computed at the correct locations
     /// even while projectedPositions is still lerping toward them.
-    private var detectionPositions: [Int64: CGPoint] {
+    private var detectionPositions: [UUID: CGPoint] {
         targetPositions.isEmpty ? projectedPositions : targetPositions
     }
 
@@ -91,12 +91,12 @@ final class EmbeddingProjection {
 
     // MARK: - Embedding Loading
 
-    func loadEmbeddings(for nodeIds: Set<Int64>, from lattice: Lattice) {
+    func loadEmbeddings(for nodeIds: Set<UUID>, from lattice: Lattice) {
         state = .loadingEmbeddings
         var loaded = 0
         for id in nodeIds {
             if embeddings[id] != nil { loaded += 1; continue }
-            guard let memory = lattice.object(Memory.self, primaryKey: id) else { continue }
+            guard let memory = lattice.objects(Memory.self).where({ $0.__globalId == id }).first else { continue }
             let elements = memory.embedding.elements
             guard !elements.isEmpty else { continue }
             embeddings[id] = elements
@@ -110,13 +110,13 @@ final class EmbeddingProjection {
     // MARK: - Projection
 
     func computeProjection(
-        nodeIds: Set<Int64>, center: CGPoint, spread: CGFloat,
-        initialPositions: [Int64: CGPoint] = [:]
+        nodeIds: Set<UUID>, center: CGPoint, spread: CGFloat,
+        initialPositions: [UUID: CGPoint] = [:]
     ) async {
         // Collect embeddings for nodes that have them
-        var ids: [Int64] = []
+        var ids: [UUID] = []
         var embeddingArrays: [[Float]] = []
-        var noEmbeddingIds: [Int64] = []
+        var noEmbeddingIds: [UUID] = []
 
         for id in nodeIds {
             if let emb = embeddings[id], !emb.isEmpty {
@@ -179,7 +179,7 @@ final class EmbeddingProjection {
         let capturedNoEmbeddingIds = noEmbeddingIds
         let capturedCenter = center
         let capturedSpread = spread
-        let positionsHandler: @Sendable ([(id: Int64, x: Double, y: Double)], _ zValues: [Double]?) -> Void = { [weak self] rawPositions, _ in
+        let positionsHandler: @Sendable ([(id: UUID, x: Double, y: Double)], _ zValues: [Double]?) -> Void = { [weak self] rawPositions, _ in
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 // Ignore stale emissions that arrive after computation finished
@@ -214,10 +214,10 @@ final class EmbeddingProjection {
 
     /// Scale raw t-SNE positions to world coordinates.
     private static func scaleToWorld(
-        _ rawPositions: [(id: Int64, x: Double, y: Double)],
+        _ rawPositions: [(id: UUID, x: Double, y: Double)],
         center: CGPoint, spread: CGFloat,
-        noEmbeddingIds: [Int64]
-    ) -> [Int64: CGPoint] {
+        noEmbeddingIds: [UUID]
+    ) -> [UUID: CGPoint] {
         var minX = Double.greatestFiniteMagnitude, minY = Double.greatestFiniteMagnitude
         var maxX = -Double.greatestFiniteMagnitude, maxY = -Double.greatestFiniteMagnitude
         for p in rawPositions {
@@ -227,7 +227,7 @@ final class EmbeddingProjection {
         let rangeX = max(maxX - minX, 1)
         let rangeY = max(maxY - minY, 1)
 
-        var positions: [Int64: CGPoint] = [:]
+        var positions: [UUID: CGPoint] = [:]
         for p in rawPositions {
             let nx = (p.x - minX) / rangeX - 0.5
             let ny = (p.y - minY) / rangeY - 0.5
@@ -283,12 +283,12 @@ final class EmbeddingProjection {
     // MARK: - 3D Projection
 
     func computeProjection3D(
-        nodeIds: Set<Int64>, spread: Float,
-        initialPositions: [Int64: SIMD3<Float>] = [:]
+        nodeIds: Set<UUID>, spread: Float,
+        initialPositions: [UUID: SIMD3<Float>] = [:]
     ) async {
-        var ids: [Int64] = []
+        var ids: [UUID] = []
         var embeddingArrays: [[Float]] = []
-        var noEmbeddingIds: [Int64] = []
+        var noEmbeddingIds: [UUID] = []
 
         for id in nodeIds {
             if let emb = embeddings[id], !emb.isEmpty {
@@ -335,7 +335,7 @@ final class EmbeddingProjection {
 
         let capturedNoEmbeddingIds = noEmbeddingIds
         let capturedSpread = spread
-        let positionsHandler: @Sendable ([(id: Int64, x: Double, y: Double)], _ zValues: [Double]?) -> Void = { [weak self] rawPositions, zValues in
+        let positionsHandler: @Sendable ([(id: UUID, x: Double, y: Double)], _ zValues: [Double]?) -> Void = { [weak self] rawPositions, zValues in
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 guard case .computing = self.state else { return }
@@ -364,11 +364,11 @@ final class EmbeddingProjection {
     }
 
     private static func scaleToWorld3D(
-        _ rawPositions: [(id: Int64, x: Double, y: Double)],
+        _ rawPositions: [(id: UUID, x: Double, y: Double)],
         zValues: [Double]?,
         spread: Float,
-        noEmbeddingIds: [Int64]
-    ) -> [Int64: SIMD3<Float>] {
+        noEmbeddingIds: [UUID]
+    ) -> [UUID: SIMD3<Float>] {
         var minX = Double.greatestFiniteMagnitude, minY = Double.greatestFiniteMagnitude, minZ = Double.greatestFiniteMagnitude
         var maxX = -Double.greatestFiniteMagnitude, maxY = -Double.greatestFiniteMagnitude, maxZ = -Double.greatestFiniteMagnitude
         let zVals = zValues ?? [Double](repeating: 0, count: rawPositions.count)
@@ -382,7 +382,7 @@ final class EmbeddingProjection {
         let rangeY = max(maxY - minY, 1)
         let rangeZ = max(maxZ - minZ, 1)
 
-        var positions: [Int64: SIMD3<Float>] = [:]
+        var positions: [UUID: SIMD3<Float>] = [:]
         for (i, p) in rawPositions.enumerated() {
             let nx = Float((p.x - minX) / rangeX - 0.5)
             let ny = Float((p.y - minY) / rangeY - 0.5)
@@ -428,7 +428,7 @@ final class EmbeddingProjection {
     /// Detect sparse regions in the projected 2D space between clusters.
     /// Uses nearest-node distance on a grid — a void is a region far from any node
     /// but surrounded by populated areas (between clusters, not at the edges).
-    func detectVoids(nodeTopics: [Int64: String], nodeProjects: [Int64: String]) {
+    func detectVoids(nodeTopics: [UUID: String], nodeProjects: [UUID: String]) {
         guard state == .ready, detectionPositions.count >= 5 else {
             knowledgeVoids = []
             return
@@ -574,7 +574,7 @@ final class EmbeddingProjection {
     /// Detect spatial clusters in the projected 2D space using hierarchical k-means.
     /// Groups nearby nodes and labels clusters by dominant topics/projects.
     /// Large clusters are sub-divided into sub-clusters for finer-grained visual grouping.
-    func detectClusters(nodeTopics: [Int64: String], nodeProjects: [Int64: String], nodeLabels: [Int64: String]) {
+    func detectClusters(nodeTopics: [UUID: String], nodeProjects: [UUID: String], nodeLabels: [UUID: String]) {
         guard state == .ready, detectionPositions.count >= 3 else {
             semanticClusters = []
             return
@@ -631,8 +631,8 @@ final class EmbeddingProjection {
 
     /// Build a SemanticCluster from a set of member indices into the ids/positions arrays.
     private func buildCluster(
-        memberIndices: [Int], ids: [Int64], positions: [CGPoint],
-        nodeTopics: [Int64: String], nodeProjects: [Int64: String], hullPadding: CGFloat
+        memberIndices: [Int], ids: [UUID], positions: [CGPoint],
+        nodeTopics: [UUID: String], nodeProjects: [UUID: String], hullPadding: CGFloat
     ) -> SemanticCluster {
         let memberIds = memberIndices.map { ids[$0] }
         let memberPositions = memberIndices.map { positions[$0] }
@@ -793,7 +793,7 @@ final class EmbeddingProjection {
     // MARK: - 3D Semantic Cluster Detection
 
     /// Detect spatial clusters in the projected 3D space using k-means.
-    func detectClusters3D(nodeTopics: [Int64: String], nodeProjects: [Int64: String], nodeLabels: [Int64: String]) {
+    func detectClusters3D(nodeTopics: [UUID: String], nodeProjects: [UUID: String], nodeLabels: [UUID: String]) {
         let positions3D = projectedPositions3D
         guard state == .ready, positions3D.count >= 3 else {
             semanticClusters3D = []

@@ -142,4 +142,52 @@ struct FlowParticleVertex {
     float       _pad2;
 };
 
+// MARK: - Mascot
+
+// 32-byte vertex for mascot mesh parts.
+struct MascotVertex {
+    simd_float3 position;    // 12 bytes
+    simd_float3 normal;      // 12 bytes
+    simd_float2 uv;          // 8 bytes
+};                           // Total: 32 bytes
+
+// Per-part transform + emissive + skinning data for mascot.
+struct MascotPartUniforms {
+    simd_float4x4 modelMatrix;     // primary transform for this part
+    simd_float4x4 parentMatrix;    // parent (body) transform for skinning blend
+    simd_float4   emissive;        // (r, g, b, intensity)
+    simd_float3   blendPivot;      // pivot in model space for distance-based blend
+    float         blendRadius;     // distance over which blend transitions (0 = no blend)
+};
+
+// Uniforms for all 5 mascot parts.
+#define MASCOT_PART_COUNT 5
+struct MascotUniforms {
+    struct MascotPartUniforms parts[MASCOT_PART_COUNT];
+};
+
+// Arcane circle orientation (passed to vertex shader for oriented billboard).
+struct ArcaneCircleUniforms {
+    simd_float3 center;
+    float       size;
+    simd_float3 right;      // mascot's local X axis in world space
+    float       opacity;
+    simd_float3 up;          // mascot's local Y axis in world space
+    float       _pad;
+};
+
+// Holographic info screen billboard (oriented to mascot's facing direction).
+struct HoloScreenUniforms {
+    simd_float3 center;          // world-space billboard center
+    float       width;           // billboard half-width
+    simd_float3 right;           // mascot's local X axis in world space
+    float       height;          // billboard half-height
+    simd_float3 up;              // mascot's local Y axis in world space
+    float       opacity;         // fade in/out (0..1)
+    float       revealProgress;  // typewriter reveal (0..1)
+    float       _pad0;
+    float       _pad1;
+    float       _pad2;
+};
+
 #endif /* SharedTypes_h */

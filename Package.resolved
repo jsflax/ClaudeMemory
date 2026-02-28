@@ -1,5 +1,5 @@
 {
-  "originHash" : "129652f1264ebd37444cf14bbf96c125961872cac1c4d6d12fe6d16afbf1d1da",
+  "originHash" : "8ccdde38c5a9ef0e3bcac53fdf6bb62b0332ea4bce589726c49b66b55aa0d7f3",
   "pins" : [
     {
       "identity" : "appauth-ios",
@@ -116,24 +116,6 @@
       "state" : {
         "revision" : "13e7513b3ba0afa13967daf77af2fb4ad087306c",
         "version" : "4.13.5"
-      }
-    },
-    {
-      "identity" : "lattice",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/jsflax/lattice",
-      "state" : {
-        "revision" : "f5a96d18f23e7b7a41d2cae706cb6a86fdf40d64",
-        "version" : "0.4.1"
-      }
-    },
-    {
-      "identity" : "latticecore",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/jsflax/LatticeCore.git",
-      "state" : {
-        "revision" : "9f24a5d996a128ca477d63081c83409f0d6b0181",
-        "version" : "0.4.1"
       }
     },
     {

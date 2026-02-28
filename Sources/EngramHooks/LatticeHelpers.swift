@@ -8,7 +8,7 @@ func openLattice() -> Lattice? {
     guard FileManager.default.fileExists(atPath: dbPath) else { return nil }
     return try? Lattice(
         Memory.self, Edge.self, Checkpoint.self, HookState.self, SessionState.self,
-        configuration: .init(fileURL: URL(fileURLWithPath: dbPath))
+        configuration: .init(fileURL: URL(fileURLWithPath: dbPath), migration: engramMigrations)
     )
 }
 
@@ -23,7 +23,7 @@ func initMemoryTools() async -> MemoryTools? {
     let embedder = EmbeddingService(modelPath: modelPath)
     await embedder.load()
 
-    return MemoryTools(lattice: lattice, embedder: embedder)
+    return MemoryTools(ref: lattice.sendableReference, embedder: embedder)
 }
 
 /// Get the current total memory count from the database.

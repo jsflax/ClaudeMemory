@@ -3,10 +3,10 @@ import SwiftUI
 struct ActivityLogPanel: View {
     let nodes: [NodeData]
     let colorMap: [String: Color]
-    let onSelect: (Int64) -> Void
+    let onSelect: (UUID) -> Void
 
-    @State private var knownIds: Set<Int64> = []
-    @State private var glowingIds: Set<Int64> = []
+    @State private var knownIds: Set<UUID> = []
+    @State private var glowingIds: Set<UUID> = []
 
     fileprivate static let relativeFormatter: RelativeDateTimeFormatter = {
         let f = RelativeDateTimeFormatter()
@@ -79,7 +79,7 @@ private struct ActivityRow: View {
     let colorMap: [String: Color]
     let isGlowing: Bool
     let now: Date
-    let onSelect: (Int64) -> Void
+    let onSelect: (UUID) -> Void
 
     var body: some View {
         Button {

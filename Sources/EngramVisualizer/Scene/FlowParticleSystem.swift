@@ -22,7 +22,7 @@ final class FlowParticleSystem {
 
     private var particles: [Particle] = []
     private var spawnTimers: [String: Float] = [:]
-    private var lastSelectedNode: Int64?
+    private var lastSelectedNode: UUID?
 
     init(device: MTLDevice) {
         self.device = device
@@ -42,10 +42,10 @@ final class FlowParticleSystem {
     /// Update flow particles and pack vertices for GPU rendering.
     func update(
         dt: Float,
-        selectedNode: Int64?,
+        selectedNode: UUID?,
         edges: [EdgeData],
-        positions: [Int64: SIMD3<Float>],
-        expandedHubs: Set<Int64>,
+        positions: [UUID: SIMD3<Float>],
+        expandedHubs: Set<UUID>,
         renderer: MetalGraphRenderer
     ) {
         // Selection change → flush all particles

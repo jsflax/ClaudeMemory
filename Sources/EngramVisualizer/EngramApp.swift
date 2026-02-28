@@ -55,7 +55,8 @@ struct EngramApp: App {
         let lat = try! Lattice(
             Memory.self, Edge.self, Checkpoint.self, VisualizerConfig.self,
             configuration: .init(
-                fileURL: URL(fileURLWithPath: dbPath)
+                fileURL: URL(fileURLWithPath: dbPath),
+                migration: engramMigrations
             )
         )
         lattice = lat

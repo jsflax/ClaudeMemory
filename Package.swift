@@ -14,10 +14,11 @@ let package = Package(
     products: [
         .library(name: "EngramKit", targets: ["EngramKit"]),
         .library(name: "EngramModels", targets: ["EngramModels"]),
+        .library(name: "EngramFoundationModels", targets: ["EngramFoundationModels"]),
     ],
     dependencies: [
         .package(url: "https://github.com/modelcontextprotocol/swift-sdk.git", from: "0.10.0"),
-        .package(url: "https://github.com/jsflax/lattice", from: "0.4.1"),
+        .package(path: "../lattice"),
         .package(url: "https://github.com/jsflax/SwiftLM.git", branch: "main"),
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.5.0"),
         .package(url: "https://github.com/sparkle-project/Sparkle.git", from: "2.0.0"),
@@ -68,6 +69,7 @@ let package = Package(
             name: "EngramVisualizer",
             dependencies: [
                 "EngramKit",
+                "EngramFoundationModels",
                 .product(name: "Lattice", package: "Lattice"),
                 .product(name: "Sparkle", package: "Sparkle"),
                 .product(name: "GoogleSignIn", package: "GoogleSignIn-iOS"),
@@ -75,6 +77,9 @@ let package = Package(
             ],
             resources: [
                 .copy("Resources/under_construction.png"),
+                .copy("Resources/mascot_mesh.bin"),
+                .copy("Resources/mascot_basecolor.jpg"),
+                .copy("Resources/mascot_metalrough.png"),
             ],
             swiftSettings: [
                 .interoperabilityMode(.Cxx),
@@ -97,11 +102,35 @@ let package = Package(
                 .interoperabilityMode(.Cxx),
             ]
         ),
+        .target(
+            name: "EngramFoundationModels",
+            dependencies: [
+                "EngramKit",
+                .product(name: "MCP", package: "swift-sdk"),
+            ],
+            swiftSettings: [
+                .interoperabilityMode(.Cxx),
+            ]
+        ),
         .testTarget(
             name: "EngramTests",
             dependencies: [
                 "EngramKit",
                 .product(name: "Lattice", package: "Lattice"),
+            ],
+            swiftSettings: [
+                .interoperabilityMode(.Cxx),
+            ]
+        ),
+        .testTarget(
+            name: "EngramFoundationModelsTests",
+            dependencies: [
+                "EngramFoundationModels",
+                "EngramKit",
+                .product(name: "Lattice", package: "Lattice"),
+            ],
+            resources: [
+                .copy("Resources/engram_memory.fmadapter"),
             ],
             swiftSettings: [
                 .interoperabilityMode(.Cxx),

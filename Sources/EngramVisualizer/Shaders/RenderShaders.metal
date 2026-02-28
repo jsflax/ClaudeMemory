@@ -45,6 +45,8 @@ vertex NodeVertexOut node_vertex(
         scalePulse = 1.0 + sin(frame.time * 3.0) * 0.2 * intensity;   // arriving
     } else if (stateType > 3.5 && stateType < 4.5) {
         scalePulse = 1.0 + sin(frame.time * 4.0) * 0.12;              // search matched
+    } else if (stateType > 4.5 && stateType < 5.5) {
+        scalePulse = 1.0 + sin(frame.time * 2.0) * 0.08 * intensity;  // mascot inspecting
     }
 
     float3 worldPos = v.position;
@@ -84,11 +86,14 @@ fragment float4 node_fragment(
 
     // Fog opacity
     bool isSearchMatched = (stateType > 3.5 && stateType < 4.5);
+    bool isInspecting = (stateType > 4.5 && stateType < 5.5);
     float fogOpacity;
     if (stateType > 0.5 && stateType < 1.5) {
         fogOpacity = 1.0;                                     // selected
     } else if (isSearchMatched) {
         fogOpacity = 1.0;                                     // search match
+    } else if (isInspecting) {
+        fogOpacity = max(0.5, 1.0 - fogT * 0.5);             // inspecting — reduced fog
     } else {
         fogOpacity = max(0.08, 1.0 - fogT * 0.92);
     }
@@ -115,6 +120,11 @@ fragment float4 node_fragment(
         emissiveColor = float3(0.0, 0.9, 1.0);
         float searchFade = max(0.3, depthFade);
         emissiveIntensity = 2.5 * (1.0 + sin(frame.time * 4.0) * 0.3) * searchFade;
+    } else if (stateType > 4.5 && stateType < 5.5) {
+        // Mascot inspecting — subtle cyan glow
+        emissiveColor = float3(0.2, 0.6, 0.9);
+        float pulse = 0.8 + 0.2 * sin(frame.time * 2.0);
+        emissiveIntensity = 1.5 * intensity * pulse * depthFade;
     } else {
         emissiveColor = baseColor;
         emissiveIntensity = 0.25;

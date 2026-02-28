@@ -3,35 +3,48 @@ import Foundation
 
 /// A directed edge between two memories, forming a knowledge graph.
 ///
-/// Edges represent typed relationships between memories:
-/// - `relates_to`: General association
-/// - `contradicts`: Memories that conflict with each other
-/// - `supersedes`: Newer knowledge replacing older knowledge
-/// - `derived_from`: Memory was derived/inferred from another
-/// - `part_of`: Memory is a sub-component of a larger concept
-/// - `summarized_by`: Memory was consolidated into a summary
+/// Edges reference memories by their globally unique `globalId` (UUID),
+/// enabling cross-database edges in multi-DB sync scenarios.
 @Model
 public final class Edge {
-    /// The primary key of the source memory.
-    public var sourceId: Int64
+    @LatticeEnum
+    public enum Relation: String, Codable, Sendable {
+        /// General association between memories.
+        case relatesTo = "relates_to"
+        /// Memories that conflict with each other.
+        case contradicts
+        /// Newer knowledge replacing older knowledge.
+        case supersedes
+        /// Memory was derived/inferred from another.
+        case derivedFrom = "derived_from"
+        /// Memory is a sub-component of a larger concept.
+        case partOf = "part_of"
+        /// Memory was consolidated into a summary.
+        case summarizedBy = "summarized_by"
+    }
 
-    /// The primary key of the target memory.
-    public var targetId: Int64
+    /// The globalId (UUID) of the source memory.
+    @Indexed()
+    public var sourceGlobalId: UUID
 
-    /// The relationship type (e.g., "relates_to", "contradicts", "supersedes").
-    public var relation: String
+    /// The globalId (UUID) of the target memory.
+    @Indexed()
+    public var targetGlobalId: UUID
+
+    /// The relationship type.
+    public var relation: Relation = .relatesTo
 
     /// When this edge was created.
     public var createdAt: Date
 
     public init(
-        sourceId: Int64,
-        targetId: Int64,
-        relation: String,
+        sourceGlobalId: UUID,
+        targetGlobalId: UUID,
+        relation: Relation,
         createdAt: Date = Date()
     ) {
-        self.sourceId = sourceId
-        self.targetId = targetId
+        self.sourceGlobalId = sourceGlobalId
+        self.targetGlobalId = targetGlobalId
         self.relation = relation
         self.createdAt = createdAt
     }

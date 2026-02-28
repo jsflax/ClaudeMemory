@@ -19,17 +19,29 @@ extension MemoryTools {
             throw MCPError.invalidParams("Invalid relation '\(relation)'. Must be one of: \(validRelations.sorted().joined(separator: ", "))")
         }
 
+        // Parse relation enum
+        guard let relationEnum = Edge.Relation(rawValue: relation) else {
+            throw MCPError.invalidParams("Invalid relation '\(relation)'.")
+        }
+
         // Validate both memories exist
-        guard lattice.objects(Memory.self).where({ $0.primaryKey == fromId }).first != nil else {
+        guard let fromMem = lattice.objects(Memory.self).where({ $0.primaryKey == fromId }).first else {
             return CallTool.Result(content: [.text("Memory with id \(fromId) not found.")], isError: true)
         }
-        guard lattice.objects(Memory.self).where({ $0.primaryKey == toId }).first != nil else {
+        guard let toMem = lattice.objects(Memory.self).where({ $0.primaryKey == toId }).first else {
             return CallTool.Result(content: [.text("Memory with id \(toId) not found.")], isError: true)
+        }
+
+        guard let fromGlobalId = fromMem.__globalId else {
+            throw MCPError.internalError("Memory \(fromId) has no globalId")
+        }
+        guard let toGlobalId = toMem.__globalId else {
+            throw MCPError.internalError("Memory \(toId) has no globalId")
         }
 
         // Check for duplicate edge
         let existing = lattice.objects(Edge.self)
-            .where { $0.sourceId == fromId && $0.targetId == toId && $0.relation == relation }
+            .where { $0.sourceGlobalId == fromGlobalId && $0.targetGlobalId == toGlobalId && $0.relation == relationEnum }
         if let edge = existing.first {
             let edgeId = edge.primaryKey.map(String.init) ?? "?"
             return CallTool.Result(
@@ -38,9 +50,10 @@ extension MemoryTools {
             )
         }
 
-        // Create edge
-        let edge = Edge(sourceId: fromId, targetId: toId, relation: relation)
-        lattice.add(edge)
+        // Create edge — route to same DB as the source memory
+        let edgeTargetDB = writeLattice(for: fromMem.project)
+        let edge = Edge(sourceGlobalId: fromGlobalId, targetGlobalId: toGlobalId, relation: relationEnum)
+        edgeTargetDB.add(edge)
 
         guard let edgeId = edge.primaryKey else {
             throw MCPError.internalError("Failed to persist edge — primaryKey is nil after add()")
@@ -80,10 +93,25 @@ extension MemoryTools {
         let fromId = Int64(from)
         let toId = Int64(to)
 
+        // Look up memories to get their globalIds
+        guard let fromMem = lattice.objects(Memory.self).where({ $0.primaryKey == fromId }).first else {
+            return CallTool.Result(content: [.text("Memory with id \(fromId) not found.")], isError: true)
+        }
+        guard let toMem = lattice.objects(Memory.self).where({ $0.primaryKey == toId }).first else {
+            return CallTool.Result(content: [.text("Memory with id \(toId) not found.")], isError: true)
+        }
+
+        guard let fromGlobalId = fromMem.__globalId else {
+            return CallTool.Result(content: [.text("Memory with id \(fromId) has no globalId.")], isError: true)
+        }
+        guard let toGlobalId = toMem.__globalId else {
+            return CallTool.Result(content: [.text("Memory with id \(toId) has no globalId.")], isError: true)
+        }
+
         var query = lattice.objects(Edge.self)
-            .where { $0.sourceId == fromId && $0.targetId == toId }
-        if let relation = a.relation {
-            query = query.where { $0.relation == relation }
+            .where { $0.sourceGlobalId == fromGlobalId && $0.targetGlobalId == toGlobalId }
+        if let relation = a.relation, let relationEnum = Edge.Relation(rawValue: relation) {
+            query = query.where { $0.relation == relationEnum }
         }
 
         let count = query.count
@@ -91,10 +119,10 @@ extension MemoryTools {
             return CallTool.Result(content: [.text("No edges found from \(fromId) to \(toId).")], isError: false)
         }
 
-        if let relation = a.relation {
-            lattice.delete(Edge.self, where: { $0.sourceId == fromId && $0.targetId == toId && $0.relation == relation })
+        if let relation = a.relation, let relationEnum = Edge.Relation(rawValue: relation) {
+            lattice.delete(Edge.self, where: { $0.sourceGlobalId == fromGlobalId && $0.targetGlobalId == toGlobalId && $0.relation == relationEnum })
         } else {
-            lattice.delete(Edge.self, where: { $0.sourceId == fromId && $0.targetId == toId })
+            lattice.delete(Edge.self, where: { $0.sourceGlobalId == fromGlobalId && $0.targetGlobalId == toGlobalId })
         }
 
         log("Disconnected \(count) edge(s) from [id:\(fromId)] to [id:\(toId)]")
@@ -116,30 +144,34 @@ extension MemoryTools {
             return CallTool.Result(content: [.text("Memory with id \(memId) not found.")], isError: true)
         }
 
-        // BFS traversal
-        var visited = Set<Int64>([memId])
-        var frontier = Set<Int64>([memId])
+        guard let rootGlobalId = rootMem.__globalId else {
+            return CallTool.Result(content: [.text("Memory with id \(memId) has no globalId.")], isError: true)
+        }
+
+        // BFS traversal using globalIds
+        var visited = Set<UUID>([rootGlobalId])
+        var frontier = Set<UUID>([rootGlobalId])
         var allEdges: [(edge: Edge, depth: Int)] = []
 
         for d in stride(from: 1, through: depth, by: 1) {
-            var nextFrontier = Set<Int64>()
-            for nodeId in frontier {
+            var nextFrontier = Set<UUID>()
+            for nodeGlobalId in frontier {
                 // Outgoing edges
-                let outgoing = lattice.objects(Edge.self).where { $0.sourceId == nodeId }
+                let outgoing = lattice.objects(Edge.self).where { $0.sourceGlobalId == nodeGlobalId }
                 for edge in outgoing {
                     allEdges.append((edge: edge, depth: d))
-                    if !visited.contains(edge.targetId) {
-                        visited.insert(edge.targetId)
-                        nextFrontier.insert(edge.targetId)
+                    if !visited.contains(edge.targetGlobalId) {
+                        visited.insert(edge.targetGlobalId)
+                        nextFrontier.insert(edge.targetGlobalId)
                     }
                 }
                 // Incoming edges
-                let incoming = lattice.objects(Edge.self).where { $0.targetId == nodeId }
+                let incoming = lattice.objects(Edge.self).where { $0.targetGlobalId == nodeGlobalId }
                 for edge in incoming {
                     allEdges.append((edge: edge, depth: d))
-                    if !visited.contains(edge.sourceId) {
-                        visited.insert(edge.sourceId)
-                        nextFrontier.insert(edge.sourceId)
+                    if !visited.contains(edge.sourceGlobalId) {
+                        visited.insert(edge.sourceGlobalId)
+                        nextFrontier.insert(edge.sourceGlobalId)
                     }
                 }
             }
@@ -158,7 +190,7 @@ extension MemoryTools {
             }
         }
 
-        // Format output
+        // Format output — look up memories by globalId for display
         var output = "[id:\(memId)] \(rootMem.content)"
 
         if uniqueEdges.isEmpty {
@@ -166,23 +198,27 @@ extension MemoryTools {
         } else {
             output += "\n\nConnections:"
             for edge in uniqueEdges {
-                if edge.sourceId == memId {
+                if edge.sourceGlobalId == rootGlobalId {
                     // Outgoing
-                    let targetContent = lattice.objects(Memory.self)
-                        .where { $0.primaryKey == edge.targetId }.first?.content ?? "(deleted)"
-                    output += "\n  --[\(edge.relation)]--> [id:\(edge.targetId)] \(targetContent.prefix(80))"
-                } else if edge.targetId == memId {
+                    let targetMem = lattice.objects(Memory.self).where { $0.__globalId == edge.targetGlobalId }.first
+                    let targetContent = targetMem?.content ?? "(deleted)"
+                    let targetDisplayId = targetMem?.primaryKey.map(String.init) ?? "?"
+                    output += "\n  --[\(edge.relation.rawValue)]--> [id:\(targetDisplayId)] \(targetContent.prefix(80))"
+                } else if edge.targetGlobalId == rootGlobalId {
                     // Incoming
-                    let sourceContent = lattice.objects(Memory.self)
-                        .where { $0.primaryKey == edge.sourceId }.first?.content ?? "(deleted)"
-                    output += "\n  <--[\(edge.relation)]-- [id:\(edge.sourceId)] \(sourceContent.prefix(80))"
+                    let sourceMem = lattice.objects(Memory.self).where { $0.__globalId == edge.sourceGlobalId }.first
+                    let sourceContent = sourceMem?.content ?? "(deleted)"
+                    let sourceDisplayId = sourceMem?.primaryKey.map(String.init) ?? "?"
+                    output += "\n  <--[\(edge.relation.rawValue)]-- [id:\(sourceDisplayId)] \(sourceContent.prefix(80))"
                 } else {
                     // Edge between two non-root nodes (deeper traversal)
-                    let sourceContent = lattice.objects(Memory.self)
-                        .where { $0.primaryKey == edge.sourceId }.first?.content ?? "(deleted)"
-                    let targetContent = lattice.objects(Memory.self)
-                        .where { $0.primaryKey == edge.targetId }.first?.content ?? "(deleted)"
-                    output += "\n  [id:\(edge.sourceId)] \(sourceContent.prefix(40))... --[\(edge.relation)]--> [id:\(edge.targetId)] \(targetContent.prefix(40))..."
+                    let sourceMem = lattice.objects(Memory.self).where { $0.__globalId == edge.sourceGlobalId }.first
+                    let targetMem = lattice.objects(Memory.self).where { $0.__globalId == edge.targetGlobalId }.first
+                    let sourceContent = sourceMem?.content ?? "(deleted)"
+                    let targetContent = targetMem?.content ?? "(deleted)"
+                    let sourceDisplayId = sourceMem?.primaryKey.map(String.init) ?? "?"
+                    let targetDisplayId = targetMem?.primaryKey.map(String.init) ?? "?"
+                    output += "\n  [id:\(sourceDisplayId)] \(sourceContent.prefix(40))... --[\(edge.relation.rawValue)]--> [id:\(targetDisplayId)] \(targetContent.prefix(40))..."
                 }
             }
         }
@@ -192,49 +228,49 @@ extension MemoryTools {
 
     // MARK: - Graph Helpers
 
-    /// Delete all edges where sourceId or targetId is in the given set. Returns count deleted.
+    /// Delete all edges where sourceGlobalId or targetGlobalId is in the given set. Returns count deleted.
     @discardableResult
-    func deleteEdgesForMemories(_ ids: [Int64]) -> Int {
+    func deleteEdgesForMemories(_ globalIds: [UUID]) -> Int {
         var total = 0
-        for id in ids {
-            let count = lattice.count(Edge.self, where: { $0.sourceId == id || $0.targetId == id })
+        for gid in globalIds {
+            let count = lattice.count(Edge.self, where: { $0.sourceGlobalId == gid || $0.targetGlobalId == gid })
             if count > 0 {
-                lattice.delete(Edge.self, where: { $0.sourceId == id || $0.targetId == id })
+                lattice.delete(Edge.self, where: { $0.sourceGlobalId == gid || $0.targetGlobalId == gid })
                 total += count
             }
         }
         return total
     }
 
-    /// BFS graph traversal from a set of starting memory IDs, returning connected memories
+    /// BFS graph traversal from a set of starting memory globalIds, returning connected memories
     /// annotated with the depth at which they were discovered.
-    func traverseGraph(from startIds: Set<Int64>, depth: Int, excludeIds: Set<Int64>) -> [(memory: Memory, depth: Int)] {
-        var visited = excludeIds
-        var frontier = startIds
+    func traverseGraph(from startGlobalIds: Set<UUID>, depth: Int, excludeGlobalIds: Set<UUID>) -> [(memory: Memory, depth: Int)] {
+        var visited = excludeGlobalIds
+        var frontier = startGlobalIds
         var result: [(memory: Memory, depth: Int)] = []
         let now = Date()
 
         for d in stride(from: 1, through: depth, by: 1) {
-            var nextFrontier = Set<Int64>()
-            for nodeId in frontier {
+            var nextFrontier = Set<UUID>()
+            for nodeGlobalId in frontier {
                 // Outgoing edges
-                for edge in lattice.objects(Edge.self).where({ $0.sourceId == nodeId }) {
-                    if !visited.contains(edge.targetId) {
-                        visited.insert(edge.targetId)
-                        nextFrontier.insert(edge.targetId)
+                for edge in lattice.objects(Edge.self).where({ $0.sourceGlobalId == nodeGlobalId }) {
+                    if !visited.contains(edge.targetGlobalId) {
+                        visited.insert(edge.targetGlobalId)
+                        nextFrontier.insert(edge.targetGlobalId)
                     }
                 }
                 // Incoming edges
-                for edge in lattice.objects(Edge.self).where({ $0.targetId == nodeId }) {
-                    if !visited.contains(edge.sourceId) {
-                        visited.insert(edge.sourceId)
-                        nextFrontier.insert(edge.sourceId)
+                for edge in lattice.objects(Edge.self).where({ $0.targetGlobalId == nodeGlobalId }) {
+                    if !visited.contains(edge.sourceGlobalId) {
+                        visited.insert(edge.sourceGlobalId)
+                        nextFrontier.insert(edge.sourceGlobalId)
                     }
                 }
             }
             // Fetch the memories for the next frontier
-            for id in nextFrontier {
-                if let mem = lattice.objects(Memory.self).where({ $0.primaryKey == id && $0.expiresAt > now }).first {
+            for gid in nextFrontier {
+                if let mem = lattice.objects(Memory.self).where({ $0.__globalId == gid && $0.expiresAt > now }).first {
                     result.append((memory: mem, depth: d))
                 }
             }

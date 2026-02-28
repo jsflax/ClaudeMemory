@@ -141,7 +141,7 @@ final class CameraController {
         else if cameraTarget != targetCameraPos { cameraTarget = targetCameraPos }
     }
 
-    func centerOnGraph(positions: [Int64: SIMD3<Float>]) {
+    func centerOnGraph(positions: [UUID: SIMD3<Float>]) {
         guard !positions.isEmpty else { return }
         var sum = SIMD3<Float>.zero
         for (_, pos) in positions { sum += pos }
@@ -190,8 +190,8 @@ final class CameraController {
         return CGPoint(x: screenX, y: screenY)
     }
 
-    func hitTest(at location: CGPoint, viewSize: CGSize, positions: [Int64: SIMD3<Float>]) -> Int64? {
-        var closest: Int64?
+    func hitTest(at location: CGPoint, viewSize: CGSize, positions: [UUID: SIMD3<Float>]) -> UUID? {
+        var closest: UUID?
         var closestDist: CGFloat = 30
 
         for (id, pos) in positions {
@@ -236,9 +236,9 @@ final class CameraController {
     var teleportCounter: Int = 0
     var teleportLabel: String?
 
-    func teleportToNextProject(positions: [Int64: SIMD3<Float>], nodes: [NodeData],
-                                hubs: Set<Int64>, direction: Int = 1) {
-        var projectNodeIds: [String: [Int64]] = [:]
+    func teleportToNextProject(positions: [UUID: SIMD3<Float>], nodes: [NodeData],
+                                hubs: Set<UUID>, direction: Int = 1) {
+        var projectNodeIds: [String: [UUID]] = [:]
         var projectPositions: [String: [SIMD3<Float>]] = [:]
         let nodeById = Dictionary(nodes.map { ($0.id, $0) }, uniquingKeysWith: { _, last in last })
         for (id, pos) in positions {
@@ -277,12 +277,12 @@ final class CameraController {
         teleportLabel = project
     }
 
-    func driveToProject(_ project: String, positions: [Int64: SIMD3<Float>],
-                        nodes: [NodeData], hubs: Set<Int64>) {
+    func driveToProject(_ project: String, positions: [UUID: SIMD3<Float>],
+                        nodes: [NodeData], hubs: Set<UUID>) {
         let nodeById = Dictionary(nodes.map { ($0.id, $0) }, uniquingKeysWith: { _, last in last })
 
         var pts: [SIMD3<Float>] = []
-        var nodeIds: [Int64] = []
+        var nodeIds: [UUID] = []
         for (id, pos) in positions {
             guard let node = nodeById[id], node.project == project else { continue }
             pts.append(pos)

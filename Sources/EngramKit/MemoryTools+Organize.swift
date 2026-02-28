@@ -26,24 +26,24 @@ extension MemoryTools {
             )
         }
 
-        // Build memory ID set and lookup
-        let memoryIds = Set(allMemories.compactMap(\.primaryKey))
-        let memoryMap: [Int64: Memory] = Dictionary(
+        // Build memory globalId set and lookup
+        let memoryGlobalIds = Set(allMemories.compactMap(\.__globalId))
+        let memoryMapByGlobalId: [UUID: Memory] = Dictionary(
             uniqueKeysWithValues: allMemories.compactMap { m in
-                guard let pk = m.primaryKey else { return nil }
-                return (pk, m)
+                guard let gid = m.__globalId else { return nil }
+                return (gid, m)
             }
         )
 
-        // Build undirected adjacency from all edges between these memories
-        var adjacency: [Int64: Set<Int64>] = [:]
-        for id in memoryIds { adjacency[id] = [] }
+        // Build undirected adjacency from all edges between these memories (keyed by globalId)
+        var adjacency: [UUID: Set<UUID>] = [:]
+        for gid in memoryGlobalIds { adjacency[gid] = [] }
 
         let edges = lattice.objects(Edge.self).snapshot()
         for edge in edges {
-            guard memoryIds.contains(edge.sourceId) && memoryIds.contains(edge.targetId) else { continue }
-            adjacency[edge.sourceId, default: []].insert(edge.targetId)
-            adjacency[edge.targetId, default: []].insert(edge.sourceId)
+            guard memoryGlobalIds.contains(edge.sourceGlobalId) && memoryGlobalIds.contains(edge.targetGlobalId) else { continue }
+            adjacency[edge.sourceGlobalId, default: []].insert(edge.targetGlobalId)
+            adjacency[edge.targetGlobalId, default: []].insert(edge.sourceGlobalId)
         }
 
         // Run label propagation
@@ -64,20 +64,21 @@ extension MemoryTools {
         var output = "Found \(significantCommunities.count) community/communities in '\(project)':\n"
 
         for (i, community) in significantCommunities.enumerated() {
-            let sorted = community.sorted()
+            let sorted = community.sorted(by: { $0.uuidString < $1.uuidString })
             output += "\n## Community \(i + 1) (\(sorted.count) memories)"
-            for memId in sorted {
-                let mem = memoryMap[memId]
+            for memGlobalId in sorted {
+                let mem = memoryMapByGlobalId[memGlobalId]
                 let topic = mem?.topic ?? "general"
                 let content = mem?.content ?? ""
                 let preview = String(content.prefix(150))
-                output += "\n  [id:\(memId)] [\(topic)] \(preview)"
+                let displayId = mem?.primaryKey.map(String.init) ?? "?"
+                output += "\n  [id:\(displayId)] [\(topic)] \(preview)"
             }
             output += "\n"
         }
 
         // Show isolated nodes count
-        let isolatedCount = memoryIds.count - significantCommunities.reduce(0) { $0 + $1.count }
+        let isolatedCount = memoryGlobalIds.count - significantCommunities.reduce(0) { $0 + $1.count }
         if isolatedCount > 0 {
             output += "\n(\(isolatedCount) memories not in any community — they have no edges or are in groups smaller than \(minSize))\n"
         }
@@ -103,13 +104,13 @@ extension MemoryTools {
         // Verify memories exist and determine project
         var memories: [Int64: Memory] = [:]
         for id in ids {
-            guard let mem = lattice.objects(Memory.self).where({ $0.primaryKey == id }).first else {
+            guard let mem = lattice.objects(Memory.self).where({ $0.primaryKey == Int64(id) }).first else {
                 return CallTool.Result(content: [.text("Memory [id:\(id)] not found.")], isError: true)
             }
-            memories[id] = mem
+            memories[Int64(id)] = mem
         }
 
-        let project = a.project ?? memories[ids[0]]?.project ?? "global"
+        let project = a.project ?? memories[Int64(ids[0])]?.project ?? "global"
 
         // Create hub memory
         let hubContent = a.summary ?? "Hub: \(label)"
@@ -117,6 +118,7 @@ extension MemoryTools {
         if let floats = try await embedder.embed(text: hubContent) {
             hubEmbedding = Vector<Float>(floats)
         }
+        let organizeTargetDB = writeLattice(for: project)
         let hub = Memory(
             content: hubContent,
             topic: label,
@@ -124,18 +126,20 @@ extension MemoryTools {
             source: "organize",
             embedding: hubEmbedding
         )
-        lattice.add(hub)
+        organizeTargetDB.add(hub)
 
         guard let hubId = hub.primaryKey else {
             return CallTool.Result(content: [.text("Failed to create hub memory.")], isError: true)
         }
 
         // Link each memory to hub and update its topic
+        guard let hubGlobalId = hub.__globalId else {
+            return CallTool.Result(content: [.text("Failed to get hub globalId.")], isError: true)
+        }
         for id in ids {
-            let edge = Edge(sourceId: id, targetId: hubId, relation: "part_of")
-            lattice.add(edge)
-
-            if let mem = memories[id] {
+            if let mem = memories[Int64(id)], let memGid = mem.__globalId {
+                let edge = Edge(sourceGlobalId: memGid, targetGlobalId: hubGlobalId, relation: .partOf)
+                organizeTargetDB.add(edge)
                 mem.topic = label
             }
         }
@@ -157,9 +161,9 @@ extension MemoryTools {
 /// Detect communities in an undirected graph via label propagation.
 /// Each node starts with its own label, then iteratively adopts the most common
 /// label among its neighbors. Converges when no labels change.
-/// Returns communities as arrays of node IDs (sorted by size descending).
-public func labelPropagation(adjacency: [Int64: Set<Int64>], maxIterations: Int = 10) -> [[Int64]] {
-    var labels: [Int64: Int64] = [:]
+/// Returns communities as arrays of node globalIds (sorted by size descending).
+public func labelPropagation(adjacency: [UUID: Set<UUID>], maxIterations: Int = 10) -> [[UUID]] {
+    var labels: [UUID: UUID] = [:]
     for id in adjacency.keys {
         labels[id] = id
     }
@@ -171,14 +175,14 @@ public func labelPropagation(adjacency: [Int64: Set<Int64>], maxIterations: Int 
         for id in adjacency.keys {
             guard let neighbors = adjacency[id], !neighbors.isEmpty else { continue }
 
-            var labelCounts: [Int64: Int] = [:]
+            var labelCounts: [UUID: Int] = [:]
             for neighbor in neighbors {
                 guard let neighborLabel = labels[neighbor] else { continue }
                 labelCounts[neighborLabel, default: 0] += 1
             }
 
             guard let bestLabel = labelCounts.max(by: {
-                $0.value != $1.value ? $0.value < $1.value : $0.key > $1.key
+                $0.value != $1.value ? $0.value < $1.value : $0.key.uuidString > $1.key.uuidString
             })?.key else { continue }
 
             if newLabels[id] != bestLabel {
@@ -191,7 +195,7 @@ public func labelPropagation(adjacency: [Int64: Set<Int64>], maxIterations: Int 
         if !changed { break }
     }
 
-    var communities: [Int64: [Int64]] = [:]
+    var communities: [UUID: [UUID]] = [:]
     for (id, label) in labels {
         communities[label, default: []].append(id)
     }

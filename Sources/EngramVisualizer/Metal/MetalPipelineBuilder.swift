@@ -157,6 +157,104 @@ struct MetalPipelineBuilder {
         return try device.makeRenderPipelineState(descriptor: desc)
     }
 
+    // MARK: - Mascot Pipeline (opaque, PBR textured, depth-write ON)
+
+    static func buildMascotPipeline(device: MTLDevice, library: MTLLibrary) throws -> MTLRenderPipelineState {
+        guard let vertexFn = library.makeFunction(name: "mascot_vertex"),
+              let fragmentFn = library.makeFunction(name: "mascot_fragment") else {
+            throw MetalPipelineError.functionNotFound("mascot_vertex or mascot_fragment")
+        }
+
+        let desc = MTLRenderPipelineDescriptor()
+        desc.label = "Mascot Pipeline"
+        desc.vertexFunction = vertexFn
+        desc.fragmentFunction = fragmentFn
+        // No vertex descriptor — manual buffer reads in shader
+        desc.colorAttachments[0].pixelFormat = .bgra8Unorm
+        desc.colorAttachments[0].isBlendingEnabled = false
+        desc.depthAttachmentPixelFormat = .depth32Float
+
+        return try device.makeRenderPipelineState(descriptor: desc)
+    }
+
+    // MARK: - Arcane Circle Pipeline (additive transparent, depth-write OFF)
+
+    static func buildArcaneCirclePipeline(device: MTLDevice, library: MTLLibrary) throws -> MTLRenderPipelineState {
+        guard let vertexFn = library.makeFunction(name: "arcane_vertex"),
+              let fragmentFn = library.makeFunction(name: "arcane_circle_fragment") else {
+            throw MetalPipelineError.functionNotFound("arcane_vertex or arcane_circle_fragment")
+        }
+
+        let desc = MTLRenderPipelineDescriptor()
+        desc.label = "Arcane Circle Pipeline"
+        desc.vertexFunction = vertexFn
+        desc.fragmentFunction = fragmentFn
+        // Additive blending — glowing magic circle adds light
+        desc.colorAttachments[0].pixelFormat = .bgra8Unorm
+        desc.colorAttachments[0].isBlendingEnabled = true
+        desc.colorAttachments[0].rgbBlendOperation = .add
+        desc.colorAttachments[0].alphaBlendOperation = .add
+        desc.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+        desc.colorAttachments[0].destinationRGBBlendFactor = .one
+        desc.colorAttachments[0].sourceAlphaBlendFactor = .one
+        desc.colorAttachments[0].destinationAlphaBlendFactor = .one
+        desc.depthAttachmentPixelFormat = .depth32Float
+
+        return try device.makeRenderPipelineState(descriptor: desc)
+    }
+
+    // MARK: - Node Ring Pipeline (additive transparent, depth-write OFF)
+
+    static func buildNodeRingPipeline(device: MTLDevice, library: MTLLibrary) throws -> MTLRenderPipelineState {
+        guard let vertexFn = library.makeFunction(name: "node_ring_vertex"),
+              let fragmentFn = library.makeFunction(name: "node_ring_fragment") else {
+            throw MetalPipelineError.functionNotFound("node_ring_vertex or node_ring_fragment")
+        }
+
+        let desc = MTLRenderPipelineDescriptor()
+        desc.label = "Node Ring Pipeline"
+        desc.vertexFunction = vertexFn
+        desc.fragmentFunction = fragmentFn
+        // Additive blending — rings add light (same as arcane circle)
+        desc.colorAttachments[0].pixelFormat = .bgra8Unorm
+        desc.colorAttachments[0].isBlendingEnabled = true
+        desc.colorAttachments[0].rgbBlendOperation = .add
+        desc.colorAttachments[0].alphaBlendOperation = .add
+        desc.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+        desc.colorAttachments[0].destinationRGBBlendFactor = .one
+        desc.colorAttachments[0].sourceAlphaBlendFactor = .one
+        desc.colorAttachments[0].destinationAlphaBlendFactor = .one
+        desc.depthAttachmentPixelFormat = .depth32Float
+
+        return try device.makeRenderPipelineState(descriptor: desc)
+    }
+
+    // MARK: - Holo Screen Pipeline (transparent, alpha blended, depth-write OFF)
+
+    static func buildHoloScreenPipeline(device: MTLDevice, library: MTLLibrary) throws -> MTLRenderPipelineState {
+        guard let vertexFn = library.makeFunction(name: "holo_vertex"),
+              let fragmentFn = library.makeFunction(name: "holo_fragment") else {
+            throw MetalPipelineError.functionNotFound("holo_vertex or holo_fragment")
+        }
+
+        let desc = MTLRenderPipelineDescriptor()
+        desc.label = "Holo Screen Pipeline"
+        desc.vertexFunction = vertexFn
+        desc.fragmentFunction = fragmentFn
+        // Premultiplied alpha blending — shader outputs color * alpha
+        desc.colorAttachments[0].pixelFormat = .bgra8Unorm
+        desc.colorAttachments[0].isBlendingEnabled = true
+        desc.colorAttachments[0].rgbBlendOperation = .add
+        desc.colorAttachments[0].alphaBlendOperation = .add
+        desc.colorAttachments[0].sourceRGBBlendFactor = .one
+        desc.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+        desc.colorAttachments[0].sourceAlphaBlendFactor = .one
+        desc.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+        desc.depthAttachmentPixelFormat = .depth32Float
+
+        return try device.makeRenderPipelineState(descriptor: desc)
+    }
+
     // MARK: - Depth Stencil States
 
     /// Opaque pass: depth test ON, depth write ON.

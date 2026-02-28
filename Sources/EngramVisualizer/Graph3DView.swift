@@ -4,6 +4,7 @@ import GameController
 import Metal
 import simd
 import os
+import Lattice
 
 private let frameLog = Logger(subsystem: "com.claudememory.visualizer", category: "3DFrameTiming")
 
@@ -132,11 +133,11 @@ final class Graph3DScene {
     private var edgeStagingCapacity: Int = 0
 
     // Point lights for glowing/arriving/search-matched nodes
-    private var pointLightEntities: [Int64: Entity] = [:]
+    private var pointLightEntities: [UUID: Entity] = [:]
 
     // Dying node entities — individual PBR entities with red flash animation (max ~5 at a time)
-    private var dyingNodeEntities: [Int64: ModelEntity] = [:]
-    private var dyingNodePos3D: [Int64: SIMD3<Float>] = [:]
+    private var dyingNodeEntities: [UUID: ModelEntity] = [:]
+    private var dyingNodePos3D: [UUID: SIMD3<Float>] = [:]
 
     // Batched edge rendering — all edges as a single LowLevelMesh (1 draw call)
     private var edgeBatchMesh: LowLevelMesh?
@@ -158,9 +159,9 @@ final class Graph3DScene {
     private var labelBatchCapacity: Int = 0
     @ObservationIgnored private var lastLabelPartIndexCount: Int = -1
     private var labelAtlasTexture: TextureResource?
-    private var labelAtlasRects: [Int64: (u0: Float, v0: Float, u1: Float, v1: Float)] = [:]
-    private var labelAtlasNodeIds: Set<Int64> = []
-    private var labelAtlasHubIds: Set<Int64> = []
+    private var labelAtlasRects: [UUID: (u0: Float, v0: Float, u1: Float, v1: Float)] = [:]
+    private var labelAtlasNodeIds: Set<UUID> = []
+    private var labelAtlasHubIds: Set<UUID> = []
     // Project labels — larger billboard quads floating above each project cluster
     private var projectLabelAtlasRects: [String: (u0: Float, v0: Float, u1: Float, v1: Float)] = [:]
     private var labelAtlasProjects: Set<String> = []
@@ -270,8 +271,8 @@ final class Graph3DScene {
     private let edgeRadius: Float = 0.004
 
     private struct EdgeKey: Hashable {
-        let source: Int64
-        let target: Int64
+        let source: UUID
+        let target: UUID
     }
 
     /// Generate a soft radial gradient circle texture for nebula particles.
@@ -540,7 +541,7 @@ final class Graph3DScene {
     // MARK: - Gamepad
 
     /// Node currently under the center reticle (nil when no controller or nothing targeted).
-    var reticleTarget: Int64?
+    var reticleTarget: UUID?
 
     /// Tracks whether A was pressed last frame to detect rising edge.
     private var prevButtonA = false
@@ -590,8 +591,8 @@ final class Graph3DScene {
 
     /// Poll gamepad and apply inputs to camera. Called each frame before updateCamera.
     /// FPS-style: L-stick = move, R-stick = look, triggers = rise/descend, bumpers = cycle nodes.
-    func pollGamepad(dt: Float, selectedNode: inout Int64?,
-                     positions: [Int64: SIMD3<Float>], viewSize: CGSize) {
+    func pollGamepad(dt: Float, selectedNode: inout UUID?,
+                     positions: [UUID: SIMD3<Float>], viewSize: CGSize) {
         guard let pad = GCController.current?.extendedGamepad else {
             reticleTarget = nil
             return
@@ -699,9 +700,9 @@ final class Graph3DScene {
     }
 
     /// Teleport camera to the hub node of the next project (falls back to centroid).
-    func teleportToNextProject(positions: [Int64: SIMD3<Float>], nodes: [NodeData], direction: Int = 1) {
+    func teleportToNextProject(positions: [UUID: SIMD3<Float>], nodes: [NodeData], direction: Int = 1) {
         // Group node IDs and positions by project
-        var projectNodeIds: [String: [Int64]] = [:]
+        var projectNodeIds: [String: [UUID]] = [:]
         var projectPositions: [String: [SIMD3<Float>]] = [:]
         let nodeById = Dictionary(nodes.map { ($0.id, $0) }, uniquingKeysWith: { _, last in last })
         for (id, pos) in positions {
@@ -780,7 +781,7 @@ final class Graph3DScene {
         let nodeById = Dictionary(nodes.map { ($0.id, $0) }, uniquingKeysWith: { _, last in last })
 
         var pts: [SIMD3<Float>] = []
-        var nodeIds: [Int64] = []
+        var nodeIds: [UUID] = []
         for (id, pos) in positions {
             guard let node = nodeById[id], node.project == project else { continue }
             pts.append(pos)
@@ -813,10 +814,10 @@ final class Graph3DScene {
 
     /// Cycle through nodes sorted by distance from camera.
     /// direction: +1 = next farther, -1 = next closer.
-    private func cycleNode(current: Int64?, direction: Int,
-                           positions: [Int64: SIMD3<Float>], viewSize: CGSize) -> Int64? {
+    private func cycleNode(current: UUID?, direction: Int,
+                           positions: [UUID: SIMD3<Float>], viewSize: CGSize) -> UUID? {
         // Only consider nodes visible on screen
-        let visible = positions.compactMap { (id, pos) -> (Int64, Float)? in
+        let visible = positions.compactMap { (id, pos) -> (UUID, Float)? in
             guard project(point3D: pos, viewSize: viewSize) != nil else { return nil }
             return (id, cameraDistance(to: pos))
         }.sorted { $0.1 < $1.1 }
@@ -863,7 +864,7 @@ final class Graph3DScene {
     }
 
     /// Center camera on the given positions (call once when graph first loads).
-    func centerOnGraph(positions: [Int64: SIMD3<Float>]) {
+    func centerOnGraph(positions: [UUID: SIMD3<Float>]) {
         guard !positions.isEmpty else { return }
         var sum = SIMD3<Float>.zero
         for (_, pos) in positions { sum += pos }
@@ -1073,7 +1074,7 @@ final class Graph3DScene {
     /// Uses LowLevelTexture for in-place pixel updates — avoids material swap on the entity
     /// which was the root cause of label flicker (RealityKit rebuilds on material assignment).
     /// Material swap only happens on first creation or rare atlas size increase.
-    private func generateLabelAtlas(nodes: [NodeData], hubs: Set<Int64>, projects: Set<String>) {
+    private func generateLabelAtlas(nodes: [NodeData], hubs: Set<UUID>, projects: Set<String>) {
         let atlasW = 4096
         let padding: CGFloat = 4
         let fontSize: CGFloat = 28
@@ -1155,7 +1156,7 @@ final class Graph3DScene {
         ctx.scaleBy(x: CGFloat(scale), y: CGFloat(-scale))
 
         // Drawing pass — node labels (UVs relative to allocated atlas size)
-        var rects: [Int64: (u0: Float, v0: Float, u1: Float, v1: Float)] = [:]
+        var rects: [UUID: (u0: Float, v0: Float, u1: Float, v1: Float)] = [:]
         cursorX = 2; cursorY = 0; rowHeight = 0
 
         for (i, node) in nodes.enumerated() {
@@ -1367,9 +1368,9 @@ final class Graph3DScene {
 
     /// Per-frame vertex stamping for label billboard quads.
     /// Encodes position (anchor), normal (corner offset), UV (atlas), color (opacity).
-    func updateLabelBatch(positions: [Int64: SIMD3<Float>],
-                          nodes: [NodeData], hubs: Set<Int64>,
-                          selectedNode: Int64?) {
+    func updateLabelBatch(positions: [UUID: SIMD3<Float>],
+                          nodes: [NodeData], hubs: Set<UUID>,
+                          selectedNode: UUID?) {
         let nodeCount = positions.count
         guard nodeCount > 0 else {
             if lastLabelPartIndexCount != 0 {
@@ -1437,7 +1438,7 @@ final class Graph3DScene {
         for (id, pos) in expandedChildPositions {
             allPositions[id] = pos
         }
-        var expandedChildren = Set<Int64>()
+        var expandedChildren = Set<UUID>()
         for hubId in expandedHubs {
             for childId in childrenOfHub(hubId) {
                 expandedChildren.insert(childId)
@@ -1614,12 +1615,12 @@ final class Graph3DScene {
     /// Rebuild the batched node mesh using Metal compute to stamp sphere instances.
     /// All alive nodes rendered as real sphere triangles in a single LowLevelMesh (1 draw call).
     /// Point lights managed as separate lightweight entities (~5-10 at most).
-    func updateNodeBatch(positions: [Int64: SIMD3<Float>],
-                         nodes: [NodeData], hubs: Set<Int64>,
+    func updateNodeBatch(positions: [UUID: SIMD3<Float>],
+                         nodes: [NodeData], hubs: Set<UUID>,
                          colorMap: [String: Color],
-                         selectedNode: Int64?,
-                         glowingNodes: [Int64: Date],
-                         newNodes: [Int64: Date]) {
+                         selectedNode: UUID?,
+                         glowingNodes: [UUID: Date],
+                         newNodes: [UUID: Date]) {
         // Invalidate SIMD color caches when the color map changes
         if let version = renderStore?.colorMapVersion, version != lastColorMapVersion {
             nodeColorCache.removeAll(keepingCapacity: true)
@@ -1656,7 +1657,7 @@ final class Graph3DScene {
         }
 
         // Fill instance array + track point lights
-        var activeLightIds = Set<Int64>()
+        var activeLightIds = Set<UUID>()
         var idx = 0
 
         for (id, pos) in positions {
@@ -1892,8 +1893,8 @@ final class Graph3DScene {
     }
 
     /// Update dying nodes — individual PBR entities with red flash animation (max ~5 at a time).
-    func updateDyingNodes(positions: [Int64: SIMD3<Float>],
-                          dyingNodes: [Int64: DyingNode]) {
+    func updateDyingNodes(positions: [UUID: SIMD3<Float>],
+                          dyingNodes: [UUID: DyingNode]) {
         let now = Date()
 
         // Capture 3D positions for dying nodes while they're still in positions
@@ -1975,13 +1976,13 @@ final class Graph3DScene {
     /// Rebuild the batched edge mesh. All edges are rendered as a single LowLevelMesh
     /// with per-edge state encoded in vertex UV and color in vertex color attribute.
     /// This produces 1 draw call instead of 1238 separate entities.
-    func updateEdgeBatch(positions: [Int64: SIMD3<Float>],
+    func updateEdgeBatch(positions: [UUID: SIMD3<Float>],
                          edges: [EdgeData],
                          nodes: [NodeData],
-                         hubs: Set<Int64>,
+                         hubs: Set<UUID>,
                          layoutMode: LayoutMode,
                          colorMap: [String: Color],
-                         selectedNode: Int64?) {
+                         selectedNode: UUID?) {
         let edgeCount = edges.count
         guard edgeCount > 0 else {
             if lastEdgePartIndexCount != 0 {
@@ -1996,12 +1997,12 @@ final class Graph3DScene {
         guard let mesh = edgeBatchMesh else { return }
 
         let isSemanticMode = layoutMode == .embedding
-        let nodeProject: [Int64: String] = Dictionary(
+        let nodeProject: [UUID: String] = Dictionary(
             nodes.map { ($0.id, $0.project) }, uniquingKeysWith: { _, last in last }
         )
 
         // Build per-node radius lookup for endpoint inset (same formula as updateNodeBatch)
-        var nodeRadii: [Int64: Float] = [:]
+        var nodeRadii: [UUID: Float] = [:]
         for node in nodes {
             let isHub = hubs.contains(node.id)
             let importance = max(1, node.importance)
@@ -2425,8 +2426,8 @@ final class Graph3DScene {
         return CGPoint(x: screenX, y: screenY)
     }
 
-    func hitTest(at location: CGPoint, viewSize: CGSize, positions: [Int64: SIMD3<Float>]) -> Int64? {
-        var closest: Int64?
+    func hitTest(at location: CGPoint, viewSize: CGSize, positions: [UUID: SIMD3<Float>]) -> UUID? {
+        var closest: UUID?
         var closestDist: CGFloat = 30
 
         for (id, pos) in positions {
@@ -2502,15 +2503,15 @@ final class Graph3DScene {
     // MARK: - Hub Expansion
 
     /// Return IDs of children connected to a hub via part_of edges.
-    func childrenOfHub(_ hubId: Int64) -> [Int64] {
+    func childrenOfHub(_ hubId: UUID) -> [UUID] {
         renderEdges.filter { $0.relation == "part_of" && $0.targetId == hubId }.map(\.sourceId)
     }
 
     /// Compute Fibonacci sphere orbit positions for children around a hub.
-    func computeOrbitPositions(hubId: Int64, children: [Int64]) -> [Int64: SIMD3<Float>] {
+    func computeOrbitPositions(hubId: UUID, children: [UUID]) -> [UUID: SIMD3<Float>] {
         guard let hubPos = renderPositions[hubId] else { return [:] }
         let radius: Float = 80
-        var result: [Int64: SIMD3<Float>] = [:]
+        var result: [UUID: SIMD3<Float>] = [:]
         let n = children.count
         guard n > 0 else { return result }
         let goldenRatio: Float = (1 + sqrt(5)) / 2
@@ -2527,7 +2528,7 @@ final class Graph3DScene {
     }
 
     /// Toggle hub expansion: start expanding if collapsed, start collapsing if expanded.
-    func toggleHubExpansion(hubId: Int64) {
+    func toggleHubExpansion(hubId: UUID) {
         if expandedHubs.contains(hubId) {
             expansionDirection[hubId] = false
         } else {
@@ -2543,8 +2544,8 @@ final class Graph3DScene {
 
     /// Per-frame expansion animation: lerp children between original and orbit positions.
     func updateExpansions(dt: Float) {
-        var toRemove: [Int64] = []
-        var allExpandedPositions: [Int64: SIMD3<Float>] = [:]
+        var toRemove: [UUID] = []
+        var allExpandedPositions: [UUID: SIMD3<Float>] = [:]
 
         for hubId in expandedHubs {
             let expanding = expansionDirection[hubId] ?? true
@@ -2738,11 +2739,11 @@ final class Graph3DScene {
     @ObservationIgnored var simulation3D: ForceSimulation3D?
     @ObservationIgnored var embeddingProjection: EmbeddingProjection?
     @ObservationIgnored var camera3DState: Camera3DState?
-    @ObservationIgnored var forcePositionSnapshot3D: [Int64: SIMD3<Float>] = [:]
+    @ObservationIgnored var forcePositionSnapshot3D: [UUID: SIMD3<Float>] = [:]
     @ObservationIgnored var transitionProgress: CGFloat = 0
 
     // Selection callback — still needed because it writes to a @Binding in Graph3DView.
-    @ObservationIgnored var selectionCallback: ((Int64?) -> Void)?
+    @ObservationIgnored var selectionCallback: ((UUID?) -> Void)?
 
     // Camera centering state (driven by renderTick)
     @ObservationIgnored private var hasCenteredCamera = false
@@ -2751,7 +2752,7 @@ final class Graph3DScene {
 
     /// Render inputs — read by renderTick (SceneEvents.Update).
     /// @ObservationIgnored: internal data channel, must NOT trigger SwiftUI body re-evaluation.
-    @ObservationIgnored var renderPositions: [Int64: SIMD3<Float>] = [:]
+    @ObservationIgnored var renderPositions: [UUID: SIMD3<Float>] = [:]
     /// Shared render store — written directly by GraphView alongside simulation updates.
     /// Eliminates timing mismatch between SwiftUI push and render tick.
     @ObservationIgnored var renderStore: GraphRenderStore?
@@ -2759,32 +2760,32 @@ final class Graph3DScene {
     /// Convenience accessors — redirect to renderStore so call sites don't change.
     var renderNodes: [NodeData] { renderStore?.nodes ?? [] }
     var renderEdges: [EdgeData] { renderStore?.edges ?? [] }
-    var renderHubs: Set<Int64> { renderStore?.hubs ?? [] }
+    var renderHubs: Set<UUID> { renderStore?.hubs ?? [] }
     var renderColorMap: [String: Color] { renderStore?.colorMap ?? [:] }
 
-    @ObservationIgnored var renderSelectedNode: Int64?
+    @ObservationIgnored var renderSelectedNode: UUID?
     @ObservationIgnored var renderLayoutMode: LayoutMode = .forceDirected
-    @ObservationIgnored var renderGlowingNodes: [Int64: Date] = [:]
-    @ObservationIgnored var renderNewNodes: [Int64: Date] = [:]
-    @ObservationIgnored var renderDyingNodes: [Int64: DyingNode] = [:]
+    @ObservationIgnored var renderGlowingNodes: [UUID: Date] = [:]
+    @ObservationIgnored var renderNewNodes: [UUID: Date] = [:]
+    @ObservationIgnored var renderDyingNodes: [UUID: DyingNode] = [:]
     @ObservationIgnored var renderSemanticClusters3D: [SemanticCluster3D] = []
     @ObservationIgnored var renderTopicGroups: [TopicGroupInfo] = []
-    @ObservationIgnored var renderClusters: [[Int64]] = []
+    @ObservationIgnored var renderClusters: [[UUID]] = []
     @ObservationIgnored var renderViewSize: CGSize = CGSize(width: 800, height: 600)
 
     // Search spotlight
-    @ObservationIgnored var renderSearchMatchIds: Set<Int64> = []
+    @ObservationIgnored var renderSearchMatchIds: Set<UUID> = []
     @ObservationIgnored var renderIsSearchActive: Bool = false
 
     // Hub expansion state
-    @ObservationIgnored var expandedHubs: Set<Int64> = []
-    @ObservationIgnored private var preExpansionPositions: [Int64: SIMD3<Float>] = [:]
-    @ObservationIgnored private var expansionProgress: [Int64: Float] = [:]
-    @ObservationIgnored private var expansionDirection: [Int64: Bool] = [:]  // true=expanding, false=collapsing
+    @ObservationIgnored var expandedHubs: Set<UUID> = []
+    @ObservationIgnored private var preExpansionPositions: [UUID: SIMD3<Float>] = [:]
+    @ObservationIgnored private var expansionProgress: [UUID: Float] = [:]
+    @ObservationIgnored private var expansionDirection: [UUID: Bool] = [:]  // true=expanding, false=collapsing
     /// Expansion-adjusted positions for labels (read by Graph3DView).
-    @ObservationIgnored private(set) var expandedChildPositions: [Int64: SIMD3<Float>] = [:]
+    @ObservationIgnored private(set) var expandedChildPositions: [UUID: SIMD3<Float>] = [:]
     /// Pending hub toggles from gamepad — consumed by Graph3DView for pinning callback.
-    @ObservationIgnored var pendingHubToggles: [(hubId: Int64, expanding: Bool)] = []
+    @ObservationIgnored var pendingHubToggles: [(hubId: UUID, expanding: Bool)] = []
 
     // Edge flow particles
     private struct FlowParticle {
@@ -2796,12 +2797,12 @@ final class Graph3DScene {
     private var flowParticleContainer = Entity()
     private let flowParticleMesh = MeshResource.generateSphere(radius: 1.0)
     private var flowSpawnTimers: [String: Float] = [:]
-    private var flowLastSelectedNode: Int64?
+    private var flowLastSelectedNode: UUID?
 
     private var renderFrameCount: UInt64 = 0
-    private var renderLastSelectedNode: Int64?
+    private var renderLastSelectedNode: UUID?
     private var renderLastSearchActive: Bool = false
-    private var renderLastSearchMatchIds: Set<Int64> = []
+    private var renderLastSearchMatchIds: Set<UUID> = []
     /// Tracks renderStore.colorMapVersion to invalidate nodeColorCache when colors change.
     @ObservationIgnored private var lastColorMapVersion: UInt64 = 0
     /// Dirty counter: after any position change, write node/edge buffers for N consecutive
@@ -2867,7 +2868,7 @@ final class Graph3DScene {
             proj.tickAnimation3D()
 
             // Compute positions (same logic as GraphView.positions3D, but reads objects directly)
-            let newPositions: [Int64: SIMD3<Float>]?
+            let newPositions: [UUID: SIMD3<Float>]?
             if sim.isSettled && proj.is3DAnimationSettled {
                 newPositions = nil  // settled — no position update needed
             } else if renderLayoutMode == .embedding {
@@ -2878,7 +2879,7 @@ final class Graph3DScene {
                     newPositions = tsne3D
                 } else {
                     // Lerp between force snapshot and t-SNE
-                    var blended: [Int64: SIMD3<Float>] = [:]
+                    var blended: [UUID: SIMD3<Float>] = [:]
                     let allIds = Set(forcePositionSnapshot3D.keys).union(tsne3D.keys)
                     for id in allIds {
                         let forcePos = forcePositionSnapshot3D[id] ?? sim.positions[id] ?? .zero
@@ -3115,23 +3116,23 @@ final class Graph3DScene {
 struct Graph3DView: View {
     let nodes: [NodeData]
     let edges: [EdgeData]
-    let hubs: Set<Int64>
+    let hubs: Set<UUID>
     let colorMap: [String: Color]
     let layoutMode: LayoutMode
-    @Binding var selectedNode: Int64?
-    let glowingNodes: [Int64: Date]
-    let newNodes: [Int64: Date]
-    let dyingNodes: [Int64: DyingNode]
+    @Binding var selectedNode: UUID?
+    let glowingNodes: [UUID: Date]
+    let newNodes: [UUID: Date]
+    let dyingNodes: [UUID: DyingNode]
     let semanticClusters3D: [SemanticCluster3D]
     let topicGroups: [TopicGroupInfo]
-    let clusters: [[Int64]]
-    let searchMatchIds: Set<Int64>
+    let clusters: [[UUID]]
+    let searchMatchIds: Set<UUID>
     let isSearchActive: Bool
     /// Direct references for renderTick — avoids closures crossing SwiftUI observation boundary.
     let simulation3D: ForceSimulation3D
     let embeddingProjection: EmbeddingProjection
     let camera3DState: Camera3DState
-    let forcePositionSnapshot3D: [Int64: SIMD3<Float>]
+    let forcePositionSnapshot3D: [UUID: SIMD3<Float>]
     let transitionProgress: CGFloat
     let renderStore: GraphRenderStore
     @Binding var cameraProjectTarget: String?
@@ -3144,6 +3145,13 @@ struct Graph3DView: View {
     @State private var metalRenderer: MetalGraphRenderer?
     @State private var scrollMonitor: Any?
     @State private var updateClosureCount: UInt64 = 0
+    /// Mirrors metalScene.reticleTarget for SwiftUI (MetalSceneManager is not @Observable).
+    @State private var metalReticleTarget: UUID?
+
+    // Mascot chat state
+    @State private var isMascotChatOpen = false
+    @State private var mascotChatEngine: AnyObject?  // type-erased for @available gating
+    @Environment(\.lattice) private var lattice
 
     /// Active scene object for input forwarding (Metal or RealityKit).
     private var activeSceneForInput: AnyObject? {
@@ -3204,6 +3212,19 @@ struct Graph3DView: View {
                                 }
                             }
                         }
+                }
+
+                // Mascot chat panel
+                if isMascotChatOpen {
+                    if #available(macOS 26.0, *), let engine = mascotChatEngine as? MascotChatEngine {
+                        MascotChatPanel(engine: engine) {
+                            toggleMascotChat()
+                        }
+                        .transition(.move(edge: .leading).combined(with: .opacity))
+                        .padding(.leading, 16)
+                        .padding(.bottom, 60)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+                    }
                 }
 
                 // Mode indicator + navigation hints
@@ -3381,6 +3402,9 @@ struct Graph3DView: View {
         mgr.selectionCallback = { newSelection in
             selectedNode = newSelection
         }
+        mgr.reticleCallback = { newTarget in
+            metalReticleTarget = newTarget
+        }
         pushDataToMetalScene()
         installInputMonitor()
     }
@@ -3424,16 +3448,26 @@ struct Graph3DView: View {
         SpatialTapGesture()
             .onEnded { value in
                 guard let ms = metalScene else { return }
+                // Check mascot tap first — mascot takes priority over nodes
+                if ms.hitTestMascot(at: value.location, viewSize: viewSize) {
+                    toggleMascotChat()
+                    return
+                }
                 if let nodeId = ms.hitTest(at: value.location, viewSize: viewSize) {
                     if hubs.contains(nodeId) {
-                        let expanding = !ms.expandedHubs.contains(nodeId)
-                        for hubId in ms.expandedHubs where hubId != nodeId {
-                            ms.toggleHubExpansion(hubId: hubId)
-                            metalPinUnpinHubChildren(hubId: hubId, expanding: false)
+                        if selectedNode == nodeId {
+                            metalCollapseAllHubs()
+                            selectedNode = nil
+                        } else {
+                            let expanding = !ms.expandedHubs.contains(nodeId)
+                            for hubId in ms.expandedHubs where hubId != nodeId {
+                                ms.toggleHubExpansion(hubId: hubId)
+                                metalPinUnpinHubChildren(hubId: hubId, expanding: false)
+                            }
+                            ms.toggleHubExpansion(hubId: nodeId)
+                            metalPinUnpinHubChildren(hubId: nodeId, expanding: expanding)
+                            selectedNode = nodeId
                         }
-                        ms.toggleHubExpansion(hubId: nodeId)
-                        metalPinUnpinHubChildren(hubId: nodeId, expanding: expanding)
-                        selectedNode = nodeId
                     } else {
                         metalCollapseAllHubs()
                         selectedNode = selectedNode == nodeId ? nil : nodeId
@@ -3445,6 +3479,29 @@ struct Graph3DView: View {
             }
     }
 
+    private func toggleMascotChat() {
+        if isMascotChatOpen {
+            isMascotChatOpen = false
+            metalScene?.mascot.setChatting(false)
+        } else {
+            isMascotChatOpen = true
+            metalScene?.mascot.setChatting(true)
+            if #available(macOS 26.0, *) {
+                setupChatEngineIfNeeded()
+            }
+        }
+    }
+
+    private func setupChatEngineIfNeeded() {
+        if #available(macOS 26.0, *) {
+            if mascotChatEngine == nil {
+                let engine = MascotChatEngine()
+                mascotChatEngine = engine
+                Task { await engine.setup(lattice: lattice) }
+            }
+        }
+    }
+
     private func metalCollapseAllHubs() {
         guard let ms = metalScene else { return }
         for hubId in ms.expandedHubs {
@@ -3453,7 +3510,7 @@ struct Graph3DView: View {
         }
     }
 
-    private func metalPinUnpinHubChildren(hubId: Int64, expanding: Bool) {
+    private func metalPinUnpinHubChildren(hubId: UUID, expanding: Bool) {
         let children = edges.filter { $0.relation == "part_of" && $0.targetId == hubId }.map(\.sourceId)
         for childId in children {
             if expanding { simulation3D.pin(childId) } else { simulation3D.unpin(childId) }
@@ -3466,7 +3523,7 @@ struct Graph3DView: View {
 
     @ViewBuilder
     private var reticleOverlay: some View {
-        let reticleTarget = Self.useMetalRenderer ? metalScene?.reticleTarget : scene.reticleTarget
+        let reticleTarget = Self.useMetalRenderer ? metalReticleTarget : scene.reticleTarget
         let hasTarget = reticleTarget != nil
         let nodeById = Dictionary(nodes.map { ($0.id, $0) }, uniquingKeysWith: { _, last in last })
 
@@ -3727,7 +3784,7 @@ struct Graph3DView: View {
     }
 
     /// Pin/unpin hub children in the force simulation directly (no closure crossing SwiftUI boundary).
-    private func pinUnpinHubChildren(hubId: Int64, expanding: Bool) {
+    private func pinUnpinHubChildren(hubId: UUID, expanding: Bool) {
         let children = edges.filter { $0.relation == "part_of" && $0.targetId == hubId }.map(\.sourceId)
         for childId in children {
             if expanding { simulation3D.pin(childId) } else { simulation3D.unpin(childId) }
@@ -3739,15 +3796,20 @@ struct Graph3DView: View {
             .onEnded { value in
                 if let nodeId = scene.hitTest(at: value.location, viewSize: viewSize, positions: scene.renderPositions) {
                     if hubs.contains(nodeId) {
-                        let expanding = !scene.expandedHubs.contains(nodeId)
-                        // Collapse other expanded hubs first
-                        for hubId in scene.expandedHubs where hubId != nodeId {
-                            scene.toggleHubExpansion(hubId: hubId)
-                            pinUnpinHubChildren(hubId: hubId, expanding: false)
+                        if selectedNode == nodeId {
+                            collapseAllHubs()
+                            selectedNode = nil
+                        } else {
+                            let expanding = !scene.expandedHubs.contains(nodeId)
+                            // Collapse other expanded hubs first
+                            for hubId in scene.expandedHubs where hubId != nodeId {
+                                scene.toggleHubExpansion(hubId: hubId)
+                                pinUnpinHubChildren(hubId: hubId, expanding: false)
+                            }
+                            scene.toggleHubExpansion(hubId: nodeId)
+                            pinUnpinHubChildren(hubId: nodeId, expanding: expanding)
+                            selectedNode = nodeId
                         }
-                        scene.toggleHubExpansion(hubId: nodeId)
-                        pinUnpinHubChildren(hubId: nodeId, expanding: expanding)
-                        selectedNode = nodeId
                     } else {
                         collapseAllHubs()
                         selectedNode = selectedNode == nodeId ? nil : nodeId

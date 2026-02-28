@@ -1,0 +1,61 @@
+---
+title: Engram Sync Architecture — Teams (Phase 2)
+---
+
+graph TB
+    subgraph Jason["Jason's Laptop"]
+        subgraph jMem["memory.db (local)"]
+            jMem_priv["🔒 canary-ios-sdk:<br/>salary notes"]
+            jMem_config["SyncConfig:<br/>canary-ios: .sync<br/>exposedTeams: [mobile]"]
+        end
+        subgraph jPers["personal.db (synced)"]
+            jPers_canary["canary-ios-sdk:<br/>auth bug<br/>API pattern<br/>retry logic"]
+        end
+        subgraph jContrib["jason_mobile.db (contribution, 1-way)"]
+            jContrib_canary["canary-ios-sdk:<br/>auth bug<br/>API pattern<br/>retry logic"]
+        end
+    end
+
+    jPers_canary -->|"dual-write"| jContrib_canary
+
+    subgraph TeamServer["Team Server"]
+        ts_jason["jason_mobile.db"]
+        ts_diana["diana_mobile.db"]
+        subgraph Agent["🤖 Agent"]
+            consolidate["consolidates member<br/>contributions →"]
+        end
+        ts_team["mobile.db<br/>(team graph)"]
+    end
+
+    jContrib -->|"sync (1-way up)"| ts_jason
+    ts_jason --> consolidate
+    ts_diana --> consolidate
+    consolidate --> ts_team
+
+    subgraph Diana["Diana's Laptop"]
+        subgraph dMem["memory.db (local)"]
+            dMem_config["SyncConfig: ..."]
+        end
+        subgraph dPers["personal.db (synced)"]
+            dPers_data["diana's memories"]
+        end
+        subgraph dContrib["diana_mobile.db (her contribution)"]
+            dContrib_data["diana's exposed memories"]
+        end
+        subgraph dJason["jason_mobile.db (read-only)"]
+            dJason_data["Jason's contributions"]
+        end
+        subgraph dTeam["mobile.db (team graph)"]
+            dTeam_data["agent-consolidated"]
+        end
+        dAttach["ATTACH: memory + personal +<br/>diana_mobile + jason_mobile + mobile"]
+    end
+
+    ts_team -->|"sync (down)"| dTeam
+    ts_jason -->|"sync (down)"| dJason
+
+    dMem --> dAttach
+    dPers --> dAttach
+    dContrib --> dAttach
+    dJason --> dAttach
+    dTeam --> dAttach

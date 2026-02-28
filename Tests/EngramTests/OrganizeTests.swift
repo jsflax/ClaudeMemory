@@ -249,42 +249,45 @@ import Foundation
 
 @Test func labelPropagation_findsCommunities() {
     // Two disconnected cliques of 3
-    let adjacency: [Int64: Set<Int64>] = [
-        1: [2, 3],
-        2: [1, 3],
-        3: [1, 2],
-        4: [5, 6],
-        5: [4, 6],
-        6: [4, 5],
+    let u1 = UUID(), u2 = UUID(), u3 = UUID(), u4 = UUID(), u5 = UUID(), u6 = UUID()
+    let adjacency: [UUID: Set<UUID>] = [
+        u1: [u2, u3],
+        u2: [u1, u3],
+        u3: [u1, u2],
+        u4: [u5, u6],
+        u5: [u4, u6],
+        u6: [u4, u5],
     ]
 
     let communities = labelPropagation(adjacency: adjacency)
 
     #expect(communities.count == 2)
-    let sizes = communities.map(\.count).sorted()
+    let sizes: [Int] = communities.map(\.count).sorted()
     #expect(sizes == [3, 3])
 
     let c1 = Set(communities[0])
     let c2 = Set(communities[1])
-    #expect((c1 == [1, 2, 3] && c2 == [4, 5, 6]) || (c1 == [4, 5, 6] && c2 == [1, 2, 3]))
+    #expect((c1 == [u1, u2, u3] && c2 == [u4, u5, u6]) || (c1 == [u4, u5, u6] && c2 == [u1, u2, u3]))
 }
 
 @Test func labelPropagation_bridgeEdge() {
     // Two dense cliques connected by a single bridge edge
-    let adjacency: [Int64: Set<Int64>] = [
-        1: [2, 3, 4],
-        2: [1, 3, 4],
-        3: [1, 2, 4],
-        4: [1, 2, 3, 5],
-        5: [4, 6, 7, 8],
-        6: [5, 7, 8],
-        7: [5, 6, 8],
-        8: [5, 6, 7],
+    let u1 = UUID(), u2 = UUID(), u3 = UUID(), u4 = UUID()
+    let u5 = UUID(), u6 = UUID(), u7 = UUID(), u8 = UUID()
+    let adjacency: [UUID: Set<UUID>] = [
+        u1: [u2, u3, u4],
+        u2: [u1, u3, u4],
+        u3: [u1, u2, u4],
+        u4: [u1, u2, u3, u5],
+        u5: [u4, u6, u7, u8],
+        u6: [u5, u7, u8],
+        u7: [u5, u6, u8],
+        u8: [u5, u6, u7],
     ]
 
     let communities = labelPropagation(adjacency: adjacency)
 
     #expect(communities.count == 2)
-    let sizes = communities.map(\.count).sorted()
+    let sizes: [Int] = communities.map(\.count).sorted()
     #expect(sizes == [4, 4])
 }

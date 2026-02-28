@@ -41,24 +41,25 @@ func truncateLabel(_ text: String, to maxLen: Int) -> String {
 // MARK: - Lightweight data structs (replaces heavy Lattice model objects)
 
 struct NodeData {
-    let id: Int64
+    let id: UUID
     let project: String
     let topic: String
     let label: String
+    let content: String
     let createdAt: Date
     var lastAccessedAt: Date
     let importance: Int
 }
 
 struct EdgeData {
-    let id: Int64
-    let sourceId: Int64
-    let targetId: Int64
+    let id: Int64       // Edge primaryKey (DB-local, for observation identity)
+    let sourceId: UUID
+    let targetId: UUID
     let relation: String
 }
 
 struct DyingNode {
-    let id: Int64
+    let id: UUID
     let position: CGPoint
     let project: String
     let isHub: Bool
@@ -72,14 +73,18 @@ struct DyingNode {
 @MainActor
 final class GraphRenderStore {
     var nodes: [NodeData] = []
-    var nodeById: [Int64: NodeData] = [:]
+    var nodeById: [UUID: NodeData] = [:]
     var edges: [EdgeData] = []
-    var hubs: Set<Int64> = []
+    var hubs: Set<UUID> = []
     var colorMap: [String: Color] = [:] {
         didSet { colorMapVersion &+= 1 }
     }
     /// Incremented whenever colorMap changes. Scene checks this to invalidate its SIMD cache.
     private(set) var colorMapVersion: UInt64 = 0
+
+    /// Incremented when nodes/hubs/projects change. Replaces O(n) Set comparison per frame in atlas check.
+    private(set) var topologyVersion: UInt64 = 0
+    func bumpTopology() { topologyVersion &+= 1 }
 }
 
 // MARK: - Perf tracking (writable from Canvas closure)
@@ -101,19 +106,19 @@ struct GraphCanvas: View {
     @ObservedObject var simulation: ForceSimulation
     let nodes: [NodeData]
     let edges: [EdgeData]
-    let hubs: Set<Int64>
-    let glowingNodes: [Int64: Date]
-    let newNodes: [Int64: Date]
-    let dyingNodes: [Int64: DyingNode]
-    let searchMatchIds: Set<Int64>
+    let hubs: Set<UUID>
+    let glowingNodes: [UUID: Date]
+    let newNodes: [UUID: Date]
+    let dyingNodes: [UUID: DyingNode]
+    let searchMatchIds: Set<UUID>
     let isSearchActive: Bool
     let viewport: ViewportState
-    @Binding var selectedNode: Int64?
-    let clusters: [[Int64]]
+    @Binding var selectedNode: UUID?
+    let clusters: [[UUID]]
     let topicGroups: [TopicGroupInfo]
     let colorMap: [String: Color]
     var layoutMode: LayoutMode = .forceDirected
-    var overridePositions: [Int64: CGPoint]? = nil
+    var overridePositions: [UUID: CGPoint]? = nil
     var knowledgeVoids: [KnowledgeVoid] = []
     var semanticClusters: [SemanticCluster] = []
     var projectionState: ProjectionState = .idle
@@ -145,9 +150,9 @@ struct GraphCanvas: View {
         let vEdges = edges
         let glows = glowingNodes
         // Precompute connected set once per body eval (not per Canvas frame)
-        let connected: Set<Int64> = {
+        let connected: Set<UUID> = {
             guard let sel = selectedNode else { return [] }
-            var ids = Set<Int64>()
+            var ids = Set<UUID>()
             for edge in edges {
                 if edge.sourceId == sel { ids.insert(edge.targetId) }
                 if edge.targetId == sel { ids.insert(edge.sourceId) }
@@ -326,10 +331,10 @@ struct GraphCanvas: View {
 
     // MARK: - Hit testing
 
-    private func hitTest(_ screenPoint: CGPoint) -> Int64? {
+    private func hitTest(_ screenPoint: CGPoint) -> UUID? {
         let world = screenToWorld(screenPoint)
         let positions = overridePositions ?? simulation.positions
-        var closest: Int64?
+        var closest: UUID?
         var closestDist: CGFloat = .greatestFiniteMagnitude
 
         for node in nodes {
@@ -359,8 +364,8 @@ struct GraphCanvas: View {
 
     // MARK: - Cluster Hulls
 
-    private func drawClusterHulls(context: inout GraphicsContext, positions: [Int64: CGPoint],
-                                  nodes: [NodeData], hubs: Set<Int64>, edges: [EdgeData], fade: CGFloat = 1.0) {
+    private func drawClusterHulls(context: inout GraphicsContext, positions: [UUID: CGPoint],
+                                  nodes: [NodeData], hubs: Set<UUID>, edges: [EdgeData], fade: CGFloat = 1.0) {
         // Per-project hulls (faint background)
         var projectPoints: [String: [CGPoint]] = [:]
         for node in nodes {
@@ -454,7 +459,7 @@ struct GraphCanvas: View {
 
     // MARK: - Semantic Clusters (embedding mode)
 
-    private func drawSemanticClusters(context: inout GraphicsContext, positions: [Int64: CGPoint], nodes: [NodeData], transitionFade: CGFloat = 1.0) {
+    private func drawSemanticClusters(context: inout GraphicsContext, positions: [UUID: CGPoint], nodes: [NodeData], transitionFade: CGFloat = 1.0) {
         guard !semanticClusters.isEmpty else { return }
 
         // Cluster appearance fade (0.6s after clusters first appear from t-SNE)
@@ -575,7 +580,7 @@ struct GraphCanvas: View {
 
     // MARK: - Knowledge Voids
 
-    private func drawKnowledgeVoids(context: inout GraphicsContext, positions: [Int64: CGPoint]) {
+    private func drawKnowledgeVoids(context: inout GraphicsContext, positions: [UUID: CGPoint]) {
         guard !knowledgeVoids.isEmpty else { return }
 
         for void in knowledgeVoids {
@@ -655,9 +660,9 @@ struct GraphCanvas: View {
 
     // MARK: - Drawing Edges
 
-    private func drawEdges(context: inout GraphicsContext, positions: [Int64: CGPoint],
-                           nodes: [NodeData], hubs: Set<Int64>, edges: [EdgeData],
-                           connectedToSelected: Set<Int64> = []) {
+    private func drawEdges(context: inout GraphicsContext, positions: [UUID: CGPoint],
+                           nodes: [NodeData], hubs: Set<UUID>, edges: [EdgeData],
+                           connectedToSelected: Set<UUID> = []) {
         let nodeByPk = Dictionary(nodes.map { ($0.id, $0) }, uniquingKeysWith: { _, last in last })
         let hasSelection = selectedNode != nil
         let selectedProject = selectedNode.flatMap { nodeByPk[$0]?.project } ?? "global"
@@ -796,10 +801,10 @@ struct GraphCanvas: View {
         let dimmed: Bool
     }
 
-    private func drawNodes(context: inout GraphicsContext, positions: [Int64: CGPoint],
-                           nodes: [NodeData], hubs: Set<Int64>, edges: [EdgeData],
-                           glowingNodes: [Int64: Date],
-                           connectedToSelected: Set<Int64> = []) {
+    private func drawNodes(context: inout GraphicsContext, positions: [UUID: CGPoint],
+                           nodes: [NodeData], hubs: Set<UUID>, edges: [EdgeData],
+                           glowingNodes: [UUID: Date],
+                           connectedToSelected: Set<UUID> = []) {
         let hasSelection = selectedNode != nil
 
         var labelCmds: [LabelCmd] = []
@@ -811,7 +816,7 @@ struct GraphCanvas: View {
         let now = Date()
 
         // Precompute recall intensities
-        var recallIntensities: [Int64: CGFloat] = [:]
+        var recallIntensities: [UUID: CGFloat] = [:]
         for node in allOrdered {
             guard let glowStart = glowingNodes[node.id], node.id != selectedNode else { continue }
             let elapsed = now.timeIntervalSince(glowStart)
@@ -829,7 +834,7 @@ struct GraphCanvas: View {
         }
 
         // Precompute arrival (new node) intensities — golden-orange glow
-        var arrivalIntensities: [Int64: CGFloat] = [:]
+        var arrivalIntensities: [UUID: CGFloat] = [:]
         for node in allOrdered {
             guard let arrivalTime = newNodes[node.id] else { continue }
             let elapsed = now.timeIntervalSince(arrivalTime)

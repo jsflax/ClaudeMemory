@@ -1,0 +1,29 @@
+---
+title: Engram Write Routing Decision Tree
+---
+
+flowchart TD
+    A["remember(content, project, isPrivate)"] --> B{isPrivate?}
+
+    B -->|true| C["memory.db<br/>(always, never syncs)"]
+
+    B -->|false| D{"SyncConfig.policy<br/>for project?"}
+
+    D -->|.local| E["memory.db"]
+
+    D -->|.sync| F["personal.db<br/>(canonical write)"]
+
+    F --> G{"exposedTeams<br/>non-empty?"}
+
+    G -->|"[]"| H["done<br/>(personal sync only)"]
+
+    G -->|"[mobile, x]"| I["dual-write to each<br/>contribution DB"]
+
+    I --> J["jason_mobile.db"]
+    I --> K["jason_x.db"]
+
+    style C fill:#ff6b6b,color:#fff
+    style E fill:#ff6b6b,color:#fff
+    style F fill:#4ecdc4,color:#fff
+    style J fill:#ffe66d,color:#333
+    style K fill:#ffe66d,color:#333

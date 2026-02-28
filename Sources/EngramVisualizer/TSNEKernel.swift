@@ -12,13 +12,13 @@ import Accelerate
 struct TSNEKernel: Sendable {
     struct Input: Sendable {
         let embeddings: [[Float]]  // n x dim
-        let ids: [Int64]
+        let ids: [UUID]
         let perplexity: Double     // default 30
         let maxIterations: Int     // default 1000
         let initialPositions: [(x: Double, y: Double)]?  // optional init from force layout
         let outputDims: Int        // 2 or 3
 
-        init(embeddings: [[Float]], ids: [Int64], perplexity: Double, maxIterations: Int,
+        init(embeddings: [[Float]], ids: [UUID], perplexity: Double, maxIterations: Int,
              initialPositions: [(x: Double, y: Double)]?, outputDims: Int = 2) {
             self.embeddings = embeddings
             self.ids = ids
@@ -30,7 +30,7 @@ struct TSNEKernel: Sendable {
     }
 
     struct Output: Sendable {
-        let positions: [(id: Int64, x: Double, y: Double)]
+        let positions: [(id: UUID, x: Double, y: Double)]
         /// Non-nil only when outputDims == 3
         let zValues: [Double]?
     }
@@ -39,7 +39,7 @@ struct TSNEKernel: Sendable {
     static func compute(
         _ input: Input,
         progress: @Sendable (Double) -> Void,
-        onPositions: @Sendable ([(id: Int64, x: Double, y: Double)], _ zValues: [Double]?) -> Void = { _, _ in }
+        onPositions: @Sendable ([(id: UUID, x: Double, y: Double)], _ zValues: [Double]?) -> Void = { _, _ in }
     ) -> Output {
         let n = input.embeddings.count
         let D = input.outputDims  // output dimensionality (2 or 3)
@@ -236,7 +236,7 @@ struct TSNEKernel: Sendable {
             // frame-level lerp in EmbeddingProjection dampens jumps). After: every 10 iters.
             let emitInterval = iter < earlyExaggerationIters ? 25 : 10
             if (iter + 1) % emitInterval == 0 {
-                var interPositions: [(id: Int64, x: Double, y: Double)] = []
+                var interPositions: [(id: UUID, x: Double, y: Double)] = []
                 interPositions.reserveCapacity(n)
                 var interZ: [Double]? = D == 3 ? [] : nil
                 for i in 0..<n {
@@ -250,7 +250,7 @@ struct TSNEKernel: Sendable {
         progress(1.0)
 
         // Build output
-        var positions: [(id: Int64, x: Double, y: Double)] = []
+        var positions: [(id: UUID, x: Double, y: Double)] = []
         positions.reserveCapacity(n)
         var zValues: [Double]? = D == 3 ? [] : nil
         for i in 0..<n {

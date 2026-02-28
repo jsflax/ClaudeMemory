@@ -27,7 +27,7 @@ final class NebulaFogSystem {
     /// Build nebula groups from current render state.
     func nebulaGroupsForCurrentMode(
         layoutMode: LayoutMode,
-        positions: [Int64: SIMD3<Float>],
+        positions: [UUID: SIMD3<Float>],
         nodes: [NodeData],
         semanticClusters3D: [SemanticCluster3D]
     ) -> [NebulaGroup] {

@@ -22,8 +22,9 @@ extension MemoryTools {
 
         let floats = try await embedder.embed(text: title)
         let embeddingVec = floats.map { Vector<Float>($0) } ?? Vector<Float>([])
+        let episodeTargetDB = writeLattice(for: project)
         let episode = Memory(content: title, topic: "episode", project: project, embedding: embeddingVec)
-        lattice.add(episode)
+        episodeTargetDB.add(episode)
 
         guard let episodeId = episode.primaryKey else {
             throw MCPError.internalError("Failed to persist episode memory — primaryKey is nil after add()")
@@ -94,13 +95,16 @@ extension MemoryTools {
         }
 
         // Find memories linked via part_of edges to this episode
+        guard let episodeGlobalId = episode.__globalId else {
+            return CallTool.Result(content: [.text("Episode has no globalId.")], isError: true)
+        }
         let edges = lattice.objects(Edge.self)
-            .where { $0.targetId == id64 && $0.relation == "part_of" }
+            .where { $0.targetGlobalId == episodeGlobalId && $0.relation == .partOf }
 
         // Fetch and sort member memories chronologically
         var members: [Memory] = []
         for edge in edges {
-            if let mem = lattice.objects(Memory.self).where({ $0.primaryKey == edge.sourceId && $0.topic != "episode" }).first {
+            if let mem = lattice.objects(Memory.self).where({ $0.__globalId == edge.sourceGlobalId && $0.topic != "episode" }).first {
                 members.append(mem)
             }
         }
@@ -194,7 +198,9 @@ extension MemoryTools {
 
     /// Count memories linked to an episode via part_of edges.
     private func countEpisodeMembers(_ episodeId: Int64) -> Int {
-        lattice.count(Edge.self, where: { $0.targetId == episodeId && $0.relation == "part_of" })
+        guard let ep = lattice.objects(Memory.self).where({ $0.primaryKey == episodeId }).first,
+              let epGlobalId = ep.__globalId else { return 0 }
+        return lattice.count(Edge.self, where: { $0.targetGlobalId == epGlobalId && $0.relation == .partOf })
     }
 
     /// Compute episode duration from creation to latest member memory (or now if active).
@@ -203,10 +209,14 @@ extension MemoryTools {
             return formatDuration(from: startedAt, to: Date())
         }
         // Find latest member memory
-        let edges = lattice.objects(Edge.self).where { $0.targetId == episodeId && $0.relation == "part_of" }
+        guard let ep = lattice.objects(Memory.self).where({ $0.primaryKey == episodeId }).first,
+              let epGlobalId = ep.__globalId else {
+            return formatDuration(from: startedAt, to: startedAt)
+        }
+        let edges = lattice.objects(Edge.self).where { $0.targetGlobalId == epGlobalId && $0.relation == .partOf }
         var latest = startedAt
         for edge in edges {
-            if let mem = lattice.objects(Memory.self).where({ $0.primaryKey == edge.sourceId }).first {
+            if let mem = lattice.objects(Memory.self).where({ $0.__globalId == edge.sourceGlobalId }).first {
                 if mem.createdAt > latest { latest = mem.createdAt }
             }
         }

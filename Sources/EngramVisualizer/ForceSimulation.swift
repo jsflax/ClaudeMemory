@@ -13,13 +13,13 @@ import Accelerate
 @MainActor
 final class ForceSimulation: ObservableObject {
     // SoA layout for cache-friendly iteration
-    private var ids: [Int64] = []
+    private var ids: [UUID] = []
     private var x: [CGFloat] = []
     private var y: [CGFloat] = []
     private var vx: [CGFloat] = []
     private var vy: [CGFloat] = []
     private var pinned: [Bool] = []
-    private var idToIndex: [Int64: Int] = [:]
+    private var idToIndex: [UUID: Int] = [:]
     private var edgeIndices: [(Int, Int)] = []
     private var projectGroup: [Int] = []  // group index per node (same project = same group)
     private var topicGroup: [Int] = []    // group index per node (same project+topic = same group)
@@ -31,7 +31,7 @@ final class ForceSimulation: ObservableObject {
     private var storedFx: [CGFloat] = []
     private var storedFy: [CGFloat] = []
 
-    private(set) var positions: [Int64: CGPoint] = [:]
+    private(set) var positions: [UUID: CGPoint] = [:]
 
     private let springLength: CGFloat = 240
     private let crossProjectSpringLength: CGFloat = 400
@@ -62,7 +62,7 @@ final class ForceSimulation: ObservableObject {
 
     // MARK: - Dragging
 
-    func pinNode(_ id: Int64, at position: CGPoint) {
+    func pinNode(_ id: UUID, at position: CGPoint) {
         guard let i = idToIndex[id] else { return }
         x[i] = position.x
         y[i] = position.y
@@ -72,7 +72,7 @@ final class ForceSimulation: ObservableObject {
         syncPositions()
     }
 
-    func unpinNode(_ id: Int64) {
+    func unpinNode(_ id: UUID) {
         guard let i = idToIndex[id] else { return }
         pinned[i] = false
 
@@ -101,14 +101,14 @@ final class ForceSimulation: ObservableObject {
     }
 
     // Per-node metadata for surgical operations
-    private var nodeProject: [Int64: String] = [:]
-    private var nodeTopic: [Int64: String] = [:]
+    private var nodeProject: [UUID: String] = [:]
+    private var nodeTopic: [UUID: String] = [:]
     private var projectToGroupIdx: [String: Int] = [:]
     private var topicKeyToGroupIdx: [String: Int] = [:]
 
     // MARK: - Surgical node/edge operations
 
-    func addNode(_ id: Int64, project: String, topic: String) {
+    func addNode(_ id: UUID, project: String, topic: String) {
         guard idToIndex[id] == nil else { return }
 
         let idx = ids.count
@@ -166,7 +166,7 @@ final class ForceSimulation: ObservableObject {
         rebuildPositions()
     }
 
-    func removeNode(_ id: Int64) {
+    func removeNode(_ id: UUID) {
         guard let idx = idToIndex[id] else { return }
         let lastIdx = ids.count - 1
 
@@ -205,14 +205,14 @@ final class ForceSimulation: ObservableObject {
         rebuildPositions()
     }
 
-    func addEdge(from sourceId: Int64, to targetId: Int64) {
+    func addEdge(from sourceId: UUID, to targetId: UUID) {
         guard let si = idToIndex[sourceId], let ti = idToIndex[targetId] else { return }
         if edgeIndices.contains(where: { $0 == (si, ti) }) { return }
         edgeIndices.append((si, ti))
         hasPendingTopologyChanges = true
     }
 
-    func removeEdge(from sourceId: Int64, to targetId: Int64) {
+    func removeEdge(from sourceId: UUID, to targetId: UUID) {
         guard let si = idToIndex[sourceId], let ti = idToIndex[targetId] else { return }
         edgeIndices.removeAll { $0 == (si, ti) }
         hasPendingTopologyChanges = true
@@ -220,7 +220,7 @@ final class ForceSimulation: ObservableObject {
 
     // MARK: - Full graph reconciliation
 
-    func updateGraph(nodeIds: Set<Int64>, edges: [(Int64, Int64)], projectForNode: [Int64: String] = [:], topicForNode: [Int64: String] = [:]) {
+    func updateGraph(nodeIds: Set<UUID>, edges: [(UUID, UUID)], projectForNode: [UUID: String] = [:], topicForNode: [UUID: String] = [:]) {
         // Remove nodes no longer in the graph
         var keep = [Bool](repeating: false, count: ids.count)
         for (i, id) in ids.enumerated() {
@@ -228,7 +228,7 @@ final class ForceSimulation: ObservableObject {
         }
 
         // Compact arrays, preserving only kept nodes
-        var newIds: [Int64] = []
+        var newIds: [UUID] = []
         var newX: [CGFloat] = []
         var newY: [CGFloat] = []
         var newVx: [CGFloat] = []
@@ -340,7 +340,7 @@ final class ForceSimulation: ObservableObject {
         // Reheat simulation if topology or topic groupings changed
         let topicGroupsChanged = topicGroup != prevTopicGroup
         if topologyChanged || topicGroupsChanged {
-            alpha = max(alpha, topologyChanged ? 0.05 : 0.03)
+            alpha = max(alpha, topologyChanged ? 0.3 : 0.03)
             prevTopicGroup = topicGroup
         }
 
@@ -368,7 +368,7 @@ final class ForceSimulation: ObservableObject {
 
     /// Write external positions (e.g. from t-SNE) into internal SoA arrays.
     /// Force layout resumes from these positions when switching back.
-    func setPositions(_ positions: [Int64: CGPoint]) {
+    func setPositions(_ positions: [UUID: CGPoint]) {
         for (id, point) in positions {
             guard let i = idToIndex[id] else { continue }
             x[i] = point.x

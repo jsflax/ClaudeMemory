@@ -16,6 +16,7 @@ final class MetalSceneManager {
     let camera: CameraController
     let nebulaFog: NebulaFogSystem
     let flowParticles: FlowParticleSystem
+    let mascot: MascotSystem
 
     // External references (set by Graph3DView)
     weak var simulation3D: ForceSimulation3D?
@@ -25,29 +26,29 @@ final class MetalSceneManager {
 
     // Data pushed from SwiftUI
     var layoutMode: LayoutMode = .forceDirected
-    var glowingNodes: [Int64: Date] = [:]
-    var newNodes: [Int64: Date] = [:]
-    var dyingNodes: [Int64: DyingNode] = [:]
+    var glowingNodes: [UUID: Date] = [:]
+    var newNodes: [UUID: Date] = [:]
+    var dyingNodes: [UUID: DyingNode] = [:]
     var semanticClusters3D: [SemanticCluster3D] = []
     var topicGroups: [TopicGroupInfo] = []
-    var clusters: [[Int64]] = []
-    var searchMatchIds: Set<Int64> = []
+    var clusters: [[UUID]] = []
+    var searchMatchIds: Set<UUID> = []
     var isSearchActive: Bool = false
-    var forcePositionSnapshot3D: [Int64: SIMD3<Float>] = [:]
+    var forcePositionSnapshot3D: [UUID: SIMD3<Float>] = [:]
     var transitionProgress: CGFloat = 0
 
     // Mutable render state
-    var positions: [Int64: SIMD3<Float>] = [:]
-    var selectedNode: Int64?
-    var selectionCallback: ((Int64?) -> Void)?
+    var positions: [UUID: SIMD3<Float>] = [:]
+    var selectedNode: UUID?
+    var selectionCallback: ((UUID?) -> Void)?
 
     // Hub expansion state
-    var expandedHubs: Set<Int64> = []
-    var expansionProgress: [Int64: Float] = [:]
-    var expansionDirection: [Int64: Bool] = [:]
-    var preExpansionPositions: [Int64: SIMD3<Float>] = [:]
-    var expandedChildPositions: [Int64: SIMD3<Float>] = [:]
-    var pendingHubToggles: [(hubId: Int64, expanding: Bool)] = []
+    var expandedHubs: Set<UUID> = []
+    var expansionProgress: [UUID: Float] = [:]
+    var expansionDirection: [UUID: Bool] = [:]
+    var preExpansionPositions: [UUID: SIMD3<Float>] = [:]
+    var expandedChildPositions: [UUID: SIMD3<Float>] = [:]
+    var pendingHubToggles: [(hubId: UUID, expanding: Bool)] = []
 
     // Input
     var heldKeys: Set<String> = []
@@ -58,12 +59,14 @@ final class MetalSceneManager {
     private var cameraStartTime: Date?
     private var centerTickCount: Int = 0
     private var isDragging = false
-    private var lastSelectedNode: Int64?
+    private var lastSelectedNode: UUID?
     private var lastSearchActive = false
-    private var lastSearchMatchIds: Set<Int64> = []
+    private var lastSearchMatchIds: Set<UUID> = []
 
     // Reticle (gamepad targeting)
-    var reticleTarget: Int64?
+    var reticleTarget: UUID?
+    /// Callback for SwiftUI to observe reticle target changes (MetalSceneManager is not @Observable).
+    var reticleCallback: ((UUID?) -> Void)?
     // Teleport state
     var teleportLabel: String?
     var teleportCounter: Int = 0
@@ -84,21 +87,22 @@ final class MetalSceneManager {
     private var instanceArray: [NodeInstance] = []
 
     // Cached per-node data rebuilt only on topology change
-    private var cachedNodeRadii: [Int64: Float] = [:]
-    private var cachedNodeProject: [Int64: String] = [:]
+    private var cachedNodeRadii: [UUID: Float] = [:]
+    private var cachedNodeProject: [UUID: String] = [:]
     private var lastTopologyNodeCount: Int = 0
 
     // Label atlas state
-    var labelAtlasRects: [Int64: (u0: Float, v0: Float, u1: Float, v1: Float)] = [:]
+    var labelAtlasRects: [UUID: (u0: Float, v0: Float, u1: Float, v1: Float)] = [:]
     var projectLabelAtlasRects: [String: (u0: Float, v0: Float, u1: Float, v1: Float)] = [:]
     var projectCentroids: [String: (centroid: SIMD3<Float>, radius: Float, maxY: Float)] = [:]
-    var labelAtlasNodeIds: Set<Int64> = []
-    var labelAtlasHubIds: Set<Int64> = []
+    var labelAtlasNodeIds: Set<UUID> = []
+    var labelAtlasHubIds: Set<UUID> = []
     var labelAtlasProjects: Set<String> = []
     private var labelAtlasAspectCorrection: Float = 1.0
     private var labelAtlasAllocW: Int = 0
     private var labelAtlasAllocH: Int = 0
     private var labelAtlasRegenFrame: UInt64 = 0
+    private var lastAtlasTopologyVersion: UInt64 = 0
     private var isAtlasGenerating = false
 
     // View properties
@@ -112,7 +116,7 @@ final class MetalSceneManager {
 
     private var renderNodes: [NodeData] { renderStore?.nodes ?? [] }
     private var renderEdges: [EdgeData] { renderStore?.edges ?? [] }
-    private var renderHubs: Set<Int64> { renderStore?.hubs ?? [] }
+    private var renderHubs: Set<UUID> { renderStore?.hubs ?? [] }
     private var renderColorMap: [String: Color] { renderStore?.colorMap ?? [:] }
 
     init?(renderer: MetalGraphRenderer) {
@@ -120,8 +124,10 @@ final class MetalSceneManager {
         self.camera = CameraController()
         self.nebulaFog = NebulaFogSystem(device: renderer.device)
         self.flowParticles = FlowParticleSystem(device: renderer.device)
+        self.mascot = MascotSystem(device: renderer.device)
 
         renderer.camera = camera
+        renderer.mascotSystem = mascot
         renderer.onFrameCallback = { [weak self] dt in
             self?.renderTick(dt: dt)
         }
@@ -149,7 +155,7 @@ final class MetalSceneManager {
             sim.tick()
             proj.tickAnimation3D()
 
-            let newPositions: [Int64: SIMD3<Float>]?
+            let newPositions: [UUID: SIMD3<Float>]?
             if sim.isSettled && proj.is3DAnimationSettled {
                 newPositions = nil
             } else if layoutMode == .embedding {
@@ -159,7 +165,7 @@ final class MetalSceneManager {
                 } else if transitionProgress >= 1.0 {
                     newPositions = tsne3D
                 } else {
-                    var blended: [Int64: SIMD3<Float>] = [:]
+                    var blended: [UUID: SIMD3<Float>] = [:]
                     let allIds = Set(forcePositionSnapshot3D.keys).union(tsne3D.keys)
                     for id in allIds {
                         let forcePos = forcePositionSnapshot3D[id] ?? sim.positions[id] ?? .zero
@@ -214,18 +220,32 @@ final class MetalSceneManager {
         let cameraMoving = camera.isMoving
         let hasInput = !heldKeys.isEmpty
         let geometryChanged = positionsChanged || selectionChanged || searchChanged || hasExpansions
-        let visualOnlyChanged = !glowingNodes.isEmpty || !newNodes.isEmpty || !dyingNodes.isEmpty
+        let mascotInspecting = mascot.arcaneIntensity > 0.01
+        let visualOnlyChanged = !glowingNodes.isEmpty || !newNodes.isEmpty || !dyingNodes.isEmpty || mascotInspecting
         let sceneNeedsUpdate = geometryChanged || visualOnlyChanged
 
-        let isActive = sceneNeedsUpdate || cameraMoving || hasInput
+        // Always advance animation time (shaders need it for scan lines, flicker, etc.)
+        renderer.animationTime += dt
+
+        // Always update mascot — it patrols independently of scene changes
+        let nodeByIdForMascot = renderStore?.nodeById ?? [:]
+        var mascotNodeInfo: [UUID: MascotNodeInfo] = [:]
+        if let targetId = mascot.currentTargetId, let nd = nodeByIdForMascot[targetId] {
+            mascotNodeInfo[targetId] = MascotNodeInfo(
+                content: nd.content, project: nd.project,
+                topic: nd.topic, importance: nd.importance,
+                createdAt: nd.createdAt, lastAccessedAt: nd.lastAccessedAt
+            )
+        }
+        mascot.update(dt: dt, camera: camera, nodePositions: positions, nodeInfo: mascotNodeInfo)
+
+        let isActive = sceneNeedsUpdate || cameraMoving || hasInput || !mascot.isSettled
 
         if !isActive {
             if renderFrameCount > 10 && renderFrameCount % 30 != 0 {
                 return
             }
         }
-
-        renderer.animationTime += dt
 
         if sceneNeedsUpdate {
             updateExpansions(dt: dt)
@@ -333,6 +353,7 @@ final class MetalSceneManager {
 
             let searchDimmed = isSearchActive && !searchMatchIds.contains(id)
             let searchMatched = isSearchActive && searchMatchIds.contains(id) && id != selectedNode
+            let isInspecting = mascot.ringTargetId == id && mascot.arcaneIntensity > 0.01
 
             let curState: Float
             let curIntensity: Float
@@ -343,6 +364,8 @@ final class MetalSceneManager {
             } else if searchDimmed {
                 // When search is active, suppress recall/arrival glow on non-matched nodes
                 curState = 0; curIntensity = 0
+            } else if isInspecting {
+                curState = 5; curIntensity = mascot.arcaneIntensity
             } else if ri > 0 {
                 curState = 2; curIntensity = ri
             } else if ai > 0 {
@@ -365,7 +388,7 @@ final class MetalSceneManager {
             idx += 1
 
             // Pack point lights into uniform buffer
-            if (curState >= 1 && curState <= 4) && pointLightCount < 16 {
+            if (curState >= 1 && curState <= 5) && pointLightCount < 16 {
                 let lightColor: SIMD3<Float>
                 let intensity: Float
                 let atten: Float
@@ -383,6 +406,11 @@ final class MetalSceneManager {
                     let pulse = 1.0 + sin(renderer.animationTime * 4.0) * 0.3
                     lightColor = SIMD3(0.0, 0.9, 1.0)
                     intensity = 4.0 * pulse
+                    atten = 0.4
+                } else if curState == 5 {
+                    let pulse = 1.0 + sin(renderer.animationTime * 2.0) * 0.2
+                    lightColor = SIMD3(0.2, 0.6, 0.9)
+                    intensity = 2.0 * curIntensity * pulse
                     atten = 0.4
                 } else {
                     lightColor = SIMD3(1, 1, 1)
@@ -532,12 +560,13 @@ final class MetalSceneManager {
 
         let nodes = renderNodes
         let hubs = renderHubs
-        let currentNodeIds = Set(positions.keys)
-        let currentProjects = Set(nodes.map(\.project))
+        let storeVersion = renderStore?.topologyVersion ?? 0
 
-        // Regen atlas if needed
-        let atlasNeedsRegen = renderer.labelAtlasTexture == nil || currentNodeIds != labelAtlasNodeIds || hubs != labelAtlasHubIds || currentProjects != labelAtlasProjects
+        // Regen atlas if needed — O(1) version check instead of O(n) Set comparison
+        let atlasNeedsRegen = renderer.labelAtlasTexture == nil || storeVersion != lastAtlasTopologyVersion
         if atlasNeedsRegen {
+            let currentNodeIds = Set(positions.keys)
+            let currentProjects = Set(nodes.map(\.project))
             let isFirstAtlas = renderer.labelAtlasTexture == nil
             let framesSinceRegen = renderFrameCount &- labelAtlasRegenFrame
             if isFirstAtlas || framesSinceRegen >= 60 {
@@ -550,6 +579,7 @@ final class MetalSceneManager {
                 }
                 labelAtlasRegenFrame = renderFrameCount
                 labelAtlasNodeIds = currentNodeIds
+                lastAtlasTopologyVersion = storeVersion
             }
         }
         guard renderer.labelAtlasTexture != nil else { return }
@@ -584,7 +614,7 @@ final class MetalSceneManager {
         for (id, pos) in expandedChildPositions {
             allPositions[id] = pos
         }
-        var expandedChildren = Set<Int64>()
+        var expandedChildren = Set<UUID>()
         for hubId in expandedHubs {
             for childId in childrenOfHub(hubId) {
                 expandedChildren.insert(childId)
@@ -699,19 +729,19 @@ final class MetalSceneManager {
     // MARK: - Label Atlas Generation (MTLTexture)
 
     private struct AtlasLabelEntry: Sendable {
-        let id: Int64; let label: String; let isHub: Bool
+        let id: UUID; let label: String; let isHub: Bool
     }
 
     private struct AtlasResult: @unchecked Sendable {
         let texture: MTLTexture
-        let nodeRects: [Int64: (u0: Float, v0: Float, u1: Float, v1: Float)]
+        let nodeRects: [UUID: (u0: Float, v0: Float, u1: Float, v1: Float)]
         let projectRects: [String: (u0: Float, v0: Float, u1: Float, v1: Float)]
         let aspectCorrection: Float
         let allocW: Int; let allocH: Int
     }
 
     /// Synchronous atlas generation (used for the first atlas only).
-    private func generateLabelAtlas(nodes: [NodeData], hubs: Set<Int64>, projects: Set<String>) {
+    private func generateLabelAtlas(nodes: [NodeData], hubs: Set<UUID>, projects: Set<String>) {
         let entries = nodes.map { AtlasLabelEntry(id: $0.id, label: $0.label, isHub: hubs.contains($0.id)) }
         guard let result = Self.renderLabelAtlas(
             entries: entries, sortedProjects: projects.sorted(), device: renderer.device
@@ -721,7 +751,7 @@ final class MetalSceneManager {
     }
 
     /// Dispatch label atlas regeneration to a background thread. Old atlas stays visible until complete.
-    private func dispatchAtlasRegen(nodes: [NodeData], hubs: Set<Int64>, projects: Set<String>) {
+    private func dispatchAtlasRegen(nodes: [NodeData], hubs: Set<UUID>, projects: Set<String>) {
         isAtlasGenerating = true
         let entries = nodes.map { AtlasLabelEntry(id: $0.id, label: $0.label, isHub: hubs.contains($0.id)) }
         let sortedProjects = projects.sorted()
@@ -743,7 +773,7 @@ final class MetalSceneManager {
         }
     }
 
-    private func applyAtlasResult(_ result: AtlasResult, nodeIds: Set<Int64>, hubs: Set<Int64>, projects: Set<String>) {
+    private func applyAtlasResult(_ result: AtlasResult, nodeIds: Set<UUID>, hubs: Set<UUID>, projects: Set<String>) {
         renderer.labelAtlasTexture = result.texture
         labelAtlasRects = result.nodeRects
         projectLabelAtlasRects = result.projectRects
@@ -821,7 +851,7 @@ final class MetalSceneManager {
         ctx.scaleBy(x: CGFloat(scale), y: CGFloat(-scale))
 
         // Draw node labels
-        var rects: [Int64: (u0: Float, v0: Float, u1: Float, v1: Float)] = [:]
+        var rects: [UUID: (u0: Float, v0: Float, u1: Float, v1: Float)] = [:]
         cursorX = 2; cursorY = 0; rowHeight = 0
 
         for (i, entry) in entries.enumerated() {
@@ -915,14 +945,14 @@ final class MetalSceneManager {
 
     // MARK: - Hub Expansion
 
-    func childrenOfHub(_ hubId: Int64) -> [Int64] {
+    func childrenOfHub(_ hubId: UUID) -> [UUID] {
         renderEdges.filter { $0.relation == "part_of" && $0.targetId == hubId }.map(\.sourceId)
     }
 
-    func computeOrbitPositions(hubId: Int64, children: [Int64]) -> [Int64: SIMD3<Float>] {
+    func computeOrbitPositions(hubId: UUID, children: [UUID]) -> [UUID: SIMD3<Float>] {
         guard let hubPos = positions[hubId] else { return [:] }
         let radius: Float = 80
-        var result: [Int64: SIMD3<Float>] = [:]
+        var result: [UUID: SIMD3<Float>] = [:]
         let n = children.count
         guard n > 0 else { return result }
         let goldenRatio: Float = (1 + sqrt(5)) / 2
@@ -938,7 +968,7 @@ final class MetalSceneManager {
         return result
     }
 
-    func toggleHubExpansion(hubId: Int64) {
+    func toggleHubExpansion(hubId: UUID) {
         if expandedHubs.contains(hubId) {
             expansionDirection[hubId] = false
         } else {
@@ -953,8 +983,8 @@ final class MetalSceneManager {
     }
 
     private func updateExpansions(dt: Float) {
-        var toRemove: [Int64] = []
-        var allExpandedPositions: [Int64: SIMD3<Float>] = [:]
+        var toRemove: [UUID] = []
+        var allExpandedPositions: [UUID: SIMD3<Float>] = [:]
 
         for hubId in expandedHubs {
             let expanding = expansionDirection[hubId] ?? true
@@ -1048,10 +1078,14 @@ final class MetalSceneManager {
         }
         prevButtonY = yPressed
 
-        // Reticle hit test
+        // Reticle hit test — guard write to avoid per-frame callback spam
         if renderViewSize.width > 0 {
             let center = CGPoint(x: renderViewSize.width / 2, y: renderViewSize.height / 2)
-            reticleTarget = camera.hitTest(at: center, viewSize: renderViewSize, positions: positions)
+            let newTarget = camera.hitTest(at: center, viewSize: renderViewSize, positions: positions)
+            if newTarget != reticleTarget {
+                reticleTarget = newTarget
+                reticleCallback?(newTarget)
+            }
         }
     }
 
@@ -1066,8 +1100,20 @@ final class MetalSceneManager {
 
     // MARK: - Hit Testing
 
-    func hitTest(at location: CGPoint, viewSize: CGSize) -> Int64? {
+    func hitTest(at location: CGPoint, viewSize: CGSize) -> UUID? {
         camera.hitTest(at: location, viewSize: viewSize, positions: positions)
+    }
+
+    /// Hit test the mascot — returns true if the tap is within 50px of the mascot's screen position.
+    /// Note: mascot.currentPosition is already in scaled world space, but camera.project()
+    /// applies scaleFactor internally, so we must unscale first to avoid double-scaling.
+    func hitTestMascot(at location: CGPoint, viewSize: CGSize) -> Bool {
+        let sf = camera.scaleFactor
+        guard sf > 0 else { return false }
+        let pos = mascot.currentPosition / sf
+        guard let screenPos = camera.project(point3D: pos, viewSize: viewSize) else { return false }
+        let dist = hypot(location.x - screenPos.x, location.y - screenPos.y)
+        return dist < 50
     }
 
     // MARK: - Drag Support

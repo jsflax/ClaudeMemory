@@ -25,24 +25,39 @@ do {
     exit(1)
 }
 
-// MARK: - Init Lattice
+// MARK: - Init Lattice (dual-DB)
 
-let lattice: Lattice
+let localLattice: Lattice
+let syncedLattice: Lattice?
+
+// Synced DB path: alongside the local DB (e.g., ~/.claude/memory-synced.sqlite)
+let syncedDbPath = (dbPath as NSString).deletingPathExtension + "-synced.sqlite"
+
 do {
-    let config: Lattice.Configuration
-    if let endpoint = syncEndpoint, let token = syncToken, let url = URL(string: endpoint) {
-        config = .init(fileURL: URL(fileURLWithPath: dbPath), authorizationToken: token, wssEndpoint: url)
-        log("Sync enabled: \(endpoint)")
+    // Local DB — always opened with full schema
+    let localConfig: Lattice.Configuration = .init(fileURL: URL(fileURLWithPath: dbPath), migration: engramMigrations)
+    localLattice = try Lattice(Memory.self, Edge.self, Checkpoint.self, HookState.self, SessionState.self, configuration: localConfig)
+    log("Local database at \(dbPath)")
+
+    // Synced DB — only opened if the file exists
+    if FileManager.default.fileExists(atPath: syncedDbPath) {
+        let syncedConfig: Lattice.Configuration
+        if let endpoint = syncEndpoint, let token = syncToken, let url = URL(string: endpoint) {
+            syncedConfig = .init(fileURL: URL(fileURLWithPath: syncedDbPath), authorizationToken: token, wssEndpoint: url, migration: engramMigrations)
+            log("Synced database at \(syncedDbPath) (sync enabled: \(endpoint))")
+        } else {
+            syncedConfig = .init(fileURL: URL(fileURLWithPath: syncedDbPath), migration: engramMigrations)
+            log("Synced database at \(syncedDbPath) (no sync endpoint)")
+        }
+        syncedLattice = try Lattice(Memory.self, Edge.self, SyncConfig.self, configuration: syncedConfig)
     } else {
-        config = .init(fileURL: URL(fileURLWithPath: dbPath))
-        log("Local-only mode (no sync endpoint configured)")
+        syncedLattice = nil
+        log("No synced database (single-DB mode)")
     }
-    lattice = try Lattice(Memory.self, Edge.self, Checkpoint.self, HookState.self, SessionState.self, configuration: config)
 } catch {
     log("Failed to initialize database at \(dbPath): \(error)")
     exit(1)
 }
-log("Database at \(dbPath)")
 
 // MARK: - Init Embedding Service
 
@@ -51,7 +66,7 @@ await embedder.startLoading()
 
 // MARK: - MCP Server
 
-let tools = MemoryTools(lattice: lattice, embedder: embedder)
+let tools = MemoryTools(localRef: localLattice.sendableReference, syncedRef: syncedLattice?.sendableReference, embedder: embedder)
 
 let server = Server(
     name: "memory",

@@ -627,10 +627,10 @@ struct StatsOverlay: View {
 
 struct MinimapView: View {
     let filteredNodes: [NodeData]
-    let hubs: Set<Int64>
-    let glowingNodes: [Int64: Date]
-    let newNodes: [Int64: Date]
-    let dyingNodes: [Int64: DyingNode]
+    let hubs: Set<UUID>
+    let glowingNodes: [UUID: Date]
+    let newNodes: [UUID: Date]
+    let dyingNodes: [UUID: DyingNode]
     let simulation: ForceSimulation
     let viewport: ViewportState
     let viewportSize: CGSize
@@ -697,15 +697,15 @@ struct MinimapView: View {
     }
 
     @ViewBuilder
-    private func minimapCanvas(nodes: [NodeData], hubIds: Set<Int64>) -> some View {
+    private func minimapCanvas(nodes: [NodeData], hubIds: Set<UUID>) -> some View {
         let is3D = camera3DState != nil
         let canvas = Canvas { context, size in
             let canvasStart = CFAbsoluteTimeGetCurrent()
             let _ = frameCount
             // In 3D mode, project XZ plane; in 2D, use force simulation positions
-            let positions: [Int64: CGPoint]
+            let positions: [UUID: CGPoint]
             if let pos3D = camera3DState?.positions {
-                var projected: [Int64: CGPoint] = [:]
+                var projected: [UUID: CGPoint] = [:]
                 for (id, p) in pos3D {
                     projected[id] = CGPoint(x: CGFloat(p.x), y: CGFloat(p.z))
                 }
@@ -920,7 +920,7 @@ struct MinimapView: View {
         }
     }
 
-    private func computeBounds(positions: [Int64: CGPoint]) -> (minX: CGFloat, minY: CGFloat, width: CGFloat, height: CGFloat) {
+    private func computeBounds(positions: [UUID: CGPoint]) -> (minX: CGFloat, minY: CGFloat, width: CGFloat, height: CGFloat) {
         var minX: CGFloat = .greatestFiniteMagnitude
         var minY: CGFloat = .greatestFiniteMagnitude
         var maxX: CGFloat = -.greatestFiniteMagnitude

@@ -22,6 +22,10 @@ final class MetalGraphRenderer: NSObject {
     var labelPipeline: MTLRenderPipelineState!
     var nebulaPipeline: MTLRenderPipelineState!
     var flowPipeline: MTLRenderPipelineState!
+    var mascotPipeline: MTLRenderPipelineState!
+    var arcaneCirclePipeline: MTLRenderPipelineState!
+    var nodeRingPipeline: MTLRenderPipelineState!
+    var holoScreenPipeline: MTLRenderPipelineState!
 
     // Depth stencil states
     var opaqueDepthState: MTLDepthStencilState!
@@ -86,6 +90,9 @@ final class MetalGraphRenderer: NSObject {
     var flowVertexCapacity: Int = 0
     var actualFlowParticleCount: Int = 0
 
+    // Mascot
+    var mascotSystem: MascotSystem?
+
     // Shared state
     var camera: CameraController!
     var animationTime: Float = 0
@@ -139,6 +146,10 @@ final class MetalGraphRenderer: NSObject {
             labelPipeline = try MetalPipelineBuilder.buildLabelPipeline(device: device, library: library)
             nebulaPipeline = try MetalPipelineBuilder.buildNebulaPipeline(device: device, library: library)
             flowPipeline = try MetalPipelineBuilder.buildFlowPipeline(device: device, library: library)
+            mascotPipeline = try MetalPipelineBuilder.buildMascotPipeline(device: device, library: library)
+            arcaneCirclePipeline = try MetalPipelineBuilder.buildArcaneCirclePipeline(device: device, library: library)
+            nodeRingPipeline = try MetalPipelineBuilder.buildNodeRingPipeline(device: device, library: library)
+            holoScreenPipeline = try MetalPipelineBuilder.buildHoloScreenPipeline(device: device, library: library)
         } catch {
             renderLog.error("[MetalGraphRenderer] Pipeline build failed: \(error)")
         }
@@ -639,6 +650,17 @@ extension MetalGraphRenderer: MTKViewDelegate {
             )
         }
 
+        // ── Opaque sub-pass: Mascot ──
+        if let mascot = mascotSystem, let mascotPSO = mascotPipeline {
+            mascot.draw(
+                encoder: encoder,
+                frameUniformBuf: frameUniformBuf,
+                lightUniformBuf: lightUniformBuf,
+                pipeline: mascotPSO,
+                depthState: opaqueDepthState
+            )
+        }
+
         // ── Transparent sub-pass ──
         encoder.setDepthStencilState(transparentDepthState)
         encoder.setCullMode(.none)
@@ -701,6 +723,42 @@ extension MetalGraphRenderer: MTKViewDelegate {
                 indexType: .uint32,
                 indexBuffer: idxBuf,
                 indexBufferOffset: 0
+            )
+        }
+
+        // Mascot thruster particles
+        if let mascot = mascotSystem {
+            mascot.drawThrusterParticles(
+                encoder: encoder,
+                frameUniformBuf: frameUniformBuf,
+                pipeline: flowPipeline
+            )
+        }
+
+        // Mascot arcane circle (additive glow, appears when hovering at a node)
+        if let mascot = mascotSystem, mascot.arcaneVisible, let arcanePSO = arcaneCirclePipeline {
+            mascot.drawArcaneCircle(
+                encoder: encoder,
+                frameUniformBuf: frameUniformBuf,
+                pipeline: arcanePSO
+            )
+        }
+
+        // Node inspection rings (additive glow, orbiting inspected node)
+        if let mascot = mascotSystem, mascot.ringsVisible, let ringPSO = nodeRingPipeline {
+            mascot.drawNodeRings(
+                encoder: encoder,
+                frameUniformBuf: frameUniformBuf,
+                pipeline: ringPSO
+            )
+        }
+
+        // Mascot holo info screen (alpha blended, appears when hovering at a node)
+        if let mascot = mascotSystem, mascot.holoVisible, let holoPSO = holoScreenPipeline {
+            mascot.drawHoloScreen(
+                encoder: encoder,
+                frameUniformBuf: frameUniformBuf,
+                pipeline: holoPSO
             )
         }
 

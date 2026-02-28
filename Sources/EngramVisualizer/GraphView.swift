@@ -14,7 +14,7 @@ typealias MemoryEdge = EngramKit.Edge
 struct TopicGroupInfo: Equatable {
     let topic: String
     let project: String
-    let ids: [Int64]
+    let ids: [UUID]
 }
 
 // MARK: - Camera 3D state (isolated from GraphView to avoid body re-evaluation on camera changes)
@@ -28,7 +28,7 @@ final class Camera3DState {
     var azimuth: Float = 0
     var position: SIMD3<Float> = .zero
     var target: SIMD3<Float> = .zero
-    var positions: [Int64: SIMD3<Float>] = [:]
+    var positions: [UUID: SIMD3<Float>] = [:]
 }
 
 // MARK: - Viewport state (isolated from query data to avoid expensive recomputation on pan/zoom)
@@ -38,8 +38,8 @@ final class Camera3DState {
 final class ViewportState {
     var scale: CGFloat = 1.0
     var offset: CGPoint = .zero
-    var draggedNode: Int64?
-    var hoveredNode: Int64?
+    var draggedNode: UUID?
+    var hoveredNode: UUID?
 
     // Animated pan target — lerped each frame by the Canvas timer
     private var targetOffset: CGPoint?
@@ -75,41 +75,42 @@ struct GraphView: View {
     @Environment(\.lattice) private var lattice
 
     // Lightweight data store — replaces @LatticeQuery with manual observation
-    @State private var allNodes: [Int64: NodeData] = [:]
+    @State private var allNodes: [UUID: NodeData] = [:]
     @State private var allEdges: [Int64: EdgeData] = [:]
-    @State private var edgesByNode: [Int64: [EdgeData]] = [:]  // adjacency index for O(degree) edge lookup
+    @State private var edgesByNode: [UUID: [EdgeData]] = [:]  // adjacency index for O(degree) edge lookup
+    @State private var pkToGlobalId: [Int64: UUID] = [:]  // reverse lookup: Memory primaryKey → globalId (for delete callbacks)
     @State private var isInitialLoad: Bool = true  // suppress sounds during streaming load
     @State private var nodeObserver: AnyCancellable?
     @State private var edgeObserver: AnyCancellable?
-    @State private var glowingNodes: [Int64: Date] = [:]
-    @State private var newNodes: [Int64: Date] = [:]
-    @State private var dyingNodes: [Int64: DyingNode] = [:]
+    @State private var glowingNodes: [UUID: Date] = [:]
+    @State private var newNodes: [UUID: Date] = [:]
+    @State private var dyingNodes: [UUID: DyingNode] = [:]
 
     // Cached filtered views — recomputed on structural changes or filter changes
     @State private var cachedFilteredNodes: [NodeData] = []
-    @State private var cachedHubs: Set<Int64> = []
+    @State private var cachedHubs: Set<UUID> = []
     @State private var cachedFilteredEdges: [EdgeData] = []
     @State private var cachedFilteredEdgeIds: Set<Int64> = []
 
     // Cached derived data — recomputed only when filtered data changes (not every body eval)
     @State private var cachedProjectColorMap: [String: Color] = [:]
     @State private var cachedTopicGroups: [TopicGroupInfo] = []
-    @State private var cachedVisibleNodeIds: Set<Int64> = []
+    @State private var cachedVisibleNodeIds: Set<UUID> = []
     @State private var cachedRelationCounts: [(key: String, value: Int)] = []
-    @State private var cachedEdgeCountByNode: [Int64: Int] = [:]
+    @State private var cachedEdgeCountByNode: [UUID: Int] = [:]
 
     @State private var simulation = ForceSimulation()
     @State private var viewport = ViewportState()
     @Environment(VisualizerConfig.self) private var config
-    @State private var selectedMemoryId: Int64?
+    @State private var selectedMemoryId: UUID?
     @State private var scrollMonitor: Any?
 
     // Search results (owned by SearchBarView, written via bindings)
-    @State private var searchMatchIds: Set<Int64> = []
+    @State private var searchMatchIds: Set<UUID> = []
     @State private var isSearchActive: Bool = false
 
     // Cluster groups (expensive — recomputed only when data or filters change)
-    @State private var clusterGroups: [[Int64]] = []
+    @State private var clusterGroups: [[UUID]] = []
 
     // Time slider (debounced like search)
     @State private var timeSliderDate: Date?
@@ -130,12 +131,12 @@ struct GraphView: View {
     // Embedding projection / layout mode
     @State private var embeddingProjection = EmbeddingProjection()
     @State private var transitionProgress: CGFloat = 0  // 0 = force, 1 = embedding
-    @State private var forcePositionSnapshot: [Int64: CGPoint] = [:]
+    @State private var forcePositionSnapshot: [UUID: CGPoint] = [:]
     @State private var projectionTopologyVersion: UInt64 = 0
 
     // 3D state
     @State private var simulation3D = ForceSimulation3D()
-    @State private var forcePositionSnapshot3D: [Int64: SIMD3<Float>] = [:]
+    @State private var forcePositionSnapshot3D: [UUID: SIMD3<Float>] = [:]
     @State private var camera3DState = Camera3DState()
     @State private var renderStore = GraphRenderStore()
     @State private var cameraProjectTarget: String?
@@ -152,6 +153,7 @@ struct GraphView: View {
         renderStore.edges = cachedFilteredEdges
         renderStore.hubs = cachedHubs
         renderStore.colorMap = cachedProjectColorMap
+        renderStore.bumpTopology()
     }
 
     /// Recompute all derived data from current filtered nodes/edges. Call after any structural change.
@@ -183,7 +185,7 @@ struct GraphView: View {
         cachedRelationCounts = counts.sorted(by: { $0.key < $1.key })
 
         // Topic groups
-        var groups: [String: (topic: String, project: String, ids: [Int64])] = [:]
+        var groups: [String: (topic: String, project: String, ids: [UUID])] = [:]
         for node in cachedFilteredNodes {
             guard node.topic != "general", node.topic != "episode" else { continue }
             let key = "\(node.project)|\(node.topic)"
@@ -196,7 +198,7 @@ struct GraphView: View {
             .map { TopicGroupInfo(topic: $0.topic, project: $0.project, ids: $0.ids) }
 
         // Per-node edge counts (for detail panel)
-        var edgeCounts: [Int64: Int] = [:]
+        var edgeCounts: [UUID: Int] = [:]
         for edge in allEdges.values {
             edgeCounts[edge.sourceId, default: 0] += 1
             edgeCounts[edge.targetId, default: 0] += 1
@@ -205,10 +207,15 @@ struct GraphView: View {
     }
 
     private func recomputeClusters() {
+        // findMemoryClusters returns [[Int64]] (primaryKeys) — convert to UUIDs via cached mapping
         let visibleProjects = Set(cachedFilteredNodes.map(\.project))
-        var all: [[Int64]] = []
+        var all: [[UUID]] = []
         for project in visibleProjects {
-            all.append(contentsOf: findMemoryClusters(in: lattice, project: project, minClusterSize: 2).clusters)
+            let pkClusters = findMemoryClusters(in: lattice, project: project, minClusterSize: 2).clusters
+            for pkCluster in pkClusters {
+                let uuidCluster = pkCluster.compactMap { self.pkToGlobalId[$0] }
+                if uuidCluster.count >= 2 { all.append(uuidCluster) }
+            }
         }
         clusterGroups = all
     }
@@ -216,7 +223,7 @@ struct GraphView: View {
     // MARK: - Embedding Projection
 
     /// Blended positions: lerp between force layout and t-SNE based on transitionProgress.
-    private var effectivePositions: [Int64: CGPoint]? {
+    private var effectivePositions: [UUID: CGPoint]? {
         guard transitionProgress > 0 else { return nil }  // pure force mode
         let tsne = embeddingProjection.projectedPositions
         guard !tsne.isEmpty else { return nil }
@@ -226,7 +233,7 @@ struct GraphView: View {
         }
 
         // Lerp between snapshot and t-SNE
-        var blended: [Int64: CGPoint] = [:]
+        var blended: [UUID: CGPoint] = [:]
         let allIds = Set(forcePositionSnapshot.keys).union(tsne.keys)
         for id in allIds {
             let forcePos = forcePositionSnapshot[id] ?? simulation.positions[id] ?? .zero
@@ -240,13 +247,13 @@ struct GraphView: View {
     }
 
     /// 3D positions for the current mode. Used by Graph3DView.
-    private var positions3D: [Int64: SIMD3<Float>] {
+    private var positions3D: [UUID: SIMD3<Float>] {
         if config.layoutMode == .embedding {
             let tsne3D = embeddingProjection.projectedPositions3D
             guard !tsne3D.isEmpty else { return simulation3D.positions }
             if transitionProgress >= 1.0 { return tsne3D }
             // Lerp between force snapshot and t-SNE
-            var blended: [Int64: SIMD3<Float>] = [:]
+            var blended: [UUID: SIMD3<Float>] = [:]
             let allIds = Set(forcePositionSnapshot3D.keys).union(tsne3D.keys)
             for id in allIds {
                 let forcePos = forcePositionSnapshot3D[id] ?? simulation3D.positions[id] ?? .zero
@@ -271,7 +278,7 @@ struct GraphView: View {
             let spreadX = (xs.max() ?? 0) - (xs.min() ?? 0)
             let spreadY = (ys.max() ?? 0) - (ys.min() ?? 0)
             let zRange = max(spreadX, spreadY) * 0.4  // z spread = 40% of largest 2D axis
-            var pos3D: [Int64: SIMD3<Float>] = [:]
+            var pos3D: [UUID: SIMD3<Float>] = [:]
             for (id, pt) in currentPositions {
                 pos3D[id] = SIMD3(Float(pt.x), Float(pt.y), Float.random(in: -zRange...zRange))
             }
@@ -280,8 +287,8 @@ struct GraphView: View {
             let filtered = cachedFilteredNodes
             let currentIds = Set(filtered.map(\.id))
             let edgePairs = cachedFilteredEdges.map { ($0.sourceId, $0.targetId) }
-            var projectMap: [Int64: String] = [:]
-            var topicMap: [Int64: String] = [:]
+            var projectMap: [UUID: String] = [:]
+            var topicMap: [UUID: String] = [:]
             for node in filtered { projectMap[node.id] = node.project; topicMap[node.id] = node.topic }
             simulation3D.updateGraph(nodeIds: currentIds, edges: edgePairs,
                                      projectForNode: projectMap, topicForNode: topicMap)
@@ -301,9 +308,9 @@ struct GraphView: View {
                     await embeddingProjection.computeProjection3D(
                         nodeIds: nodeIds, spread: spread, initialPositions: pos3D
                     )
-                    var topics: [Int64: String] = [:]
-                    var projects: [Int64: String] = [:]
-                    var labels: [Int64: String] = [:]
+                    var topics: [UUID: String] = [:]
+                    var projects: [UUID: String] = [:]
+                    var labels: [UUID: String] = [:]
                     for node in cachedFilteredNodes {
                         topics[node.id] = node.topic
                         projects[node.id] = node.project
@@ -316,7 +323,7 @@ struct GraphView: View {
         case .twoD:
             // Project 3D positions to 2D (drop z) and inject into 2D sim
             let current3D = positions3D
-            var pos2D: [Int64: CGPoint] = [:]
+            var pos2D: [UUID: CGPoint] = [:]
             for (id, p) in current3D {
                 pos2D[id] = CGPoint(x: CGFloat(p.x), y: CGFloat(p.y))
             }
@@ -342,9 +349,9 @@ struct GraphView: View {
                         nodeIds: nodeIds, center: center, spread: spread,
                         initialPositions: pos2D
                     )
-                    var topics: [Int64: String] = [:]
-                    var projects: [Int64: String] = [:]
-                    var labels: [Int64: String] = [:]
+                    var topics: [UUID: String] = [:]
+                    var projects: [UUID: String] = [:]
+                    var labels: [UUID: String] = [:]
                     for node in cachedFilteredNodes {
                         topics[node.id] = node.topic
                         projects[node.id] = node.project
@@ -358,7 +365,7 @@ struct GraphView: View {
     }
 
     /// Helper to set initial 2D positions when switching back from 3D
-    private func projectedPositions2DFromSwitch(_ positions: [Int64: CGPoint]) {
+    private func projectedPositions2DFromSwitch(_ positions: [UUID: CGPoint]) {
         forcePositionSnapshot = positions
         withAnimation(.easeInOut(duration: 0.8)) { transitionProgress = 1.0 }
     }
@@ -405,9 +412,9 @@ struct GraphView: View {
                     initialPositions: forcePositionSnapshot
                 )
                 // Detect clusters and voids after projection converges
-                var topics: [Int64: String] = [:]
-                var projects: [Int64: String] = [:]
-                var labels: [Int64: String] = [:]
+                var topics: [UUID: String] = [:]
+                var projects: [UUID: String] = [:]
+                var labels: [UUID: String] = [:]
                 for node in cachedFilteredNodes {
                     topics[node.id] = node.topic
                     projects[node.id] = node.project
@@ -461,9 +468,9 @@ struct GraphView: View {
                     nodeIds: nodeIds, spread: spread,
                     initialPositions: forcePositionSnapshot3D
                 )
-                var topics: [Int64: String] = [:]
-                var projects: [Int64: String] = [:]
-                var labels: [Int64: String] = [:]
+                var topics: [UUID: String] = [:]
+                var projects: [UUID: String] = [:]
+                var labels: [UUID: String] = [:]
                 for node in cachedFilteredNodes {
                     topics[node.id] = node.topic
                     projects[node.id] = node.project
@@ -520,7 +527,7 @@ struct GraphView: View {
             var allEdgeBatch: [EdgeData] = []
             for e in bgLattice.objects(MemoryEdge.self) {
                 guard let pk = e.primaryKey else { continue }
-                allEdgeBatch.append(EdgeData(id: pk, sourceId: e.sourceId, targetId: e.targetId, relation: e.relation))
+                allEdgeBatch.append(EdgeData(id: pk, sourceId: e.sourceGlobalId, targetId: e.targetGlobalId, relation: e.relation.rawValue))
             }
 
             // Flush edges to main actor in one shot (lightweight — just dict insertions).
@@ -535,18 +542,24 @@ struct GraphView: View {
             // 2. Read nodes in batches off main actor, flush each batch to main actor
             //    so nodes pop in incrementally while the run loop stays responsive.
             var nodeBatch: [NodeData] = []
+            var pkBatch: [Int64: UUID] = [:]
             for m in bgLattice.objects(Memory.self) {
-                guard let pk = m.primaryKey else { continue }
+                guard let gid = m.__globalId, let pk = m.primaryKey else { continue }
+                pkBatch[pk] = gid
                 nodeBatch.append(NodeData(
-                    id: pk, project: m.project, topic: m.topic,
+                    id: gid, project: m.project, topic: m.topic,
                     label: extractLabel(content: m.content, topic: m.topic),
+                    content: m.content,
                     createdAt: m.createdAt, lastAccessedAt: m.lastAccessedAt,
                     importance: m.importance
                 ))
                 if nodeBatch.count >= batchSize {
                     let batch = nodeBatch
+                    let pks = pkBatch
                     nodeBatch = []
+                    pkBatch = [:]
                     await MainActor.run {
+                        self.pkToGlobalId.merge(pks) { _, new in new }
                         insertNodeBatch(batch, hiddenProjects: hiddenProjects,
                                         hiddenRelations: hiddenRelations,
                                         timeFilter: timeFilter, is3D: is3D)
@@ -556,7 +569,9 @@ struct GraphView: View {
             // Flush remainder
             if !nodeBatch.isEmpty {
                 let batch = nodeBatch
+                let pks = pkBatch
                 await MainActor.run {
+                    self.pkToGlobalId.merge(pks) { _, new in new }
                     insertNodeBatch(batch, hiddenProjects: hiddenProjects,
                                     hiddenRelations: hiddenRelations,
                                     timeFilter: timeFilter, is3D: is3D)
@@ -569,6 +584,11 @@ struct GraphView: View {
                 syncRenderStore()
                 isInitialLoad = false
 
+                // Wake 3D simulation now that topology is stable — during batch loading,
+                // force dispatches produced stale results (node count kept changing),
+                // consuming alpha budget without doing useful work.
+                if is3D { simulation3D.wake() }
+
                 // 4. Set up live observers (uses original lattice from environment)
                 edgeObserver = lattice.objects(MemoryEdge.self).observe { change in
                     Task { @MainActor in handleEdgeChange(change) }
@@ -579,10 +599,21 @@ struct GraphView: View {
             }
 
             // 5. Cluster computation — vector search queries, run off main actor
+            // findMemoryClusters returns [[Int64]] (primaryKeys) — convert to UUIDs
+            let pkToGlobalId: [Int64: UUID] = Dictionary(
+                uniqueKeysWithValues: bgLattice.objects(Memory.self).compactMap { m in
+                    guard let pk = m.primaryKey, let gid = m.__globalId else { return nil }
+                    return (pk, gid)
+                }
+            )
             let visibleProjects = await MainActor.run { Set(cachedFilteredNodes.map(\.project)) }
-            var clusters: [[Int64]] = []
+            var clusters: [[UUID]] = []
             for project in visibleProjects {
-                clusters.append(contentsOf: findMemoryClusters(in: bgLattice, project: project, minClusterSize: 2).clusters)
+                let pkClusters = findMemoryClusters(in: bgLattice, project: project, minClusterSize: 2).clusters
+                for pkCluster in pkClusters {
+                    let uuidCluster = pkCluster.compactMap { pkToGlobalId[$0] }
+                    if uuidCluster.count >= 2 { clusters.append(uuidCluster) }
+                }
             }
             let result = clusters
             await MainActor.run {
@@ -656,33 +687,36 @@ struct GraphView: View {
     private func handleNodeChange(_ change: CollectionChange) {
         switch change {
         case .insert(let pk):
-            guard let memory = lattice.object(Memory.self, primaryKey: pk) else { return }
+            guard let memory = lattice.object(Memory.self, primaryKey: pk),
+                  let gid = memory.__globalId else { return }
+            pkToGlobalId[pk] = gid
             let node = NodeData(
-                id: pk, project: memory.project, topic: memory.topic,
+                id: gid, project: memory.project, topic: memory.topic,
                 label: extractLabel(content: memory.content, topic: memory.topic),
+                content: memory.content,
                 createdAt: memory.createdAt, lastAccessedAt: memory.lastAccessedAt,
                 importance: memory.importance
             )
-            allNodes[pk] = node
-            newNodes[pk] = Date()
+            allNodes[gid] = node
+            newNodes[gid] = Date()
             if !isInitialLoad && config.notificationsEnabled {
-                sendMemoryNotification(title: "[\(memory.project)] New memory", body: node.label, id: pk)
+                sendMemoryNotification(title: "[\(memory.project)] New memory", body: node.label, id: gid)
             }
             let visible = !config.hiddenProjects.contains(node.project) &&
                 (debouncedTimeSliderDate == nil || node.createdAt <= debouncedTimeSliderDate!)
-            if visible && !cachedVisibleNodeIds.contains(pk) {
+            if visible && !cachedVisibleNodeIds.contains(gid) {
                 cachedFilteredNodes.append(node)
-                cachedVisibleNodeIds.insert(pk)
+                cachedVisibleNodeIds.insert(gid)
                 renderStore.nodes.append(node)
-                renderStore.nodeById[pk] = node
-                simulation.addNode(pk, project: node.project, topic: node.topic)
+                renderStore.nodeById[gid] = node
+                simulation.addNode(gid, project: node.project, topic: node.topic)
                 if config.dimensionMode == .threeD {
-                    simulation3D.addNode(pk, project: node.project, topic: node.topic)
+                    simulation3D.addNode(gid, project: node.project, topic: node.topic)
                 }
                 // Add edges for this node from existing edge data (O(degree) via adjacency index)
                 let nodeIds = cachedVisibleNodeIds
-                for edge in edgesByNode[pk] ?? [] {
-                    let otherId = edge.sourceId == pk ? edge.targetId : edge.sourceId
+                for edge in edgesByNode[gid] ?? [] {
+                    let otherId = edge.sourceId == gid ? edge.targetId : edge.sourceId
                     guard nodeIds.contains(otherId),
                           !config.hiddenRelations.contains(edge.relation) else { continue }
                     simulation.addEdge(from: edge.sourceId, to: edge.targetId)
@@ -695,9 +729,9 @@ struct GraphView: View {
                         renderStore.edges.append(edge)
                     }
                     // Check if edge makes this node a hub target
-                    if edge.relation == "part_of" && edge.targetId == pk {
-                        cachedHubs.insert(pk)
-                        renderStore.hubs.insert(pk)
+                    if edge.relation == "part_of" && edge.targetId == gid {
+                        cachedHubs.insert(gid)
+                        renderStore.hubs.insert(gid)
                     }
                 }
                 // Assign color for previously unseen project
@@ -707,14 +741,16 @@ struct GraphView: View {
                     cachedProjectColorMap[node.project] = color
                     renderStore.colorMap[node.project] = color
                 }
+                renderStore.bumpTopology()
             }
 
         case .update(let pk):
-            guard let memory = lattice.object(Memory.self, primaryKey: pk) else { return }
-            let old = allNodes[pk]
+            guard let memory = lattice.object(Memory.self, primaryKey: pk),
+                  let gid = memory.__globalId else { return }
+            let old = allNodes[gid]
             // Detect recall: lastAccessedAt changed → trigger glow
             if let old, memory.lastAccessedAt > old.lastAccessedAt {
-                glowingNodes[pk] = Date()
+                glowingNodes[gid] = Date()
             }
             // Only update dict if structural properties changed (avoids unnecessary body re-eval)
             let newLabel = extractLabel(content: memory.content, topic: memory.topic)
@@ -725,24 +761,25 @@ struct GraphView: View {
                 old!.label != newLabel
             if !structuralChange {
                 // Still update lastAccessedAt for recency visualization (no recompute needed)
-                allNodes[pk]?.lastAccessedAt = memory.lastAccessedAt
-                if let idx = cachedFilteredNodes.firstIndex(where: { $0.id == pk }) {
+                allNodes[gid]?.lastAccessedAt = memory.lastAccessedAt
+                if let idx = cachedFilteredNodes.firstIndex(where: { $0.id == gid }) {
                     cachedFilteredNodes[idx].lastAccessedAt = memory.lastAccessedAt
                 }
                 return
             }
             let node = NodeData(
-                id: pk, project: memory.project, topic: memory.topic,
+                id: gid, project: memory.project, topic: memory.topic,
                 label: newLabel,
+                content: memory.content,
                 createdAt: memory.createdAt, lastAccessedAt: memory.lastAccessedAt,
                 importance: memory.importance
             )
-            allNodes[pk] = node
-            renderStore.nodeById[pk] = node
-            if let idx = cachedFilteredNodes.firstIndex(where: { $0.id == pk }) {
+            allNodes[gid] = node
+            renderStore.nodeById[gid] = node
+            if let idx = cachedFilteredNodes.firstIndex(where: { $0.id == gid }) {
                 cachedFilteredNodes[idx] = node
             }
-            if let idx = renderStore.nodes.firstIndex(where: { $0.id == pk }) {
+            if let idx = renderStore.nodes.firstIndex(where: { $0.id == gid }) {
                 renderStore.nodes[idx] = node
             }
             if old?.project != node.project || old?.topic != node.topic {
@@ -752,34 +789,47 @@ struct GraphView: View {
             }
 
         case .delete(let pk):
-            if !isInitialLoad && config.notificationsEnabled, let node = allNodes[pk] {
-                sendMemoryNotification(title: "[\(node.project)] Memory removed", body: node.label, id: pk)
+            // Resolve globalId from our reverse-lookup map (populated during load/insert).
+            // Falls back to lattice lookup if the object is still accessible.
+            let gid: UUID
+            if let cached = pkToGlobalId[pk] {
+                gid = cached
+            } else if let memory = lattice.object(Memory.self, primaryKey: pk),
+                      let memGid = memory.__globalId {
+                gid = memGid
+            } else {
+                return  // Object gone and no cached mapping — nothing to clean up
+            }
+            pkToGlobalId.removeValue(forKey: pk)
+            if !isInitialLoad && config.notificationsEnabled, let node = allNodes[gid] {
+                sendMemoryNotification(title: "[\(node.project)] Memory removed", body: node.label, id: gid)
             }
             // Snapshot dying node for fade-out animation before removal
-            if let node = allNodes[pk], let pos = simulation.positions[pk] {
-                dyingNodes[pk] = DyingNode(
-                    id: pk, position: pos, project: node.project,
-                    isHub: cachedHubs.contains(pk), importance: node.importance,
+            if let node = allNodes[gid], let pos = simulation.positions[gid] {
+                dyingNodes[gid] = DyingNode(
+                    id: gid, position: pos, project: node.project,
+                    isHub: cachedHubs.contains(gid), importance: node.importance,
                     startTime: Date()
                 )
             }
-            allNodes.removeValue(forKey: pk)
-            glowingNodes.removeValue(forKey: pk)
-            newNodes.removeValue(forKey: pk)
-            cachedFilteredNodes.removeAll { $0.id == pk }
-            let removedEdgeIds = Set(cachedFilteredEdges.filter { $0.sourceId == pk || $0.targetId == pk }.map(\.id))
-            cachedFilteredEdges.removeAll { $0.sourceId == pk || $0.targetId == pk }
+            allNodes.removeValue(forKey: gid)
+            glowingNodes.removeValue(forKey: gid)
+            newNodes.removeValue(forKey: gid)
+            cachedFilteredNodes.removeAll { $0.id == gid }
+            let removedEdgeIds = Set(cachedFilteredEdges.filter { $0.sourceId == gid || $0.targetId == gid }.map(\.id))
+            cachedFilteredEdges.removeAll { $0.sourceId == gid || $0.targetId == gid }
             cachedFilteredEdgeIds.subtract(removedEdgeIds)
-            cachedVisibleNodeIds.remove(pk)
-            simulation.removeNode(pk)
-            cachedHubs.remove(pk)
-            renderStore.nodes.removeAll { $0.id == pk }
-            renderStore.nodeById.removeValue(forKey: pk)
-            renderStore.edges.removeAll { $0.sourceId == pk || $0.targetId == pk }
-            renderStore.hubs.remove(pk)
+            cachedVisibleNodeIds.remove(gid)
+            simulation.removeNode(gid)
+            cachedHubs.remove(gid)
+            renderStore.nodes.removeAll { $0.id == gid }
+            renderStore.nodeById.removeValue(forKey: gid)
+            renderStore.edges.removeAll { $0.sourceId == gid || $0.targetId == gid }
+            renderStore.hubs.remove(gid)
+            renderStore.bumpTopology()
             // Remove from cluster groups surgically
             clusterGroups = clusterGroups.compactMap { cluster in
-                let filtered = cluster.filter { $0 != pk }
+                let filtered = cluster.filter { $0 != gid }
                 return filtered.count >= 2 ? filtered : nil
             }
         }
@@ -789,7 +839,7 @@ struct GraphView: View {
         switch change {
         case .insert(let pk):
             guard let edge = lattice.object(MemoryEdge.self, primaryKey: pk) else { return }
-            let data = EdgeData(id: pk, sourceId: edge.sourceId, targetId: edge.targetId, relation: edge.relation)
+            let data = EdgeData(id: pk, sourceId: edge.sourceGlobalId, targetId: edge.targetGlobalId, relation: edge.relation.rawValue)
             allEdges[pk] = data
             edgesByNode[data.sourceId, default: []].append(data)
             edgesByNode[data.targetId, default: []].append(data)
@@ -809,11 +859,12 @@ struct GraphView: View {
             if data.relation == "part_of" {
                 cachedHubs.insert(data.targetId)
                 renderStore.hubs.insert(data.targetId)
+                renderStore.bumpTopology()
             }
 
         case .update(let pk):
             guard let edge = lattice.object(MemoryEdge.self, primaryKey: pk) else { return }
-            let data = EdgeData(id: pk, sourceId: edge.sourceId, targetId: edge.targetId, relation: edge.relation)
+            let data = EdgeData(id: pk, sourceId: edge.sourceGlobalId, targetId: edge.targetGlobalId, relation: edge.relation.rawValue)
             allEdges[pk] = data
             if let idx = cachedFilteredEdges.firstIndex(where: { $0.id == pk }) {
                 cachedFilteredEdges[idx] = data
@@ -858,7 +909,7 @@ struct GraphView: View {
     }
 
     private func recomputeHubs() {
-        var hubs = Set<Int64>()
+        var hubs = Set<UUID>()
         for edge in allEdges.values where edge.relation == "part_of" {
             hubs.insert(edge.targetId)
         }
@@ -869,8 +920,8 @@ struct GraphView: View {
         let filtered = cachedFilteredNodes
         let currentIds = Set(filtered.map(\.id))
         let edgePairs = cachedFilteredEdges.map { ($0.sourceId, $0.targetId) }
-        var projectMap: [Int64: String] = [:]
-        var topicMap: [Int64: String] = [:]
+        var projectMap: [UUID: String] = [:]
+        var topicMap: [UUID: String] = [:]
         for node in filtered {
             projectMap[node.id] = node.project
             topicMap[node.id] = node.topic
@@ -1218,7 +1269,7 @@ struct GraphView: View {
                 onClose: { selectedMemoryId = nil },
                 colorMap: colorMap
             )
-            .id(memory.primaryKey)
+            .id(memory.__globalId)
             .frame(maxWidth: min(400, size.width * 0.35), maxHeight: min(500, size.height * 0.7))
             .frame(maxWidth: .infinity, alignment: .trailing)
             .padding(24)
@@ -1274,7 +1325,7 @@ struct GraphView: View {
         }
     }
 
-    private func handleSelectionChange(oldId: Int64?, newId: Int64?, viewSize: CGSize) {
+    private func handleSelectionChange(oldId: UUID?, newId: UUID?, viewSize: CGSize) {
         guard let new = newId,
               let worldPos = simulation.positions[new] else { return }
 
@@ -1308,7 +1359,7 @@ struct GraphView: View {
 
     private var selectedMemory: Memory? {
         guard let id = selectedMemoryId else { return nil }
-        return lattice.object(Memory.self, primaryKey: id)
+        return lattice.objects(Memory.self).where { $0.__globalId == id }.first
     }
 
     // MARK: - Helpers
@@ -1371,9 +1422,12 @@ struct GraphView: View {
         recomputeHubs()
         recomputeDerivedData()
         syncRenderStore()
-        clusterGroups.append(contentsOf:
-            findMemoryClusters(in: lattice, project: project, minClusterSize: 2).clusters
-        )
+        // findMemoryClusters returns [[Int64]] (primaryKeys) — convert to UUIDs via cached mapping
+        let pkClusters = findMemoryClusters(in: lattice, project: project, minClusterSize: 2).clusters
+        for pkCluster in pkClusters {
+            let uuidCluster = pkCluster.compactMap { self.pkToGlobalId[$0] }
+            if uuidCluster.count >= 2 { clusterGroups.append(uuidCluster) }
+        }
     }
 
     private func toggleRelation(_ relation: String) {
@@ -1397,7 +1451,7 @@ struct GraphView: View {
 
     private func cycleConnectedNode() {
         guard let sel = selectedMemoryId else { return }
-        var connected: [Int64] = []
+        var connected: [UUID] = []
         for edge in allEdges.values {
             if edge.sourceId == sel { connected.append(edge.targetId) }
             if edge.targetId == sel { connected.append(edge.sourceId) }
@@ -1443,7 +1497,7 @@ struct GraphView: View {
         colorMap[project] ?? .gray
     }
 
-    private func sendMemoryNotification(title: String, body: String, id: Int64) {
+    private func sendMemoryNotification(title: String, body: String, id: UUID) {
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
@@ -1481,7 +1535,7 @@ struct SoundToggleButton: View {
 // MARK: - Keyboard Shortcuts Modifier
 
 struct GraphKeyboardShortcuts: ViewModifier {
-    @Binding var selectedMemoryId: Int64?
+    @Binding var selectedMemoryId: UUID?
     let viewport: ViewportState
     let cycleConnectedNode: () -> Void
     let exportToPNG: () -> Void
@@ -1521,7 +1575,7 @@ struct GraphKeyboardShortcuts: ViewModifier {
 // MARK: - Search Bar (isolated view — owns its own text state to avoid invalidating GraphView on each keystroke)
 
 struct SearchBarView: View {
-    @Binding var matchIds: Set<Int64>
+    @Binding var matchIds: Set<UUID>
     @Binding var isActive: Bool
     let lattice: Lattice
 
@@ -1590,9 +1644,9 @@ struct SearchBarView: View {
             try? await Task.sleep(for: .milliseconds(150))
             guard !Task.isCancelled else { return }
             let ftsQuery: TextQuery = .search(query)
-            var ids = Set<Int64>()
+            var ids = Set<UUID>()
             for match in lattice.objects(Memory.self).matching(ftsQuery, on: \.content, limit: 500) {
-                if let pk = match.object.primaryKey { ids.insert(pk) }
+                if let gid = match.object.__globalId { ids.insert(gid) }
             }
             matchIds = ids
         }

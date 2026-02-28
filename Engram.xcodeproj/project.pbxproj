@@ -119,6 +119,7 @@
 			name = Engram;
 			packageProductDependencies = (
 				D4E5F60000000000000001 /* EngramKit */,
+				D4E5F60000000000000006 /* EngramFoundationModels */,
 				D4E5F60000000000000002 /* Lattice */,
 				D4E5F60000000000000003 /* Sparkle */,
 				D4E5F60000000000000004 /* GoogleSignIn */,
@@ -429,6 +430,10 @@
 			isa = XCSwiftPackageProductDependency;
 			package = D4E5F60000000000000040 /* XCRemoteSwiftPackageReference "GoogleSignIn-iOS" */;
 			productName = GoogleSignInSwift;
+		};
+		D4E5F60000000000000006 /* EngramFoundationModels */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = EngramFoundationModels;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};
