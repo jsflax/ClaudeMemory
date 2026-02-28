@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		534190B92F531FC200537D6F /* EngramFoundationModels in Frameworks */ = {isa = PBXBuildFile; productRef = D4E5F60000000000000006 /* EngramFoundationModels */; };
 		53E92B8D2F4924860006B3B2 /* Engram.icon in Resources */ = {isa = PBXBuildFile; fileRef = 53E92B8C2F4924860006B3B2 /* Engram.icon */; };
 		A1B2C3D400000000000001 /* EngramKit in Frameworks */ = {isa = PBXBuildFile; productRef = D4E5F60000000000000001 /* EngramKit */; };
 		A1B2C3D400000000000002 /* Lattice in Frameworks */ = {isa = PBXBuildFile; productRef = D4E5F60000000000000002 /* Lattice */; };
@@ -51,6 +52,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				534190B92F531FC200537D6F /* EngramFoundationModels in Frameworks */,
 				A1B2C3D400000000000001 /* EngramKit in Frameworks */,
 				A1B2C3D400000000000002 /* Lattice in Frameworks */,
 				A1B2C3D400000000000003 /* RealityKit.framework in Frameworks */,

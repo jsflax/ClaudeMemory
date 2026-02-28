@@ -8,5 +8,18 @@
 	<string>1dJlcpyVu57oSerP7cfvyRT0PHx7IuvCDbRSptbflfE=</string>
 	<key>SUEnableAutomaticChecks</key>
 	<true/>
+	<key>GIDClientID</key>
+	<string>121738958638-bfhdga09svpuiumk61t88ck4ru6t31k5.apps.googleusercontent.com</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>com.googleusercontent.apps.121738958638-bfhdga09svpuiumk61t88ck4ru6t31k5</string>
+			</array>
+			<key>CFBundleURLName</key>
+			<string>Google Sign-In</string>
+		</dict>
+	</array>
 </dict>
 </plist>

@@ -9,10 +9,13 @@ import UserNotifications
 
 @main
 struct EngramApp: App {
-    let lattice: Lattice
+    let localLattice: Lattice
+    let lattice: Lattice  // For now, just localLattice. ATTACH'd view added when sync connects.
     let config: VisualizerConfig
+    let dbPath: String
     private let updaterController: SPUStandardUpdaterController
     @State private var accountService = AccountService()
+    @State private var syncManager = SyncManager()
 
     #if SWIFT_PACKAGE && os(macOS)
     private final class Delegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
@@ -52,30 +55,33 @@ struct EngramApp: App {
 
         let dbPath = ProcessInfo.processInfo.environment["CLAUDE_MEMORY_DB"]
             ?? NSHomeDirectory() + "/.claude/memory.sqlite"
-        let lat = try! Lattice(
-            Memory.self, Edge.self, Checkpoint.self, VisualizerConfig.self,
+        self.dbPath = dbPath
+
+        // Local DB — full schema (always opened)
+        let local = try! Lattice(
+            Memory.self, Edge.self, Checkpoint.self, VisualizerConfig.self, SyncConfig.self,
             configuration: .init(
                 fileURL: URL(fileURLWithPath: dbPath),
                 migration: engramMigrations
             )
         )
-        lattice = lat
-        config = lat.objects(VisualizerConfig.self).first ?? {
+        localLattice = local
+        lattice = local
+
+        config = local.objects(VisualizerConfig.self).first ?? {
             let c = VisualizerConfig()
-            lat.add(c)
+            local.add(c)
             return c
         }()
         // DIAG: force 3D mode for performance testing
         config.dimensionMode = .threeD
 
-        #if ENABLE_ACCOUNT
         // Configure Google Sign-In if client ID is available
         if let googleClientID = ProcessInfo.processInfo.environment["GOOGLE_CLIENT_ID"]
             ?? Bundle.main.object(forInfoDictionaryKey: "GIDClientID") as? String
         {
             GIDSignIn.sharedInstance.configuration = GIDConfiguration(clientID: googleClientID)
         }
-        #endif
 
         Task.detached { CLIInstaller.syncIfNeeded() }
     }
@@ -86,8 +92,16 @@ struct EngramApp: App {
                 .environment(\.lattice, lattice)
                 .environment(config)
                 .environment(accountService)
+                .environment(syncManager)
                 .frame(minWidth: 800, minHeight: 600)
                 .ignoresSafeArea()
+                .onAppear {
+                    syncManager.localLattice = localLattice
+                    syncManager.dbPath = dbPath
+                }
+                .onOpenURL { url in
+                    GIDSignIn.sharedInstance.handle(url)
+                }
         }
         .windowStyle(.hiddenTitleBar)
         .commands {
@@ -116,6 +130,8 @@ struct EngramApp: App {
         MenuBarExtra {
             MenuBarActivityFeed()
                 .environment(\.lattice, lattice)
+                .environment(accountService)
+                .environment(syncManager)
         } label: {
             Image(systemName: "brain.head.profile")
         }

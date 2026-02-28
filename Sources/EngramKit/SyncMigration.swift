@@ -58,7 +58,7 @@ public struct SyncMigration {
                     importance: memory.importance,
                     isPrivate: memory.isPrivate
                 )
-                destination.add(migrated)
+                destination.add(migrated, preservingGlobalId: globalId)
                 migratedGlobalIds.insert(globalId)
                 totalMemories += 1
             }

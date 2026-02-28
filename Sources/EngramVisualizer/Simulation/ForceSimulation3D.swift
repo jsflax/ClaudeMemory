@@ -1,152 +1,9 @@
 import Foundation
 import Accelerate
-@preconcurrency import Metal
 import simd
 import os
 
-private let frameLog = Logger(subsystem: "com.claudememory.visualizer", category: "ForceSimulation3D")
-
-// MARK: - Metal Force Compute
-
-/// Manages Metal compute pipeline for GPU-accelerated charge force computation.
-/// Falls back to CPU when Metal is unavailable or node count is too small.
-@MainActor
-final class MetalForceCompute {
-    private let device: MTLDevice
-    private let commandQueue: MTLCommandQueue
-    private let pipelineState: MTLComputePipelineState
-
-    // Persistent buffers — resized only when node count changes
-    private var nodeBuffer: MTLBuffer?
-    private var forceBuffer: MTLBuffer?
-    private var paramBuffer: MTLBuffer?
-    private var currentNodeCount: Int = 0
-
-    /// Matches the `ForceNode` struct in Shaders.metal.
-    struct GPUForceNode {
-        var px: Float, py: Float, pz: Float
-        var projectGroup: Int32
-        var topicGroup: Int32
-        var _pad: Int32
-    }
-
-    /// Matches the `ForceParams` struct in Shaders.metal.
-    struct GPUForceParams {
-        var chargeStrength: Float
-        var crossChargeMultiplier: Float
-        var sameTopicChargeScale: Float
-        var sameProjectChargeScale: Float
-        var cutoffSq: Float
-        var nodeCount: UInt32
-    }
-
-    init?() {
-        guard let device = MTLCreateSystemDefaultDevice(),
-              let queue = device.makeCommandQueue(),
-              let library = device.makeDefaultLibrary(),
-              let function = library.makeFunction(name: "compute_charge_forces"),
-              let pipeline = try? device.makeComputePipelineState(function: function)
-        else { return nil }
-
-        self.device = device
-        self.commandQueue = queue
-        self.pipelineState = pipeline
-    }
-
-    /// Dispatch charge force computation on GPU. Non-blocking — calls completion on main thread.
-    /// Result from GPU charge force computation.
-    struct ChargeResult: Sendable {
-        let fx: [Float], fy: [Float], fz: [Float]
-    }
-
-    func dispatchChargeForces(
-        positions: (x: [Float], y: [Float], z: [Float]),
-        projectGroups: [Int],
-        topicGroups: [Int],
-        chargeStrength: Float,
-        crossChargeMultiplier: Float,
-        sameTopicChargeScale: Float,
-        sameProjectChargeScale: Float
-    ) async -> ChargeResult {
-        let n = positions.x.count
-        guard n > 0 else { return ChargeResult(fx: [], fy: [], fz: []) }
-
-        // Resize buffers if node count changed
-        if n != currentNodeCount {
-            let nodeSize = MemoryLayout<GPUForceNode>.stride * n
-            let forceSize = MemoryLayout<SIMD3<Float>>.stride * n
-            nodeBuffer = device.makeBuffer(length: nodeSize, options: .storageModeShared)
-            forceBuffer = device.makeBuffer(length: forceSize, options: .storageModeShared)
-            paramBuffer = device.makeBuffer(length: MemoryLayout<GPUForceParams>.stride, options: .storageModeShared)
-            currentNodeCount = n
-        }
-
-        let zeros = ChargeResult(
-            fx: [Float](repeating: 0, count: n),
-            fy: [Float](repeating: 0, count: n),
-            fz: [Float](repeating: 0, count: n)
-        )
-        guard let nodeBuffer, let forceBuffer, let paramBuffer else { return zeros }
-
-        // Pack node data
-        let nodePtr = nodeBuffer.contents().bindMemory(to: GPUForceNode.self, capacity: n)
-        for i in 0..<n {
-            nodePtr[i] = GPUForceNode(
-                px: positions.x[i], py: positions.y[i], pz: positions.z[i],
-                projectGroup: Int32(projectGroups[i]),
-                topicGroup: Int32(i < topicGroups.count ? topicGroups[i] : -1),
-                _pad: 0
-            )
-        }
-
-        // Set params
-        let paramPtr = paramBuffer.contents().bindMemory(to: GPUForceParams.self, capacity: 1)
-        paramPtr.pointee = GPUForceParams(
-            chargeStrength: chargeStrength,
-            crossChargeMultiplier: crossChargeMultiplier,
-            sameTopicChargeScale: sameTopicChargeScale,
-            sameProjectChargeScale: sameProjectChargeScale,
-            cutoffSq: 500 * 500,
-            nodeCount: UInt32(n)
-        )
-
-        // Zero force buffer
-        memset(forceBuffer.contents(), 0, MemoryLayout<SIMD3<Float>>.stride * n)
-
-        guard let cmdBuffer = commandQueue.makeCommandBuffer(),
-              let encoder = cmdBuffer.makeComputeCommandEncoder() else { return zeros }
-
-        encoder.setComputePipelineState(pipelineState)
-        encoder.setBuffer(nodeBuffer, offset: 0, index: 0)
-        encoder.setBuffer(forceBuffer, offset: 0, index: 1)
-        encoder.setBuffer(paramBuffer, offset: 0, index: 2)
-
-        let threadGroupSize = min(pipelineState.maxTotalThreadsPerThreadgroup, n)
-        let gridSize = MTLSize(width: n, height: 1, depth: 1)
-        let threadGroup = MTLSize(width: threadGroupSize, height: 1, depth: 1)
-        encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadGroup)
-        encoder.endEncoding()
-
-        // Use continuation to bridge Metal's callback-based API to async/await
-        let capturedForceBuffer = forceBuffer
-        let capturedN = n
-        return await withCheckedContinuation { continuation in
-            cmdBuffer.addCompletedHandler { @Sendable _ in
-                let forcePtr = capturedForceBuffer.contents().bindMemory(to: SIMD3<Float>.self, capacity: capturedN)
-                var fx = [Float](repeating: 0, count: capturedN)
-                var fy = [Float](repeating: 0, count: capturedN)
-                var fz = [Float](repeating: 0, count: capturedN)
-                for i in 0..<capturedN {
-                    fx[i] = forcePtr[i].x
-                    fy[i] = forcePtr[i].y
-                    fz[i] = forcePtr[i].z
-                }
-                continuation.resume(returning: ChargeResult(fx: fx, fy: fy, fz: fz))
-            }
-            cmdBuffer.commit()
-        }
-    }
-}
+private let forceSimLog = Logger(subsystem: "com.claudememory.visualizer", category: "ForceSimulation3D")
 
 /// 3D force-directed graph layout engine. Same split architecture as ForceSimulation:
 /// O(n²) force computation runs async on @ForceSimulatorActor, O(n) integration runs sync at 60fps.
@@ -163,6 +20,7 @@ final class ForceSimulation3D {
     private var pinned: [Bool] = []
     private var idToIndex: [UUID: Int] = [:]
     private var edgeIndices: [(Int, Int)] = []
+    private var edgeIndexSet: Set<UInt64> = []  // packed (si << 32 | ti) for O(1) duplicate check
     private var projectGroup: [Int] = []
     private var topicGroup: [Int] = []
     private var topicProjectGroup: [Int] = []
@@ -308,6 +166,7 @@ final class ForceSimulation3D {
             guard let si = idToIndex[src], let ti = idToIndex[tgt] else { return nil }
             return (si, ti)
         }
+        edgeIndexSet = Set(edgeIndices.map { UInt64($0.0) << 32 | UInt64($0.1) })
 
         storedFx = [Float](repeating: 0, count: ids.count)
         storedFy = [Float](repeating: 0, count: ids.count)
@@ -356,13 +215,15 @@ final class ForceSimulation3D {
 
         storedFx.append(0); storedFy.append(0); storedFz.append(0)
         hasPendingTopologyChanges = true
-        rebuildPositions()
+        // Set only the new node's position — syncPositions() in the next tick() will update all.
+        positions[id] = SIMD3(x.last!, y.last!, z.last!)
     }
 
     /// Surgically insert a single edge without rebuilding the entire graph.
     func addEdge(from source: UUID, to target: UUID) {
         guard let si = idToIndex[source], let ti = idToIndex[target] else { return }
-        guard !edgeIndices.contains(where: { $0.0 == si && $0.1 == ti }) else { return }
+        let key = UInt64(si) << 32 | UInt64(ti)
+        guard edgeIndexSet.insert(key).inserted else { return }
         edgeIndices.append((si, ti))
         hasPendingTopologyChanges = true
     }
@@ -578,7 +439,7 @@ final class ForceSimulation3D {
         }
 
         // CPU fallback path — should not be reached in production (Metal always available on macOS)
-        frameLog.error("[ForceSimulation3D] ⚠️ CPU fallback path hit — Metal unavailable or n<16 (n=\(n))")
+        forceSimLog.error("[ForceSimulation3D] ⚠️ CPU fallback path hit — Metal unavailable or n<16 (n=\(n))")
         Task.detached(priority: .userInitiated) { [pendingForces] in
             let result = await Self.computeForces(state)
             pendingForces.withLock { $0 = result }

@@ -45,6 +45,9 @@ let package = Package(
             resources: [
                 .copy("Resources/paraphrase-MiniLM-L6-v2_Embedding.mlmodelc"),
                 .copy("Resources/paraphrase-MiniLM-L6-v2_tokenizer"),
+                .copy("Resources/session-learner.md"),
+                .copy("Resources/memory-maintenance.md"),
+                .copy("Resources/sync-reconciliation.md"),
             ],
             swiftSettings: [
                 .interoperabilityMode(.Cxx),

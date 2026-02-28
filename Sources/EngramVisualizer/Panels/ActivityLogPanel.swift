@@ -1,8 +1,7 @@
 import SwiftUI
 
 struct ActivityLogPanel: View {
-    let nodes: [NodeData]
-    let colorMap: [String: Color]
+    let renderStore: GraphRenderStore
     let onSelect: (UUID) -> Void
 
     @State private var knownIds: Set<UUID> = []
@@ -16,6 +15,11 @@ struct ActivityLogPanel: View {
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 1)) { context in
+            let nodes = renderStore.nodes
+            let colorMap = renderStore.colorMap
+            let currentIds = Set(nodes.map(\.id))
+            let newIds = currentIds.subtracting(knownIds)
+
             VStack(alignment: .trailing, spacing: 0) {
                 HStack(spacing: 6) {
                     Image(systemName: "clock.arrow.circlepath")
@@ -52,22 +56,20 @@ struct ActivityLogPanel: View {
             .frame(maxHeight: 300)
             .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 10))
             .foregroundStyle(.white.opacity(0.7))
-        }
-        .onAppear {
-            knownIds = Set(nodes.map(\.id))
-        }
-        .onChange(of: nodes.count) { _, _ in
-            let currentIds = Set(nodes.map(\.id))
-            let newIds = currentIds.subtracting(knownIds)
-            knownIds = currentIds
-            guard !newIds.isEmpty else { return }
-            withAnimation(.easeInOut(duration: 0.3)) {
-                glowingIds.formUnion(newIds)
-            }
-            Task { @MainActor in
-                try? await Task.sleep(for: .seconds(1))
-                withAnimation(.easeOut(duration: 0.6)) {
-                    glowingIds.subtract(newIds)
+            .onChange(of: currentIds.count) { _, _ in
+                guard !newIds.isEmpty, !knownIds.isEmpty else {
+                    knownIds = currentIds
+                    return
+                }
+                knownIds = currentIds
+                withAnimation(.easeInOut(duration: 0.3)) {
+                    glowingIds.formUnion(newIds)
+                }
+                Task { @MainActor in
+                    try? await Task.sleep(for: .seconds(1))
+                    withAnimation(.easeOut(duration: 0.6)) {
+                        glowingIds.subtract(newIds)
+                    }
                 }
             }
         }

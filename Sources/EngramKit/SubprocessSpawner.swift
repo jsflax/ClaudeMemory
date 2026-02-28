@@ -1,7 +1,7 @@
 import Foundation
 
 /// Rotate a log file if it exceeds `maxBytes`. Keeps one `.1` backup.
-func rotateFileIfNeeded(_ path: String, maxBytes: Int = 256 * 1024) {
+public func rotateFileIfNeeded(_ path: String, maxBytes: Int = 256 * 1024) {
     let fm = FileManager.default
     guard let attrs = try? fm.attributesOfItem(atPath: path),
           let size = attrs[.size] as? Int,
@@ -24,14 +24,14 @@ func rotateFileIfNeeded(_ path: String, maxBytes: Int = 256 * 1024) {
 ///   - envGuard: Environment variable set on the subprocess to prevent recursion.
 ///   - logPath: Absolute path to the log file for stdout/stderr capture.
 ///   - cwd: Optional working directory for the subprocess.
-func spawnClaudeSubprocess(
+public func spawnClaudeSubprocess(
     prompt: String,
     systemPrompt: String,
     allowedTools: String,
     model: String,
     envGuard: (key: String, value: String),
     logPath: String,
-    cwd: String?
+    cwd: String? = nil
 ) throws {
     let escapedPrompt = prompt.replacingOccurrences(of: "'", with: "'\\''")
     let escapedSystemPrompt = systemPrompt.replacingOccurrences(of: "'", with: "'\\''")
@@ -69,32 +69,36 @@ func spawnClaudeSubprocess(
 }
 
 /// Strip YAML frontmatter (--- delimited block) from markdown content.
-func stripFrontmatter(_ content: String) -> String {
+public func stripFrontmatter(_ content: String) -> String {
     guard content.hasPrefix("---") else { return content }
     let lines = content.components(separatedBy: .newlines)
-    var endIndex = 0
     for i in 1..<lines.count {
         if lines[i].hasPrefix("---") {
-            endIndex = i + 1
-            break
+            return lines[(i + 1)...].joined(separator: "\n")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
         }
     }
-    guard endIndex > 0 else { return content }
-    return lines[endIndex...].joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+    return content
 }
 
-/// Load an agent system prompt from `~/.claude/agents/<name>.md`, stripping frontmatter.
-/// Falls back to the provided inline default if the file doesn't exist.
-func loadAgentSystemPrompt(name: String, fallback: String) -> String {
-    let possiblePaths = [
-        NSHomeDirectory() + "/.claude/agents/\(name).md",
-        Bundle.main.bundlePath + "/../../../agents/\(name).md",
-    ]
+/// Load an agent system prompt by name, stripping YAML frontmatter.
+///
+/// Searches in order:
+/// 1. `~/.claude/agents/<name>.md` (user-installed override)
+/// 2. `Bundle.module` SPM resource (bundled .md files)
+///
+/// Falls back to the provided inline default if neither source exists.
+public func loadAgentSystemPrompt(name: String, fallback: String) -> String {
+    // 1. User-installed override (hot-editable without rebuild)
+    let userPath = NSHomeDirectory() + "/.claude/agents/\(name).md"
+    if let content = try? String(contentsOfFile: userPath, encoding: .utf8) {
+        return stripFrontmatter(content)
+    }
 
-    for path in possiblePaths {
-        if let content = try? String(contentsOfFile: path, encoding: .utf8) {
-            return stripFrontmatter(content)
-        }
+    // 2. Bundled SPM resource
+    if let url = Bundle.module.url(forResource: name, withExtension: "md"),
+       let content = try? String(contentsOf: url, encoding: .utf8) {
+        return stripFrontmatter(content)
     }
 
     return fallback

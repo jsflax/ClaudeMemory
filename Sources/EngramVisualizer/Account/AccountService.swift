@@ -25,6 +25,9 @@ final class AccountService {
     /// Current subscription status.
     private(set) var subscription: SubscriptionInfo?
 
+    /// User profile info from the server.
+    private(set) var userProfile: UserProfile?
+
     /// Whether a network operation is in progress.
     private(set) var isLoading = false
 
@@ -37,7 +40,10 @@ final class AccountService {
         self.token = KeychainHelper.load(for: Self.tokenKey)
 
         if token != nil {
-            Task { await refreshSubscriptionStatus() }
+            Task {
+                await fetchProfile()
+                await refreshSubscriptionStatus()
+            }
         }
     }
 
@@ -63,6 +69,7 @@ final class AccountService {
 
             let loginResponse = try JSONDecoder().decode(LoginResponse.self, from: data)
             token = loginResponse.token
+            userProfile = loginResponse.user
             try KeychainHelper.save(loginResponse.token, for: Self.tokenKey)
             await refreshSubscriptionStatus()
         } catch {
@@ -105,6 +112,7 @@ final class AccountService {
     func signOut() {
         token = nil
         subscription = nil
+        userProfile = nil
         KeychainHelper.delete(for: Self.tokenKey)
     }
 
@@ -187,8 +195,28 @@ final class AccountService {
 
         let loginResponse = try JSONDecoder().decode(LoginResponse.self, from: data)
         token = loginResponse.token
+        userProfile = loginResponse.user
         try KeychainHelper.save(loginResponse.token, for: Self.tokenKey)
         await refreshSubscriptionStatus()
+    }
+
+    // MARK: - Profile
+
+    func fetchProfile() async {
+        guard let token else { return }
+
+        do {
+            let url = URL(string: "\(endpoint)/me")!
+            var request = URLRequest(url: url)
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else { return }
+
+            userProfile = try JSONDecoder().decode(UserProfile.self, from: data)
+        } catch {
+            // Non-fatal — profile fetch can fail silently
+        }
     }
 
     // MARK: - Subscription
@@ -224,6 +252,15 @@ final class AccountService {
 
     struct LoginResponse: Decodable {
         let token: String
+        let user: UserProfile?
+    }
+
+    struct UserProfile: Decodable {
+        let id: UUID
+        let email: String?
+        let fullName: String?
+        let profilePictureUrl: String?
+        let providers: [String]?
     }
 
     struct SubscriptionInfo: Decodable {

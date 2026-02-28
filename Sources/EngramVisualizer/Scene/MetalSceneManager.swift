@@ -24,18 +24,20 @@ final class MetalSceneManager {
     weak var camera3DState: Camera3DState?
     weak var renderStore: GraphRenderStore?
 
-    // Data pushed from SwiftUI
+    // Data pushed from SwiftUI (only layout/transition state — visual data comes from renderStore)
     var layoutMode: LayoutMode = .forceDirected
-    var glowingNodes: [UUID: Date] = [:]
-    var newNodes: [UUID: Date] = [:]
-    var dyingNodes: [UUID: DyingNode] = [:]
     var semanticClusters3D: [SemanticCluster3D] = []
-    var topicGroups: [TopicGroupInfo] = []
-    var clusters: [[UUID]] = []
-    var searchMatchIds: Set<UUID> = []
-    var isSearchActive: Bool = false
     var forcePositionSnapshot3D: [UUID: SIMD3<Float>] = [:]
     var transitionProgress: CGFloat = 0
+
+    // Convenience accessors — read from renderStore (no local copies needed)
+    private var glowingNodes: [UUID: Date] { renderStore?.glowingNodes ?? [:] }
+    private var newNodes: [UUID: Date] { renderStore?.newNodeGlows ?? [:] }
+    private var dyingNodes: [UUID: DyingNode] { renderStore?.dyingNodes ?? [:] }
+    private var topicGroups: [TopicGroupInfo] { renderStore?.topicGroups ?? [] }
+    private var clusters: [[UUID]] { renderStore?.clusterGroups ?? [] }
+    private var searchMatchIds: Set<UUID> { renderStore?.searchMatchIds ?? [] }
+    private var isSearchActive: Bool { renderStore?.isSearchActive ?? false }
 
     // Mutable render state
     var positions: [UUID: SIMD3<Float>] = [:]
@@ -90,6 +92,8 @@ final class MetalSceneManager {
     private var cachedNodeRadii: [UUID: Float] = [:]
     private var cachedNodeProject: [UUID: String] = [:]
     private var lastTopologyNodeCount: Int = 0
+
+    // Edge packing: cached source/target IDs + radii for fast position-only updates
 
     // Label atlas state
     var labelAtlasRects: [UUID: (u0: Float, v0: Float, u1: Float, v1: Float)] = [:]
@@ -254,11 +258,7 @@ final class MetalSceneManager {
             // Edge and nebula packing only needed when geometry changed
             // (positions, selection, search), not for glow/arrival visual-only changes.
             if geometryChanged {
-                // Edge instance packing is now lightweight (48 bytes/edge) — GPU stamp
-                // kernel handles all cylinder geometry. No throttle needed.
                 packEdgeVertices()
-
-                // Nebulae are still CPU-packed; throttle during position-only convergence.
                 let positionOnly = positionsChanged && !selectionChanged && !searchChanged && !hasExpansions
                 if !positionOnly || renderFrameCount % 6 == 0 {
                     updateNebulae()
@@ -279,6 +279,7 @@ final class MetalSceneManager {
             lastSelectedNode = selectedNode
             lastSearchActive = isSearchActive
             lastSearchMatchIds = searchMatchIds
+
         }
 
         if sceneNeedsUpdate || cameraMoving {
@@ -491,12 +492,13 @@ final class MetalSceneManager {
             }
             lastTopologyNodeCount = nodes.count
         }
-        let nodeProject = cachedNodeProject
 
         renderer.ensureEdgeBuffers(edgeCount: edgeCount)
         guard let instanceBuf = renderer.edgeInstanceBuffer else { return }
 
         let instances = instanceBuf.contents().bindMemory(to: EdgeInstance.self, capacity: edgeCount)
+
+        let nodeProject = cachedNodeProject
         let nodeRadii = cachedNodeRadii
         var ei = 0
 
@@ -606,7 +608,7 @@ final class MetalSceneManager {
             projectColors[project] = nodeColorFloat3(for: project, colorMap: renderColorMap)
         }
 
-        let nodeById = Dictionary(nodes.map { ($0.id, $0) }, uniquingKeysWith: { _, last in last })
+        let nodeById = renderStore?.nodeById ?? [:]
         let sf = scaleFactor
         let aspectCorr = labelAtlasAspectCorrection
 

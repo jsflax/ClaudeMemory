@@ -1,5 +1,4 @@
-import AuthenticationServices
-import GoogleSignInSwift
+import EngramModels
 import Lattice
 import SwiftUI
 import UserNotifications
@@ -15,6 +14,7 @@ struct SidebarView: View {
 
     @Environment(VisualizerConfig.self) private var config
     @Environment(\.lattice) private var lattice
+    @Environment(SyncManager.self) var syncManager
     @State private var selectedTab: Tab = .visualizer
     @State private var isCompacting = false
 
@@ -34,9 +34,10 @@ struct SidebarView: View {
 
     // Account tab
     @Bindable var accountService: AccountService
-    @State private var email = ""
-    @State private var password = ""
-    @State private var isRegistering = false
+    @LatticeQuery<SyncConfig>(sort: \SyncConfig.project) var syncConfigs
+    @State var email = ""
+    @State var password = ""
+    @State var isRegistering = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -113,7 +114,7 @@ struct SidebarView: View {
 
     // MARK: - Section Helper
 
-    private func section(_ title: String, @ViewBuilder content: () -> some View) -> some View {
+    func section(_ title: String, @ViewBuilder content: () -> some View) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             Text(title.uppercased())
                 .font(.system(size: 10, weight: .semibold, design: .monospaced))
@@ -343,7 +344,7 @@ struct SidebarView: View {
         .buttonStyle(.plain)
     }
 
-    private func togglePill(isOn: Bool) -> some View {
+    func togglePill(isOn: Bool) -> some View {
         RoundedRectangle(cornerRadius: 8)
             .fill(isOn ? Color.cyan.opacity(0.5) : .white.opacity(0.1))
             .frame(width: 32, height: 18)
@@ -469,191 +470,6 @@ struct SidebarView: View {
                     let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
                     statRow("Version", value: "v\(version)")
                     statRow("Build", value: build)
-                }
-            }
-        }
-    }
-
-    // MARK: - Account Tab
-
-    @ViewBuilder
-    private var accountContent: some View {
-        #if DEBUG
-        if accountService.isSignedIn {
-            signedInContent
-        } else {
-            signInContent
-        }
-        #else
-        underConstructionContent
-        #endif
-    }
-
-    private var resourceBundle: Bundle {
-        #if SWIFT_PACKAGE
-        Bundle.module
-        #else
-        Bundle.main
-        #endif
-    }
-
-    private var underConstructionContent: some View {
-        VStack(spacing: 16) {
-            Spacer()
-            if let url = resourceBundle.url(forResource: "under_construction", withExtension: "png"),
-               let nsImage = NSImage(contentsOf: url) {
-                Image(nsImage: nsImage)
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
-                    .frame(maxWidth: 200)
-            }
-            Text("Coming Soon")
-                .font(.system(size: 14, weight: .semibold, design: .monospaced))
-                .foregroundStyle(.white.opacity(0.6))
-            Text("Account features are under construction.")
-                .font(.system(size: 11, design: .monospaced))
-                .foregroundStyle(.white.opacity(0.35))
-                .multilineTextAlignment(.center)
-            Spacer()
-        }
-        .frame(maxWidth: .infinity)
-    }
-
-    @ViewBuilder
-    private var signedInContent: some View {
-        VStack(alignment: .leading, spacing: 24) {
-            section("Account") {
-                VStack(alignment: .leading, spacing: 12) {
-                    HStack(spacing: 10) {
-                        Image(systemName: "person.circle.fill")
-                            .font(.system(size: 28))
-                            .foregroundStyle(.white.opacity(0.4))
-
-                        VStack(alignment: .leading, spacing: 2) {
-                            if let sub = accountService.subscription {
-                                Text(sub.displayStatus)
-                                    .font(.system(size: 12, weight: .medium, design: .monospaced))
-                                    .foregroundStyle(.white.opacity(0.8))
-                                if let tier = sub.tier {
-                                    Text("Engram \(tier.capitalized)")
-                                        .font(.system(size: 11, design: .monospaced))
-                                        .foregroundStyle(.white.opacity(0.4))
-                                }
-                            } else {
-                                Text("Free Tier")
-                                    .font(.system(size: 12, weight: .medium, design: .monospaced))
-                                    .foregroundStyle(.white.opacity(0.8))
-                                Text("Upgrade for cloud sync")
-                                    .font(.system(size: 11, design: .monospaced))
-                                    .foregroundStyle(.white.opacity(0.4))
-                            }
-                        }
-                    }
-
-                    HStack(spacing: 8) {
-                        Button("Sign Out") { accountService.signOut() }
-                            .font(.system(size: 11, design: .monospaced))
-                        Spacer()
-                        Button("Refresh") {
-                            Task { await accountService.refreshSubscriptionStatus() }
-                        }
-                        .font(.system(size: 11, design: .monospaced))
-                    }
-                }
-            }
-
-            section("Sync") {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Endpoint")
-                        .font(.system(size: 10, design: .monospaced))
-                        .foregroundStyle(.white.opacity(0.35))
-                    TextField("https://api.engram.io", text: $accountService.endpoint)
-                        .textFieldStyle(.roundedBorder)
-                        .font(.system(size: 11, design: .monospaced))
-                }
-            }
-        }
-    }
-
-    @ViewBuilder
-    private var signInContent: some View {
-        VStack(alignment: .leading, spacing: 24) {
-            section("Sign In") {
-                VStack(spacing: 12) {
-                    Text("Sign in to enable cloud sync and backup.")
-                        .font(.system(size: 11, design: .monospaced))
-                        .foregroundStyle(.white.opacity(0.5))
-                        .fixedSize(horizontal: false, vertical: true)
-
-                    SignInWithAppleButton(.signIn) { request in
-                        request.requestedScopes = [.email, .fullName]
-                    } onCompletion: { result in
-                        Task { await accountService.handleAppleSignIn(result: result) }
-                    }
-                    .frame(height: 36)
-
-                    GoogleSignInButton {
-                        Task { await accountService.signInWithGoogle() }
-                    }
-                    .frame(height: 36)
-
-                    HStack(spacing: 8) {
-                        Rectangle().frame(height: 1).foregroundStyle(.white.opacity(0.1))
-                        Text("or")
-                            .font(.system(size: 10))
-                            .foregroundStyle(.white.opacity(0.3))
-                        Rectangle().frame(height: 1).foregroundStyle(.white.opacity(0.1))
-                    }
-
-                    VStack(spacing: 8) {
-                        TextField("Email", text: $email)
-                            .textFieldStyle(.roundedBorder)
-                            .textContentType(.emailAddress)
-                            .font(.system(size: 12))
-
-                        SecureField("Password", text: $password)
-                            .textFieldStyle(.roundedBorder)
-                            .textContentType(isRegistering ? .newPassword : .password)
-                            .font(.system(size: 12))
-                    }
-
-                    if let error = accountService.errorMessage {
-                        Text(error)
-                            .font(.system(size: 10))
-                            .foregroundStyle(.red.opacity(0.8))
-                    }
-
-                    Button(isRegistering ? "Create Account" : "Sign In") {
-                        Task {
-                            if isRegistering {
-                                await accountService.register(email: email, password: password)
-                            } else {
-                                await accountService.signIn(email: email, password: password)
-                            }
-                        }
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .font(.system(size: 12, design: .monospaced))
-                    .disabled(email.isEmpty || password.isEmpty || accountService.isLoading)
-
-                    Button(isRegistering ? "Have an account? Sign in" : "No account? Register") {
-                        isRegistering.toggle()
-                        accountService.errorMessage = nil
-                    }
-                    .font(.system(size: 10, design: .monospaced))
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.cyan.opacity(0.8))
-                }
-            }
-
-            section("Server") {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Endpoint")
-                        .font(.system(size: 10, design: .monospaced))
-                        .foregroundStyle(.white.opacity(0.35))
-                    TextField("https://api.engram.io", text: $accountService.endpoint)
-                        .textFieldStyle(.roundedBorder)
-                        .font(.system(size: 11, design: .monospaced))
                 }
             }
         }

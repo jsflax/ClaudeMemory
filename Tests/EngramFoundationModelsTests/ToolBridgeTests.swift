@@ -336,6 +336,61 @@ func onDeviceModelRecallsMemories() async throws {
         "Expected the model to surface memories or produce a tool call, got: \(response.content)")
 }
 
+@Test("Structured output: respond(to:generating: MemoryContext.self) with tools")
+func structuredOutputWithTools() async throws {
+    guard #available(macOS 26.0, *) else { return }
+    guard SystemLanguageModel.default.availability == .available else { return }
+
+    let mt = try await makeMemoryTools()
+
+    // Seed with 3 memories across different scopes
+    let remember = RememberTool(memoryTools: mt)
+    _ = try await remember.call(arguments: .init(
+        content: "SwiftUI previews crash when using @Observable inside #Preview",
+        topic: "debugging",
+        project: "MyApp"
+    ))
+    _ = try await remember.call(arguments: .init(
+        content: "Decided to use actor isolation for the networking layer",
+        topic: "architecture",
+        project: "MyApp"
+    ))
+    _ = try await remember.call(arguments: .init(
+        content: "User prefers dark mode and compact sidebar",
+        topic: "preferences",
+        project: "global"
+    ))
+
+    // Stage 1: retrieval session with read-only tools + structured output
+    let session = LanguageModelSession(
+        tools: EngramTools.readOnly(memoryTools: mt),
+        instructions: """
+            You are a memory retrieval assistant. Use the recall tool to search for \
+            relevant memories, then return them as structured data. Do NOT generate \
+            a user-facing response — just gather and summarize the data.
+            """
+    )
+
+    let start = ContinuousClock.now
+    let result = try await session.respond(
+        to: "What do you know about SwiftUI, networking architecture, and user preferences?",
+        generating: MemoryContext.self
+    )
+    let elapsed = ContinuousClock.now - start
+
+    let ctx = result.content
+    print("[StructuredOutput] took \(elapsed)")
+    print("[StructuredOutput] summary: \(ctx.summary)")
+    print("[StructuredOutput] memories count: \(ctx.memories.count)")
+    for m in ctx.memories {
+        print("  - [\(m.project)/\(m.topic)] \(m.content)")
+    }
+
+    // Verify the struct is populated — the model should have found at least one memory
+    #expect(!ctx.summary.isEmpty, "Summary should not be empty")
+    #expect(!ctx.memories.isEmpty, "Should have found at least one memory")
+}
+
 @Test("On-device model with adapter recalls memories via tools")
 func onDeviceModelWithAdapterRecallsMemories() async throws {
     guard #available(macOS 26.0, *) else { return }

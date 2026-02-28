@@ -14,7 +14,8 @@ public func findMemoryClusters(
     distanceThreshold: Double = 0.15,
     jaccardThreshold: Double = 0.2,
     minClusterSize: Int = 2,
-    maxClusters: Int = 10
+    maxClusters: Int = 10,
+    neighborLimit: Int? = nil
 ) -> (clusters: [[Int64]], distances: [Int64: [Int64: Double]]) {
     let now = Date()
     var baseQuery = lattice.objects(Memory.self).where { $0.expiresAt > now }
@@ -42,7 +43,7 @@ public func findMemoryClusters(
 
     for (memId, mem) in memoryMap {
         let matches = baseQuery
-            .nearest(to: mem.embedding, on: \.embedding, limit: memories.count, distance: .cosine)
+            .nearest(to: mem.embedding, on: \.embedding, limit: neighborLimit ?? memories.count, distance: .cosine)
 
         var neighbors: [Int64] = []
         var dists: [Int64: Double] = [:]

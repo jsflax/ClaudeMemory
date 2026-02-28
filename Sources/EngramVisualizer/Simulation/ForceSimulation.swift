@@ -21,6 +21,7 @@ final class ForceSimulation: ObservableObject {
     private var pinned: [Bool] = []
     private var idToIndex: [UUID: Int] = [:]
     private var edgeIndices: [(Int, Int)] = []
+    private var edgeIndexSet: Set<UInt64> = []  // packed (si << 32 | ti) for O(1) duplicate check
     private var projectGroup: [Int] = []  // group index per node (same project = same group)
     private var topicGroup: [Int] = []    // group index per node (same project+topic = same group)
     private var topicProjectGroup: [Int] = []  // which project group each topic group belongs to
@@ -190,6 +191,8 @@ final class ForceSimulation: ObservableObject {
                 if edgeIndices[i].1 == lastIdx { edgeIndices[i].1 = idx }
             }
         }
+        // Rebuild edge set after swap-remove patching
+        edgeIndexSet = Set(edgeIndices.map { UInt64($0.0) << 32 | UInt64($0.1) })
 
         ids.removeLast(); x.removeLast(); y.removeLast()
         vx.removeLast(); vy.removeLast(); pinned.removeLast()
@@ -207,13 +210,16 @@ final class ForceSimulation: ObservableObject {
 
     func addEdge(from sourceId: UUID, to targetId: UUID) {
         guard let si = idToIndex[sourceId], let ti = idToIndex[targetId] else { return }
-        if edgeIndices.contains(where: { $0 == (si, ti) }) { return }
+        let key = UInt64(si) << 32 | UInt64(ti)
+        guard edgeIndexSet.insert(key).inserted else { return }
         edgeIndices.append((si, ti))
         hasPendingTopologyChanges = true
     }
 
     func removeEdge(from sourceId: UUID, to targetId: UUID) {
         guard let si = idToIndex[sourceId], let ti = idToIndex[targetId] else { return }
+        let key = UInt64(si) << 32 | UInt64(ti)
+        edgeIndexSet.remove(key)
         edgeIndices.removeAll { $0 == (si, ti) }
         hasPendingTopologyChanges = true
     }
@@ -349,6 +355,7 @@ final class ForceSimulation: ObservableObject {
             guard let si = idToIndex[src], let ti = idToIndex[tgt] else { return nil }
             return (si, ti)
         }
+        edgeIndexSet = Set(edgeIndices.map { UInt64($0.0) << 32 | UInt64($0.1) })
 
         // Sync per-node metadata for surgical operations
         nodeProject = projectForNode

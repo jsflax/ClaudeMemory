@@ -1,370 +1,13 @@
 import SwiftUI
 import EngramKit
 
-// MARK: - File-level helpers
+// MARK: - Drawing methods
 
-func extractLabel(content: String, topic: String) -> String {
-    let maxLen = 30
-    if let headerRange = content.range(of: #"^#{1,3}\s+"#, options: .regularExpression) {
-        let title = content[headerRange.upperBound...].prefix(while: { $0 != "\n" })
-        return truncateLabel(String(title), to: maxLen)
-    }
-    if content.hasPrefix("**"), let end = content.dropFirst(2).range(of: "**") {
-        let title = content[content.index(content.startIndex, offsetBy: 2)..<end.lowerBound]
-        return truncateLabel(String(title), to: maxLen)
-    }
-    if let colon = content.firstIndex(of: ":"),
-       content.distance(from: content.startIndex, to: colon) < maxLen {
-        return String(content[..<colon])
-    }
-    let firstLine = String(content.prefix(while: { $0 != "\n" }))
-    if firstLine.count <= maxLen { return firstLine }
-    if topic != "general" {
-        let combined = "\(topic): \(firstLine)"
-        if combined.count <= maxLen { return combined }
-        // Topic fits — truncate content only
-        if topic.count + 2 + 5 <= maxLen {
-            return "\(topic): \(truncateLabel(firstLine, to: maxLen - topic.count - 2))"
-        }
-        // Topic too long — truncate both
-        let prefix = truncateLabel(topic, to: 12)
-        return "\(prefix): \(truncateLabel(firstLine, to: maxLen - prefix.count - 2))"
-    }
-    return truncateLabel(firstLine, to: maxLen)
-}
-
-func truncateLabel(_ text: String, to maxLen: Int) -> String {
-    if text.count <= maxLen { return text }
-    return String(text.prefix(maxLen - 1)) + "…"
-}
-
-// MARK: - Lightweight data structs (replaces heavy Lattice model objects)
-
-struct NodeData {
-    let id: UUID
-    let project: String
-    let topic: String
-    let label: String
-    let content: String
-    let createdAt: Date
-    var lastAccessedAt: Date
-    let importance: Int
-}
-
-struct EdgeData {
-    let id: Int64       // Edge primaryKey (DB-local, for observation identity)
-    let sourceId: UUID
-    let targetId: UUID
-    let relation: String
-}
-
-struct DyingNode {
-    let id: UUID
-    let position: CGPoint
-    let project: String
-    let isHub: Bool
-    let importance: Int
-    let startTime: Date
-}
-
-/// Shared render data store — written by GraphView (insertNodeBatch, handleNodeChange, etc.),
-/// read by Graph3DScene's renderTick. Both run on MainActor, so no race.
-/// NOT @Observable — must not trigger SwiftUI re-evaluation.
-@MainActor
-final class GraphRenderStore {
-    var nodes: [NodeData] = []
-    var nodeById: [UUID: NodeData] = [:]
-    var edges: [EdgeData] = []
-    var hubs: Set<UUID> = []
-    var colorMap: [String: Color] = [:] {
-        didSet { colorMapVersion &+= 1 }
-    }
-    /// Incremented whenever colorMap changes. Scene checks this to invalidate its SIMD cache.
-    private(set) var colorMapVersion: UInt64 = 0
-
-    /// Incremented when nodes/hubs/projects change. Replaces O(n) Set comparison per frame in atlas check.
-    private(set) var topologyVersion: UInt64 = 0
-    func bumpTopology() { topologyVersion &+= 1 }
-}
-
-// MARK: - Perf tracking (writable from Canvas closure)
-
-private final class PerfStats: @unchecked Sendable {
-    var lastFrameTime: CFAbsoluteTime = 0
-    var fps: Double = 0
-    var drawMs: Double = 0
-    var hullMs: Double = 0
-    var edgeMs: Double = 0
-    var nodeMs: Double = 0
-}
-
-// MARK: - GraphCanvas
-
-/// Pure rendering component for the force-directed graph.
-/// Receives all data from GraphView — no Lattice queries or observers.
-struct GraphCanvas: View {
-    @ObservedObject var simulation: ForceSimulation
-    let nodes: [NodeData]
-    let edges: [EdgeData]
-    let hubs: Set<UUID>
-    let glowingNodes: [UUID: Date]
-    let newNodes: [UUID: Date]
-    let dyingNodes: [UUID: DyingNode]
-    let searchMatchIds: Set<UUID>
-    let isSearchActive: Bool
-    let viewport: ViewportState
-    @Binding var selectedNode: UUID?
-    let clusters: [[UUID]]
-    let topicGroups: [TopicGroupInfo]
-    let colorMap: [String: Color]
-    var layoutMode: LayoutMode = .forceDirected
-    var overridePositions: [UUID: CGPoint]? = nil
-    var knowledgeVoids: [KnowledgeVoid] = []
-    var semanticClusters: [SemanticCluster] = []
-    var projectionState: ProjectionState = .idle
-    var onAnimationTick: (() -> Void)? = nil
-
-    @GestureState private var lastMagnification: CGFloat = 1.0
-    @State private var frameCount: UInt64 = 0
-    @State private var clusterFadeStartFrame: UInt64 = 0
-    @State private var hullTransitionFrame: UInt64 = 0  // frame when layout mode last changed
-    private let perf = PerfStats()
-    private let baseRadius: CGFloat = 12
-    private let hubScale: CGFloat = 1.6
-    private let bgColor = Color(red: 0.051, green: 0.067, blue: 0.09)
-    private let timer = Timer.publish(every: 1.0 / 60.0, on: .main, in: .common).autoconnect()
-
-    // Edge relation colors
-    static let relationColors: [String: Color] = [
-        "part_of": .cyan,
-        "contradicts": .red,
-        "supersedes": .orange,
-        "derived_from": .yellow,
-        "relates_to": .blue,
-        "summarized_by": .purple,
-    ]
-
-    var body: some View {
-        let mems = nodes
-        let hubSet = hubs
-        let vEdges = edges
-        let glows = glowingNodes
-        // Precompute connected set once per body eval (not per Canvas frame)
-        let connected: Set<UUID> = {
-            guard let sel = selectedNode else { return [] }
-            var ids = Set<UUID>()
-            for edge in edges {
-                if edge.sourceId == sel { ids.insert(edge.targetId) }
-                if edge.targetId == sel { ids.insert(edge.sourceId) }
-            }
-            return ids
-        }()
-        Canvas(rendersAsynchronously: true) { context, size in
-            let _ = frameCount
-            let t0 = CFAbsoluteTimeGetCurrent()
-            // FPS from inter-frame interval
-            let p = perf
-            if p.lastFrameTime > 0 {
-                let dt = t0 - p.lastFrameTime
-                if dt > 0 { p.fps = p.fps * 0.9 + (1.0 / dt) * 0.1 }
-            }
-            p.lastFrameTime = t0
-
-            var ctx = context
-            ctx.translateBy(x: viewport.offset.x, y: viewport.offset.y)
-            ctx.scaleBy(x: viewport.scale, y: viewport.scale)
-            let positions = overridePositions ?? simulation.positions
-            let t1 = CFAbsoluteTimeGetCurrent()
-            // Cross-fade hulls during mode transitions (36 frames / 0.6s)
-            let hullTransitionProgress: CGFloat = hullTransitionFrame > 0 && frameCount > hullTransitionFrame
-                ? min(1.0, CGFloat(frameCount - hullTransitionFrame) / 36.0)
-                : 1.0
-            let forceHullFade: CGFloat = layoutMode == .forceDirected ? hullTransitionProgress : (1.0 - hullTransitionProgress)
-            let semanticHullFade: CGFloat = layoutMode == .embedding ? hullTransitionProgress : (1.0 - hullTransitionProgress)
-            if forceHullFade > 0 {
-                drawClusterHulls(context: &ctx, positions: positions, nodes: mems, hubs: hubSet, edges: vEdges, fade: forceHullFade)
-            }
-            if semanticHullFade > 0 {
-                drawSemanticClusters(context: &ctx, positions: positions, nodes: mems, transitionFade: semanticHullFade)
-            }
-            drawKnowledgeVoids(context: &ctx, positions: positions)
-            let t2 = CFAbsoluteTimeGetCurrent()
-            drawEdges(context: &ctx, positions: positions, nodes: mems, hubs: hubSet, edges: vEdges, connectedToSelected: connected)
-            let t3 = CFAbsoluteTimeGetCurrent()
-            drawNodes(context: &ctx, positions: positions, nodes: mems, hubs: hubSet, edges: vEdges, glowingNodes: glows, connectedToSelected: connected)
-            let t4 = CFAbsoluteTimeGetCurrent()
-            p.drawMs = (t4 - t0) * 1000
-            p.hullMs = (t2 - t1) * 1000
-            p.edgeMs = (t3 - t2) * 1000
-            p.nodeMs = (t4 - t3) * 1000
-            context.draw(
-                Text("\(Int(p.fps))fps \(String(format: "%.0f", p.drawMs))ms [hull:\(String(format: "%.0f", p.hullMs)) edge:\(String(format: "%.0f", p.edgeMs)) node:\(String(format: "%.0f", p.nodeMs))] \(mems.count)n \(vEdges.count)e")
-                    .font(.system(size: 11, weight: .medium, design: .monospaced))
-                    .foregroundStyle(.green.opacity(0.8)),
-                at: CGPoint(x: size.width / 2, y: size.height - 16)
-            )
-
-            // Semantic mode indicator
-            if layoutMode == .embedding && projectionState == .ready {
-                context.draw(
-                    Text("SEMANTIC VIEW — proximity = embedding similarity")
-                        .font(.system(size: 11, weight: .medium, design: .monospaced))
-                        .foregroundStyle(.cyan.opacity(0.4)),
-                    at: CGPoint(x: size.width / 2, y: 20)
-                )
-            }
-
-            // Progress is shown via nodes drifting progressively — no overlay needed
-            // Log FPS to file every ~1s
-            if frameCount % 60 == 0 && frameCount > 0 {
-                let line = "[perf] \(Int(p.fps))fps | \(String(format: "%.0f", p.drawMs))ms [hull:\(String(format: "%.0f", p.hullMs)) edge:\(String(format: "%.0f", p.edgeMs)) node:\(String(format: "%.0f", p.nodeMs))] | \(mems.count)n \(vEdges.count)e\n"
-                if let data = line.data(using: .utf8) {
-                    let fh = FileHandle(forWritingAtPath: "/tmp/visualizer-fps.log")
-                        ?? { FileManager.default.createFile(atPath: "/tmp/visualizer-fps.log", contents: nil); return FileHandle(forWritingAtPath: "/tmp/visualizer-fps.log")! }()
-                    fh.seekToEndOfFile()
-                    fh.write(data)
-                    fh.closeFile()
-                }
-            }
-        }
-        .onReceive(timer) { _ in
-            viewport.tickPan()
-            simulation.tick()
-            onAnimationTick?()
-            // Track cluster fade-in: record the frame when clusters first appear
-            if !semanticClusters.isEmpty && clusterFadeStartFrame == 0 {
-                clusterFadeStartFrame = frameCount
-            } else if semanticClusters.isEmpty && clusterFadeStartFrame != 0 {
-                clusterFadeStartFrame = 0
-            }
-            let isProjecting: Bool = {
-                if case .computing = projectionState { return true }
-                return false
-            }()
-            let needsRedraw = simulation.isActive
-            || !glowingNodes.isEmpty
-            || !newNodes.isEmpty
-            || !dyingNodes.isEmpty
-            || viewport.draggedNode != nil
-            || viewport.isAnimatingPan
-            || (isSearchActive && !searchMatchIds.isEmpty)
-            || !knowledgeVoids.isEmpty  // void pulse animation needs frameCount
-            || isProjecting
-            || (clusterFadeStartFrame > 0 && frameCount < clusterFadeStartFrame + 36)
-            || (hullTransitionFrame > 0 && frameCount < hullTransitionFrame + 36)
-            if needsRedraw { frameCount &+= 1 }
-        }
-        .onChange(of: layoutMode) { _, _ in
-            hullTransitionFrame = max(frameCount, 1)
-        }
-        .gesture(nodeDragGesture)
-        .gesture(magnificationGesture)
-        .simultaneousGesture(
-            SpatialTapGesture()
-                .onEnded { value in
-                    if let nodeId = hitTest(value.location) {
-                        selectedNode = selectedNode == nodeId ? nil : nodeId
-                    } else {
-                        selectedNode = nil
-                    }
-                }
-        )
-        .onContinuousHover { phase in
-            switch phase {
-            case .active(let location): viewport.hoveredNode = hitTest(location)
-            case .ended: viewport.hoveredNode = nil
-            }
-        }
-    }
-
-    // MARK: - Gestures
-
-    @GestureState private var dragStartOffset: CGPoint?
-
-    private var nodeDragGesture: some Gesture {
-        DragGesture(minimumDistance: 2)
-            .updating($dragStartOffset) { value, state, _ in
-                if state == nil {
-                    if let nodeId = hitTest(value.startLocation) {
-                        viewport.draggedNode = nodeId
-                    }
-                    state = viewport.offset
-                }
-                if let nodeId = viewport.draggedNode {
-                    simulation.pinNode(nodeId, at: screenToWorld(value.location))
-                } else if let start = state {
-                    viewport.offset = CGPoint(
-                        x: start.x + value.translation.width,
-                        y: start.y + value.translation.height
-                    )
-                }
-            }
-            .onEnded { _ in
-                if let nodeId = viewport.draggedNode { simulation.unpinNode(nodeId) }
-                viewport.draggedNode = nil
-            }
-    }
-
-    private var magnificationGesture: some Gesture {
-        MagnifyGesture()
-            .updating($lastMagnification) { value, state, _ in
-                let delta = value.magnification / state
-                state = value.magnification
-                guard let window = NSApp.keyWindow else {
-                    viewport.scale = max(0.2, min(3.0, viewport.scale * delta))
-                    return
-                }
-                let mouseLoc = window.mouseLocationOutsideOfEventStream
-                let cursor = CGPoint(x: mouseLoc.x, y: window.frame.height - mouseLoc.y)
-                let worldPoint = CGPoint(
-                    x: (cursor.x - viewport.offset.x) / viewport.scale,
-                    y: (cursor.y - viewport.offset.y) / viewport.scale
-                )
-                let newScale = max(0.2, min(3.0, viewport.scale * delta))
-                viewport.offset = CGPoint(
-                    x: cursor.x - worldPoint.x * newScale,
-                    y: cursor.y - worldPoint.y * newScale
-                )
-                viewport.scale = newScale
-            }
-    }
-
-    // MARK: - Hit testing
-
-    private func hitTest(_ screenPoint: CGPoint) -> UUID? {
-        let world = screenToWorld(screenPoint)
-        let positions = overridePositions ?? simulation.positions
-        var closest: UUID?
-        var closestDist: CGFloat = .greatestFiniteMagnitude
-
-        for node in nodes {
-            guard let pos = positions[node.id] else { continue }
-            let radius = nodeRadius(for: node)
-            let dist = hypot(world.x - pos.x, world.y - pos.y)
-            if dist < radius + 4, dist < closestDist {
-                closest = node.id
-                closestDist = dist
-            }
-        }
-        return closest
-    }
-
-    func screenToWorld(_ screen: CGPoint) -> CGPoint {
-        CGPoint(
-            x: (screen.x - viewport.offset.x) / viewport.scale,
-            y: (screen.y - viewport.offset.y) / viewport.scale
-        )
-    }
-
-    private func nodeRadius(for node: NodeData) -> CGFloat {
-        let importance = max(1, node.importance)
-        let isHub = hubs.contains(node.id)
-        return baseRadius * (isHub ? hubScale : 1.0) * (1.0 + CGFloat(importance - 1) * 0.08)
-    }
+extension GraphCanvas {
 
     // MARK: - Cluster Hulls
 
-    private func drawClusterHulls(context: inout GraphicsContext, positions: [UUID: CGPoint],
+    func drawClusterHulls(context: inout GraphicsContext, positions: [UUID: CGPoint],
                                   nodes: [NodeData], hubs: Set<UUID>, edges: [EdgeData], fade: CGFloat = 1.0) {
         // Per-project hulls (faint background)
         var projectPoints: [String: [CGPoint]] = [:]
@@ -459,7 +102,7 @@ struct GraphCanvas: View {
 
     // MARK: - Semantic Clusters (embedding mode)
 
-    private func drawSemanticClusters(context: inout GraphicsContext, positions: [UUID: CGPoint], nodes: [NodeData], transitionFade: CGFloat = 1.0) {
+    func drawSemanticClusters(context: inout GraphicsContext, positions: [UUID: CGPoint], nodes: [NodeData], transitionFade: CGFloat = 1.0) {
         guard !semanticClusters.isEmpty else { return }
 
         // Cluster appearance fade (0.6s after clusters first appear from t-SNE)
@@ -580,7 +223,7 @@ struct GraphCanvas: View {
 
     // MARK: - Knowledge Voids
 
-    private func drawKnowledgeVoids(context: inout GraphicsContext, positions: [UUID: CGPoint]) {
+    func drawKnowledgeVoids(context: inout GraphicsContext, positions: [UUID: CGPoint]) {
         guard !knowledgeVoids.isEmpty else { return }
 
         for void in knowledgeVoids {
@@ -660,7 +303,7 @@ struct GraphCanvas: View {
 
     // MARK: - Drawing Edges
 
-    private func drawEdges(context: inout GraphicsContext, positions: [UUID: CGPoint],
+    func drawEdges(context: inout GraphicsContext, positions: [UUID: CGPoint],
                            nodes: [NodeData], hubs: Set<UUID>, edges: [EdgeData],
                            connectedToSelected: Set<UUID> = []) {
         let nodeByPk = Dictionary(nodes.map { ($0.id, $0) }, uniquingKeysWith: { _, last in last })
@@ -724,14 +367,14 @@ struct GraphCanvas: View {
         }
     }
 
-    private func shortenEndpoint(from: CGPoint, to: CGPoint, by amount: CGFloat) -> CGPoint {
+    func shortenEndpoint(from: CGPoint, to: CGPoint, by amount: CGFloat) -> CGPoint {
         let dx = to.x - from.x, dy = to.y - from.y
         let dist = max(hypot(dx, dy), 1)
         let ratio = max(0, (dist - amount) / dist)
         return CGPoint(x: from.x + dx * ratio, y: from.y + dy * ratio)
     }
 
-    private func drawArrowHead(context: inout GraphicsContext, from: CGPoint, to: CGPoint, color: Color, opacity: CGFloat) {
+    func drawArrowHead(context: inout GraphicsContext, from: CGPoint, to: CGPoint, color: Color, opacity: CGFloat) {
         let dx = to.x - from.x, dy = to.y - from.y
         let dist = max(hypot(dx, dy), 1)
         let ux = dx / dist, uy = dy / dist
@@ -757,7 +400,7 @@ struct GraphCanvas: View {
 
     // MARK: - Label Tiers (zoom-based visibility)
 
-    private enum LabelTier: Int, Comparable {
+    enum LabelTier: Int, Comparable {
         case always    = 0
         case project   = 1
         case hub       = 2
@@ -767,7 +410,7 @@ struct GraphCanvas: View {
         static func < (lhs: LabelTier, rhs: LabelTier) -> Bool { lhs.rawValue < rhs.rawValue }
     }
 
-    private func labelVisible(tier: LabelTier, scale: CGFloat) -> Bool {
+    func labelVisible(tier: LabelTier, scale: CGFloat) -> Bool {
         switch tier {
         case .always:    return true
         case .project:   return scale >= 0.2
@@ -778,7 +421,7 @@ struct GraphCanvas: View {
         }
     }
 
-    private func labelFontSize(tier: LabelTier) -> CGFloat {
+    func labelFontSize(tier: LabelTier) -> CGFloat {
         switch tier {
         case .always:    return 10
         case .project:   return 13
@@ -801,7 +444,7 @@ struct GraphCanvas: View {
         let dimmed: Bool
     }
 
-    private func drawNodes(context: inout GraphicsContext, positions: [UUID: CGPoint],
+    func drawNodes(context: inout GraphicsContext, positions: [UUID: CGPoint],
                            nodes: [NodeData], hubs: Set<UUID>, edges: [EdgeData],
                            glowingNodes: [UUID: Date],
                            connectedToSelected: Set<UUID> = []) {
@@ -1005,7 +648,7 @@ struct GraphCanvas: View {
             )
             context.fill(Circle().path(in: bloomRect), with: .color(Color(red: 0.9, green: 0.15, blue: 0.1).opacity(0.4 * di)))
 
-            // Node fill: blend from red → dark/black
+            // Node fill: blend from red -> dark/black
             let rect = CGRect(x: pos.x - r, y: pos.y - r, width: r * 2, height: r * 2)
             let darkening = elapsed > Double(flashIn) ? min(1.0, (CGFloat(elapsed) - flashIn) / (hold + fadeOut)) : 0.0
             let red = Color(red: 0.9 * (1.0 - darkening * 0.8), green: 0.15 * (1.0 - darkening), blue: 0.1 * (1.0 - darkening))
@@ -1088,7 +731,7 @@ struct GraphCanvas: View {
         }
     }
 
-    private func bestLabelPlacement(anchorPos: CGPoint, clearRadius: CGFloat,
+    func bestLabelPlacement(anchorPos: CGPoint, clearRadius: CGFloat,
                                      labelSize: CGSize, placed: inout [CGRect]) -> CGRect {
         let gap: CGFloat = 5
         let r = clearRadius

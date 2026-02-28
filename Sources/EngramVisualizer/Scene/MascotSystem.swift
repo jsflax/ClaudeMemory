@@ -738,17 +738,34 @@ final class MascotSystem {
 
     /// Render info card texture using AppKit text rendering. Called only when target node changes.
     private func renderHoloTexture(info: MascotNodeInfo) {
-        let texW: CGFloat = 512
-        let texH: CGFloat = 400
-        let charsPerLine = 50
+        let texW = 512
+        let texH = 400
+        let scale = 2  // retina
+        let allocW = texW * scale
+        let allocH = texH * scale
+        let bytesPerRow = allocW * 4
 
-        // Use a flipped NSImage so drawing coordinates match UV (origin top-left)
-        let image = NSImage(size: NSSize(width: texW, height: texH))
-        image.lockFocusFlipped(true)
+        // Draw directly into a CGContext — bypasses NSImage entirely to avoid
+        // stale bitmap backing memory that NSImage.lockFocusFlipped can recycle.
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        guard let ctx = CGContext(
+            data: nil,
+            width: allocW, height: allocH,
+            bitsPerComponent: 8, bytesPerRow: bytesPerRow,
+            space: colorSpace,
+            bitmapInfo: CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.premultipliedFirst.rawValue
+        ) else { return }
 
-        // Clear to transparent
-        NSColor.clear.set()
-        NSRect(x: 0, y: 0, width: texW, height: texH).fill()
+        // Guarantee zeroed buffer
+        ctx.clear(CGRect(x: 0, y: 0, width: allocW, height: allocH))
+
+        // Flip + scale for top-left origin text drawing
+        ctx.translateBy(x: 0, y: CGFloat(allocH))
+        ctx.scaleBy(x: CGFloat(scale), y: CGFloat(-scale))
+
+        // Wrap CGContext for NSString.draw(at:withAttributes:)
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx, flipped: true)
 
         let margin: CGFloat = 32
         var y: CGFloat = 28
@@ -789,14 +806,18 @@ final class MascotSystem {
             .foregroundColor: NSColor(red: 0.65, green: 0.8, blue: 0.9, alpha: 0.85)
         ]
         let lineHeight: CGFloat = 14
-        let usableWidth = texW - margin * 2
+        let usableWidth = CGFloat(texW) - margin * 2
         let contentCharsPerLine = Int(usableWidth / 6)  // ~6pt per monospace char at size 10
-        let maxLines = Int((texH - y - 20) / lineHeight)
+        let maxLines = Int((CGFloat(texH) - y - 20) / lineHeight)
+        // Collapse newlines to spaces — draw(at:withAttributes:) renders \n as
+        // actual line breaks, which overlap with the next word-wrapped line.
         let content = info.content
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
         // Word-wrap into lines
         var lines: [String] = []
         var currentLine = ""
-        for word in content.split(separator: " ", omittingEmptySubsequences: false) {
+        for word in content.split(separator: " ", omittingEmptySubsequences: true) {
             let candidate = currentLine.isEmpty ? String(word) : currentLine + " " + word
             if candidate.count > contentCharsPerLine && !currentLine.isEmpty {
                 lines.append(currentLine)
@@ -812,32 +833,14 @@ final class MascotSystem {
             y += lineHeight
         }
 
-        image.unlockFocus()
+        NSGraphicsContext.restoreGraphicsState()
 
-        // Convert NSImage → CGImage → BGRA pixel buffer → MTLTexture
-        guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return }
-
-        let pixelW = cgImage.width
-        let pixelH = cgImage.height
-        let bytesPerRow = pixelW * 4
-
-        let colorSpace = CGColorSpaceCreateDeviceRGB()
-        guard let ctx = CGContext(
-            data: nil,
-            width: pixelW, height: pixelH,
-            bitsPerComponent: 8, bytesPerRow: bytesPerRow,
-            space: colorSpace,
-            bitmapInfo: CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.premultipliedFirst.rawValue
-        ) else { return }
-
-        // CGImage from flipped NSImage is already top-down; draw without flipping
-        ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: pixelW, height: pixelH))
-
+        // Create MTLTexture directly from CGContext pixel data
         guard let data = ctx.data else { return }
 
         let texDesc = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .bgra8Unorm,
-            width: pixelW, height: pixelH,
+            width: allocW, height: allocH,
             mipmapped: false
         )
         texDesc.usage = .shaderRead
@@ -846,7 +849,7 @@ final class MascotSystem {
         guard let texture = device.makeTexture(descriptor: texDesc) else { return }
         texture.replace(
             region: MTLRegion(origin: MTLOrigin(x: 0, y: 0, z: 0),
-                              size: MTLSize(width: pixelW, height: pixelH, depth: 1)),
+                              size: MTLSize(width: allocW, height: allocH, depth: 1)),
             mipmapLevel: 0,
             withBytes: data,
             bytesPerRow: bytesPerRow

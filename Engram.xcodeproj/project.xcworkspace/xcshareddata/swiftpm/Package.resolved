@@ -119,21 +119,12 @@
       }
     },
     {
-      "identity" : "lattice",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/jsflax/lattice",
-      "state" : {
-        "revision" : "6d88b68bd2385b3be426ae37f02e5c4193f7877e",
-        "version" : "0.5.0"
-      }
-    },
-    {
       "identity" : "latticecore",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/jsflax/LatticeCore.git",
       "state" : {
-        "revision" : "1407cb5cbd9d510d0d1b1bfd523825af9313faea",
-        "version" : "0.5.0"
+        "revision" : "011f9b9380d5f17bcdc1d13db37c67027772d7d0",
+        "version" : "0.5.1"
       }
     },
     {
