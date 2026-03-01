@@ -118,6 +118,14 @@ HOOKS_CONFIG='{
         "timeout": 5
       }]
     }],
+    "PreToolUse": [{
+      "matcher": "Agent",
+      "hooks": [{
+        "type": "command",
+        "command": "'"$INSTALL_DIR"'/memory-hooks pre-tool 2>/dev/null",
+        "timeout": 5
+      }]
+    }],
     "PreCompact": [{
       "matcher": "auto",
       "hooks": [{
@@ -138,12 +146,11 @@ HOOKS_CONFIG='{
 
 if [ -f "$SETTINGS_FILE" ]; then
     if command -v jq &>/dev/null; then
-        # Merge hooks (overwrite ours, preserve user-added), append permission if missing, remove stale PreToolUse
+        # Merge hooks (overwrite ours, preserve user-added), append permission if missing
         jq -s '
             (.[0] // {}) as $existing | (.[1] // {}) as $new |
             $existing * $new |
-            .permissions.allow = (($existing.permissions.allow // []) + ($new.permissions.allow // []) | unique) |
-            .hooks |= del(.PreToolUse)
+            .permissions.allow = (($existing.permissions.allow // []) + ($new.permissions.allow // []) | unique)
         ' "$SETTINGS_FILE" <(echo "$HOOKS_CONFIG") > "$SETTINGS_FILE.tmp"
         mv "$SETTINGS_FILE.tmp" "$SETTINGS_FILE"
         echo "Merged hooks into $SETTINGS_FILE"

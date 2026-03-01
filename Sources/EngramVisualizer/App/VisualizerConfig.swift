@@ -10,4 +10,6 @@ final class VisualizerConfig {
     var showVoids: Bool = false
     var soundEnabled: Bool = false
     var notificationsEnabled: Bool = false
+    var showActivityLog: Bool = true
+    var showDetailPanel: Bool = true
 }

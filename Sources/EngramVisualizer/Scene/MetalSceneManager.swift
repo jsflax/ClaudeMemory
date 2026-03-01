@@ -139,8 +139,17 @@ final class MetalSceneManager {
 
     // MARK: - Render Tick
 
+    #if DEBUG
+    private var lastFrameWallTime: CFAbsoluteTime = 0
+    #endif
+
     func renderTick(dt: Float) {
         renderFrameCount &+= 1
+        let frameStart = CFAbsoluteTimeGetCurrent()
+        #if DEBUG
+        let wallDt = lastFrameWallTime > 0 ? (frameStart - lastFrameWallTime) * 1000.0 : 0
+        lastFrameWallTime = frameStart
+        #endif
 
         // Input + camera
         let preInputSelection = selectedNode
@@ -154,6 +163,7 @@ final class MetalSceneManager {
         }
 
         // Tick simulation + compute positions
+        let simStart = CFAbsoluteTimeGetCurrent()
         var didUpdatePositions = false
         if let sim = simulation3D, let proj = embeddingProjection {
             sim.tick()
@@ -196,6 +206,7 @@ final class MetalSceneManager {
                 }
             }
         }
+        let simMs = (CFAbsoluteTimeGetCurrent() - simStart) * 1000.0
 
         // Consume hub toggles
         if !pendingHubToggles.isEmpty, let sim = simulation3D {
@@ -232,6 +243,7 @@ final class MetalSceneManager {
         renderer.animationTime += dt
 
         // Always update mascot — it patrols independently of scene changes
+        let mascotStart = CFAbsoluteTimeGetCurrent()
         let nodeByIdForMascot = renderStore?.nodeById ?? [:]
         var mascotNodeInfo: [UUID: MascotNodeInfo] = [:]
         if let targetId = mascot.currentTargetId, let nd = nodeByIdForMascot[targetId] {
@@ -242,6 +254,7 @@ final class MetalSceneManager {
             )
         }
         mascot.update(dt: dt, camera: camera, nodePositions: positions, nodeInfo: mascotNodeInfo)
+        let mascotMs = (CFAbsoluteTimeGetCurrent() - mascotStart) * 1000.0
 
         let isActive = sceneNeedsUpdate || cameraMoving || hasInput || !mascot.isSettled
 
@@ -251,21 +264,32 @@ final class MetalSceneManager {
             }
         }
 
+        var nodesMs = 0.0, edgesMs = 0.0, nebMs = 0.0, labelsMs = 0.0, flowMs = 0.0
+
         if sceneNeedsUpdate {
             updateExpansions(dt: dt)
+
+            let t0 = CFAbsoluteTimeGetCurrent()
             packNodeInstances()
+            nodesMs = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0
 
             // Edge and nebula packing only needed when geometry changed
             // (positions, selection, search), not for glow/arrival visual-only changes.
             if geometryChanged {
+                let t1 = CFAbsoluteTimeGetCurrent()
                 packEdgeVertices()
+                edgesMs = (CFAbsoluteTimeGetCurrent() - t1) * 1000.0
+
                 let positionOnly = positionsChanged && !selectionChanged && !searchChanged && !hasExpansions
                 if !positionOnly || renderFrameCount % 6 == 0 {
+                    let t2 = CFAbsoluteTimeGetCurrent()
                     updateNebulae()
+                    nebMs = (CFAbsoluteTimeGetCurrent() - t2) * 1000.0
                 }
             }
 
             if selectedNode != nil || renderer.actualFlowParticleCount > 0 {
+                let t3 = CFAbsoluteTimeGetCurrent()
                 flowParticles.update(
                     dt: dt,
                     selectedNode: selectedNode,
@@ -274,6 +298,7 @@ final class MetalSceneManager {
                     expandedHubs: expandedHubs,
                     renderer: renderer
                 )
+                flowMs = (CFAbsoluteTimeGetCurrent() - t3) * 1000.0
             }
 
             lastSelectedNode = selectedNode
@@ -283,7 +308,9 @@ final class MetalSceneManager {
         }
 
         if sceneNeedsUpdate || cameraMoving {
+            let t4 = CFAbsoluteTimeGetCurrent()
             packLabelInstances()
+            labelsMs = (CFAbsoluteTimeGetCurrent() - t4) * 1000.0
         }
 
         // Report camera state
@@ -293,7 +320,38 @@ final class MetalSceneManager {
             if camera.cameraTarget != camState.target { camState.target = camera.cameraTarget }
             if didUpdatePositions { camState.positions = positions }
         }
+
+        let totalMs = (CFAbsoluteTimeGetCurrent() - frameStart) * 1000.0
+        let nodeCount = positions.count
+        let edgeCount = renderEdges.count
+
+        // Write CSV for analysis — every frame when active, every 30th when idle
+        #if DEBUG
+        let reason: String
+        if positionsChanged && geometryChanged { reason = "sim" }
+        else if selectionChanged { reason = "select" }
+        else if searchChanged { reason = "search" }
+        else if visualOnlyChanged { reason = "glow" }
+        else if cameraMoving { reason = "camera" }
+        else { reason = "idle" }
+
+        if metalTimingFile == nil {
+            metalTimingFile = fopen("/tmp/metal-frame-timing.csv", "w")
+            if let f = metalTimingFile {
+                fputs("frame,dt_ms,wall_dt_ms,total_ms,sim_ms,mascot_ms,nodes_ms,edges_ms,neb_ms,labels_ms,flow_ms,node_count,edge_count,reason\n", f)
+            }
+        }
+        if let f = metalTimingFile, (isActive || renderFrameCount % 30 == 0) {
+            let line = "\(renderFrameCount),\(String(format: "%.2f", dt * 1000)),\(String(format: "%.2f", wallDt)),\(String(format: "%.2f", totalMs)),\(String(format: "%.2f", simMs)),\(String(format: "%.2f", mascotMs)),\(String(format: "%.2f", nodesMs)),\(String(format: "%.2f", edgesMs)),\(String(format: "%.2f", nebMs)),\(String(format: "%.2f", labelsMs)),\(String(format: "%.2f", flowMs)),\(nodeCount),\(edgeCount),\(reason)\n"
+            fputs(line, f)
+            fflush(f)
+        }
+        #endif
     }
+
+    #if DEBUG
+    private var metalTimingFile: UnsafeMutablePointer<FILE>? = nil
+    #endif
 
     // MARK: - Node Instance Packing
 
@@ -576,7 +634,6 @@ final class MetalSceneManager {
                     // First atlas must be synchronous — nothing to show until it's ready
                     generateLabelAtlas(nodes: nodes, hubs: hubs, projects: currentProjects)
                 } else if !isAtlasGenerating {
-                    // Subsequent rebuilds run async — old atlas stays visible until new one is ready
                     dispatchAtlasRegen(nodes: nodes, hubs: hubs, projects: currentProjects)
                 }
                 labelAtlasRegenFrame = renderFrameCount
@@ -745,8 +802,12 @@ final class MetalSceneManager {
     /// Synchronous atlas generation (used for the first atlas only).
     private func generateLabelAtlas(nodes: [NodeData], hubs: Set<UUID>, projects: Set<String>) {
         let entries = nodes.map { AtlasLabelEntry(id: $0.id, label: $0.label, isHub: hubs.contains($0.id)) }
+        let monoMedium: CTFont = NSFont.monospacedSystemFont(ofSize: 28, weight: .medium) as CTFont
+        let monoBold: CTFont = NSFont.monospacedSystemFont(ofSize: 28, weight: .bold) as CTFont
+        let projCTFont: CTFont = NSFont.systemFont(ofSize: 40, weight: .bold) as CTFont
         guard let result = Self.renderLabelAtlas(
-            entries: entries, sortedProjects: projects.sorted(), device: renderer.device
+            entries: entries, sortedProjects: projects.sorted(), device: renderer.device,
+            monoMedium: monoMedium, monoBold: monoBold, projFont: projCTFont
         ) else { return }
         applyAtlasResult(result, nodeIds: Set(nodes.map(\.id)), hubs: hubs, projects: projects)
         frameLog.info("[labelAtlas] \(result.nodeRects.count) node + \(result.projectRects.count) project labels, \(result.allocW/2)x\(result.allocH/2)")
@@ -762,15 +823,43 @@ final class MetalSceneManager {
         let capturedHubs = hubs
         let capturedProjects = projects
 
+        // Create fonts on the main thread (NSFont is safe here), then pass CTFont refs
+        // to the background. CTFont is immutable and thread-safe; this avoids NSFont
+        // shared cache lock contention from the background thread.
+        let monoMedium: CTFont = NSFont.monospacedSystemFont(ofSize: 28, weight: .medium) as CTFont
+        let monoBold: CTFont = NSFont.monospacedSystemFont(ofSize: 28, weight: .bold) as CTFont
+        let projCTFont: CTFont = NSFont.systemFont(ofSize: 40, weight: .bold) as CTFont
+
+        #if DEBUG
+        let dispatchFrame = renderFrameCount
+        #endif
+
         Task.detached(priority: .userInitiated) { [weak self] in
-            let result = Self.renderLabelAtlas(entries: entries, sortedProjects: sortedProjects, device: device)
+            #if DEBUG
+            let bgStart = CFAbsoluteTimeGetCurrent()
+            #endif
+            let result = Self.renderLabelAtlas(
+                entries: entries, sortedProjects: sortedProjects, device: device,
+                monoMedium: monoMedium, monoBold: monoBold, projFont: projCTFont
+            )
+            #if DEBUG
+            let bgMs = (CFAbsoluteTimeGetCurrent() - bgStart) * 1000.0
+            #endif
             await MainActor.run { [weak self] in
                 guard let self else { return }
                 if let result {
                     self.applyAtlasResult(result, nodeIds: capturedNodeIds, hubs: capturedHubs, projects: capturedProjects)
-                    frameLog.info("[labelAtlas] async regen: \(result.nodeRects.count) node + \(result.projectRects.count) project labels")
                 }
                 self.isAtlasGenerating = false
+                #if DEBUG
+                let msg = "dispatched=frame\(dispatchFrame) bg=\(String(format: "%.1f", bgMs))ms currentFrame=\(self.renderFrameCount)\n"
+                if let data = msg.data(using: .utf8) {
+                    let url = URL(fileURLWithPath: "/tmp/atlas-timing.log")
+                    if let fh = try? FileHandle(forWritingTo: url) {
+                        fh.seekToEndOfFile(); fh.write(data); fh.closeFile()
+                    } else { try? data.write(to: url) }
+                }
+                #endif
             }
         }
     }
@@ -787,44 +876,67 @@ final class MetalSceneManager {
         labelAtlasProjects = projects
     }
 
-    /// Pure rendering work — can run on any thread. CoreText (via NSString.draw) is thread-safe.
+    /// Pure rendering work — can run on any thread.
+    /// Uses CoreText (CTLine) + CGContext directly — no AppKit (NSGraphicsContext/NSString.draw)
+    /// to avoid internal AppKit lock contention with the main thread.
+    /// Fonts are pre-created on the main thread and passed in (CTFont is immutable, thread-safe).
     nonisolated private static func renderLabelAtlas(
-        entries: [AtlasLabelEntry], sortedProjects: [String], device: MTLDevice
+        entries: [AtlasLabelEntry], sortedProjects: [String], device: MTLDevice,
+        monoMedium: CTFont, monoBold: CTFont, projFont: CTFont
     ) -> AtlasResult? {
         let atlasW = 4096
         let padding: CGFloat = 4
-        let fontSize: CGFloat = 28
-        let projFontSize: CGFloat = 40
 
-        struct LabelSize { let width: CGFloat; let height: CGFloat }
-        var nodeSizes: [LabelSize] = []
-        nodeSizes.reserveCapacity(entries.count)
-        for entry in entries {
-            let weight: NSFont.Weight = entry.isHub ? .bold : .medium
-            let font = NSFont.monospacedSystemFont(ofSize: fontSize, weight: weight)
-            let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: NSColor.white]
-            let size = (entry.label as NSString).size(withAttributes: attrs)
-            nodeSizes.append(LabelSize(width: ceil(size.width) + padding * 2, height: ceil(size.height) + padding))
+        // --- Pure CoreText measurement + line creation (no AppKit calls) ---
+        let white = CGColor(red: 1, green: 1, blue: 1, alpha: 1)
+
+        func makeLine(_ text: String, font: CTFont) -> (line: CTLine, width: CGFloat, ascent: CGFloat, descent: CGFloat, leading: CGFloat) {
+            let attrs: [CFString: Any] = [
+                kCTFontAttributeName: font,
+                kCTForegroundColorAttributeName: white
+            ]
+            let attrStr = CFAttributedStringCreate(nil, text as CFString, attrs as CFDictionary)!
+            let line = CTLineCreateWithAttributedString(attrStr)
+            var ascent: CGFloat = 0, descent: CGFloat = 0, leading: CGFloat = 0
+            let width = CGFloat(CTLineGetTypographicBounds(line, &ascent, &descent, &leading))
+            return (line, width, ascent, descent, leading)
         }
 
-        let projFont = NSFont.systemFont(ofSize: projFontSize, weight: .bold)
-        let projAttrs: [NSAttributedString.Key: Any] = [.font: projFont, .foregroundColor: NSColor.white]
-        var projSizes: [LabelSize] = []
+        struct LabelSize { let width: CGFloat; let height: CGFloat }
+        struct LabelInfo { let line: CTLine; let size: LabelSize; let ascent: CGFloat }
+
+        // Measure node labels
+        var nodeInfos: [LabelInfo] = []
+        nodeInfos.reserveCapacity(entries.count)
+        for entry in entries {
+            let font = entry.isHub ? monoBold : monoMedium
+            let m = makeLine(entry.label, font: font)
+            let w = ceil(m.width) + padding * 2
+            let h = ceil(m.ascent + m.descent + m.leading) + padding
+            nodeInfos.append(LabelInfo(line: m.line, size: LabelSize(width: w, height: h), ascent: m.ascent))
+        }
+
+        // Measure project labels
+        var projInfos: [LabelInfo] = []
         for project in sortedProjects {
-            let size = (project as NSString).size(withAttributes: projAttrs)
-            projSizes.append(LabelSize(width: ceil(size.width) + padding * 2, height: ceil(size.height) + padding))
+            let m = makeLine(project, font: projFont)
+            let w = ceil(m.width) + padding * 2
+            let h = ceil(m.ascent + m.descent + m.leading) + padding
+            projInfos.append(LabelInfo(line: m.line, size: LabelSize(width: w, height: h), ascent: m.ascent))
         }
 
         // Simulate packing
         var cursorX: CGFloat = 2
         var cursorY: CGFloat = 0
         var rowHeight: CGFloat = 0
-        for s in nodeSizes {
+        for info in nodeInfos {
+            let s = info.size
             if cursorX + s.width > CGFloat(atlasW) { cursorX = 2; cursorY += rowHeight + padding; rowHeight = 0 }
             cursorX += s.width + padding; rowHeight = max(rowHeight, s.height)
         }
         cursorX = 2; cursorY += rowHeight + padding; rowHeight = 0
-        for s in projSizes {
+        for info in projInfos {
+            let s = info.size
             if cursorX + s.width > CGFloat(atlasW) { cursorX = 2; cursorY += rowHeight + padding; rowHeight = 0 }
             cursorX += s.width + padding; rowHeight = max(rowHeight, s.height)
         }
@@ -852,24 +964,25 @@ final class MetalSceneManager {
         ctx.translateBy(x: 0, y: CGFloat(allocH))
         ctx.scaleBy(x: CGFloat(scale), y: CGFloat(-scale))
 
-        // Draw node labels
+        // Draw node labels using CTLineDraw (no AppKit locks)
         var rects: [UUID: (u0: Float, v0: Float, u1: Float, v1: Float)] = [:]
         cursorX = 2; cursorY = 0; rowHeight = 0
 
         for (i, entry) in entries.enumerated() {
-            let s = nodeSizes[i]
+            let info = nodeInfos[i]
+            let s = info.size
             if cursorX + s.width > CGFloat(atlasW) { cursorX = 2; cursorY += rowHeight + padding; rowHeight = 0 }
             if cursorY + s.height > CGFloat(uvAtlasH) { break }
 
-            let weight: NSFont.Weight = entry.isHub ? .bold : .medium
-            let font = NSFont.monospacedSystemFont(ofSize: fontSize, weight: weight)
-            let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: NSColor.white]
-
-            let drawPoint = CGPoint(x: cursorX + padding, y: cursorY + padding * 0.5)
-            NSGraphicsContext.saveGraphicsState()
-            NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx, flipped: true)
-            (entry.label as NSString).draw(at: drawPoint, withAttributes: attrs)
-            NSGraphicsContext.restoreGraphicsState()
+            // CTLineDraw renders glyphs upward from baseline, but the CGContext has
+            // a negative y-scale (flipped). Locally unflip at the draw point so text
+            // renders right-side up, then restore.
+            ctx.saveGState()
+            ctx.translateBy(x: cursorX + padding, y: cursorY + padding * 0.5 + info.ascent)
+            ctx.scaleBy(x: 1, y: -1)
+            ctx.textPosition = .zero
+            CTLineDraw(info.line, ctx)
+            ctx.restoreGState()
 
             rects[entry.id] = (
                 Float(cursorX) / Float(uvAtlasW), Float(cursorY) / Float(uvAtlasH),
@@ -878,20 +991,22 @@ final class MetalSceneManager {
             cursorX += s.width + padding; rowHeight = max(rowHeight, s.height)
         }
 
-        // Draw project labels
+        // Draw project labels using CTLineDraw (no AppKit locks)
         var projRects: [String: (u0: Float, v0: Float, u1: Float, v1: Float)] = [:]
         cursorX = 2; cursorY += rowHeight + padding; rowHeight = 0
 
         for (i, project) in sortedProjects.enumerated() {
-            let s = projSizes[i]
+            let info = projInfos[i]
+            let s = info.size
             if cursorX + s.width > CGFloat(atlasW) { cursorX = 2; cursorY += rowHeight + padding; rowHeight = 0 }
             if cursorY + s.height > CGFloat(uvAtlasH) { break }
 
-            let drawPoint = CGPoint(x: cursorX + padding, y: cursorY + padding * 0.5)
-            NSGraphicsContext.saveGraphicsState()
-            NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx, flipped: true)
-            (project as NSString).draw(at: drawPoint, withAttributes: projAttrs)
-            NSGraphicsContext.restoreGraphicsState()
+            ctx.saveGState()
+            ctx.translateBy(x: cursorX + padding, y: cursorY + padding * 0.5 + info.ascent)
+            ctx.scaleBy(x: 1, y: -1)
+            ctx.textPosition = .zero
+            CTLineDraw(info.line, ctx)
+            ctx.restoreGState()
 
             projRects[project] = (
                 Float(cursorX) / Float(uvAtlasW), Float(cursorY) / Float(uvAtlasH),

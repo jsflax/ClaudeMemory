@@ -109,9 +109,10 @@ final class GraphRenderStore {
     var searchMatchIds: Set<UUID> = []
     var isSearchActive: Bool = false
 
-    // Batched observer coalescing — accumulates inserts and flushes once per run loop iteration.
-    var pendingNodeInserts: [Int64] = []
-    var pendingEdgeInserts: [Int64] = []
+    // Batched observer coalescing — accumulates inserts (pre-built on background thread)
+    // and flushes once per run loop iteration. No Lattice reads on main thread.
+    var pendingNodeInserts: [(pk: Int64, node: NodeData)] = []
+    var pendingEdgeInserts: [(pk: Int64, edge: EdgeData)] = []
     var pendingNodeFlush: Task<Void, Never>?
     var pendingEdgeFlush: Task<Void, Never>?
 }

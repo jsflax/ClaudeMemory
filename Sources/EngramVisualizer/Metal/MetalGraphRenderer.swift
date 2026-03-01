@@ -245,8 +245,8 @@ final class MetalGraphRenderer: NSObject {
 
     func ensureNodeBuffers(nodeCount: Int) {
         guard nodeCount > 0, vertsPerSphere > 0 else { return }
+        guard nodeCount > nodeVertexCapacity else { return }
         let needed = max(nodeCount * 2, 512)
-        guard needed > nodeVertexCapacity else { return }
 
         let totalVerts = needed * vertsPerSphere
         let totalIndices = needed * indicesPerSphere
@@ -287,9 +287,10 @@ final class MetalGraphRenderer: NSObject {
     func ensureEdgeBuffers(edgeCount: Int) {
         let vertsPerEdge = 12
         let indicesPerEdge = 36
+        guard edgeCount > edgeVertexCapacity else { return }
         let needed = max(edgeCount * 2, 2048)
 
-        if needed > edgeVertexCapacity {
+        if true {
             let totalVerts = needed * vertsPerEdge
             let totalIndices = needed * indicesPerEdge
 
@@ -546,6 +547,10 @@ final class MetalGraphRenderer: NSObject {
 
         return (vertices, indices)
     }
+
+    #if DEBUG
+    var drawTimingFile: UnsafeMutablePointer<FILE>? = nil
+    #endif
 }
 
 // MARK: - MTKViewDelegate
@@ -570,11 +575,23 @@ extension MetalGraphRenderer: MTKViewDelegate {
         animationTime += dtSec
         frameCount &+= 1
 
+        #if DEBUG
+        let drawStart = CFAbsoluteTimeGetCurrent()
+        #endif
+
         // Let the scene manager do its per-frame work (input, simulation, data packing)
         onFrameCallback?(dtSec)
 
+        #if DEBUG
+        let afterCallback = CFAbsoluteTimeGetCurrent()
+        #endif
+
         // Wait for a free frame slot
         bufferPool.waitForNextFrame()
+
+        #if DEBUG
+        let afterWait = CFAbsoluteTimeGetCurrent()
+        #endif
 
         guard let drawable = view.currentDrawable,
               drawable.texture.width > 0,
@@ -787,5 +804,24 @@ extension MetalGraphRenderer: MTKViewDelegate {
             pool.signalFrameComplete()
         }
         commandBuffer.commit()
+
+        #if DEBUG
+        let drawEnd = CFAbsoluteTimeGetCurrent()
+        let callbackMs = (afterCallback - drawStart) * 1000.0
+        let waitMs = (afterWait - afterCallback) * 1000.0
+        let encodeMs = (drawEnd - afterWait) * 1000.0
+        let totalDrawMs = (drawEnd - drawStart) * 1000.0
+        if drawTimingFile == nil {
+            drawTimingFile = fopen("/tmp/draw-timing.csv", "w")
+            if let f = drawTimingFile {
+                fputs("frame,total_draw_ms,callback_ms,wait_ms,encode_ms\n", f)
+            }
+        }
+        if let f = drawTimingFile {
+            let line = "\(frameCount),\(String(format: "%.2f", totalDrawMs)),\(String(format: "%.2f", callbackMs)),\(String(format: "%.2f", waitMs)),\(String(format: "%.2f", encodeMs))\n"
+            fputs(line, f)
+            fflush(f)
+        }
+        #endif
     }
 }

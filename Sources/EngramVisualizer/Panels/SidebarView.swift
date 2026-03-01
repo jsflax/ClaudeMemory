@@ -415,6 +415,23 @@ struct SidebarView: View {
                 }
             }
 
+            section("Panels") {
+                toggleRow(
+                    "Activity Log",
+                    icon: config.showActivityLog ? "list.bullet.rectangle" : "list.bullet.rectangle",
+                    isOn: config.showActivityLog
+                ) {
+                    config.showActivityLog.toggle()
+                }
+                toggleRow(
+                    "Detail Panel",
+                    icon: config.showDetailPanel ? "sidebar.trailing" : "sidebar.trailing",
+                    isOn: config.showDetailPanel
+                ) {
+                    config.showDetailPanel.toggle()
+                }
+            }
+
             section("Audio") {
                 toggleRow(
                     "Sound Effects",

@@ -26,23 +26,37 @@ struct Advise: AsyncParsableCommand {
             return
         }
 
-        guard let prompt = input.prompt, !prompt.isEmpty else { return }
+        guard let prompt = input.prompt, !prompt.isEmpty else {
+            hookLog("Advise: empty or nil prompt, skipping")
+            return
+        }
 
         let project = projectName(from: input.cwd)
         let proj = project ?? "unknown"
+        hookLog("Advise: project=\(proj), prompt=\(String(prompt.prefix(80)))...")
 
         var sections: [String] = []
 
         // Recall relevant memories
         if let tools = await initMemoryTools() {
-            if let result = try await tools.directRecall(
-                query: prompt,
-                project: project,
-                depth: 1,
-                limit: 5
-            ) {
-                sections.append("## Relevant memories\n\n\(result)")
+            hookLog("Advise: initialized memory tools, running directRecall")
+            do {
+                if let result = try await tools.directRecall(
+                    query: prompt,
+                    project: project,
+                    depth: 1,
+                    limit: 5
+                ) {
+                    hookLog("Advise: recall returned \(result.count) chars")
+                    sections.append("## Relevant memories\n\n\(result)")
+                } else {
+                    hookLog("Advise: recall returned nil")
+                }
+            } catch {
+                hookLog("Advise: recall failed: \(error)")
             }
+        } else {
+            hookLog("Advise: failed to initialize memory tools")
         }
 
         // Spawn maintenance subprocess if threshold crossed (fire-and-forget)

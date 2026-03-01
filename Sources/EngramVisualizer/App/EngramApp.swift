@@ -84,6 +84,27 @@ struct EngramApp: App {
         }
 
         Task.detached { CLIInstaller.syncIfNeeded() }
+
+        // Test hook: insert a test memory after a delay for jitter profiling
+        if let delayStr = ProcessInfo.processInfo.environment["ENGRAM_TEST_INSERT_DELAY"],
+           let delay = Double(delayStr) {
+            let ref = local.sendableReference
+            Task { @ForceSimulatorActor in
+                let bg = ref.resolve()!
+                try? await Task.sleep(for: .seconds(delay))
+                let m = Memory()
+                m.content = "UI test memory inserted at \(Date()) for jitter profiling"
+                m.project = "Engram"
+                m.topic = "profiling"
+                m.importance = 3
+                m.embedding = Vector<Float>([Float](repeating: 0.01, count: 384))
+                m.createdAt = Date()
+                m.lastAccessedAt = Date()
+                bg.add(m)
+                try? await Task.sleep(for: .seconds(3))
+                bg.delete(m)
+            }
+        }
     }
 
     var body: some Scene {

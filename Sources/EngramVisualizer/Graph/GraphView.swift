@@ -6,6 +6,9 @@ import UniformTypeIdentifiers
 import AppKit
 import simd
 import UserNotifications
+import os
+
+private let bodyLog = Logger(subsystem: "io.engram.app", category: "GraphViewBody")
 typealias MemoryEdge = EngramKit.Edge
 
 // MARK: - Root view (owns data store, simulation, and state)
@@ -82,6 +85,7 @@ struct GraphView: View {
     // MARK: - Body
 
     var body: some View {
+        let _ = bodyLog.warning("[BODY-EVAL] GraphView.body evaluated at frame \(CFAbsoluteTimeGetCurrent())")
         GeometryReader { geo in
             graphContent(size: geo.size)
                 .onChange(of: geo.size, initial: true) { _, newSize in
@@ -259,20 +263,22 @@ struct GraphView: View {
     @ViewBuilder
     private func graphOverlays(size: CGSize, colorMap: [String: Color]) -> some View {
         // Right column: activity log
-        VStack(alignment: .trailing, spacing: 8) {
-            if selectedMemoryId == nil {
-                ActivityLogPanel(
-                    renderStore: renderStore,
-                    onSelect: { id in selectedMemoryId = id }
-                )
-                .transition(.opacity)
-            }
+        if config.showActivityLog {
+            VStack(alignment: .trailing, spacing: 8) {
+                if selectedMemoryId == nil {
+                    ActivityLogPanel(
+                        renderStore: renderStore,
+                        onSelect: { id in selectedMemoryId = id }
+                    )
+                    .transition(.opacity)
+                }
 
-            Spacer()
+                Spacer()
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .trailing)
+            .animation(.easeInOut(duration: 0.25), value: selectedMemoryId == nil)
         }
-        .padding(12)
-        .frame(maxWidth: .infinity, alignment: .trailing)
-        .animation(.easeInOut(duration: 0.25), value: selectedMemoryId == nil)
 
         // Top bar: search (offset right to clear sidebar toggle + traffic lights)
         VStack {
@@ -296,15 +302,10 @@ struct GraphView: View {
                 Spacer()
                 HStack {
                     MinimapView(
-                        filteredNodes: renderStore.nodes,
-                        hubs: renderStore.hubs,
-                        glowingNodes: renderStore.glowingNodes,
-                        newNodes: renderStore.newNodeGlows,
-                        dyingNodes: renderStore.dyingNodes,
+                        renderStore: renderStore,
                         simulation: simulation,
                         viewport: viewport,
                         viewportSize: size,
-                        colorMap: colorMap,
                         pipAction: { minimapDetached = true },
                         camera3DState: config.dimensionMode == .threeD ? camera3DState : nil
                     )
@@ -343,7 +344,7 @@ struct GraphView: View {
 
     @ViewBuilder
     private func detailPanel(size: CGSize, colorMap: [String: Color]) -> some View {
-        if let memory = selectedMemory {
+        if config.showDetailPanel, let memory = selectedMemory {
             let sid = selectedMemoryId!
             let count = renderStore.edgeCountByNode[sid] ?? 0
             MemoryDetailPanel(
@@ -364,15 +365,10 @@ struct GraphView: View {
 
     private func floatingMinimap(size: CGSize, colorMap: [String: Color]) -> some View {
         MinimapView(
-            filteredNodes: renderStore.nodes,
-            hubs: renderStore.hubs,
-            glowingNodes: renderStore.glowingNodes,
-            newNodes: renderStore.newNodeGlows,
-            dyingNodes: renderStore.dyingNodes,
+            renderStore: renderStore,
             simulation: simulation,
             viewport: viewport,
             viewportSize: size,
-            colorMap: colorMap,
             pipAction: { minimapPanel.animatedDismiss { minimapDetached = false } },
             isFloating: true,
             camera3DState: config.dimensionMode == .threeD ? camera3DState : nil

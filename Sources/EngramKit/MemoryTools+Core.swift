@@ -151,13 +151,13 @@ extension MemoryTools {
             let candidates = lattice.objects(Memory.self)
                 .where { $0.expiresAt > Date() && $0.topic != "episode" }
                 .where { $0.project == project || $0.project == "global" }
-                .nearest(to: embeddingVec, on: \.embedding, limit: 8, distance: .cosine)
+                .nearest(to: embeddingVec, on: \.embedding, limit: 8, distance: .l2)
 
             // Conflict detection (unchanged behavior, just nested under force guard)
             if a.force != true {
                 let conflicts = candidates.filter { match in
                     let sameProject = match.object.project == project
-                    let threshold = sameProject ? 0.12 : 0.05
+                    let threshold = sameProject ? 0.49 : 0.316  // L2 equivalents of cosine 0.12/0.05
                     guard match.distance < threshold else { return false }
                     return jaccardSimilarity(content, match.object.content) >= 0.4
                 }
@@ -182,8 +182,8 @@ extension MemoryTools {
             // Gather auto-connect candidates (beyond conflict zone, within relatedness threshold)
             autoConnectCandidates = candidates.compactMap { match in
                 let sameProject = match.object.project == project
-                let conflictThreshold = sameProject ? 0.12 : 0.05
-                guard match.distance >= conflictThreshold && match.distance < 0.20 else { return nil }
+                let conflictThreshold = sameProject ? 0.49 : 0.316  // L2 equivalents of cosine 0.12/0.05
+                guard match.distance >= conflictThreshold && match.distance < 0.632 else { return nil }  // L2 of cosine 0.20
                 return (object: match.object, distance: match.distance)
             }
             autoConnectCandidates.sort { $0.distance < $1.distance }
@@ -435,21 +435,16 @@ extension MemoryTools {
             results = results.where { $0.createdAt <= beforeDate }
         }
 
-        // FTS5 query: extract content words via NLTagger, fall back to raw split
-        let contentWords = Self.extractContentWords(from: query)
-        let ftsTerms = contentWords.isEmpty ? query.split(separator: " ").map(String.init) : contentWords
-        let ftsQuery: TextQuery = ._anyOf(ftsTerms)
-
-        // Semantic search with vector similarity
+        // Vector-first recall: L2 KNN uses the native vec0 index (O(log n)).
+        // Embeddings are normalized so L2 and cosine give equivalent rankings.
+        // FTS5 is only used as a degraded fallback when the embedding model is unavailable.
         if let queryEmbedding = try await embedder.embed(text: query) {
             // Soft project boost: fetch wider net, then re-rank
             let fetchLimit = projectFilter != nil ? limit * 3 : limit
             let embedding = Vector<Float>(queryEmbedding)
 
-            // Hybrid: FTS5 (any term) intersected with vector similarity
             let nearest = results
-                .matching(ftsQuery, on: \.content)
-                .nearest(to: embedding, on: \.embedding, limit: fetchLimit, distance: .cosine)
+                .nearest(to: embedding, on: \.embedding, limit: fetchLimit, distance: .l2)
 
             if nearest.isEmpty {
                 return CallTool.Result(content: [.text("No memories found.")], isError: false)
@@ -457,9 +452,9 @@ extension MemoryTools {
 
             // Apply soft project boosting and reinforcement scoring on distances
             let now = Date()
-            let boosted: [(object: Memory, distance: Double, ftsRank: Double?)] = nearest.map { match in
+            let boosted: [(object: Memory, distance: Double)] = nearest.map { match in
                 let m = match.object
-                let cosine = match.distances["embedding"] ?? match.distance
+                let l2Dist = match.distances["embedding"] ?? match.distance
 
                 // Project boost
                 let projectBoost: Double
@@ -491,8 +486,8 @@ extension MemoryTools {
                     ? 1.0 + min((daysSinceCreation - 14.0) / 180.0 * 0.20, 0.20)
                     : 1.0
 
-                let distance = cosine * projectBoost * frequencyBoost * importanceBoost * recencyBoost * stalenessPenalty
-                return (object: m, distance: distance, ftsRank: match.distances["content"])
+                let distance = l2Dist * projectBoost * frequencyBoost * importanceBoost * recencyBoost * stalenessPenalty
+                return (object: m, distance: distance)
             }
 
             // Re-sort by boosted distance and take top `limit`
@@ -523,18 +518,17 @@ extension MemoryTools {
                 let m = match.object
                 guard let mId = m.primaryKey else { return nil }
                 let dist = String(format: "%.3f", match.distance)
-                let ftsInfo = match.ftsRank.map { ", fts5: \(String(format: "%.3f", $0))" } ?? ""
                 let impInfo = m.importance > 0 ? ", importance: \(m.importance)" : ""
                 let expires = m.expiresAt == .distantFuture ? "" : ", expires: \(Self.dateFormatter.string(from: m.expiresAt))"
                 let created = hasTemporalFilter ? ", created: \(Self.dateFormatter.string(from: m.createdAt))" : ""
-                return "[id:\(mId)] [\(m.project)/\(m.topic)] (distance: \(dist)\(ftsInfo)\(impInfo)\(expires)\(created)) \(m.content)"
+                return "[id:\(mId)] [\(m.project)/\(m.topic)] (distance: \(dist)\(impInfo)\(expires)\(created)) \(m.content)"
             }
 
             var output = lines.joined(separator: "\n\n")
 
             // Knowledge gap detection — signal when recall results are weak
             let avgDistance = filtered.map(\.distance).reduce(0, +) / Double(max(filtered.count, 1))
-            if avgDistance > 0.07 {
+            if avgDistance > 0.374 {  // L2 equivalent of cosine 0.07 for normalized vectors
                 output = "⚠️ Weak recall (avg distance: \(String(format: "%.3f", avgDistance)), count: \(filtered.count)). Results may not be closely related to the query.\n\n" + output
             }
 
@@ -600,6 +594,9 @@ extension MemoryTools {
             return CallTool.Result(content: [.text(output)], isError: false)
         } else {
             // Degraded mode: FTS5 full-text search (no embedding model loaded)
+            let contentWords = Self.extractContentWords(from: query)
+            let ftsTerms = contentWords.isEmpty ? query.split(separator: " ").map(String.init) : contentWords
+            let ftsQuery: TextQuery = ._anyOf(ftsTerms)
             if let projectFilter {
                 results = results.where { $0.project == projectFilter || $0.project == "global" }
             }
@@ -745,7 +742,7 @@ extension MemoryTools {
                 throw MCPError.internalError("Failed to generate embedding for query")
             }
             let nearest = results
-                .nearest(to: Vector<Float>(queryEmbedding), on: \.embedding, limit: 1, distance: .cosine)
+                .nearest(to: Vector<Float>(queryEmbedding), on: \.embedding, limit: 1, distance: .l2)
             guard let match = nearest.first else {
                 return CallTool.Result(content: [.text("No matching memory found to update.")], isError: false)
             }

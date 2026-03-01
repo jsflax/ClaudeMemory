@@ -6,15 +6,10 @@ private let minimapLog = Logger(subsystem: "com.claudememory.visualizer", catego
 // MARK: - Minimap
 
 struct MinimapView: View {
-    let filteredNodes: [NodeData]
-    let hubs: Set<UUID>
-    let glowingNodes: [UUID: Date]
-    let newNodes: [UUID: Date]
-    let dyingNodes: [UUID: DyingNode]
+    let renderStore: GraphRenderStore
     let simulation: ForceSimulation
     let viewport: ViewportState
     let viewportSize: CGSize
-    let colorMap: [String: Color]
     var pipAction: (() -> Void)?
     var isFloating: Bool = false
 
@@ -33,8 +28,11 @@ struct MinimapView: View {
     private let inlineSize = CGSize(width: 160, height: 120)
 
     var body: some View {
-        let nodes = filteredNodes
-        let hubIds = hubs
+        // Read from renderStore each evaluation — renderStore is a plain class, so SwiftUI
+        // won't observe it, but the 10fps timer bumps frameCount which forces Canvas redraws
+        // that read current values from renderStore.
+        let nodes = renderStore.nodes
+        let hubIds = renderStore.hubs
         ZStack(alignment: .topTrailing) {
             minimapCanvas(nodes: nodes, hubIds: hubIds)
 
@@ -70,9 +68,10 @@ struct MinimapView: View {
         .shadow(color: .black.opacity(isFloating ? 0.5 : 0), radius: 12)
         .onHover { isHovered = $0 }
         .onReceive(timer) { _ in
-            if camera3DState != nil || simulation.isActive || !glowingNodes.isEmpty || !newNodes.isEmpty || !dyingNodes.isEmpty {
-                frameCount &+= 1
-            }
+            // Always tick — 10fps is trivial. Ensures Canvas reads fresh renderStore data
+            // (glowingNodes, newNodeGlows, dyingNodes, nodes) every frame.
+            // The old condition checked captured `let` values that were stale at construction.
+            frameCount &+= 1
         }
     }
 
@@ -98,8 +97,8 @@ struct MinimapView: View {
             let bounds = computeBounds(positions: positions)
             let mapScale = min(size.width / bounds.width, size.height / bounds.height)
 
-            let glows = glowingNodes
-            let arrivals = newNodes
+            let glows = renderStore.glowingNodes
+            let arrivals = renderStore.newNodeGlows
             let now = Date()
             struct MiniDot {
                 let mx: CGFloat; let my: CGFloat; let dotSize: CGFloat
@@ -111,7 +110,7 @@ struct MinimapView: View {
                 guard let pos = positions[node.id] else { continue }
                 let mx = (pos.x - bounds.minX) * mapScale
                 let my = (pos.y - bounds.minY) * mapScale
-                let color = GraphView.projectColor(for: node.project, in: colorMap)
+                let color = GraphView.projectColor(for: node.project, in: renderStore.colorMap)
                 let isHub = hubIds.contains(node.id)
                 let dotSize: CGFloat = (isHub ? 4 : 2.5) * dotScale
                 let ri: CGFloat
@@ -170,7 +169,7 @@ struct MinimapView: View {
             }
 
             // Dying node ghosts (red to black fade-out) — 2D only, ghosts store CGPoint positions
-            let dying = is3D ? [:] : dyingNodes
+            let dying: [UUID: DyingNode] = is3D ? [:] : renderStore.dyingNodes
             for (_, ghost) in dying {
                 let elapsed = now.timeIntervalSince(ghost.startTime)
                 let flashIn: CGFloat = 0.3, hold: CGFloat = 1.2, fadeOutD: CGFloat = 1.5

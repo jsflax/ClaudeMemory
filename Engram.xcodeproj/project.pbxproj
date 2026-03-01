@@ -15,6 +15,8 @@
 		A1B2C3D400000000000004 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = D4E5F60000000000000003 /* Sparkle */; };
 		A1B2C3D400000000000005 /* GoogleSignIn in Frameworks */ = {isa = PBXBuildFile; productRef = D4E5F60000000000000004 /* GoogleSignIn */; };
 		A1B2C3D400000000000006 /* GoogleSignInSwift in Frameworks */ = {isa = PBXBuildFile; productRef = D4E5F60000000000000005 /* GoogleSignInSwift */; };
+		UITEST00000000000000101 /* EngramKit in Frameworks */ = {isa = PBXBuildFile; productRef = UITEST00000000000000201 /* EngramKit */; };
+		UITEST00000000000000102 /* Lattice in Frameworks */ = {isa = PBXBuildFile; productRef = UITEST00000000000000202 /* Lattice */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -28,6 +30,7 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
+		534194632F53B3D000537D6F /* Engram.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = Engram.entitlements; sourceTree = "<group>"; };
 		53E92B8C2F4924860006B3B2 /* Engram.icon */ = {isa = PBXFileReference; lastKnownFileType = folder.iconcomposer.icon; path = Engram.icon; sourceTree = "<group>"; };
 		B2C3D4E500000000000001 /* RealityKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = RealityKit.framework; path = System/Library/Frameworks/RealityKit.framework; sourceTree = SDKROOT; };
 		B2C3D4E500000000000002 /* Engram.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Engram.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -66,6 +69,8 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				UITEST00000000000000101 /* EngramKit in Frameworks */,
+				UITEST00000000000000102 /* Lattice in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -75,6 +80,7 @@
 		F6A1B2C300000000000001 = {
 			isa = PBXGroup;
 			children = (
+				534194632F53B3D000537D6F /* Engram.entitlements */,
 				C3D4E5F600000000000001 /* Sources/EngramVisualizer */,
 				UITEST00000000000000020 /* EngramUITests */,
 				F6A1B2C300000000000002 /* Frameworks */,
@@ -147,6 +153,10 @@
 				UITEST00000000000000020 /* EngramUITests */,
 			);
 			name = EngramUITests;
+			packageProductDependencies = (
+				UITEST00000000000000201 /* EngramKit */,
+				UITEST00000000000000202 /* Lattice */,
+			);
 			productName = EngramUITests;
 			productReference = UITEST00000000000000010 /* EngramUITests.xctest */;
 			productType = "com.apple.product-type.bundle.ui-testing";
@@ -273,9 +283,12 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = Engram;
+				CODE_SIGN_ENTITLEMENTS = Engram.entitlements;
+				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 5Q68UZPXQG;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Sources/EngramVisualizer/Info.plist;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
@@ -299,9 +312,12 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = Engram;
+				CODE_SIGN_ENTITLEMENTS = Engram.entitlements;
+				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 5Q68UZPXQG;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Sources/EngramVisualizer/Info.plist;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
@@ -328,6 +344,7 @@
 				CURRENT_PROJECT_VERSION = 1;
 				GENERATE_INFOPLIST_FILE = YES;
 				MARKETING_VERSION = 1.0;
+				OTHER_SWIFT_FLAGS = "-cxx-interoperability-mode=default";
 				PRODUCT_BUNDLE_IDENTIFIER = io.engram.app.uitests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = NO;
@@ -343,6 +360,7 @@
 				CURRENT_PROJECT_VERSION = 1;
 				GENERATE_INFOPLIST_FILE = YES;
 				MARKETING_VERSION = 1.0;
+				OTHER_SWIFT_FLAGS = "-cxx-interoperability-mode=default";
 				PRODUCT_BUNDLE_IDENTIFIER = io.engram.app.uitests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = NO;
@@ -436,6 +454,14 @@
 		D4E5F60000000000000006 /* EngramFoundationModels */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = EngramFoundationModels;
+		};
+		UITEST00000000000000201 /* EngramKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = EngramKit;
+		};
+		UITEST00000000000000202 /* Lattice */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = Lattice;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

@@ -1198,7 +1198,8 @@ import Foundation
     ))
     let output = text(from: result)
     #expect(output.contains("handleRecall"))
-    #expect(output.contains("fts5:"))
+    // Vector-only recall (L2 KNN) — no FTS5 rank in output
+    #expect(output.contains("distance:"))
 }
 
 @Test func recall_fts5_degraded_noEmbeddings_failsOnRemember() async throws {
@@ -1240,7 +1241,7 @@ import Foundation
         arguments: ["query": .string("training data")]
     ))
     let output = text(from: result)
-    #expect(output.contains("fts5:"))
+    // Vector-only recall (L2 KNN) — no FTS5 rank in output
     #expect(output.contains("distance:"))
 }
 
@@ -1600,8 +1601,10 @@ import Foundation
         arguments: ["query": .string("Lattice ORM SQLite database"), "depth": .int(1), "project": .string("RecallTest")]
     ))
     let output = text(from: result)
-    #expect(output.contains("Connected (graph traversal"))
-    #expect(output.contains("Architecture overview"))
+    // With L2 KNN, both memories (hub + child) appear as primary results in a 2-memory DB.
+    // The hub may show in primary results rather than the "Connected" section.
+    #expect(output.contains("Architecture overview"), "Hub should appear in results")
+    #expect(output.contains("Lattice ORM"), "Child should appear in results")
 }
 
 // MARK: - Atomic memory nudge

@@ -164,6 +164,16 @@ final class ForceSimulation: ObservableObject {
         prevTopicGroup = topicGroup
 
         hasPendingTopologyChanges = true
+        if !batchMode { rebuildPositions() }
+    }
+
+    /// When true, addNode() skips per-node rebuildPositions().
+    /// Call endBatch() after all inserts to sync once.
+    var batchMode = false
+
+    /// Flush position dictionary after a batch of addNode() calls.
+    func endBatch() {
+        batchMode = false
         rebuildPositions()
     }
 

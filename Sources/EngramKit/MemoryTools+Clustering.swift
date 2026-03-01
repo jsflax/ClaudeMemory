@@ -11,7 +11,7 @@ public func findMemoryClusters(
     in lattice: Lattice,
     project: String? = nil,
     topic: String? = nil,
-    distanceThreshold: Double = 0.15,
+    distanceThreshold: Double = 0.547,  // L2 equivalent of cosine 0.15
     jaccardThreshold: Double = 0.2,
     minClusterSize: Int = 2,
     maxClusters: Int = 10,
@@ -43,7 +43,7 @@ public func findMemoryClusters(
 
     for (memId, mem) in memoryMap {
         let matches = baseQuery
-            .nearest(to: mem.embedding, on: \.embedding, limit: neighborLimit ?? memories.count, distance: .cosine)
+            .nearest(to: mem.embedding, on: \.embedding, limit: neighborLimit ?? memories.count, distance: .l2)
 
         var neighbors: [Int64] = []
         var dists: [Int64: Double] = [:]
@@ -110,7 +110,9 @@ extension MemoryTools {
     func handleFindClusters(_ args: [String: Value]?) async throws -> CallTool.Result {
         let a = try args.decode(FindClustersArgs.self)
         let minSize = a.minClusterSize?.value ?? 3
-        let threshold = Double(a.distanceThreshold?.value ?? 15) / 100.0
+        // Convert user-facing cosine percentage to L2 distance: L2 = sqrt(2 * cosine)
+        let cosineThreshold = Double(a.distanceThreshold?.value ?? 15) / 100.0
+        let threshold = sqrt(2.0 * cosineThreshold)
         let maxClusters = a.maxClusters?.value ?? 10
 
         let result = findMemoryClusters(
@@ -145,7 +147,8 @@ extension MemoryTools {
             for a in cluster {
                 for b in cluster where a < b {
                     if let dist = result.distances[a]?[b] ?? result.distances[b]?[a] {
-                        totalSim += 1.0 - dist
+                        // Convert L2 distance to cosine similarity for normalized vectors
+                        totalSim += 1.0 - (dist * dist) / 2.0
                         pairCount += 1
                         distances.append(dist)
                     }

@@ -171,10 +171,9 @@ enum CLIInstaller {
                 existing["permissions"] = hooksConfig["permissions"]
             }
 
-            // Replace hooks (remove stale PreToolUse if present), keep our hooks up to date
+            // Replace hooks, keep our hooks up to date
             var hooks = hooksConfig["hooks"] as! [String: Any]
             if var existingHooks = existing["hooks"] as? [String: Any] {
-                existingHooks.removeValue(forKey: "PreToolUse")
                 // Overwrite our hook keys, preserve any user-added hooks
                 for (key, value) in hooks {
                     existingHooks[key] = value
