@@ -13,7 +13,7 @@ struct SidebarView: View {
     }
 
     @Environment(VisualizerConfig.self) private var config
-    @Environment(\.lattice) private var lattice
+    @Environment(\.lattice) var lattice
     @Environment(SyncManager.self) var syncManager
     @State private var selectedTab: Tab = .visualizer
     @State private var isCompacting = false
@@ -424,11 +424,11 @@ struct SidebarView: View {
                     config.showActivityLog.toggle()
                 }
                 toggleRow(
-                    "Detail Panel",
-                    icon: config.showDetailPanel ? "sidebar.trailing" : "sidebar.trailing",
-                    isOn: config.showDetailPanel
+                    "Stats Overlay",
+                    icon: config.showStatsOverlay ? "chart.bar.fill" : "chart.bar",
+                    isOn: config.showStatsOverlay
                 ) {
-                    config.showDetailPanel.toggle()
+                    config.showStatsOverlay.toggle()
                 }
             }
 

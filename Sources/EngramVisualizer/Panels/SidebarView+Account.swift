@@ -87,7 +87,6 @@ extension SidebarView {
             if syncManager.isSyncing {
                 section("Projects") {
                     VStack(alignment: .leading, spacing: 4) {
-                        let projects = syncManager.allProjects()
                         if projects.isEmpty {
                             Text("No projects yet")
                                 .font(.system(size: 11, design: .monospaced))
@@ -129,7 +128,7 @@ extension SidebarView {
 
     func syncProjectRow(_ project: String) -> some View {
         let isOn = syncConfigs.first(where: { $0.project == project })?.policy == .sync
-        let count = syncManager.memoryCount(for: project)
+        let count = self.lattice.objects(Memory.self).where { $0.project == project }.count
         return Button {
             syncManager.toggleProject(project)
         } label: {

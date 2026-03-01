@@ -3,69 +3,79 @@ import Foundation
 import Lattice
 import Observation
 
-/// Dedicated manager for sync configuration and project-level migration.
-/// Owns all Lattice references needed for sync — AccountService stays auth-only.
+/// Manages cloud sync via Lattice IPC relay.
+///
+/// Architecture:
+/// - `hubLattice`: second Lattice instance on memory.db with IPC target + sync filter
+/// - `syncedLattice`: Lattice on memory_synced.db with IPC target + WSS credentials
+///
+/// Write path: MCP → memory.db → xproc notify → hubLattice (IPC, filtered) → syncedLattice → WSS → cloud
+/// Read path: cloud → WSS → syncedLattice → IPC → hubLattice → xproc notify → MCP sees new data
 @Observable
 @MainActor
 final class SyncManager {
+    /// The app's primary Lattice (memory.db). Set during configuration.
     var localLattice: Lattice?
-    var syncedLattice: Lattice?
-    var teamLattices: [String: Lattice] = [:]  // teamId → Lattice (Phase 2)
+    /// Path to the primary database file.
     var dbPath: String?
+
+    /// Second instance of memory.db with IPC target — drives filtered sync to syncedLattice.
+    private var hubLattice: Lattice?
+    /// memory_synced.db with IPC target + WSS — cloud endpoint.
+    private var syncedLattice: Lattice?
+
+    var teamLattices: [String: Lattice] = [:]  // teamId → Lattice (Phase 2)
     var statusMessage: String?
 
-    /// Whether the synced lattice has an active WebSocket connection.
-    var isSyncing: Bool { syncedLattice != nil }
+    /// Whether the IPC relay sync is active.
+    var isSyncing: Bool { hubLattice != nil && syncedLattice != nil }
 
-    /// Create the synced lattice with WebSocket credentials and start syncing.
+    // MARK: - Sync Lifecycle
+
+    /// Set up IPC relay sync with cloud credentials.
     /// Called when the user signs in and has an active subscription.
     func connectSync(wssEndpoint: URL, authToken: String) {
-        guard let dbPath else { return }
+        guard let dbPath, let localLattice else { return }
+
         let syncedDbPath = (dbPath as NSString).deletingPathExtension + "-synced.sqlite"
-        syncedLattice = try! Lattice(
-            Memory.self, Edge.self, SyncConfig.self,
-            configuration: .init(
-                fileURL: URL(fileURLWithPath: syncedDbPath),
-                authorizationToken: authToken,
-                wssEndpoint: wssEndpoint,
-                migration: engramMigrations
-            )
+        let channel = "engram-sync"
+        let filter = buildSyncFilter(from: localLattice)
+
+        // Hub: second connection to memory.db with IPC + sync filter
+        var hubConfig = Lattice.Configuration(
+            fileURL: URL(fileURLWithPath: dbPath),
+            migration: engramMigrations
         )
+        hubConfig.ipcTargets = [.init(channel: channel, syncFilter: filter)]
+        hubLattice = try? Lattice(
+            Memory.self, Edge.self, SyncConfig.self,
+            configuration: hubConfig
+        )
+
+        // Synced: memory_synced.db with IPC (no filter) + WSS
+        var syncedConfig = Lattice.Configuration(
+            fileURL: URL(fileURLWithPath: syncedDbPath),
+            authorizationToken: authToken,
+            wssEndpoint: wssEndpoint,
+            migration: engramMigrations
+        )
+        syncedConfig.ipcTargets = [.init(channel: channel)]
+        syncedLattice = try? Lattice(
+            Memory.self, Edge.self, SyncConfig.self,
+            configuration: syncedConfig
+        )
+
         statusMessage = "Connected to sync server"
     }
 
-    /// Tear down the synced lattice. Stops the WebSocket connection.
+    /// Tear down IPC relay and WSS connection.
     func disconnectSync() {
+        hubLattice = nil
         syncedLattice = nil
         statusMessage = nil
     }
 
-    /// All distinct project names across both local and synced databases.
-    /// Uses SQL-level `.group(by:)` — no `.snapshot()`.
-    func allProjects() -> [String] {
-        guard let localLattice else { return [] }
-        var projects = Set<String>()
-        for mem in localLattice.objects(Memory.self).group(by: \.project) {
-            projects.insert(mem.project)
-        }
-        if let syncedLattice {
-            for mem in syncedLattice.objects(Memory.self).group(by: \.project) {
-                projects.insert(mem.project)
-            }
-        }
-        return projects.sorted()
-    }
-
-    /// Memory count for a single project across both databases.
-    /// Uses SQL-level `.where { }.count` — no `.snapshot()`.
-    func memoryCount(for project: String) -> Int {
-        guard let localLattice else { return 0 }
-        var total = localLattice.objects(Memory.self).where { $0.project == project }.count
-        if let syncedLattice {
-            total += syncedLattice.objects(Memory.self).where { $0.project == project }.count
-        }
-        return total
-    }
+    // MARK: - Sync Policy
 
     /// Current sync policy for a project (defaults to `.local`).
     func syncPolicy(for project: String) -> SyncConfig.Policy {
@@ -77,14 +87,14 @@ final class SyncManager {
         return .local
     }
 
-    /// Toggle a single project's sync policy and migrate immediately.
+    /// Toggle a project's sync policy and update the IPC relay filter.
     func toggleProject(_ project: String) {
-        guard let localLattice, let syncedLattice else { return }
+        guard let localLattice else { return }
 
         let current = syncPolicy(for: project)
         let newPolicy: SyncConfig.Policy = current == .sync ? .local : .sync
 
-        // Update SyncConfig row
+        // Update SyncConfig row in memory.db
         if let existing = localLattice.objects(SyncConfig.self)
             .where({ $0.project == project }).first {
             existing.policy = newPolicy
@@ -93,21 +103,46 @@ final class SyncManager {
             localLattice.add(SyncConfig(project: project, policy: newPolicy))
         }
 
-        // Migrate memories
-        let result: SyncMigration.Result
+        // Rebuild filter and push to hub — Lattice's reconcile_sync_filter handles catch-up
+        let filter = buildSyncFilter(from: localLattice)
+        hubLattice?.updateSyncFilter(filter)
+
+        statusMessage = newPolicy == .sync
+            ? "Syncing \(project)"
+            : "Stopped syncing \(project)"
+
         if newPolicy == .sync {
-            result = SyncMigration.migrateProjects([project], from: localLattice, to: syncedLattice)
-        } else {
-            result = SyncMigration.migrateProjects([project], from: syncedLattice, to: localLattice)
+            Self.spawnReconciliationAgent(project: project)
         }
+    }
 
-        if result.memoriesMigrated > 0 {
-            statusMessage = "Moved \(result.memoriesMigrated) memories"
+    // MARK: - Sync Filter Construction
 
-            if newPolicy == .sync {
-                Self.spawnReconciliationAgent(project: project)
+    /// Build a SyncFilter from SyncConfig rows in the local database.
+    /// Includes non-private memories for projects with `.sync` policy,
+    /// all edges, and all SyncConfig rows.
+    private func buildSyncFilter(from lattice: Lattice) -> Lattice.SyncFilter {
+        let syncedProjects = lattice.objects(SyncConfig.self)
+            .where { $0.policy == .sync }
+            .snapshot()
+            .map(\.project)
+
+        var filter = Lattice.SyncFilter()
+
+        if !syncedProjects.isEmpty {
+            filter.include(Memory.self) { mem in
+                var match = mem.project == syncedProjects[0]
+                for p in syncedProjects.dropFirst() { match = match || mem.project == p }
+                return mem.isPrivate == false && match
             }
         }
+
+        // Edges: sync all (dangling refs are harmless, cleaned on next reconciliation)
+        filter.include(Edge.self)
+        // SyncConfig: replicate sync preferences across devices
+        filter.include(SyncConfig.self)
+
+        return filter
     }
 
     // MARK: - Reconciliation Subprocess

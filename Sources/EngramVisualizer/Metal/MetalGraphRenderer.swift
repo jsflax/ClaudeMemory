@@ -550,6 +550,49 @@ final class MetalGraphRenderer: NSObject {
 
     #if DEBUG
     var drawTimingFile: UnsafeMutablePointer<FILE>? = nil
+    var interFrameFile: UnsafeMutablePointer<FILE>? = nil
+    var lastDrawEnd: Double = 0
+    var canaryScheduleTime: Double = 0
+    var runLoopFile: UnsafeMutablePointer<FILE>? = nil
+    private var runLoopObserver: CFRunLoopObserver?
+    private var runLoopSourceStart: Double = 0
+
+    /// Install a CFRunLoopObserver that times each source/timer/observer pass.
+    /// Logs passes >5ms to /tmp/runloop-timing.csv so we can see what's blocking.
+    func installRunLoopObserver() {
+        let fp = fopen("/tmp/runloop-timing.csv", "w")
+        fputs("timestamp,activity,duration_ms\n", fp)
+        runLoopFile = fp
+
+        // BeforeSources observer — records start time
+        let beforeObs = CFRunLoopObserverCreateWithHandler(nil, CFRunLoopActivity.beforeSources.rawValue, true, -1) { [weak self] _, _ in
+            self?.runLoopSourceStart = CFAbsoluteTimeGetCurrent()
+        }
+        // AfterWaiting observer — records when run loop resumes from sleep
+        let afterWaitObs = CFRunLoopObserverCreateWithHandler(nil, CFRunLoopActivity.afterWaiting.rawValue, true, -1) { [weak self] _, _ in
+            self?.runLoopSourceStart = CFAbsoluteTimeGetCurrent()
+        }
+        // BeforeWaiting observer — logs time since last source start
+        let beforeWaitObs = CFRunLoopObserverCreateWithHandler(nil, CFRunLoopActivity.beforeWaiting.rawValue, true, 1000000) { [weak self] _, _ in
+            guard let self, self.runLoopSourceStart > 0, let f = self.runLoopFile else { return }
+            let ms = (CFAbsoluteTimeGetCurrent() - self.runLoopSourceStart) * 1000.0
+            if ms > 5 {
+                let line = "\(String(format: "%.3f", CFAbsoluteTimeGetCurrent())),sources_to_wait,\(String(format: "%.1f", ms))\n"
+                fputs(line, f)
+                fflush(f)
+            }
+        }
+        if let beforeObs {
+            CFRunLoopAddObserver(CFRunLoopGetMain(), beforeObs, .commonModes)
+        }
+        if let afterWaitObs {
+            CFRunLoopAddObserver(CFRunLoopGetMain(), afterWaitObs, .commonModes)
+        }
+        if let beforeWaitObs {
+            CFRunLoopAddObserver(CFRunLoopGetMain(), beforeWaitObs, .commonModes)
+        }
+        runLoopObserver = beforeWaitObs
+    }
     #endif
 }
 
@@ -811,14 +854,43 @@ extension MetalGraphRenderer: MTKViewDelegate {
         let waitMs = (afterWait - afterCallback) * 1000.0
         let encodeMs = (drawEnd - afterWait) * 1000.0
         let totalDrawMs = (drawEnd - drawStart) * 1000.0
+
+        // Inter-frame analysis: how long between drawFrame end and next drawFrame start
+        let interFrameMs: Double
+        if lastDrawEnd > 0 {
+            interFrameMs = (drawStart - lastDrawEnd) * 1000.0
+        } else {
+            interFrameMs = 0
+        }
+
+        // Process canary: how long did the main queue block take to execute?
+        // If canaryDelayMs >> 0, something is occupying the main thread after drawFrame
+        let canaryDelayMs: Double
+        if canaryScheduleTime > 0 {
+            // canaryScheduleTime was set by the previous frame's canary when it executed
+            // We compare it to when drawFrame ended to see the dispatch delay
+            canaryDelayMs = (canaryScheduleTime - lastDrawEnd) * 1000.0
+        } else {
+            canaryDelayMs = 0
+        }
+
+        lastDrawEnd = drawEnd
+
+        // Schedule a canary block on the main queue to detect main-thread contention
+        // If the main thread is free, this executes almost immediately after drawFrame returns.
+        // If something else runs between frames, this is delayed.
+        DispatchQueue.main.async { [weak self] in
+            self?.canaryScheduleTime = CFAbsoluteTimeGetCurrent()
+        }
+
         if drawTimingFile == nil {
             drawTimingFile = fopen("/tmp/draw-timing.csv", "w")
             if let f = drawTimingFile {
-                fputs("frame,total_draw_ms,callback_ms,wait_ms,encode_ms\n", f)
+                fputs("frame,total_draw_ms,callback_ms,wait_ms,encode_ms,inter_frame_ms,canary_delay_ms\n", f)
             }
         }
         if let f = drawTimingFile {
-            let line = "\(frameCount),\(String(format: "%.2f", totalDrawMs)),\(String(format: "%.2f", callbackMs)),\(String(format: "%.2f", waitMs)),\(String(format: "%.2f", encodeMs))\n"
+            let line = "\(frameCount),\(String(format: "%.2f", totalDrawMs)),\(String(format: "%.2f", callbackMs)),\(String(format: "%.2f", waitMs)),\(String(format: "%.2f", encodeMs)),\(String(format: "%.2f", interFrameMs)),\(String(format: "%.2f", canaryDelayMs))\n"
             fputs(line, f)
             fflush(f)
         }

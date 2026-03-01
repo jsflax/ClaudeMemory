@@ -280,6 +280,9 @@ struct Graph3DView: View {
         guard metalRenderer == nil else { return }
         guard let r = MetalGraphRenderer(create: true) else { return }
         metalRenderer = r
+        #if DEBUG
+        r.installRunLoopObserver()
+        #endif
         guard let mgr = MetalSceneManager(renderer: r) else { return }
         metalScene = mgr
 

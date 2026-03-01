@@ -50,10 +50,9 @@ extension MemoryTools {
             )
         }
 
-        // Create edge — route to same DB as the source memory
-        let edgeTargetDB = writeLattice(for: fromMem.project)
+        // Create edge
         let edge = Edge(sourceGlobalId: fromGlobalId, targetGlobalId: toGlobalId, relation: relationEnum)
-        edgeTargetDB.add(edge)
+        localLattice.add(edge)
 
         guard let edgeId = edge.primaryKey else {
             throw MCPError.internalError("Failed to persist edge — primaryKey is nil after add()")

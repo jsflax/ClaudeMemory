@@ -310,7 +310,11 @@ final class ForceSimulation3D {
 
         let hasForcesComputed = storedFx.count == n
         let rawAttenuation = pow(damping, Float(forceAge))
-        smoothedAttenuation += (rawAttenuation - smoothedAttenuation) * 0.1
+        // Blend=0.04: with off-MainActor dispatch, forces arrive every 1-2 frames,
+        // so forceAge oscillates 2→3→2. Heavy smoothing flattens the sawtooth into
+        // near-constant application. Settling still works because isSettled returns
+        // early before this code runs, and forceAge grows unbounded when forces stop.
+        smoothedAttenuation += (rawAttenuation - smoothedAttenuation) * 0.04
         let attenuation = smoothedAttenuation
         forceAge += 1
 
@@ -381,7 +385,6 @@ final class ForceSimulation3D {
         guard n > 1 else { return }
 
         tickInFlight = true
-        let version = topologyVersion
 
         // Capture state needed for CPU forces (springs, cohesion, center)
         let state = SimState(
@@ -404,11 +407,11 @@ final class ForceSimulation3D {
             let projGroups = Array(projectGroup)
             let topGroups = Array(topicGroup)
 
-            // GPU dispatch must be on MainActor (Metal command buffers).
-            // Combination with CPU forces and result storage happen in a detached task
-            // to avoid blocking the main thread between renderTick calls.
-            Task { @MainActor [pendingForces] in
-                let chargeResult = await metal.dispatchChargeForces(
+            // Run entire force pipeline off MainActor — MetalForceCompute is @unchecked Sendable
+            // and Metal device/queue/pipeline are thread-safe. The tickInFlight flag ensures
+            // at most one concurrent dispatch, so buffer access is safe.
+            Task.detached(priority: .userInitiated) { [pendingForces] in
+                async let chargeResult = metal.dispatchChargeForces(
                     positions: positions,
                     projectGroups: projGroups,
                     topicGroups: topGroups,
@@ -417,23 +420,21 @@ final class ForceSimulation3D {
                     sameTopicChargeScale: state.sameTopicChargeScale,
                     sameProjectChargeScale: state.sameProjectChargeScale
                 )
-                // Move combination work off MainActor
-                let capturedCharge = chargeResult
-                let capturedState = state
-                Task.detached(priority: .userInitiated) {
-                    let cpuForces = Self.computeCPUOnlyForces(capturedState)
-                    let nn = min(capturedCharge.fx.count, cpuForces.fx.count)
-                    var combinedFx = [Float](repeating: 0, count: nn)
-                    var combinedFy = [Float](repeating: 0, count: nn)
-                    var combinedFz = [Float](repeating: 0, count: nn)
-                    for i in 0..<nn {
-                        combinedFx[i] = capturedCharge.fx[i] + cpuForces.fx[i]
-                        combinedFy[i] = capturedCharge.fy[i] + cpuForces.fy[i]
-                        combinedFz[i] = capturedCharge.fz[i] + cpuForces.fz[i]
-                    }
-                    let result = ForceResult(fx: combinedFx, fy: combinedFy, fz: combinedFz)
-                    pendingForces.withLock { $0 = result }
+                // Run CPU forces concurrently with GPU charge forces
+                let cpuForces = ForceSimulation3D.computeCPUOnlyForces(state)
+                let charge = await chargeResult
+
+                let nn = min(charge.fx.count, cpuForces.fx.count)
+                var combinedFx = [Float](repeating: 0, count: nn)
+                var combinedFy = [Float](repeating: 0, count: nn)
+                var combinedFz = [Float](repeating: 0, count: nn)
+                for i in 0..<nn {
+                    combinedFx[i] = charge.fx[i] + cpuForces.fx[i]
+                    combinedFy[i] = charge.fy[i] + cpuForces.fy[i]
+                    combinedFz[i] = charge.fz[i] + cpuForces.fz[i]
                 }
+                let result = ForceResult(fx: combinedFx, fy: combinedFy, fz: combinedFz)
+                pendingForces.withLock { $0 = result }
             }
             return
         }

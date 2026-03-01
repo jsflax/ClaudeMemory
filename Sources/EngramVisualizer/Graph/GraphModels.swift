@@ -72,7 +72,17 @@ struct DyingNode {
 /// NOT @Observable — must not trigger SwiftUI re-evaluation.
 @MainActor
 final class GraphRenderStore {
-    var nodes: [NodeData] = []
+    var nodes: [NodeData] = [] {
+        didSet { _recentNodes = nil }
+    }
+    /// Top 50 nodes by createdAt — lazily sorted, cached until `nodes` changes.
+    var recentNodes: [NodeData] {
+        if let cached = _recentNodes { return cached }
+        let sorted = Array(nodes.sorted(by: { $0.createdAt > $1.createdAt }).prefix(50))
+        _recentNodes = sorted
+        return sorted
+    }
+    private var _recentNodes: [NodeData]?
     var nodeById: [UUID: NodeData] = [:]
     var edges: [EdgeData] = []
     var hubs: Set<UUID> = []

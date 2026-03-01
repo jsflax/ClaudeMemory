@@ -17,13 +17,16 @@ struct TopicGroupInfo: Equatable {
 /// Holds 3D camera state + minimap positions. Written by renderTick's cameraCallback.
 /// Only MinimapView reads these properties, so only MinimapView re-renders when they change —
 /// GraphView's body passes this by reference without reading properties.
+/// 3D camera state for minimap. All properties are @ObservationIgnored because
+/// MinimapView redraws on its own 10fps timer — @Observable tracking at 60fps
+/// would trigger expensive Canvas redraws every frame.
 @Observable
 @MainActor
 final class Camera3DState {
-    var azimuth: Float = 0
-    var position: SIMD3<Float> = .zero
-    var target: SIMD3<Float> = .zero
-    var positions: [UUID: SIMD3<Float>] = [:]
+    @ObservationIgnored var azimuth: Float = 0
+    @ObservationIgnored var position: SIMD3<Float> = .zero
+    @ObservationIgnored var target: SIMD3<Float> = .zero
+    @ObservationIgnored var positions: [UUID: SIMD3<Float>] = [:]
 }
 
 // MARK: - Viewport state (isolated from query data to avoid expensive recomputation on pan/zoom)

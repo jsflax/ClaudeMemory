@@ -4,7 +4,7 @@ struct ActivityLogPanel: View {
     let renderStore: GraphRenderStore
     let onSelect: (UUID) -> Void
 
-    @State private var knownIds: Set<UUID> = []
+    @State private var knownCount: Int = 0
     @State private var glowingIds: Set<UUID> = []
 
     fileprivate static let relativeFormatter: RelativeDateTimeFormatter = {
@@ -15,10 +15,9 @@ struct ActivityLogPanel: View {
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 1)) { context in
-            let nodes = renderStore.nodes
             let colorMap = renderStore.colorMap
-            let currentIds = Set(nodes.map(\.id))
-            let newIds = currentIds.subtracting(knownIds)
+            let recent = renderStore.recentNodes
+            let nodeCount = renderStore.nodes.count
 
             VStack(alignment: .trailing, spacing: 0) {
                 HStack(spacing: 6) {
@@ -35,7 +34,6 @@ struct ActivityLogPanel: View {
 
                 ScrollView(.vertical, showsIndicators: true) {
                     LazyVStack(alignment: .trailing, spacing: 2) {
-                        let recent = Array(nodes.sorted(by: { $0.createdAt > $1.createdAt }).prefix(50))
                         ForEach(recent, id: \.id) { node in
                             let isGlowing = glowingIds.contains(node.id)
                             ActivityRow(
@@ -49,19 +47,21 @@ struct ActivityLogPanel: View {
                         }
                     }
                     .padding(.vertical, 4)
-                    .animation(.easeInOut(duration: 0.3), value: nodes.count)
+                    .animation(.easeInOut(duration: 0.3), value: nodeCount)
                 }
             }
             .frame(width: 220)
             .frame(maxHeight: 300)
             .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 10))
             .foregroundStyle(.white.opacity(0.7))
-            .onChange(of: currentIds.count) { _, _ in
-                guard !newIds.isEmpty, !knownIds.isEmpty else {
-                    knownIds = currentIds
+            .onChange(of: nodeCount) { _, newCount in
+                guard knownCount > 0, newCount > knownCount else {
+                    knownCount = newCount
                     return
                 }
-                knownIds = currentIds
+                // New nodes = those in recentNodes that weren't there before
+                let newIds = Set(recent.prefix(newCount - knownCount).map(\.id))
+                knownCount = newCount
                 withAnimation(.easeInOut(duration: 0.3)) {
                     glowingIds.formUnion(newIds)
                 }

@@ -120,6 +120,8 @@ struct EngramApp: App {
                     syncManager.localLattice = localLattice
                     syncManager.dbPath = dbPath
                 }
+                // Note: SyncManager reads SyncConfig from localLattice to build
+                // the IPC relay filter. All data lives in memory.db — no dual-DB routing.
                 .onOpenURL { url in
                     GIDSignIn.sharedInstance.handle(url)
                 }

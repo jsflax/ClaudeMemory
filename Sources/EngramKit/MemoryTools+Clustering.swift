@@ -224,7 +224,6 @@ extension MemoryTools {
         let embeddingVec = Vector<Float>(floats)
 
         // Create summary memory
-        let consolidateTargetDB = writeLattice(for: project)
         let summary = Memory(
             content: a.content,
             topic: topic,
@@ -233,7 +232,7 @@ extension MemoryTools {
             embedding: embeddingVec,
             importance: importance
         )
-        consolidateTargetDB.add(summary)
+        localLattice.add(summary)
 
         guard let summaryId = summary.primaryKey else {
             throw MCPError.internalError("Failed to persist summary — primaryKey is nil after add()")
@@ -247,7 +246,7 @@ extension MemoryTools {
             source.importance = 0
             guard let sourceGlobalId = source.__globalId else { continue }
             let edge = Edge(sourceGlobalId: sourceGlobalId, targetGlobalId: summaryGlobalId, relation: .summarizedBy)
-            consolidateTargetDB.add(edge)
+            localLattice.add(edge)
         }
 
         let preview = String(a.content.prefix(120))

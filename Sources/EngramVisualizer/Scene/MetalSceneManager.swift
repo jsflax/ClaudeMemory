@@ -846,13 +846,17 @@ final class MetalSceneManager {
             let bgMs = (CFAbsoluteTimeGetCurrent() - bgStart) * 1000.0
             #endif
             await MainActor.run { [weak self] in
+                #if DEBUG
+                let applyStart = CFAbsoluteTimeGetCurrent()
+                #endif
                 guard let self else { return }
                 if let result {
                     self.applyAtlasResult(result, nodeIds: capturedNodeIds, hubs: capturedHubs, projects: capturedProjects)
                 }
                 self.isAtlasGenerating = false
                 #if DEBUG
-                let msg = "dispatched=frame\(dispatchFrame) bg=\(String(format: "%.1f", bgMs))ms currentFrame=\(self.renderFrameCount)\n"
+                let applyMs = (CFAbsoluteTimeGetCurrent() - applyStart) * 1000.0
+                let msg = "dispatched=frame\(dispatchFrame) bg=\(String(format: "%.1f", bgMs))ms apply=\(String(format: "%.1f", applyMs))ms currentFrame=\(self.renderFrameCount)\n"
                 if let data = msg.data(using: .utf8) {
                     let url = URL(fileURLWithPath: "/tmp/atlas-timing.log")
                     if let fh = try? FileHandle(forWritingTo: url) {

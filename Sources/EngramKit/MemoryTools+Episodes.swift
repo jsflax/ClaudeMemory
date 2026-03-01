@@ -22,9 +22,8 @@ extension MemoryTools {
 
         let floats = try await embedder.embed(text: title)
         let embeddingVec = floats.map { Vector<Float>($0) } ?? Vector<Float>([])
-        let episodeTargetDB = writeLattice(for: project)
         let episode = Memory(content: title, topic: "episode", project: project, embedding: embeddingVec)
-        episodeTargetDB.add(episode)
+        localLattice.add(episode)
 
         guard let episodeId = episode.primaryKey else {
             throw MCPError.internalError("Failed to persist episode memory — primaryKey is nil after add()")

@@ -262,23 +262,38 @@ struct GraphView: View {
 
     @ViewBuilder
     private func graphOverlays(size: CGSize, colorMap: [String: Color]) -> some View {
-        // Right column: activity log
-        if config.showActivityLog {
-            VStack(alignment: .trailing, spacing: 8) {
-                if selectedMemoryId == nil {
-                    ActivityLogPanel(
-                        renderStore: renderStore,
-                        onSelect: { id in selectedMemoryId = id }
-                    )
-                    .transition(.opacity)
-                }
-
-                Spacer()
+        // Right column: activity log + stats overlay
+        VStack(alignment: .trailing, spacing: 8) {
+            if config.showActivityLog, selectedMemoryId == nil {
+                ActivityLogPanel(
+                    renderStore: renderStore,
+                    onSelect: { id in selectedMemoryId = id }
+                )
+                .transition(.opacity)
             }
-            .padding(12)
-            .frame(maxWidth: .infinity, alignment: .trailing)
-            .animation(.easeInOut(duration: 0.25), value: selectedMemoryId == nil)
+
+            Spacer()
+
+            if config.showStatsOverlay {
+                StatsOverlay(
+                    visibleMemoryCount: renderStore.visibleNodeIds.count,
+                    visibleEdgeCount: renderStore.edges.count,
+                    totalMemories: renderStore.nodes.count,
+                    hiddenProjects: config.hiddenProjects,
+                    hiddenRelations: config.hiddenRelations,
+                    projects: uniqueProjects(),
+                    allRelationCounts: renderStore.relationCounts,
+                    toggleProject: toggleProject,
+                    toggleRelation: toggleRelation,
+                    colorMap: renderStore.colorMap,
+                    driveToProject: config.dimensionMode == .threeD ? { cameraProjectTarget = $0 } : nil
+                )
+                .transition(.opacity)
+            }
         }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .trailing)
+        .animation(.easeInOut(duration: 0.25), value: selectedMemoryId == nil)
 
         // Top bar: search (offset right to clear sidebar toggle + traffic lights)
         VStack {
@@ -344,7 +359,7 @@ struct GraphView: View {
 
     @ViewBuilder
     private func detailPanel(size: CGSize, colorMap: [String: Color]) -> some View {
-        if config.showDetailPanel, let memory = selectedMemory {
+        if let memory = selectedMemory {
             let sid = selectedMemoryId!
             let count = renderStore.edgeCountByNode[sid] ?? 0
             MemoryDetailPanel(

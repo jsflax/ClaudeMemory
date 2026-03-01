@@ -199,11 +199,8 @@ extension MemoryTools {
 
         let isPrivate = a.isPrivate ?? false
 
-        // Private memories always stay local regardless of sync policy
-        let targetDB = isPrivate ? localLattice : writeLattice(for: project)
-
         let memory = Memory(content: content, topic: topic, project: project, source: source, embedding: embeddingVec, expiresAt: expiresAt, importance: importance, isPrivate: isPrivate)
-        targetDB.add(memory)
+        localLattice.add(memory)
 
         guard let memoryId = memory.primaryKey else {
             throw MCPError.internalError("Failed to persist memory — primaryKey is nil after add()")
@@ -221,7 +218,7 @@ extension MemoryTools {
                 throw MCPError.invalidParams("parent_id \(parentId) not found")
             }
             let edge = Edge(sourceGlobalId: memoryGlobalId, targetGlobalId: parentGlobalId, relation: .partOf)
-            targetDB.add(edge)
+            localLattice.add(edge)
             parentNote = ", parent: \(parentId)"
             log("Auto-created part_of edge: \(memoryId) -> \(parentId)")
         }
@@ -231,7 +228,7 @@ extension MemoryTools {
            let epMem = lattice.objects(Memory.self).where({ $0.primaryKey == epId }).first,
            let epGlobalId = epMem.__globalId {
             let edge = Edge(sourceGlobalId: memoryGlobalId, targetGlobalId: epGlobalId, relation: .partOf)
-            targetDB.add(edge)
+            localLattice.add(edge)
             log("Linked memory \(memoryId) to episode \(epId)")
         }
 
@@ -256,7 +253,7 @@ extension MemoryTools {
             guard !hasEdge else { continue }
 
             let edge = Edge(sourceGlobalId: memoryGlobalId, targetGlobalId: candidateGlobalId, relation: .relatesTo)
-            targetDB.add(edge)
+            localLattice.add(edge)
             autoLinkedIds.append(targetId)
             log("Auto-connected [\(memoryId)] --[relates_to]--> [\(targetId)] (distance: \(String(format: "%.3f", candidate.distance)))")
         }
@@ -304,7 +301,7 @@ extension MemoryTools {
                 guard !(forwardLinked || reverseLinked) else { continue }
 
                 let edge = Edge(sourceGlobalId: memoryGlobalId, targetGlobalId: hubGlobalId, relation: .relatesTo)
-                targetDB.add(edge)
+                localLattice.add(edge)
                 if let hid = hubDisplayId { autoLinkedIds.append(hid) }
                 log("Cross-project link [\(memoryId)] --[relates_to]--> [\(hubDisplayId.map(String.init) ?? "?")] (project '\(otherProject)' mentioned in content)")
             }
@@ -356,7 +353,7 @@ extension MemoryTools {
                         .first != nil
                     if !alreadyLinked {
                         let edge = Edge(sourceGlobalId: memoryGlobalId, targetGlobalId: hubGlobalId, relation: .partOf)
-                        targetDB.add(edge)
+                        localLattice.add(edge)
                         let hubDisplayId = lattice.objects(Memory.self).where({ $0.__globalId == hubGlobalId }).first?.primaryKey
                         log("Auto-organized [\(memoryId)] into hub [\(hubDisplayId.map(String.init) ?? "?")]")
                     }
@@ -876,9 +873,8 @@ extension MemoryTools {
         let embeddingVec = Vector<Float>(floats)
 
         // Create merged memory
-        let mergeTargetDB = writeLattice(for: project)
         let merged = Memory(content: content, topic: topic, project: project, source: "merged", embedding: embeddingVec)
-        mergeTargetDB.add(merged)
+        localLattice.add(merged)
 
         guard let mergedId = merged.primaryKey else {
             throw MCPError.internalError("Failed to persist merged memory — primaryKey is nil after add()")

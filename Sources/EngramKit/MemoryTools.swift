@@ -16,14 +16,10 @@ import Foundation
 /// - **disconnect**: Remove edges by ID or by (from, to) pair.
 /// - **graph**: View a memory's neighborhood in the knowledge graph.
 public actor MemoryTools {
-    /// Query lattice — ATTACH'd view spanning both local and synced DBs.
-    /// All reads, deletes, and property-mutation queries go through this.
+    /// Single database — all reads and writes go through this.
+    /// Sync is handled by the visualizer via Lattice IPC relay, not by the MCP server.
     let lattice: Lattice
-    /// Local-only database (memory.db). HookState, Checkpoint, and local-policy memories live here.
     let localLattice: Lattice
-    /// Synced database (synced.db). Non-private memories for sync-policy projects live here.
-    /// nil when no synced DB exists (single-DB mode, identical to pre-dual-DB behavior).
-    let syncedLattice: Lattice?
     let embedder: EmbeddingService
 
     /// Tracks the currently active episode memory ID for this session.
@@ -44,51 +40,14 @@ public actor MemoryTools {
         return f
     }()
 
-    /// Dual-DB initializer. Resolves sendable references inside the actor's isolation domain.
-    /// When `syncedRef` is provided, creates an ATTACH'd query lattice that transparently
-    /// spans both DBs for reads/deletes. When nil, behaves identically to the old single-DB mode.
-    public init(localRef: LatticeThreadSafeReference, syncedRef: LatticeThreadSafeReference?, embedder: EmbeddingService) {
-        guard let local = localRef.resolve() else {
-            fatalError("Failed to resolve localLattice reference")
-        }
-        self.localLattice = local
-        self.embedder = embedder
-
-        if let syncedRef, let synced = syncedRef.resolve() {
-            self.syncedLattice = synced
-            self.lattice = local.attaching(lattice: synced)
-        } else {
-            self.syncedLattice = nil
-            self.lattice = local
-        }
-    }
-
-    /// Legacy single-DB initializer. Resolves sendable reference inside the actor's isolation domain.
+    /// Resolves a sendable reference inside the actor's isolation domain.
     public init(ref: LatticeThreadSafeReference, embedder: EmbeddingService) {
         guard let lattice = ref.resolve() else {
             fatalError("Failed to resolve lattice reference")
         }
         self.localLattice = lattice
-        self.syncedLattice = nil
         self.lattice = lattice
         self.embedder = embedder
-    }
-
-    // MARK: - Write Routing
-
-    /// Returns the correct Lattice for writing memories/edges for a given project.
-    /// SyncConfig lives in synced.db (replicates across devices).
-    /// Only projects with an explicit `.sync` policy route to syncedLattice.
-    func writeLattice(for project: String) -> Lattice {
-        guard let syncedLattice else { return localLattice }
-
-        if let config = syncedLattice.objects(SyncConfig.self)
-            .where({ $0.project == project }).first,
-           config.policy == .sync {
-            return syncedLattice
-        }
-
-        return localLattice
     }
 
     #if DEBUG

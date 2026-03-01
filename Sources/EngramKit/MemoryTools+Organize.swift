@@ -118,7 +118,6 @@ extension MemoryTools {
         if let floats = try await embedder.embed(text: hubContent) {
             hubEmbedding = Vector<Float>(floats)
         }
-        let organizeTargetDB = writeLattice(for: project)
         let hub = Memory(
             content: hubContent,
             topic: label,
@@ -126,7 +125,7 @@ extension MemoryTools {
             source: "organize",
             embedding: hubEmbedding
         )
-        organizeTargetDB.add(hub)
+        localLattice.add(hub)
 
         guard let hubId = hub.primaryKey else {
             return CallTool.Result(content: [.text("Failed to create hub memory.")], isError: true)
@@ -139,7 +138,7 @@ extension MemoryTools {
         for id in ids {
             if let mem = memories[Int64(id)], let memGid = mem.__globalId {
                 let edge = Edge(sourceGlobalId: memGid, targetGlobalId: hubGlobalId, relation: .partOf)
-                organizeTargetDB.add(edge)
+                localLattice.add(edge)
                 mem.topic = label
             }
         }

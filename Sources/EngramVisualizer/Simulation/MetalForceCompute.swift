@@ -6,8 +6,11 @@ import simd
 
 /// Manages Metal compute pipeline for GPU-accelerated charge force computation.
 /// Falls back to CPU when Metal is unavailable or node count is too small.
-@MainActor
-final class MetalForceCompute {
+///
+/// Thread safety: not actor-isolated. Safe because `ForceSimulation3D.tickInFlight`
+/// guarantees at most one concurrent call to `dispatchChargeForces`.
+/// Metal device/queue/pipeline are inherently thread-safe.
+final class MetalForceCompute: @unchecked Sendable {
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
     private let pipelineState: MTLComputePipelineState
