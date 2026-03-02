@@ -109,6 +109,8 @@ final class GraphRenderStore {
     var glowingNodes: [UUID: Date] = [:]
     var newNodeGlows: [UUID: Date] = [:]
     var dyingNodes: [UUID: DyingNode] = [:]
+    /// Nodes being conjured by a mascot — scale 0→1 over 1.5s. Key = node UUID, value = start time.
+    var birthingNodes: [UUID: Date] = [:]
 
     // Derived display data — recomputed on structural changes.
     var topicGroups: [TopicGroupInfo] = []

@@ -88,6 +88,10 @@ final class ForceSimulation3D {
         isSettled = false
         settledFrameCount = 0
         forceAge = 2
+        // Reset smoothedAttenuation so forces apply at meaningful strength immediately.
+        // Without this, smoothedAttenuation ramps from near-zero at 4%/frame — taking
+        // ~30 frames to reach useful values — causing newly added nodes to appear stuck.
+        smoothedAttenuation = pow(damping, Float(forceAge))
     }
 
     // MARK: - Graph Management
@@ -176,6 +180,71 @@ final class ForceSimulation3D {
         isSettled = false; settledFrameCount = 0
         forceAge = 2
         rebuildPositions()
+    }
+
+    /// Surgically remove nodes without rebuilding the entire graph.
+    /// Compacts SoA arrays and remaps edge indices.
+    func removeNodes(_ idsToRemove: Set<UUID>) {
+        guard !idsToRemove.isEmpty else { return }
+        let oldCount = ids.count
+
+        // Build old→new index mapping
+        var oldToNew = [Int](repeating: -1, count: oldCount)
+        var newIdx = 0
+        for i in 0..<oldCount {
+            if !idsToRemove.contains(ids[i]) {
+                oldToNew[i] = newIdx
+                newIdx += 1
+            }
+        }
+
+        // Compact SoA arrays
+        let cap = newIdx
+        var newIds: [UUID] = [];      newIds.reserveCapacity(cap)
+        var newX: [Float] = [];       newX.reserveCapacity(cap)
+        var newY: [Float] = [];       newY.reserveCapacity(cap)
+        var newZ: [Float] = [];       newZ.reserveCapacity(cap)
+        var newVx: [Float] = [];      newVx.reserveCapacity(cap)
+        var newVy: [Float] = [];      newVy.reserveCapacity(cap)
+        var newVz: [Float] = [];      newVz.reserveCapacity(cap)
+        var newPinned: [Bool] = [];   newPinned.reserveCapacity(cap)
+        var newProjGroup: [Int] = []; newProjGroup.reserveCapacity(cap)
+        var newTopicGrp: [Int] = [];  newTopicGrp.reserveCapacity(cap)
+
+        for i in 0..<oldCount where oldToNew[i] >= 0 {
+            newIds.append(ids[i])
+            newX.append(x[i]); newY.append(y[i]); newZ.append(z[i])
+            newVx.append(vx[i]); newVy.append(vy[i]); newVz.append(vz[i])
+            newPinned.append(pinned[i])
+            newProjGroup.append(projectGroup[i])
+            newTopicGrp.append(topicGroup[i])
+        }
+
+        ids = newIds; x = newX; y = newY; z = newZ
+        vx = newVx; vy = newVy; vz = newVz; pinned = newPinned
+        projectGroup = newProjGroup; topicGroup = newTopicGrp
+
+        // Rebuild index
+        idToIndex.removeAll(keepingCapacity: true)
+        for (i, id) in ids.enumerated() { idToIndex[id] = i }
+
+        // Remap edge indices (drop edges that touch removed nodes)
+        edgeIndices = edgeIndices.compactMap { (si, ti) in
+            let nsi = oldToNew[si]; let nti = oldToNew[ti]
+            guard nsi >= 0, nti >= 0 else { return nil }
+            return (nsi, nti)
+        }
+        edgeIndexSet = Set(edgeIndices.map { UInt64($0.0) << 32 | UInt64($0.1) })
+
+        // Compact stored forces
+        storedFx = [Float](repeating: 0, count: cap)
+        storedFy = [Float](repeating: 0, count: cap)
+        storedFz = [Float](repeating: 0, count: cap)
+
+        // Remove from positions dict
+        for id in idsToRemove { positions.removeValue(forKey: id) }
+
+        hasPendingTopologyChanges = true
     }
 
     /// Surgically insert a single node without rebuilding the entire graph.

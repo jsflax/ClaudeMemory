@@ -746,6 +746,19 @@ public actor MemoryTools {
     // MARK: - Dispatch
 
     public func handle(_ params: CallTool.Parameters) async throws -> CallTool.Result {
+        log("Tool call: \(params.name)")
+        let result: CallTool.Result
+        do {
+            result = try await dispatch(params)
+        } catch {
+            log("Tool \(params.name) failed: \(error)")
+            throw error
+        }
+        log("Tool \(params.name) completed")
+        return result
+    }
+
+    private func dispatch(_ params: CallTool.Parameters) async throws -> CallTool.Result {
         switch params.name {
         case "remember":
             return try await handleRemember(params.arguments)

@@ -13,18 +13,66 @@ struct MascotNodeInfo {
     let lastAccessedAt: Date
 }
 
+/// Shared GPU resources for all mascot instances (loaded once, shared across fleet).
+@MainActor
+struct MascotSharedResources {
+    let parts: [MascotSystem.PartMesh]
+    let baseColorTexture: MTLTexture?
+    let metalRoughTexture: MTLTexture?
+    let sampler: MTLSamplerState?
+}
+
 /// Loads, animates, and draws the robot mascot companion.
 /// The mascot floats near the camera and has 5 independently animated parts:
 /// body, left arm, right arm, eyes, and bottom thruster.
 @MainActor
 final class MascotSystem {
 
+    // MARK: - State Machine
+
+    enum MascotState: Equatable {
+        case idle(IdleSubState)
+        case patrol(targetId: UUID, targetPos: SIMD3<Float>)
+        case hover(nodeId: UUID, timer: Float)
+        case conjure(nodeId: UUID, phase: Float)
+        case absorb(nodeId: UUID, phase: Float)
+        case react(nodeId: UUID, ReactionType)
+        case busy
+        case chatting
+    }
+
+    enum IdleSubState: Equatable { case awake, drowsy, sleeping }
+    enum ReactionType: Equatable { case headTurn, inspect, importanceBoost }
+
+    enum MascotTask: Comparable {
+        case create(nodeId: UUID, position: SIMD3<Float>)
+        case delete(nodeId: UUID, position: SIMD3<Float>)
+        case react(nodeId: UUID, type: ReactionType)
+        case patrol
+        case idle
+
+        /// Priority ordering: create > delete > react > patrol > idle
+        private var priority: Int {
+            switch self {
+            case .create: return 4
+            case .delete: return 3
+            case .react: return 2
+            case .patrol: return 1
+            case .idle: return 0
+            }
+        }
+
+        static func < (lhs: MascotTask, rhs: MascotTask) -> Bool {
+            lhs.priority < rhs.priority
+        }
+    }
+
     // Part indices matching the binary file order
     private enum Part: Int, CaseIterable {
         case body = 0, leftArm, rightArm, eye, bottom
     }
 
-    private struct PartMesh {
+    struct PartMesh {
         let vertexBuffer: MTLBuffer
         let indexBuffer: MTLBuffer
         let vertexCount: Int
@@ -33,11 +81,22 @@ final class MascotSystem {
     }
 
     private let device: MTLDevice
-    private var parts: [PartMesh] = []
+    private(set) var parts: [PartMesh] = []
     private var uniformBuffer: MTLBuffer?
-    private var baseColorTexture: MTLTexture?
-    private var metalRoughTexture: MTLTexture?
-    private var sampler: MTLSamplerState?
+    private(set) var baseColorTexture: MTLTexture?
+    private(set) var metalRoughTexture: MTLTexture?
+    private(set) var sampler: MTLSamplerState?
+
+    // State machine
+    private(set) var currentState: MascotState = .idle(.awake)
+    private(set) var taskQueue: [MascotTask] = []  // sorted descending by priority, max depth 8
+    private let maxTaskQueueDepth = 8
+    private var idleTimer: Float = 0  // time spent in idle state
+    private var nextPatrolThreshold: Float = Float.random(in: 12...30)  // set once on idle entry
+
+    // Project identity
+    var projectId: String = ""
+    var projectTint: SIMD3<Float> = SIMD3<Float>(0, 0.8, 1.0)  // default cyan
 
     // Animation state
     private var time: Float = 0
@@ -45,23 +104,32 @@ final class MascotSystem {
     private var initialized = false
     private var currentDynamicScale: Float = 0
 
-    // Chat state — when chatting, mascot stops patrolling and faces the camera
-    private(set) var isChatting = false
+    // Backward-compat computed properties
+    var isChatting: Bool { if case .chatting = currentState { return true } else { return false } }
+    var isHovering: Bool {
+        switch currentState {
+        case .hover, .chatting: return true
+        default: return false
+        }
+    }
 
     // Fixed render-space scale — mascot is about 3x node size (nodes are radius 0.04)
     private let mascotScale: Float = 0.06
 
-    // Patrol state — mascot flies between nodes
+    // Patrol/hover timing constants
     private var patrolTarget: SIMD3<Float> = .zero
     private var patrolHoverTimer: Float = 0
     private let patrolHoverDuration: Float = 8.0  // total seconds at a node (includes fade-out)
     private let holoDelay: Float = 1.5  // seconds after hover starts before holo appears
     private let holoFadeOutLead: Float = 1.0  // seconds before departure to start fading holo out
-    private(set) var isHovering = false
     private var patrolSpeed: Float = 0.3  // render-space units/sec
 
     // Smooth yaw — lerps toward target direction instead of snapping
     private var currentYaw: Float = 0
+    private var idleYawDrift: Float = 0  // random wander in idle state
+
+    // Conjure/absorb arm animation angle (radians, 0 = resting, positive = raised)
+    private var conjureArmAngle: Float = 0
 
     // Thruster particles
     private struct ThrusterParticle {
@@ -110,12 +178,67 @@ final class MascotSystem {
 
     /// Toggle chat mode. When chatting, mascot stops patrolling and faces the camera.
     func setChatting(_ chatting: Bool) {
-        isChatting = chatting
         if chatting {
-            isHovering = true
+            currentState = .chatting
             patrolHoverTimer = 0
         } else {
-            isHovering = false
+            enterIdle()
+        }
+    }
+
+    /// Enter busy (maintenance) mode. Patrol/idle tasks are paused but create/delete still process.
+    func enterBusyMode() {
+        currentState = .busy
+    }
+
+    /// Exit busy mode back to idle.
+    func exitBusyMode() {
+        enterIdle()
+    }
+
+    /// Enqueue a task. Maintains sorted order (highest priority first) and caps at maxTaskQueueDepth.
+    func enqueueTask(_ task: MascotTask) {
+        taskQueue.append(task)
+        taskQueue.sort(by: >)  // highest priority first
+        // Drop lowest-priority tasks if over capacity
+        while taskQueue.count > maxTaskQueueDepth {
+            taskQueue.removeLast()
+        }
+    }
+
+    /// Dequeue the next highest-priority task, or nil if empty.
+    private func dequeueTask() -> MascotTask? {
+        taskQueue.isEmpty ? nil : taskQueue.removeFirst()
+    }
+
+    /// Enter idle state with a fresh patrol threshold.
+    private func enterIdle() {
+        currentState = .idle(.awake)
+        idleTimer = 0
+        nextPatrolThreshold = Float.random(in: 12...30)
+        idleYawDrift = 0
+    }
+
+    /// Transition to the next task from the queue, or idle if empty.
+    private func transitionToNextTask(positions: [UUID: SIMD3<Float>], scaleFactor: Float) {
+        if let task = dequeueTask() {
+            switch task {
+            case .create(let nodeId, let position):
+                currentState = .conjure(nodeId: nodeId, phase: 0)
+                patrolTarget = position
+            case .delete(let nodeId, let position):
+                currentState = .absorb(nodeId: nodeId, phase: 0)
+                patrolTarget = position
+            case .react(let nodeId, let type):
+                currentState = .react(nodeId: nodeId, type)
+            case .patrol:
+                pickNewPatrolTarget(positions: positions, scaleFactor: scaleFactor)
+            case .idle:
+                enterIdle()
+            }
+        } else {
+            // Default: idle between patrols so drowsy/sleeping states are reachable
+            enterIdle()
         }
     }
 
@@ -131,6 +254,34 @@ final class MascotSystem {
         setupArcaneBuffers()
         setupRingBuffers()
         setupHoloBuffers()
+    }
+
+    /// Init from shared resources — used by MascotFleet to avoid per-instance mesh duplication.
+    init(device: MTLDevice, shared: MascotSharedResources, projectId: String, tint: SIMD3<Float>) {
+        self.device = device
+        self.parts = shared.parts
+        self.baseColorTexture = shared.baseColorTexture
+        self.metalRoughTexture = shared.metalRoughTexture
+        self.sampler = shared.sampler
+        self.projectId = projectId
+        self.projectTint = tint
+        uniformBuffer = device.makeBuffer(
+            length: MemoryLayout<MascotUniforms>.stride,
+            options: .storageModeShared
+        )
+        setupArcaneBuffers()
+        setupRingBuffers()
+        setupHoloBuffers()
+    }
+
+    /// Extract shared resources from this instance (call on the "template" mascot).
+    func extractSharedResources() -> MascotSharedResources {
+        MascotSharedResources(
+            parts: parts,
+            baseColorTexture: baseColorTexture,
+            metalRoughTexture: metalRoughTexture,
+            sampler: sampler
+        )
     }
 
     private func setupArcaneBuffers() {
@@ -287,9 +438,12 @@ final class MascotSystem {
     // MARK: - Animation
 
     /// Pick a new random node to fly to, keeping track of which node UUID it is.
-    private func pickNewPatrolTarget(positions: [UUID: SIMD3<Float>], scaleFactor: Float) {
+    func pickNewPatrolTarget(positions: [UUID: SIMD3<Float>], scaleFactor: Float) {
         let scaled = positions.map { (id: $0.key, pos: $0.value * scaleFactor) }
-        guard !scaled.isEmpty else { return }
+        guard !scaled.isEmpty else {
+            enterIdle()
+            return
+        }
         // Pick a random node, but try to avoid the one we're already near
         var candidate = scaled.randomElement()!
         for _ in 0..<3 {
@@ -302,6 +456,256 @@ final class MascotSystem {
         currentTargetId = candidate.id
         // Hover slightly above the node
         patrolTarget = candidate.pos + SIMD3<Float>(0, mascotScale * 2.0, 0)
+        currentState = .patrol(targetId: candidate.id, targetPos: patrolTarget)
+    }
+
+    // MARK: - State-Dispatched Update Methods
+
+    private func updateIdle(dt: Float, camera: CameraController, positions: [UUID: SIMD3<Float>], sf: Float) {
+        idleTimer += dt
+
+        // Sub-state transitions based on idle duration
+        switch currentState {
+        case .idle(.awake):
+            if idleTimer >= 30 {
+                currentState = .idle(.drowsy)
+            }
+            // Random yaw drift — curious look-around
+            idleYawDrift += Float.random(in: -0.1...0.1) * dt
+            idleYawDrift = max(-0.3, min(0.3, idleYawDrift))  // clamp drift range
+        case .idle(.drowsy):
+            if idleTimer >= 60 {
+                currentState = .idle(.sleeping)
+            }
+        case .idle(.sleeping):
+            break
+        default:
+            break
+        }
+
+        // Check for queued tasks — any task wakes from sleep
+        if !taskQueue.isEmpty {
+            transitionToNextTask(positions: positions, scaleFactor: sf)
+            return
+        }
+
+        // Patrol after stored threshold. Skip for single-node projects (nowhere to go).
+        if idleTimer >= nextPatrolThreshold && positions.count > 1 {
+            idleTimer = 0
+            pickNewPatrolTarget(positions: positions, scaleFactor: sf)
+        } else if positions.count == 1, let (_, pos) = positions.first {
+            // Single node: idle near the node
+            let targetPos = pos * sf + SIMD3<Float>(0, mascotScale * 2.0, 0)
+            let dist = simd_length(targetPos - currentPosition)
+            if dist > mascotScale * 4.0 {
+                // Too far — fly to it
+                currentPosition = currentPosition + simd_normalize(targetPos - currentPosition) * min(dt * 2.0, dist)
+            }
+        }
+    }
+
+    private func updatePatrol(dt: Float, targetId: UUID, targetPos: SIMD3<Float>, positions: [UUID: SIMD3<Float>], sf: Float) {
+        // Check for higher-priority tasks
+        if let first = taskQueue.first {
+            switch first {
+            case .create, .delete:
+                transitionToNextTask(positions: positions, scaleFactor: sf)
+                return
+            default: break
+            }
+        }
+
+        let distToTarget = simd_length(patrolTarget - currentPosition)
+
+        if distToTarget < mascotScale * 0.5 {
+            // Arrived — start hovering
+            patrolHoverTimer = 0
+            currentState = .hover(nodeId: targetId, timer: 0)
+        } else {
+            // Smooth flight with ease-in/ease-out
+            let dir = simd_normalize(patrolTarget - currentPosition)
+            let approachFactor = min(distToTarget / (mascotScale * 3.0), 1.0)
+            let speed = patrolSpeed * approachFactor
+            let step = dir * speed * dt
+            if simd_length(step) < distToTarget {
+                currentPosition += step
+            } else {
+                currentPosition = patrolTarget
+            }
+        }
+    }
+
+    private func updateHover(dt: Float, nodeId: UUID, timer: Float, positions: [UUID: SIMD3<Float>], sf: Float) {
+        // Check for higher-priority tasks
+        if let first = taskQueue.first {
+            switch first {
+            case .create, .delete:
+                transitionToNextTask(positions: positions, scaleFactor: sf)
+                return
+            default: break
+            }
+        }
+
+        patrolHoverTimer += dt
+        if patrolHoverTimer >= patrolHoverDuration {
+            patrolHoverTimer = 0
+            transitionToNextTask(positions: positions, scaleFactor: sf)
+        } else {
+            currentState = .hover(nodeId: nodeId, timer: patrolHoverTimer)
+        }
+    }
+
+    /// Conjure animation: fly to position, arms raise, node materializes.
+    /// Phase 0→0.2: flyTo, 0.2→1.0: perform (node scales 0→1)
+    private func updateConjure(dt: Float, nodeId: UUID, phase: Float, positions: [UUID: SIMD3<Float>], sf: Float) {
+        let totalDuration: Float = 3.0
+        let newPhase = phase + dt / totalDuration
+
+        if newPhase >= 1.0 {
+            // Complete — restore normal state
+            conjureArmAngle = 0
+            transitionToNextTask(positions: positions, scaleFactor: sf)
+            return
+        }
+
+        // Update spawn position from simulation if available
+        if let pos = positions[nodeId] {
+            patrolTarget = pos * sf + SIMD3<Float>(0, mascotScale * 2.0, 0)
+        }
+
+        if newPhase < 0.2 {
+            // FlyTo phase: move toward target
+            let distToTarget = simd_length(patrolTarget - currentPosition)
+            if distToTarget > mascotScale * 0.3 {
+                let dir = simd_normalize(patrolTarget - currentPosition)
+                let speed = patrolSpeed * 1.5  // faster than normal patrol
+                let step = dir * speed * dt
+                if simd_length(step) < distToTarget {
+                    currentPosition += step
+                } else {
+                    currentPosition = patrolTarget
+                }
+            }
+            // Arms begin raising
+            conjureArmAngle = (newPhase / 0.2) * 1.05  // 0→60 degrees
+        } else {
+            // Perform phase: arms at +60 degrees, arcane circle brightens
+            conjureArmAngle = 1.05  // 60 degrees
+            // Node materialization is tracked via birthingNodes in GraphRenderStore
+            // (triggered by MascotFleet.onNodeCreated → enqueueTask)
+        }
+
+        currentState = .conjure(nodeId: nodeId, phase: newPhase)
+    }
+
+    /// Absorb animation: fly to condemned node, node shrinks, mascot absorbs.
+    /// Phase 0→0.2: flyTo, 0.2→1.0: perform (node scales 1→0)
+    private func updateAbsorb(dt: Float, nodeId: UUID, phase: Float, positions: [UUID: SIMD3<Float>], sf: Float) {
+        let totalDuration: Float = 3.0
+        let newPhase = phase + dt / totalDuration
+
+        if newPhase >= 1.0 {
+            conjureArmAngle = 0
+            transitionToNextTask(positions: positions, scaleFactor: sf)
+            return
+        }
+
+        // Update target position from simulation if available
+        if let pos = positions[nodeId] {
+            patrolTarget = pos * sf + SIMD3<Float>(0, mascotScale * 2.0, 0)
+        }
+
+        if newPhase < 0.2 {
+            // FlyTo phase
+            let distToTarget = simd_length(patrolTarget - currentPosition)
+            if distToTarget > mascotScale * 0.3 {
+                let dir = simd_normalize(patrolTarget - currentPosition)
+                let speed = patrolSpeed * 1.5
+                let step = dir * speed * dt
+                if simd_length(step) < distToTarget {
+                    currentPosition += step
+                } else {
+                    currentPosition = patrolTarget
+                }
+            }
+            conjureArmAngle = (newPhase / 0.2) * 1.57  // 0→90 degrees (T-pose)
+        } else {
+            // Perform phase: arms in T-pose, node shrinks
+            conjureArmAngle = 1.57  // 90 degrees (T-pose)
+        }
+
+        currentState = .absorb(nodeId: nodeId, phase: newPhase)
+    }
+
+    /// Reaction timer for transient reactions (headTurn, importanceBoost).
+    private var reactTimer: Float = 0
+    private var reactYawTarget: Float?
+
+    private func updateReact(dt: Float, nodeId: UUID, type: ReactionType, positions: [UUID: SIMD3<Float>], sf: Float) {
+        reactTimer += dt
+
+        switch type {
+        case .headTurn:
+            // Yaw toward target node over 0.3s, hold 1s, return. Duration ~2s.
+            let duration: Float = 2.0
+            if reactTimer >= duration {
+                reactTimer = 0
+                reactYawTarget = nil
+                transitionToNextTask(positions: positions, scaleFactor: sf)
+                return
+            }
+            // Turn toward the target node
+            if let pos = positions[nodeId] {
+                let targetWorld = pos * sf
+                let toTarget = targetWorld - currentPosition
+                if simd_length(toTarget) > 0.001 {
+                    reactYawTarget = atan2(toTarget.x, toTarget.z)
+                }
+            }
+
+        case .inspect:
+            // If idle/patrolling, fly to node, short hover (3s)
+            if reactTimer < 0.1 {
+                // On first tick, set up flight toward node
+                if let pos = positions[nodeId] {
+                    patrolTarget = pos * sf + SIMD3<Float>(0, mascotScale * 2.0, 0)
+                    currentTargetId = nodeId
+                }
+            }
+            let distToTarget = simd_length(patrolTarget - currentPosition)
+            if distToTarget > mascotScale * 0.5 {
+                let dir = simd_normalize(patrolTarget - currentPosition)
+                let speed = patrolSpeed * 0.8
+                let step = dir * speed * dt
+                if simd_length(step) < distToTarget {
+                    currentPosition += step
+                }
+            }
+            // Short hover for 3s then done
+            if reactTimer >= 3.5 {
+                reactTimer = 0
+                reactYawTarget = nil
+                transitionToNextTask(positions: positions, scaleFactor: sf)
+            }
+
+        case .importanceBoost:
+            // Arm raise for 0.5s then release. Duration ~1.5s.
+            let duration: Float = 1.5
+            if reactTimer >= duration {
+                reactTimer = 0
+                conjureArmAngle = 0
+                transitionToNextTask(positions: positions, scaleFactor: sf)
+                return
+            }
+            // Brief arm raise (both arms +45 deg for 0.5s)
+            if reactTimer < 0.5 {
+                conjureArmAngle = 0.785 * min(reactTimer / 0.3, 1.0)  // 45 degrees
+            } else if reactTimer < 1.0 {
+                conjureArmAngle = 0.785 * (1.0 - (reactTimer - 0.5) / 0.5)  // lower back
+            } else {
+                conjureArmAngle = 0
+            }
+        }
     }
 
     /// Update mascot position and animation. Call once per frame.
@@ -312,54 +716,44 @@ final class MascotSystem {
         let sf: Float = camera.scaleFactor
         let dynamicScale: Float = mascotScale
 
-        // ── Patrol behavior: fly between nodes ──
+        // ── Initialize on first frame ──
         if !initialized {
-            // Start at graph center
             let graphCenter: SIMD3<Float> = camera.cameraTarget * sf
             currentPosition = graphCenter
             pickNewPatrolTarget(positions: nodePositions, scaleFactor: sf)
             initialized = true
-            isHovering = false
         }
 
-        if !isChatting {
-            let distToTarget: Float = simd_length(patrolTarget - currentPosition)
-
-            if isHovering {
-                // Hover at current node
-                patrolHoverTimer += dt
-                if patrolHoverTimer >= patrolHoverDuration {
-                    patrolHoverTimer = 0
-                    isHovering = false
-                    pickNewPatrolTarget(positions: nodePositions, scaleFactor: sf)
-                }
-            } else {
-                // Flying toward target
-                if distToTarget < mascotScale * 0.5 {
-                    // Arrived — start hovering
-                    isHovering = true
-                    patrolHoverTimer = 0
-                } else {
-                    // Smooth flight with ease-in/ease-out
-                    let dir: SIMD3<Float> = simd_normalize(patrolTarget - currentPosition)
-                    // Speed ramps down as we approach target for smooth arrival
-                    let approachFactor: Float = min(distToTarget / (mascotScale * 3.0), 1.0)
-                    let speed: Float = patrolSpeed * approachFactor
-                    let step: SIMD3<Float> = dir * speed * dt
-                    if simd_length(step) < distToTarget {
-                        currentPosition += step
-                    } else {
-                        currentPosition = patrolTarget
-                    }
+        // ── State-dispatched behavior ──
+        switch currentState {
+        case .idle:
+            updateIdle(dt: dt, camera: camera, positions: nodePositions, sf: sf)
+        case .patrol(let targetId, let targetPos):
+            updatePatrol(dt: dt, targetId: targetId, targetPos: targetPos, positions: nodePositions, sf: sf)
+        case .hover(let nodeId, let timer):
+            updateHover(dt: dt, nodeId: nodeId, timer: timer, positions: nodePositions, sf: sf)
+        case .conjure(let nodeId, let phase):
+            updateConjure(dt: dt, nodeId: nodeId, phase: phase, positions: nodePositions, sf: sf)
+        case .absorb(let nodeId, let phase):
+            updateAbsorb(dt: dt, nodeId: nodeId, phase: phase, positions: nodePositions, sf: sf)
+        case .react(let nodeId, let type):
+            updateReact(dt: dt, nodeId: nodeId, type: type, positions: nodePositions, sf: sf)
+        case .busy:
+            // During busy mode, still process create/delete tasks
+            if let first = taskQueue.first {
+                switch first {
+                case .create, .delete:
+                    transitionToNextTask(positions: nodePositions, scaleFactor: sf)
+                default: break
                 }
             }
+        case .chatting:
+            break  // stay at current position
         }
-        // else: chatting — stay at current position, keep hovering
 
-        // Face direction: camera when chatting, travel direction when patrolling
+        // Face direction: camera when chatting, travel direction otherwise
         let desiredYaw: Float
         if isChatting {
-            // Face toward camera
             let camPos = camera.cameraPosition * sf
             let toCamera = camPos - currentPosition
             if simd_length(toCamera) > 0.001 {
@@ -367,28 +761,48 @@ final class MascotSystem {
             } else {
                 desiredYaw = currentYaw
             }
+        } else if case .idle = currentState {
+            // Idle: gentle random yaw drift
+            desiredYaw = currentYaw + idleYawDrift
         } else {
-            // Face the direction of travel
-            let toTarget: SIMD3<Float> = patrolTarget - currentPosition
+            let toTarget = patrolTarget - currentPosition
             if simd_length(toTarget) > 0.001 {
                 desiredYaw = atan2(toTarget.x, toTarget.z)
             } else {
-                desiredYaw = currentYaw  // hold current facing when hovering
+                desiredYaw = currentYaw
             }
         }
-        // Shortest-path angle difference
         var yawDiff = desiredYaw - currentYaw
         if yawDiff > .pi { yawDiff -= 2 * .pi }
         if yawDiff < -.pi { yawDiff += 2 * .pi }
-        let yawSpeed: Float = isHovering ? 1.5 : 3.0  // slower turn when hovering
+        let yawSpeed: Float = isHovering ? 1.5 : 3.0
         currentYaw += yawDiff * min(dt * yawSpeed, 1.0)
 
         // Build per-part model matrices
         guard let uniformBuf = uniformBuffer else { return }
         let ptr = uniformBuf.contents().bindMemory(to: MascotUniforms.self, capacity: 1)
 
-        // Idle animation: bob + lean (more when hovering, less when flying)
-        let bobY: Float = sin(time * 2.0) * dynamicScale * 0.15
+        // Idle animation: bob + lean with state-dependent intensity
+        let idleSubState: IdleSubState? = {
+            if case .idle(let s) = currentState { return s } else { return nil }
+        }()
+        let isBusy = { if case .busy = currentState { return true } else { return false } }()
+        let bobSpeed: Float = {
+            if isBusy { return 6.0 }  // 3x normal during maintenance
+            switch idleSubState {
+            case .drowsy: return 1.0
+            case .sleeping: return 0.6
+            default: return 2.0
+            }
+        }()
+        let bobAmplitude: Float = {
+            if isBusy { return 0.12 }
+            switch idleSubState {
+            case .sleeping: return 0.08
+            default: return 0.15
+            }
+        }()
+        let bobY: Float = sin(time * bobSpeed) * dynamicScale * bobAmplitude
         let idleYaw: Float = currentYaw
         let flyLean: Float = isHovering ? 0.0 : 0.2  // tilt forward when flying
         let leanZ: Float = sin(time * 1.3) * 0.08 + flyLean
@@ -411,9 +825,29 @@ final class MascotSystem {
         // so vertices near the shoulder stay with the body and the hand
         // follows the arm rotation fully.
         // Dampen swing during flight to prevent stretching from rapid yaw changes.
-        let swingAmplitude: Float = isHovering ? 0.4 : 0.15
-        let leftSwing: Float = sin(time * 2.5) * swingAmplitude
-        let rightSwing: Float = sin(time * 2.5 + .pi) * swingAmplitude  // opposite phase
+        let swingAmplitude: Float = {
+            switch idleSubState {
+            case .sleeping: return 0.05  // arms droop in sleep
+            case .drowsy: return 0.2
+            default: return isHovering ? 0.4 : 0.15
+            }
+        }()
+        // Override arm angle for conjure/absorb animations (arms raise)
+        let leftSwing: Float
+        let rightSwing: Float
+        if conjureArmAngle > 0.01 {
+            // Both arms raise symmetrically during conjure/absorb
+            leftSwing = -conjureArmAngle   // negative = raise upward
+            rightSwing = -conjureArmAngle
+        } else if isBusy {
+            // Busy mode: arms at working angle (45 degrees outward)
+            let busyAngle: Float = -.pi / 4.0
+            leftSwing = busyAngle + sin(time * 4.0) * 0.1   // subtle working motion
+            rightSwing = busyAngle + sin(time * 4.0 + .pi) * 0.1
+        } else {
+            leftSwing = sin(time * 2.5) * swingAmplitude
+            rightSwing = sin(time * 2.5 + .pi) * swingAmplitude  // opposite phase
+        }
 
         // Left arm pivot at ball joint center (from the Python script)
         let leftPivot = SIMD3<Float>(-0.68, -0.21, 0.10)
@@ -453,11 +887,20 @@ final class MascotSystem {
             emissive: SIMD4<Float>(0, 0, 0, 0), blendPivot: rightPivot, blendRadius: 1.0
         )
 
-        // Eye: cyan emissive pulse
-        let eyePulse: Float = 0.6 + 0.4 * sin(time * 3.0)
+        // Eye: cyan emissive pulse (dims in drowsy/sleeping idle states)
+        let eyeMax: Float = {
+            if isBusy { return 1.2 }  // brighter during maintenance
+            switch idleSubState {
+            case .drowsy: return 0.5   // 50% brightness
+            case .sleeping: return 0.1  // 10% brightness
+            default: return 1.0
+            }
+        }()
+        let eyeFreq: Float = isBusy ? 6.0 : 3.0
+        let eyePulse: Float = eyeMax * (0.6 + 0.4 * sin(time * eyeFreq))
         ptr.pointee.parts.3 = MascotPartUniforms(
             modelMatrix: bodyMatrix, parentMatrix: bodyMatrix,
-            emissive: SIMD4<Float>(0, 0.8, 1.0, eyePulse), blendPivot: zp, blendRadius: 0
+            emissive: SIMD4<Float>(projectTint.x, projectTint.y, projectTint.z, eyePulse), blendPivot: zp, blendRadius: 0
         )
 
         // Bottom: blue thruster glow
@@ -467,8 +910,14 @@ final class MascotSystem {
             emissive: SIMD4<Float>(0.2, 0.4, 1.0, bottomPulse), blendPivot: zp, blendRadius: 0
         )
 
-        // ── Thruster particles ──
-        updateThrusterParticles(dt: dt, bodyMatrix: bodyMatrix, dynamicScale: dynamicScale)
+        // ── Thruster particles (skip packing when off-screen for performance) ──
+        let camPos = camera.cameraPosition * sf
+        let camFwd = camera.forward
+        let toMascot = currentPosition - camPos
+        let behindCamera = simd_dot(toMascot, camFwd) < -dynamicScale * 2.0
+        if !behindCamera {
+            updateThrusterParticles(dt: dt, bodyMatrix: bodyMatrix, dynamicScale: dynamicScale)
+        }
 
         // ── Arcane circle ──
         updateArcaneCircle(dt: dt, bodyMatrix: bodyMatrix, bodyRot: bodyRot, dynamicScale: dynamicScale)
@@ -607,7 +1056,9 @@ final class MascotSystem {
             right: right,
             opacity: arcaneIntensity,
             up: up,
-            _pad: 0
+            _pad0: 0,
+            tintColor: projectTint,
+            _pad1: 0
         )
     }
 
@@ -670,7 +1121,9 @@ final class MascotSystem {
                 right: right,
                 opacity: ringIntensity,
                 up: up,
-                _pad: 0
+                _pad0: 0,
+                tintColor: projectTint,
+                _pad1: 0
             )
         }
     }

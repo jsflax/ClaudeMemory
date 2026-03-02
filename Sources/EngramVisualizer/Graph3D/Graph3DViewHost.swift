@@ -5,6 +5,7 @@ import Metal
 import simd
 import os
 import Lattice
+import EngramModels
 
 private let frameLog = Logger(subsystem: "com.claudememory.visualizer", category: "3DFrameTiming")
 
@@ -12,6 +13,7 @@ private let frameLog = Logger(subsystem: "com.claudememory.visualizer", category
 
 struct Graph3DView: View {
     let layoutMode: LayoutMode
+    let showMascots: Bool
     @Binding var selectedNode: UUID?
     let semanticClusters3D: [SemanticCluster3D]
     /// Direct references for renderTick — avoids closures crossing SwiftUI observation boundary.
@@ -21,6 +23,7 @@ struct Graph3DView: View {
     let forcePositionSnapshot3D: [UUID: SIMD3<Float>]
     let transitionProgress: CGFloat
     let renderStore: GraphRenderStore
+    let galaxyRegistry: GalaxyRegistry
     @Binding var cameraProjectTarget: String?
 
     /// Feature flag: set to true to use raw Metal renderer instead of RealityKit.
@@ -33,11 +36,17 @@ struct Graph3DView: View {
     @State private var updateClosureCount: UInt64 = 0
     /// Mirrors metalScene.reticleTarget for SwiftUI (MetalSceneManager is not @Observable).
     @State private var metalReticleTarget: UUID?
+    /// Mirrors metalScene teleport state for SwiftUI (MetalSceneManager is not @Observable).
+    @State private var metalTeleportLabel: String?
+    @State private var metalTeleportCounter: Int = 0
 
     // Mascot chat state
     @State private var isMascotChatOpen = false
     @State private var mascotChatEngine: AnyObject?  // type-erased for @available gating
     @Environment(\.lattice) private var lattice
+
+    // Maintenance mode observation
+    @State private var maintenanceObserver: AnyObject?
 
     /// Active scene object for input forwarding (Metal or RealityKit).
     private var activeSceneForInput: AnyObject? {
@@ -75,8 +84,8 @@ struct Graph3DView: View {
                 }
 
                 // Teleport project label (fades after 2s)
-                if let label = Self.useMetalRenderer ? metalScene?.teleportLabel : scene.teleportLabel {
-                    let counter = Self.useMetalRenderer ? (metalScene?.teleportCounter ?? 0) : scene.teleportCounter
+                if let label = Self.useMetalRenderer ? metalTeleportLabel : scene.teleportLabel {
+                    let counter = Self.useMetalRenderer ? metalTeleportCounter : scene.teleportCounter
                     Text(label)
                         .font(.system(size: 24, weight: .bold, design: .monospaced))
                         .foregroundStyle(.white.opacity(0.8))
@@ -89,8 +98,8 @@ struct Graph3DView: View {
                             let myCounter = counter
                             try? await Task.sleep(for: .seconds(2))
                             if Self.useMetalRenderer {
-                                if metalScene?.teleportCounter == myCounter {
-                                    metalScene?.teleportLabel = nil
+                                if metalTeleportCounter == myCounter {
+                                    metalTeleportLabel = nil
                                 }
                             } else {
                                 if scene.teleportCounter == myCounter {
@@ -145,6 +154,7 @@ struct Graph3DView: View {
                             Label("QE rise/descend", systemImage: "keyboard")
                             Label("Shift sprint", systemImage: "keyboard")
                             Label("T/R teleport", systemImage: "keyboard")
+                            Label("[/] galaxy", systemImage: "keyboard")
                         }
                         if GCController.current != nil {
                             HStack(spacing: 16) {
@@ -187,9 +197,7 @@ struct Graph3DView: View {
         .onChange(of: cameraProjectTarget) { _, project in
             if let project {
                 if Self.useMetalRenderer {
-                    metalScene?.camera.driveToProject(project, positions: metalScene?.positions ?? [:],
-                                                     nodes: metalScene?.renderStore?.nodes ?? [],
-                                                     hubs: metalScene?.renderStore?.hubs ?? [])
+                    metalScene?.driveToProject(project)
                 } else {
                     scene.driveToProject(project)
                 }
@@ -217,7 +225,7 @@ struct Graph3DView: View {
     private var realityViewContent: some View {
         RealityView { content in
             let (root, camera) = scene.setup()
-            #if DEBUG
+            #if ENGRAM_INSTRUMENTATION
             scene.setupProfiling()
             #endif
             content.add(root)
@@ -229,6 +237,7 @@ struct Graph3DView: View {
             scene.embeddingProjection = embeddingProjection
             scene.camera3DState = camera3DState
             scene.renderStore = renderStore
+            // galaxyRegistry wired only for Metal path (RealityKit deprecated)
             scene.forcePositionSnapshot3D = forcePositionSnapshot3D
             scene.transitionProgress = transitionProgress
             scene.selectionCallback = { newSelection in
@@ -266,6 +275,7 @@ struct Graph3DView: View {
         if let renderer = metalRenderer {
             MetalViewRepresentable(renderer: renderer)
                 .onChange(of: layoutMode) { _, _ in pushDataToMetalScene() }
+                .onChange(of: showMascots) { _, _ in pushDataToMetalScene() }
                 .onChange(of: transitionProgress) { _, _ in
                     metalScene?.forcePositionSnapshot3D = forcePositionSnapshot3D
                     metalScene?.transitionProgress = transitionProgress
@@ -280,15 +290,18 @@ struct Graph3DView: View {
         guard metalRenderer == nil else { return }
         guard let r = MetalGraphRenderer(create: true) else { return }
         metalRenderer = r
-        #if DEBUG
+        #if ENGRAM_INSTRUMENTATION
         r.installRunLoopObserver()
         #endif
         guard let mgr = MetalSceneManager(renderer: r) else { return }
         metalScene = mgr
 
+        // Galaxy registry provides all simulation/render data for the Metal path.
+        // Singular refs kept for RealityKit fallback (deprecated).
+        mgr.galaxyRegistry = galaxyRegistry
+        mgr.camera3DState = camera3DState
         mgr.simulation3D = simulation3D
         mgr.embeddingProjection = embeddingProjection
-        mgr.camera3DState = camera3DState
         mgr.renderStore = renderStore
         mgr.forcePositionSnapshot3D = forcePositionSnapshot3D
         mgr.transitionProgress = transitionProgress
@@ -298,13 +311,53 @@ struct Graph3DView: View {
         mgr.reticleCallback = { newTarget in
             metalReticleTarget = newTarget
         }
+        mgr.teleportCallback = { label, counter in
+            metalTeleportLabel = label
+            metalTeleportCounter = counter
+        }
         pushDataToMetalScene()
         installInputMonitor()
+        setupMaintenanceObserver(mgr: mgr)
+    }
+
+    private func setupMaintenanceObserver(mgr: MetalSceneManager) {
+        // Check initial state
+        updateMaintenanceState(mgr: mgr)
+
+        // Observe HookState changes
+        let ref = lattice.sendableReference
+        maintenanceObserver = lattice.objects(HookState.self).observe { [weak mgr] change in
+            guard let bgLattice = ref.resolve() else { return }
+            // Check if this is the maintenanceActive key
+            switch change {
+            case .insert(let pk), .update(let pk):
+                guard let state = bgLattice.object(HookState.self, primaryKey: pk),
+                      state.key == .maintenanceActive else { return }
+                let isActive = state.value == "1" &&
+                    state.updatedAt.timeIntervalSinceNow > -600  // 10 min timeout
+                Task { @MainActor [weak mgr] in
+                    mgr?.isMaintenanceActive = isActive
+                }
+            case .delete:
+                Task { @MainActor [weak mgr] in
+                    mgr?.isMaintenanceActive = false
+                }
+            }
+        } as AnyObject
+    }
+
+    private func updateMaintenanceState(mgr: MetalSceneManager) {
+        if let state = lattice.objects(HookState.self)
+            .where({ $0.key == .maintenanceActive }).first {
+            mgr.isMaintenanceActive = state.value == "1" &&
+                state.updatedAt.timeIntervalSinceNow > -600
+        }
     }
 
     private func pushDataToMetalScene() {
         guard let ms = metalScene else { return }
         ms.layoutMode = layoutMode
+        ms.showMascots = showMascots
         ms.semanticClusters3D = semanticClusters3D
     }
 
@@ -368,7 +421,7 @@ struct Graph3DView: View {
     private func toggleMascotChat() {
         if isMascotChatOpen {
             isMascotChatOpen = false
-            metalScene?.mascot.setChatting(false)
+            metalScene?.exitFleetChat()
             // Clear sessions so next open starts fresh — prevents
             // response session context from accumulating across conversations
             if #available(macOS 26.0, *),
@@ -378,7 +431,7 @@ struct Graph3DView: View {
             mascotChatEngine = nil
         } else {
             isMascotChatOpen = true
-            metalScene?.mascot.setChatting(true)
+            metalScene?.enterFleetChat()
             if #available(macOS 26.0, *) {
                 setupChatEngineIfNeeded()
             }
@@ -390,7 +443,15 @@ struct Graph3DView: View {
             if mascotChatEngine == nil {
                 let engine = MascotChatEngine()
                 mascotChatEngine = engine
-                Task { await engine.setup(lattice: lattice) }
+                let store = renderStore
+                let binding = $selectedNode
+                Task {
+                    await engine.setup(
+                        lattice: lattice,
+                        renderStore: store,
+                        selectedMemoryId: { binding.wrappedValue }
+                    )
+                }
             }
         }
     }
@@ -487,6 +548,7 @@ struct Graph3DView: View {
         let heldKeys: (Bool, String) -> Void   // (insert, key) — insert=true inserts, false removes
         let clearKeys: () -> Void
         let teleport: (Int) -> Void
+        let galaxyTeleport: (Int) -> Void
         let lookRotate: (Float, Float) -> Void
         let dolly: (Float) -> Void
         let dollyAt: (Float, Float, Float) -> Void  // (amount, cursorNX, cursorNY)
@@ -496,6 +558,7 @@ struct Graph3DView: View {
             heldKeys = { insert, key in if insert { ms.heldKeys.insert(key) } else { ms.heldKeys.remove(key) } }
             clearKeys = { ms.heldKeys.removeAll() }
             teleport = { direction in ms.teleportToNextProject(direction: direction) }
+            galaxyTeleport = { direction in ms.teleportToNextGalaxy(direction: direction) }
             lookRotate = { dAz, dEl in ms.camera.lookRotate(deltaAz: dAz, deltaEl: dEl) }
             dolly = { amount in ms.camera.dolly(amount: amount) }
             dollyAt = { amount, nx, ny in ms.camera.dolly(amount: amount, cursorNX: nx, cursorNY: ny) }
@@ -505,6 +568,7 @@ struct Graph3DView: View {
             heldKeys = { insert, key in if insert { s.heldKeys.insert(key) } else { s.heldKeys.remove(key) } }
             clearKeys = { s.heldKeys.removeAll() }
             teleport = { direction in s.teleportToNextProject(positions: s.renderPositions, nodes: s.renderNodes, direction: direction) }
+            galaxyTeleport = { _ in } // Galaxy teleport only supported on Metal path
             lookRotate = { dAz, dEl in s.lookRotate(deltaAz: dAz, deltaEl: dEl) }
             dolly = { amount in s.dolly(amount: amount) }
             dollyAt = { amount, nx, ny in s.dolly(amount: amount, cursorNX: nx, cursorNY: ny) }
@@ -537,6 +601,8 @@ struct Graph3DView: View {
                     }
                     if key == "t" && noMods { teleport(1); return nil }
                     if key == "r" && noMods { teleport(-1); return nil }
+                    if key == "]" && noMods { galaxyTeleport(1); return nil }
+                    if key == "[" && noMods { galaxyTeleport(-1); return nil }
                 } else {
                     if Self.movementKeys.contains(key) {
                         heldKeys(false, key)

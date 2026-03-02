@@ -200,7 +200,7 @@ extension Graph3DScene {
         teleportCounter += 1
         teleportLabel = project
 
-        #if DEBUG
+        #if ENGRAM_INSTRUMENTATION
         // Write teleport verification data for UI tests
         let camRK = (targetPos + SIMD3(orbitRadius, 0, 0)) * scaleFactor
         let nodeRK = targetPos * scaleFactor

@@ -19,7 +19,7 @@ struct FrameUniforms {
     simd_float3   bgColor;            // for fog baking (0.051, 0.067, 0.09)
     float         fogNear;            // world units
     float         fogFar;             // world units
-    float         _pad0;
+    float         maintenancePulse;   // 0..1 lerp for maintenance atmosphere
     float         _pad1;
     float         _pad2;
 };
@@ -173,7 +173,9 @@ struct ArcaneCircleUniforms {
     simd_float3 right;      // mascot's local X axis in world space
     float       opacity;
     simd_float3 up;          // mascot's local Y axis in world space
-    float       _pad;
+    float       _pad0;
+    simd_float3 tintColor;   // per-project tint for arcane circle / rings
+    float       _pad1;
 };
 
 // Holographic info screen billboard (oriented to mascot's facing direction).

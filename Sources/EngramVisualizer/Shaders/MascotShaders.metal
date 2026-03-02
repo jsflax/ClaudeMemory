@@ -46,7 +46,10 @@ vertex ArcaneVertexOut arcane_vertex(
     ArcaneVertexOut out;
     out.position = frame.viewProjectionMatrix * float4(worldPos, 1.0);
     out.uv    = uvs[cornerIdx];
-    out.color = float4(0.0, 0.9, 1.0, circle.opacity);
+    // Use per-project tint color (defaults to cyan if zero)
+    float3 tint = circle.tintColor;
+    if (length(tint) < 0.01) tint = float3(0.0, 0.9, 1.0);
+    out.color = float4(tint, circle.opacity);
     return out;
 }
 
@@ -166,8 +169,9 @@ fragment float4 arcane_circle_fragment(
 
     if (totalAlpha < 0.004) discard_fragment();
 
-    // Color: bright cyan at center → deeper blue toward edges
-    float3 color = mix(float3(0.0, 0.92, 1.0), float3(0.25, 0.45, 1.0), r * 0.7);
+    // Color: tint at center → deeper blue toward edges
+    float3 tint = in.color.rgb;
+    float3 color = mix(tint, float3(0.25, 0.45, 1.0), r * 0.7);
 
     return float4(color, totalAlpha);   // straight alpha
 }
@@ -281,6 +285,7 @@ struct NodeRingVertexOut {
     float4 position [[position]];
     float2 uv;
     float  opacity;
+    float3 tint;
 };
 
 vertex NodeRingVertexOut node_ring_vertex(
@@ -301,6 +306,8 @@ vertex NodeRingVertexOut node_ring_vertex(
     out.position = frame.viewProjectionMatrix * float4(worldPos, 1.0);
     out.uv       = uvs[cornerIdx];
     out.opacity  = ring.opacity;
+    float3 tint  = ring.tintColor;
+    out.tint     = length(tint) < 0.01 ? float3(0.15, 0.7, 1.0) : tint;
     return out;
 }
 
@@ -347,8 +354,8 @@ fragment float4 node_ring_fragment(
 
     if (totalAlpha < 0.004) discard_fragment();
 
-    // Cyan color matching the inspecting node emissive
-    float3 color = mix(float3(0.15, 0.7, 1.0), float3(0.3, 0.5, 1.0), r * 0.6);
+    // Tinted color matching the inspecting node emissive
+    float3 color = mix(in.tint, float3(0.3, 0.5, 1.0), r * 0.6);
 
     return float4(color, totalAlpha);   // straight alpha — additive blend in pipeline
 }

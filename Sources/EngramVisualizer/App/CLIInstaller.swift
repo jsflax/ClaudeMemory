@@ -5,6 +5,7 @@ enum CLIInstaller {
     private static let claudeDir = NSHomeDirectory() + "/.claude"
     private static let installDir = claudeDir + "/bin"
     private static let agentsDir = claudeDir + "/agents"
+    private static let skillsDir = claudeDir + "/skills"
     private static let versionFile = installDir + "/.memory-version"
     private static let claudeMDPath = claudeDir + "/CLAUDE.md"
     private static let settingsPath = claudeDir + "/settings.json"
@@ -61,6 +62,26 @@ enum CLIInstaller {
                         let dst = URL(fileURLWithPath: agentsDir).appendingPathComponent(agent)
                         try? fm.removeItem(at: dst)
                         try fm.copyItem(at: src, to: dst)
+                    }
+                }
+            }
+
+            // Copy skill definitions
+            let skillsSrc = cliDir.appendingPathComponent("skills")
+            if fm.fileExists(atPath: skillsSrc.path) {
+                if let skillDirs = try? fm.contentsOfDirectory(atPath: skillsSrc.path) {
+                    for skillName in skillDirs {
+                        let srcDir = skillsSrc.appendingPathComponent(skillName)
+                        let dstDir = URL(fileURLWithPath: skillsDir).appendingPathComponent(skillName)
+                        var isDir: ObjCBool = false
+                        guard fm.fileExists(atPath: srcDir.path, isDirectory: &isDir), isDir.boolValue else { continue }
+                        try fm.createDirectory(at: dstDir, withIntermediateDirectories: true)
+                        let skillFile = srcDir.appendingPathComponent("SKILL.md")
+                        if fm.fileExists(atPath: skillFile.path) {
+                            let dst = dstDir.appendingPathComponent("SKILL.md")
+                            try? fm.removeItem(at: dst)
+                            try fm.copyItem(at: skillFile, to: dst)
+                        }
                     }
                 }
             }

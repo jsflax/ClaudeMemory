@@ -1,4 +1,6 @@
 import SwiftUI
+import Lattice
+import EngramKit
 
 // MARK: - Stats Overlay
 
@@ -14,6 +16,10 @@ struct StatsOverlay: View {
     let toggleRelation: (String) -> Void
     let colorMap: [String: Color]
     var driveToProject: ((String) -> Void)? = nil
+
+    @Environment(\.lattice) private var lattice
+    @State private var isMaintenanceActive: Bool = false
+    @State private var maintenanceObserver: AnyObject?
 
     private var dbFileSize: String {
         let dbPath = ProcessInfo.processInfo.environment["CLAUDE_MEMORY_DB"]
@@ -47,6 +53,17 @@ struct StatsOverlay: View {
                 .font(.system(size: 13, weight: .medium, design: .monospaced))
             Text("db: \(dbFileSize)")
                 .font(.system(size: 11, design: .monospaced))
+
+            if isMaintenanceActive {
+                HStack(spacing: 4) {
+                    Circle()
+                        .fill(.purple)
+                        .frame(width: 6, height: 6)
+                    Text("maintenance active")
+                        .font(.system(size: 11, design: .monospaced))
+                }
+                .foregroundStyle(.purple.opacity(0.9))
+            }
 
             Divider().frame(width: 100).overlay(Color.white.opacity(0.2))
 
@@ -111,6 +128,30 @@ struct StatsOverlay: View {
         .foregroundStyle(.white.opacity(0.7))
         .padding(12)
         .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 10))
+        .onAppear { setupMaintenanceObserver() }
+    }
+
+    private func setupMaintenanceObserver() {
+        // Check initial state
+        if let state = lattice.objects(HookState.self)
+            .where({ $0.key == .maintenanceActive }).first {
+            isMaintenanceActive = state.updatedAt.timeIntervalSinceNow > -600
+        }
+
+        // Observe changes
+        let ref = lattice.sendableReference
+        maintenanceObserver = lattice.objects(HookState.self).observe { change in
+            guard let bgLattice = ref.resolve() else { return }
+            switch change {
+            case .insert(let pk), .update(let pk):
+                guard let state = bgLattice.object(HookState.self, primaryKey: pk),
+                      state.key == .maintenanceActive else { return }
+                let active = state.updatedAt.timeIntervalSinceNow > -600
+                Task { @MainActor in isMaintenanceActive = active }
+            case .delete:
+                Task { @MainActor in isMaintenanceActive = false }
+            }
+        } as AnyObject
     }
 }
 

@@ -308,6 +308,15 @@ final class CameraController {
         teleportLabel = project
     }
 
+    /// Teleport camera to a galaxy's world center with appropriate orbit radius.
+    func teleportToGalaxy(center: SIMD3<Float>, radius: Float, label: String) {
+        orbitRadius = max(radius, 60)
+        targetCameraPos = center
+        cameraTarget = center
+        teleportCounter += 1
+        teleportLabel = label
+    }
+
     // MARK: - Matrix Helpers
 
     private func lookAt(eye: SIMD3<Float>, center: SIMD3<Float>, up: SIMD3<Float>) -> simd_float4x4 {

@@ -2,8 +2,36 @@ import Lattice
 import MCP
 import Foundation
 
+private let logFilePath = NSHomeDirectory() + "/.claude/memory.log"
+private let logMaxBytes = 256 * 1024
+
+private func rotateLogIfNeeded() {
+    let fm = FileManager.default
+    guard let attrs = try? fm.attributesOfItem(atPath: logFilePath),
+          let size = attrs[.size] as? Int,
+          size > logMaxBytes else { return }
+    let backup = logFilePath + ".1"
+    try? fm.removeItem(atPath: backup)
+    try? fm.moveItem(atPath: logFilePath, toPath: backup)
+}
+
 public func log(_ message: String) {
-    FileHandle.standardError.write(Data("[claude-memory] \(message)\n".utf8))
+    let line = "[claude-memory] \(ISO8601DateFormatter().string(from: Date())) \(message)\n"
+    // Always write to stderr for immediate visibility
+    FileHandle.standardError.write(Data(line.utf8))
+    // Also append to rotating log file
+    rotateLogIfNeeded()
+    if let data = line.data(using: .utf8) {
+        if FileManager.default.fileExists(atPath: logFilePath) {
+            if let fh = FileHandle(forWritingAtPath: logFilePath) {
+                fh.seekToEndOfFile()
+                fh.write(data)
+                fh.closeFile()
+            }
+        } else {
+            FileManager.default.createFile(atPath: logFilePath, contents: data)
+        }
+    }
 }
 
 // MARK: - Codable Argument Decoding

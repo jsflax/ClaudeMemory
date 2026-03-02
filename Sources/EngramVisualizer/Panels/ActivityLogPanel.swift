@@ -43,11 +43,9 @@ struct ActivityLogPanel: View {
                                 now: context.date,
                                 onSelect: onSelect
                             )
-                            .transition(.move(edge: .top).combined(with: .opacity))
                         }
                     }
                     .padding(.vertical, 4)
-                    .animation(.easeInOut(duration: 0.3), value: nodeCount)
                 }
             }
             .frame(width: 220)

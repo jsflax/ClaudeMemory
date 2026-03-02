@@ -29,6 +29,7 @@ jobs:
           cp -R .build/release/swift-transformers_Hub.bundle staging/
           cp -R .build/release/SwiftLM_SwiftLM.bundle staging/
           cp agents/*.md staging/agents/
+          cp -R skills staging/skills
           cd staging && tar czf ../engram-macos-arm64.tar.gz *
 
       - name: Import signing certificate
@@ -108,6 +109,7 @@ jobs:
           cp -R .build/release/swift-transformers_Hub.bundle "$CLI_DIR/"
           cp -R .build/release/SwiftLM_SwiftLM.bundle "$CLI_DIR/"
           cp agents/*.md "$AGENTS_DIR/"
+          cp -R skills "$CLI_DIR/skills"
 
           sign() {
             codesign --force --sign "Developer ID Application" \

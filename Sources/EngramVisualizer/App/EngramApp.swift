@@ -57,13 +57,21 @@ struct EngramApp: App {
             ?? NSHomeDirectory() + "/.claude/memory.sqlite"
         self.dbPath = dbPath
 
-        // Local DB — full schema (always opened)
+        // Local DB — full schema, with IPC target for sync relay.
+        // The IPC channel is inert until syncedLattice connects on the other end.
+        #if TEST_SYNC_CHANNEL
+        let syncChannel = ProcessInfo.processInfo.environment["TEST_SYNC_CHANNEL"] ?? "engram-sync"
+        #else
+        let syncChannel = "engram-sync"
+        #endif
+        var localConfig = Lattice.Configuration(
+            fileURL: URL(fileURLWithPath: dbPath),
+            migration: engramMigrations
+        )
+        localConfig.ipcTargets = [.init(channel: syncChannel)]
         let local = try! Lattice(
-            Memory.self, Edge.self, Checkpoint.self, VisualizerConfig.self, SyncConfig.self,
-            configuration: .init(
-                fileURL: URL(fileURLWithPath: dbPath),
-                migration: engramMigrations
-            )
+            Memory.self, Edge.self, Checkpoint.self, VisualizerConfig.self, SyncConfig.self, HookState.self,
+            configuration: localConfig
         )
         localLattice = local
         lattice = local
@@ -107,6 +115,14 @@ struct EngramApp: App {
         }
     }
 
+    private func autoConnectSync() {
+        guard let wsURL = accountService.syncWebSocketURL,
+              let token = accountService.token,
+              !syncManager.isSyncing else { return }
+        syncManager.compactBeforeSync()
+        syncManager.connectSync(wssEndpoint: wsURL, authToken: token)
+    }
+
     var body: some Scene {
         WindowGroup("Engram") {
             GraphView()
@@ -119,9 +135,13 @@ struct EngramApp: App {
                 .onAppear {
                     syncManager.localLattice = localLattice
                     syncManager.dbPath = dbPath
+                    autoConnectSync()
                 }
-                // Note: SyncManager reads SyncConfig from localLattice to build
-                // the IPC relay filter. All data lives in memory.db — no dual-DB routing.
+                .onChange(of: accountService.subscription?.isActive) { _, active in
+                    if active == true {
+                        autoConnectSync()
+                    }
+                }
                 .onOpenURL { url in
                     GIDSignIn.sharedInstance.handle(url)
                 }

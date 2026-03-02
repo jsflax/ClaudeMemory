@@ -47,6 +47,10 @@ vertex NodeVertexOut node_vertex(
         scalePulse = 1.0 + sin(frame.time * 4.0) * 0.12;              // search matched
     } else if (stateType > 4.5 && stateType < 5.5) {
         scalePulse = 1.0 + sin(frame.time * 2.0) * 0.08 * intensity;  // mascot inspecting
+    } else if (stateType > 5.5 && stateType < 6.5) {
+        scalePulse = intensity;                                         // birth: scale 0→1
+    } else if (stateType > 6.5 && stateType < 7.5) {
+        scalePulse = 1.0 - intensity;                                   // death: scale 1→0
     }
 
     float3 worldPos = v.position;
@@ -125,6 +129,16 @@ fragment float4 node_fragment(
         emissiveColor = float3(0.2, 0.6, 0.9);
         float pulse = 0.8 + 0.2 * sin(frame.time * 2.0);
         emissiveIntensity = 1.5 * intensity * pulse * depthFade;
+    } else if (stateType > 5.5 && stateType < 6.5) {
+        // Birth: warm glow that fades as node solidifies
+        emissiveColor = float3(1.0, 0.9, 0.5);
+        float pulse = 0.8 + 0.2 * sin(frame.time * 3.5);
+        emissiveIntensity = 3.0 * (1.0 - intensity) * pulse * depthFade;
+    } else if (stateType > 6.5 && stateType < 7.5) {
+        // Death: red-orange dissolve
+        emissiveColor = float3(1.0, 0.4, 0.1);
+        float pulse = 0.8 + 0.2 * sin(frame.time * 3.5);
+        emissiveIntensity = 3.0 * intensity * pulse * depthFade;
     } else {
         emissiveColor = baseColor;
         emissiveIntensity = 0.25;
@@ -169,6 +183,8 @@ fragment float4 node_fragment(
     }
 
     float3 ambient = baseColor * lights.ambientIntensity;
+    // Maintenance atmosphere: subtle purple-blue ambient boost
+    ambient += float3(0.3, 0.2, 0.5) * frame.maintenancePulse * 0.1;
     float3 lit = baseColor * diffuseAccum + specAccum + ambient;
     lit += emissiveColor * emissiveIntensity;
 
@@ -443,7 +459,15 @@ fragment float4 nebula_fragment(
         discard_fragment();
     }
 
-    return float4(in.color.rgb, alpha);  // straight alpha — blender applies sourceAlpha
+    // Maintenance atmosphere tint
+    float3 nebulaColor = in.color.rgb;
+    if (frame.maintenancePulse > 0.001) {
+        float3 maintenanceTint = float3(0.4, 0.3, 0.8);
+        nebulaColor = mix(nebulaColor, maintenanceTint, frame.maintenancePulse * 0.3);
+        alpha *= 1.0 + sin(frame.time * 1.5) * 0.15 * frame.maintenancePulse;
+    }
+
+    return float4(nebulaColor, alpha);  // straight alpha — blender applies sourceAlpha
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

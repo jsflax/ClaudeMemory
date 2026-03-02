@@ -8,7 +8,7 @@ private let frameLog = Logger(subsystem: "com.claudememory.visualizer", category
 
 extension Graph3DScene {
 
-    #if DEBUG
+    #if ENGRAM_INSTRUMENTATION
     func setupProfiling() {
         let path = "/tmp/frame-timing.csv"
         FileManager.default.createFile(atPath: path, contents: nil)
@@ -249,7 +249,7 @@ extension Graph3DScene {
             frameLog.error("[3D-render] dt=\(dt, format: .fixed(precision: 1))ms work=\(elapsed, format: .fixed(precision: 2))ms expand=\(msExpand, format: .fixed(precision: 2)) nodes=\(msNodes, format: .fixed(precision: 2)) edges=\(msEdges, format: .fixed(precision: 2)) flow=\(msFlow, format: .fixed(precision: 2)) neb=\(msNeb, format: .fixed(precision: 2)) | n=\(self.renderPositions.count) e=\(self.renderEdges.count) entities=\(totalEntities) nebEmitters=\(self.nebulaEmitters.count) ptLights=\(self.pointLightEntities.count) frame=\(self.renderFrameCount) idle=\(self.idleFrameCount)")
         }
 
-        #if DEBUG
+        #if ENGRAM_INSTRUMENTATION
         // Write every frame to CSV for profiling analysis
         if profilingReady {
             let idleFlag = isActive ? 0 : 1

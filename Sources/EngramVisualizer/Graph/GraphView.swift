@@ -16,14 +16,22 @@ typealias MemoryEdge = EngramKit.Edge
 struct GraphView: View {
     @Environment(\.lattice) var lattice
 
-    // All rendering/filtering data lives on renderStore (class, no SwiftUI re-eval on mutation).
-    // Only lightweight counters that the body actually reads are @State.
-    @State var isInitialLoad: Bool = true  // suppress sounds during streaming load
-    @State var nodeObserver: AnyCancellable?
-    @State var edgeObserver: AnyCancellable?
+    // Galaxy registry — manages one or more galaxies (each with its own pipeline)
+    @State var galaxyRegistry = GalaxyRegistry()
 
-    // No @State for data counts — sidebar reads from renderStore lazily.
-    // Sound is played directly in flush/delete handlers, not via @State observation.
+    // Primary galaxy (convenience accessor — the personal/local galaxy)
+    var primaryGalaxy: Galaxy? { galaxyRegistry.galaxies["personal"] }
+
+    // Merged render data — delegated to GalaxyRegistry for multi-galaxy support.
+    // MetalSceneManager reads from the registry; GraphView accesses via these for overlays/panels.
+    var renderStore: GraphRenderStore { primaryGalaxy?.renderStore ?? _fallbackRenderStore }
+    @State private var _fallbackRenderStore = GraphRenderStore()
+
+    var simulation3D: ForceSimulation3D { primaryGalaxy?.simulation3D ?? _fallbackSimulation3D }
+    @State private var _fallbackSimulation3D = ForceSimulation3D()
+
+    var embeddingProjection: EmbeddingProjection { primaryGalaxy?.embeddingProjection ?? _fallbackEmbeddingProjection }
+    @State private var _fallbackEmbeddingProjection = EmbeddingProjection()
 
     @State var simulation = ForceSimulation()
     @State var viewport = ViewportState()
@@ -45,6 +53,7 @@ struct GraphView: View {
     @State private var sidebarPeeking: Bool = false
     @State private var sidebarHideTask: Task<Void, Never>?
     @Environment(AccountService.self) private var accountService
+    @Environment(SyncManager.self) var syncManager
     private var sidebarVisible: Bool { sidebarPinned || sidebarPeeking }
 
     // Minimap PiP
@@ -52,16 +61,13 @@ struct GraphView: View {
     @State private var minimapPanel = MinimapPanelController()
 
     // Embedding projection / layout mode
-    @State var embeddingProjection = EmbeddingProjection()
     @State var transitionProgress: CGFloat = 0  // 0 = force, 1 = embedding
     @State var forcePositionSnapshot: [UUID: CGPoint] = [:]
     @State var projectionTopologyVersion: UInt64 = 0
 
     // 3D state
-    @State var simulation3D = ForceSimulation3D()
     @State var forcePositionSnapshot3D: [UUID: SIMD3<Float>] = [:]
     @State var camera3DState = Camera3DState()
-    @State var renderStore = GraphRenderStore()
     @State var cameraProjectTarget: String?
 
     // Glow cleanup timer (1s interval — removes entries older than 4.3s)
@@ -103,6 +109,10 @@ struct GraphView: View {
                     if frame.width > 0 { minimapPanel.inlineFrame = frame }
                 }
                 .onChange(of: selectedMemoryId) { oldId, newId in
+                    // Auto-track focused galaxy based on selection
+                    if let id = newId {
+                        galaxyRegistry.focusedGalaxyId = galaxyRegistry.nodeToGalaxy[id]
+                    }
                     handleSelectionChange(oldId: oldId, newId: newId, viewSize: geo.size)
                 }
                 .modifier(keyboardShortcuts)
@@ -112,10 +122,15 @@ struct GraphView: View {
                 }
                 // Sound is played directly in flush/delete handlers (no @State needed)
                 // Push search state to renderStore for Metal renderer
-                .onChange(of: searchMatchIds) { _, ids in renderStore.searchMatchIds = ids }
-                .onChange(of: isSearchActive) { _, active in renderStore.isSearchActive = active }
+                .onChange(of: searchMatchIds) { _, ids in
+                    for galaxy in galaxyRegistry.galaxies.values { galaxy.renderStore.searchMatchIds = ids }
+                }
+                .onChange(of: isSearchActive) { _, active in
+                    for galaxy in galaxyRegistry.galaxies.values { galaxy.renderStore.isSearchActive = active }
+                }
                 // hiddenProjects changes handled surgically in toggleProject()
-                .onChange(of: config.hiddenRelations) { _, _ in
+                .onChange(of: config.hiddenRelations) { _, newRelations in
+                    galaxyRegistry.hiddenRelations = newRelations
                     recomputeFilteredData()
                     rebuildSimulationGraph()
                 }
@@ -125,22 +140,26 @@ struct GraphView: View {
                 }
                 .onReceive(glowTimer) { _ in
                     let now = Date()
-                    if !renderStore.glowingNodes.isEmpty {
-                        let filtered = renderStore.glowingNodes.filter { now.timeIntervalSince($0.value) < 4.3 }
-                        if filtered.count != renderStore.glowingNodes.count {
-                            renderStore.glowingNodes = filtered
+                    // Clean up expired glows across ALL galaxies
+                    for galaxy in galaxyRegistry.galaxies.values {
+                        let store = galaxy.renderStore
+                        if !store.glowingNodes.isEmpty {
+                            let filtered = store.glowingNodes.filter { now.timeIntervalSince($0.value) < 4.3 }
+                            if filtered.count != store.glowingNodes.count {
+                                store.glowingNodes = filtered
+                            }
                         }
-                    }
-                    if !renderStore.newNodeGlows.isEmpty {
-                        let filtered = renderStore.newNodeGlows.filter { now.timeIntervalSince($0.value) < 5.5 }
-                        if filtered.count != renderStore.newNodeGlows.count {
-                            renderStore.newNodeGlows = filtered
+                        if !store.newNodeGlows.isEmpty {
+                            let filtered = store.newNodeGlows.filter { now.timeIntervalSince($0.value) < 5.5 }
+                            if filtered.count != store.newNodeGlows.count {
+                                store.newNodeGlows = filtered
+                            }
                         }
-                    }
-                    if !renderStore.dyingNodes.isEmpty {
-                        let filtered = renderStore.dyingNodes.filter { now.timeIntervalSince($0.value.startTime) < 3.0 }
-                        if filtered.count != renderStore.dyingNodes.count {
-                            renderStore.dyingNodes = filtered
+                        if !store.dyingNodes.isEmpty {
+                            let filtered = store.dyingNodes.filter { now.timeIntervalSince($0.value.startTime) < 3.0 }
+                            if filtered.count != store.dyingNodes.count {
+                                store.dyingNodes = filtered
+                            }
                         }
                     }
                 }
@@ -160,7 +179,7 @@ struct GraphView: View {
 
     @ViewBuilder
     private func graphContent(size: CGSize) -> some View {
-        let colorMap = renderStore.colorMap
+        let colorMap = galaxyRegistry.mergedColorMap
         ZStack {
             Color(red: 0.051, green: 0.067, blue: 0.09).ignoresSafeArea()
 
@@ -185,11 +204,11 @@ struct GraphView: View {
             if sidebarVisible {
                 SidebarView(
                     projects: uniqueProjects(),
-                    colorMap: colorMap,
-                    allRelationCounts: renderStore.relationCounts,
-                    visibleMemoryCount: renderStore.visibleNodeIds.count,
-                    visibleEdgeCount: renderStore.edges.count,
-                    totalMemories: renderStore.allNodes.count,
+                    colorMap: galaxyRegistry.mergedColorMap,
+                    allRelationCounts: galaxyRegistry.mergedRelationCounts,
+                    visibleMemoryCount: galaxyRegistry.mergedVisibleNodeIds.count,
+                    visibleEdgeCount: galaxyRegistry.mergedEdges.count,
+                    totalMemories: galaxyRegistry.mergedAllNodes.count,
                     projectionState: embeddingProjection.state,
                     toggleProject: toggleProject,
                     toggleRelation: toggleRelation,
@@ -276,16 +295,16 @@ struct GraphView: View {
 
             if config.showStatsOverlay {
                 StatsOverlay(
-                    visibleMemoryCount: renderStore.visibleNodeIds.count,
-                    visibleEdgeCount: renderStore.edges.count,
-                    totalMemories: renderStore.nodes.count,
+                    visibleMemoryCount: galaxyRegistry.mergedVisibleNodeIds.count,
+                    visibleEdgeCount: galaxyRegistry.mergedEdges.count,
+                    totalMemories: galaxyRegistry.mergedNodes.count,
                     hiddenProjects: config.hiddenProjects,
                     hiddenRelations: config.hiddenRelations,
                     projects: uniqueProjects(),
-                    allRelationCounts: renderStore.relationCounts,
+                    allRelationCounts: galaxyRegistry.mergedRelationCounts,
                     toggleProject: toggleProject,
                     toggleRelation: toggleRelation,
-                    colorMap: renderStore.colorMap,
+                    colorMap: galaxyRegistry.mergedColorMap,
                     driveToProject: config.dimensionMode == .threeD ? { cameraProjectTarget = $0 } : nil
                 )
                 .transition(.opacity)
@@ -322,6 +341,7 @@ struct GraphView: View {
                         viewport: viewport,
                         viewportSize: size,
                         pipAction: { minimapDetached = true },
+                        galaxyRegistry: galaxyRegistry,
                         camera3DState: config.dimensionMode == .threeD ? camera3DState : nil
                     )
                     .background(GeometryReader { geo in
@@ -361,7 +381,7 @@ struct GraphView: View {
     private func detailPanel(size: CGSize, colorMap: [String: Color]) -> some View {
         if let memory = selectedMemory {
             let sid = selectedMemoryId!
-            let count = renderStore.edgeCountByNode[sid] ?? 0
+            let count = galaxyRegistry.galaxyForNode(sid)?.renderStore.edgeCountByNode[sid] ?? 0
             MemoryDetailPanel(
                 memory: memory,
                 connectedCount: count,
@@ -386,16 +406,19 @@ struct GraphView: View {
             viewportSize: size,
             pipAction: { minimapPanel.animatedDismiss { minimapDetached = false } },
             isFloating: true,
+            galaxyRegistry: galaxyRegistry,
             camera3DState: config.dimensionMode == .threeD ? camera3DState : nil
             // No camera chevron in floating mode (per user request)
         )
     }
 
-    // MARK: - Selected Memory (single Lattice lookup for detail panel)
+    // MARK: - Selected Memory (routed to correct galaxy's Lattice)
 
     private var selectedMemory: Memory? {
         guard let id = selectedMemoryId else { return nil }
-        return lattice.objects(Memory.self).where { $0.__globalId == id }.first
+        // Route to the galaxy that owns this node, fall back to primary lattice
+        let targetLattice = galaxyRegistry.galaxyForNode(id)?.lattice ?? lattice
+        return targetLattice.objects(Memory.self).where { $0.__globalId == id }.first
     }
 
     // MARK: - Helpers
@@ -410,63 +433,79 @@ struct GraphView: View {
         }
     }
 
-    /// Surgically remove a project's nodes/edges from filtered data and simulation.
+    /// Surgically remove a project's nodes/edges from filtered data and simulation across all galaxies.
     private func hideProject(_ project: String) {
-        let removedIds = Set(renderStore.nodes.filter { $0.project == project }.map(\.id))
-        guard !removedIds.isEmpty else { return }
-        renderStore.nodes.removeAll { $0.project == project }
-        for id in removedIds { renderStore.nodeById.removeValue(forKey: id) }
-        let removedEdgeIds2 = Set(renderStore.edges.filter { removedIds.contains($0.sourceId) || removedIds.contains($0.targetId) }.map(\.id))
-        renderStore.edges.removeAll { removedIds.contains($0.sourceId) || removedIds.contains($0.targetId) }
-        renderStore.filteredEdgeIds.subtract(removedEdgeIds2)
-        renderStore.visibleNodeIds.subtract(removedIds)
-        for id in removedIds { simulation.removeNode(id) }
-        renderStore.clusterGroups = renderStore.clusterGroups.compactMap { cluster in
-            let filtered = cluster.filter { !removedIds.contains($0) }
-            return filtered.count >= 2 ? filtered : nil
+        for galaxy in galaxyRegistry.galaxies.values {
+            let store = galaxy.renderStore
+            let removedIds = Set(store.nodes.filter { $0.project == project }.map(\.id))
+            guard !removedIds.isEmpty else { continue }
+            store.nodes.removeAll { $0.project == project }
+            for id in removedIds { store.nodeById.removeValue(forKey: id) }
+            let removedEdgeIds2 = Set(store.edges.filter { removedIds.contains($0.sourceId) || removedIds.contains($0.targetId) }.map(\.id))
+            store.edges.removeAll { removedIds.contains($0.sourceId) || removedIds.contains($0.targetId) }
+            store.filteredEdgeIds.subtract(removedEdgeIds2)
+            store.visibleNodeIds.subtract(removedIds)
+            // 2D simulation only on primary galaxy
+            if galaxy.id == "personal" {
+                for id in removedIds { simulation.removeNode(id) }
+            }
+            store.clusterGroups = store.clusterGroups.compactMap { cluster in
+                let filtered = cluster.filter { !removedIds.contains($0) }
+                return filtered.count >= 2 ? filtered : nil
+            }
+            GalaxyDataLoader.recomputeDerivedData(for: galaxy)
+            store.bumpTopology()
         }
-        recomputeDerivedData()
-        renderStore.bumpTopology()
-        // (renderStore is source of truth — no @State sync needed)
     }
 
-    /// Surgically add a project's nodes/edges back into filtered data and simulation.
+    /// Surgically add a project's nodes/edges back into filtered data and simulation across all galaxies.
     private func showProject(_ project: String) {
-        let addedNodes = renderStore.allNodes.values.filter {
-            $0.project == project &&
-            (debouncedTimeSliderDate == nil || $0.createdAt <= debouncedTimeSliderDate!)
-        }
-        guard !addedNodes.isEmpty else { return }
-        renderStore.nodes.append(contentsOf: addedNodes)
-        for node in addedNodes { renderStore.nodeById[node.id] = node }
-        let newIds = Set(addedNodes.map(\.id))
-        renderStore.visibleNodeIds.formUnion(newIds)
+        for galaxy in galaxyRegistry.galaxies.values {
+            let store = galaxy.renderStore
+            let addedNodes = store.allNodes.values.filter {
+                $0.project == project &&
+                (debouncedTimeSliderDate == nil || $0.createdAt <= debouncedTimeSliderDate!)
+            }
+            guard !addedNodes.isEmpty else { continue }
+            store.nodes.append(contentsOf: addedNodes)
+            for node in addedNodes { store.nodeById[node.id] = node }
+            let newIds = Set(addedNodes.map(\.id))
+            store.visibleNodeIds.formUnion(newIds)
 
-        let allVisibleIds = renderStore.visibleNodeIds
-        let newEdges = renderStore.allEdges.values.filter { edge in
-            allVisibleIds.contains(edge.sourceId) && allVisibleIds.contains(edge.targetId) &&
-            !config.hiddenRelations.contains(edge.relation) &&
-            !renderStore.filteredEdgeIds.contains(edge.id)
-        }
-        renderStore.edges.append(contentsOf: newEdges)
-        renderStore.filteredEdgeIds.formUnion(newEdges.map(\.id))
+            let allVisibleIds = store.visibleNodeIds
+            let newEdges = store.allEdges.values.filter { edge in
+                allVisibleIds.contains(edge.sourceId) && allVisibleIds.contains(edge.targetId) &&
+                !config.hiddenRelations.contains(edge.relation) &&
+                !store.filteredEdgeIds.contains(edge.id)
+            }
+            store.edges.append(contentsOf: newEdges)
+            store.filteredEdgeIds.formUnion(newEdges.map(\.id))
 
-        for node in addedNodes {
-            simulation.addNode(node.id, project: node.project, topic: node.topic)
-        }
-        for edge in newEdges {
-            simulation.addEdge(from: edge.sourceId, to: edge.targetId)
-        }
+            // 2D simulation only on primary galaxy
+            if galaxy.id == "personal" {
+                for node in addedNodes {
+                    simulation.addNode(node.id, project: node.project, topic: node.topic)
+                }
+                for edge in newEdges {
+                    simulation.addEdge(from: edge.sourceId, to: edge.targetId)
+                }
+            }
 
-        recomputeHubs()
-        recomputeDerivedData()
-        renderStore.bumpTopology()
-        // (renderStore is source of truth — no @State sync needed)
-        // findMemoryClusters returns [[Int64]] (primaryKeys) — convert to UUIDs via cached mapping
-        let pkClusters = findMemoryClusters(in: lattice, project: project, minClusterSize: 2, neighborLimit: 20).clusters
-        for pkCluster in pkClusters {
-            let uuidCluster = pkCluster.compactMap { self.renderStore.pkToGlobalId[$0] }
-            if uuidCluster.count >= 2 { renderStore.clusterGroups.append(uuidCluster) }
+            // Recompute hubs for this galaxy
+            var hubs = Set<UUID>()
+            for edge in store.allEdges.values where edge.relation == "part_of" {
+                hubs.insert(edge.targetId)
+            }
+            store.hubs = hubs
+
+            GalaxyDataLoader.recomputeDerivedData(for: galaxy)
+            store.bumpTopology()
+
+            let pkClusters = findMemoryClusters(in: galaxy.lattice, project: project, minClusterSize: 2, neighborLimit: 20).clusters
+            for pkCluster in pkClusters {
+                let uuidCluster = pkCluster.compactMap { store.pkToGlobalId[$0] }
+                if uuidCluster.count >= 2 { store.clusterGroups.append(uuidCluster) }
+            }
         }
     }
 
@@ -481,9 +520,11 @@ struct GraphView: View {
     func uniqueProjects() -> [String] {
         var seen = Set<String>()
         var result: [String] = []
-        for node in renderStore.allNodes.values {
-            if seen.insert(node.project).inserted {
-                result.append(node.project)
+        for galaxy in galaxyRegistry.galaxies.values {
+            for node in galaxy.renderStore.allNodes.values {
+                if seen.insert(node.project).inserted {
+                    result.append(node.project)
+                }
             }
         }
         return result.sorted()
@@ -491,8 +532,10 @@ struct GraphView: View {
 
     private func cycleConnectedNode() {
         guard let sel = selectedMemoryId else { return }
+        // Route to the galaxy that owns this node for edge lookup
+        let edges = galaxyRegistry.galaxyForNode(sel)?.renderStore.allEdges ?? primaryGalaxy?.renderStore.allEdges ?? [:]
         var connected: [UUID] = []
-        for edge in renderStore.allEdges.values {
+        for edge in edges.values {
             if edge.sourceId == sel { connected.append(edge.targetId) }
             if edge.targetId == sel { connected.append(edge.sourceId) }
         }

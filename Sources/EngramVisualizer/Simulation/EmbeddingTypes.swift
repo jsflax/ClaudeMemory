@@ -5,12 +5,12 @@ import simd
 
 // MARK: - Data Types
 
-enum LayoutMode: String, CaseIterable, Equatable, LatticeEnum {
+@LatticeEnum enum LayoutMode: String, CaseIterable, Equatable {
     case forceDirected = "Force"
     case embedding = "Semantic"
 }
 
-enum DimensionMode: String, CaseIterable, Equatable, LatticeEnum {
+@LatticeEnum enum DimensionMode: String, CaseIterable, Equatable {
     case twoD = "2D"
     case threeD = "3D"
 }

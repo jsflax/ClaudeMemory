@@ -74,38 +74,6 @@ extension MemoryTools {
     }
 }
 
-// MARK: - CRUD Operation Tracking
-
-extension MemoryTools {
-    /// Increment the CRUD operation counter in HookState.
-    /// Called after successful remember, forget, update, merge, consolidate.
-    func incrementCrudCounter() {
-        let current = Int(localLattice.objects(HookState.self)
-            .where { $0.key == .crudOperationCount }
-            .first?.value ?? "0") ?? 0
-        let newCount = current + 1
-        if let existing = localLattice.objects(HookState.self).where({ $0.key == .crudOperationCount }).first {
-            existing.value = String(newCount)
-            existing.updatedAt = Date()
-        } else {
-            localLattice.add(HookState(key: .crudOperationCount, value: String(newCount)))
-        }
-    }
-
-    /// Reset the maintenance baseline to the current CRUD op count.
-    /// Called after organize/consolidate — the actual maintenance actions.
-    func resetMaintenanceBaseline() {
-        let opCount = localLattice.objects(HookState.self)
-            .where { $0.key == .crudOperationCount }
-            .first?.value ?? "0"
-        if let existing = localLattice.objects(HookState.self).where({ $0.key == .maintenanceLastOpCount }).first {
-            existing.value = opCount
-            existing.updatedAt = Date()
-        } else {
-            localLattice.add(HookState(key: .maintenanceLastOpCount, value: opCount))
-        }
-    }
-}
 
 // MARK: - CRUD + Search + Timeline
 
@@ -388,7 +356,6 @@ extension MemoryTools {
             response += "Consider storing each section as a child memory with `parent_id: \(memoryId)` for more precise recall."
         }
 
-        incrementCrudCounter()
         return CallTool.Result(
             content: [.text(response)],
             isError: false
@@ -640,8 +607,7 @@ extension MemoryTools {
             lattice.delete(Memory.self, where: { $0.primaryKey == id64 })
             let edgeNote = edgeCount > 0 ? " Removed \(edgeCount) edge(s)." : ""
             log("Deleted memory [id:\(id)]: \(summary)")
-            incrementCrudCounter()
-            return CallTool.Result(
+                return CallTool.Result(
                 content: [.text("Deleted memory (id: \(id), project: \(mem.project), topic: \(mem.topic)): \(summary)\(edgeNote)")],
                 isError: false
             )
@@ -656,8 +622,7 @@ extension MemoryTools {
             let count = memories.count
             lattice.delete(Memory.self, where: { $0.topic == topic && $0.project == project })
             let edgeNote = edgeCount > 0 ? " Removed \(edgeCount) edge(s)." : ""
-            incrementCrudCounter()
-            return CallTool.Result(
+                return CallTool.Result(
                 content: [.text("Deleted \(count) memories (project: \(project), topic: \(topic)).\(edgeNote)")],
                 isError: false
             )
@@ -669,8 +634,7 @@ extension MemoryTools {
             let count = memories.count
             lattice.delete(Memory.self, where: { $0.topic == topic })
             let edgeNote = edgeCount > 0 ? " Removed \(edgeCount) edge(s)." : ""
-            incrementCrudCounter()
-            return CallTool.Result(
+                return CallTool.Result(
                 content: [.text("Deleted \(count) memories with topic '\(topic)'.\(edgeNote)")],
                 isError: false
             )
@@ -682,8 +646,7 @@ extension MemoryTools {
             let count = memories.count
             lattice.delete(Memory.self, where: { $0.project == project })
             let edgeNote = edgeCount > 0 ? " Removed \(edgeCount) edge(s)." : ""
-            incrementCrudCounter()
-            return CallTool.Result(
+                return CallTool.Result(
                 content: [.text("Deleted \(count) memories for project '\(project)'.\(edgeNote)")],
                 isError: false
             )
@@ -831,8 +794,7 @@ extension MemoryTools {
         // Count as CRUD op unless only the topic changed
         let hasNonTopicChange = contentChanged || a.setProject != nil || a.source != nil || a.expiresInDays != nil || a.importance != nil || a.isPrivate != nil
         if hasNonTopicChange {
-            incrementCrudCounter()
-        }
+            }
         return CallTool.Result(
             content: [.text("Updated memory (id: \(memId), project: \(mem.project), topic: \(mem.topic)).\nChanges:\n\(changes.joined(separator: "\n"))")],
             isError: false
@@ -893,7 +855,6 @@ extension MemoryTools {
 
         let edgeNote = edgeCount > 0 ? " Removed \(edgeCount) edge(s) from source memories." : ""
         log("Merged \(ids.count) memories into [id:\(mergedId)]")
-        incrementCrudCounter()
         return CallTool.Result(
             content: [.text("Merged \(ids.count) memories into new memory (id: \(mergedId), project: \(project), topic: \(topic)).\(edgeNote)\n\nDeleted:\n\(oldSummaries.joined(separator: "\n"))\n\nNew:\n\(content)")],
             isError: false

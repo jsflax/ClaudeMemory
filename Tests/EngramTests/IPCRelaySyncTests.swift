@@ -3,15 +3,14 @@ import EngramKit
 import Lattice
 import MCP
 import Foundation
+import os
 
 // MARK: - IPC Relay Sync Tests
 //
 // These tests verify the Lattice IPC relay pattern that replaces the old
 // migration-based sync. The architecture:
 //
-//   MCP server writes to memory.db
-//       ↓ (cross-process notification)
-//   hubLattice (2nd connection to memory.db, IPC target + sync filter)
+//   localLattice (memory.db, IPC target + sync filter)
 //       ↓ (IPC relay, filtered)
 //   syncedLattice (memory_synced.db, IPC target)
 //       ↓ (WSS — not tested here)
@@ -42,12 +41,14 @@ struct IPCRelaySyncTests {
             task = Task.detached {
                 let db = try await Lattice(Memory.self, Edge.self, SyncConfig.self, configuration: readConfig)
                 let stream = db.changeStream
-                continuation.resume()
-                var seen = 0
+                continuation.resume(returning: ())
+                var seenRowIds = Set<Int64>()
                 for await changes in stream {
                     let resolved = changes.compactMap { $0.resolve(on: db) }
-                    seen += resolved.filter({ $0.tableName == table && $0.operation == operation }).count
-                    if seen >= count {
+                    for r in resolved where r.tableName == table && r.operation == operation {
+                        seenRowIds.insert(r.rowId)
+                    }
+                    if seenRowIds.count >= count {
                         return
                     }
                 }
@@ -270,17 +271,20 @@ struct IPCRelaySyncTests {
         #expect(synced.objects(Memory.self).count == 1)
 
         // Phase 2: Synced → Hub (simulates cloud download arriving via WSS)
+        print("[test4] Phase 2: setting up waitForChange on hub")
         let task2 = await waitForChange(on: hubConfig, table: "Memory", operation: .insert)
+        print("[test4] Phase 2: adding memory on synced")
         synced.add(Memory(
             content: "From cloud",
             project: "Engram",
             embedding: Vector<Float>([Float](repeating: 0.2, count: 384))
         ))
+        print("[test4] Phase 2: waiting for task2")
         try await task2.value
-        try await Task.sleep(for: .milliseconds(500))
+        print("[test4] Phase 2: task2 completed, hub count = \(hub.objects(Memory.self).count)")
 
         #expect(hub.objects(Memory.self).count == 2)
-        let contents = hub.objects(Memory.self).snapshot().map(\.content).sorted()
+        let contents = hub.objects(Memory.self).map(\.content).sorted()
         #expect(contents == ["From MCP server", "From cloud"])
     }
 
@@ -425,7 +429,622 @@ struct IPCRelaySyncTests {
         try await task2.value
 
         #expect(synced.objects(Memory.self).count == 2)
-        let contents = synced.objects(Memory.self).snapshot().map(\.content).sorted()
+        let contents = synced.objects(Memory.self).map(\.content).sorted()
         #expect(contents == ["ProjectA memory", "ProjectB memory"])
+    }
+
+    // MARK: - Test 7: Filter narrowing sends synthetic DELETEs
+    //
+    // Mirrors production: hub (memory.db) and synced (memory_synced.db) are
+    // separate DBs connected by IPC. Multiple projects synced, one toggled off.
+    // Uses .in([projects]) predicate like SyncManager.buildSyncFilter.
+    // No sleeps — tests whether IPC handshake races with data flow.
+
+    @Test(.timeLimit(.minutes(1)))
+    func ipcRelay_filterNarrowingSendsDeletes() async throws {
+        let channel = "engram-narrow-\(UUID().uuidString.prefix(8))"
+
+        let hubURL = FileManager.default.temporaryDirectory
+            .appending(path: "relay-narrow-hub-\(UUID().uuidString).sqlite")
+        let syncedURL = FileManager.default.temporaryDirectory
+            .appending(path: "relay-narrow-synced-\(UUID().uuidString).sqlite")
+
+        defer {
+            try? Lattice.delete(for: .init(fileURL: hubURL))
+            try? Lattice.delete(for: .init(fileURL: syncedURL))
+        }
+
+        // Initial filter: Lattice + engram-server + ComoHotels all synced
+        let syncedProjects = ["Lattice", "engram-server", "ComoHotels"]
+        var filter = Lattice.SyncFilter()
+        filter.include(Memory.self) { mem in
+            mem.isPrivate == false && mem.project.in(syncedProjects)
+        }
+        filter.include(Edge.self)
+        filter.include(SyncConfig.self)
+
+        var hubConfig = Lattice.Configuration(fileURL: hubURL)
+        hubConfig.ipcTargets = [.init(channel: channel, syncFilter: filter)]
+        let hub = try Lattice(Memory.self, Edge.self, SyncConfig.self, configuration: hubConfig)
+
+        var syncedConfig = Lattice.Configuration(fileURL: syncedURL)
+        syncedConfig.ipcTargets = [.init(channel: channel)]
+        let synced = try Lattice(Memory.self, Edge.self, SyncConfig.self, configuration: syncedConfig)
+
+        // Add memories across all 3 projects, wait for all 5 to arrive on synced
+        let insertTask = await waitForChange(on: syncedConfig, table: "Memory", operation: .insert, count: 5)
+
+        hub.add(Memory(
+            content: "Lattice arch decision",
+            project: "Lattice",
+            embedding: Vector<Float>([Float](repeating: 0.1, count: 384))
+        ))
+        hub.add(Memory(
+            content: "engram-server deploy note",
+            project: "engram-server",
+            embedding: Vector<Float>([Float](repeating: 0.2, count: 384))
+        ))
+        hub.add(Memory(
+            content: "ComoHotels drag fix",
+            project: "ComoHotels",
+            embedding: Vector<Float>([Float](repeating: 0.3, count: 384))
+        ))
+        hub.add(Memory(
+            content: "ComoHotels chat jitter",
+            project: "ComoHotels",
+            embedding: Vector<Float>([Float](repeating: 0.4, count: 384))
+        ))
+        hub.add(Memory(
+            content: "ComoHotels payment flow",
+            project: "ComoHotels",
+            embedding: Vector<Float>([Float](repeating: 0.5, count: 384))
+        ))
+
+        try await insertTask.value
+        #expect(synced.objects(Memory.self).count == 5)
+
+        // Narrow filter: toggle ComoHotels to local, keep Lattice + engram-server
+        let remainingProjects = ["Lattice", "engram-server"]
+        var newFilter = Lattice.SyncFilter()
+        newFilter.include(Memory.self) { mem in
+            mem.isPrivate == false && mem.project.in(remainingProjects)
+        }
+        newFilter.include(Edge.self)
+        newFilter.include(SyncConfig.self)
+
+        // Wait for synthetic DELETEs of the 3 ComoHotels rows on synced side
+        let deleteTask = await waitForChange(on: syncedConfig, table: "Memory", operation: .delete, count: 3)
+
+        hub.updateSyncFilter(newFilter)
+
+        // reconcile_sync_filter should synthesize DELETE audit entries
+        // for the 3 ComoHotels rows that no longer match the narrowed filter
+        try await deleteTask.value
+
+        // Only Lattice + engram-server memories should remain
+        let remaining = synced.objects(Memory.self)
+        #expect(remaining.count == 2)
+        let projects = Set(remaining.map(\.project))
+        #expect(projects == ["Lattice", "engram-server"])
+    }
+
+    // MARK: - Test 8: Filter narrowing must NOT delete from source (relay loop proof)
+    //
+    // Proves the critical data-loss bug: when localLattice narrows its sync filter,
+    // synthetic DELETEs sent to syncedLattice must NOT relay back and delete from
+    // localLattice (the source of truth). IPC is bidirectional, so the DELETE
+    // AuditLog entry on syncedLattice is visible to syncedLattice's IPC synchronizer
+    // unless properly marked.
+
+    @Test(.timeLimit(.minutes(1)))
+    func ipcRelay_filterNarrowingDoesNotDeleteFromSource() async throws {
+        let channel = "engram-nodelete-\(UUID().uuidString.prefix(8))"
+
+        let localURL = FileManager.default.temporaryDirectory
+            .appending(path: "relay-nodelete-local-\(UUID().uuidString).sqlite")
+        let syncedURL = FileManager.default.temporaryDirectory
+            .appending(path: "relay-nodelete-synced-\(UUID().uuidString).sqlite")
+
+        defer {
+            try? Lattice.delete(for: .init(fileURL: localURL))
+            try? Lattice.delete(for: .init(fileURL: syncedURL))
+        }
+
+        // Initial filter: projects A, B, C all synced
+        let syncedProjects = ["ProjectA", "ProjectB", "ProjectC"]
+        var filter = Lattice.SyncFilter()
+        filter.include(Memory.self) { mem in
+            mem.isPrivate == false && mem.project.in(syncedProjects)
+        }
+        filter.include(Edge.self)
+        filter.include(SyncConfig.self)
+
+        // localLattice = source of truth (memory.sqlite analog)
+        var localConfig = Lattice.Configuration(fileURL: localURL)
+        localConfig.ipcTargets = [.init(channel: channel, syncFilter: filter)]
+        let local = try Lattice(Memory.self, Edge.self, SyncConfig.self, configuration: localConfig)
+
+        try await Task.sleep(for: .milliseconds(100))
+
+        // syncedLattice = relay target (memory-synced.sqlite analog)
+        // Also has IPC target on same channel — bidirectional, like production
+        var syncedConfig = Lattice.Configuration(fileURL: syncedURL)
+        syncedConfig.ipcTargets = [.init(channel: channel)]
+        let synced = try Lattice(Memory.self, Edge.self, SyncConfig.self, configuration: syncedConfig)
+
+        try await Task.sleep(for: .milliseconds(200))
+
+        // Add memories across all 3 projects to localLattice
+        let insertTask = await waitForChange(on: syncedConfig, table: "Memory", operation: .insert, count: 5)
+
+        local.add(Memory(content: "A knowledge", project: "ProjectA",
+            embedding: Vector<Float>([Float](repeating: 0.1, count: 384))))
+        local.add(Memory(content: "B knowledge", project: "ProjectB",
+            embedding: Vector<Float>([Float](repeating: 0.2, count: 384))))
+        local.add(Memory(content: "C item 1", project: "ProjectC",
+            embedding: Vector<Float>([Float](repeating: 0.3, count: 384))))
+        local.add(Memory(content: "C item 2", project: "ProjectC",
+            embedding: Vector<Float>([Float](repeating: 0.4, count: 384))))
+        local.add(Memory(content: "C item 3", project: "ProjectC",
+            embedding: Vector<Float>([Float](repeating: 0.5, count: 384))))
+
+        try await insertTask.value
+        #expect(synced.objects(Memory.self).count == 5)
+        #expect(local.objects(Memory.self).count == 5, "Precondition: local has all 5 memories")
+
+        // Narrow filter: remove ProjectC (simulates toggleProject to local)
+        let remainingProjects = ["ProjectA", "ProjectB"]
+        var newFilter = Lattice.SyncFilter()
+        newFilter.include(Memory.self) { mem in
+            mem.isPrivate == false && mem.project.in(remainingProjects)
+        }
+        newFilter.include(Edge.self)
+        newFilter.include(SyncConfig.self)
+
+        let deleteTask = await waitForChange(on: syncedConfig, table: "Memory", operation: .delete, count: 3)
+        local.updateSyncFilter(newFilter)
+
+        // Wait for DELETEs to arrive and be applied on synced side
+        try await deleteTask.value
+
+        // Synced should lose the 3 ProjectC rows (correct behavior)
+        #expect(synced.objects(Memory.self).count == 2, "synced should have 2 remaining")
+
+        // *** CRITICAL ASSERTION ***
+        // localLattice must STILL have all 5 memories.
+        // If the relay loop exists, the synthetic DELETEs will have been relayed
+        // back from syncedLattice → localLattice, deleting from the source of truth.
+        #expect(local.objects(Memory.self).count == 5,
+            "DATA LOSS BUG: local lost memories due to DELETE relay loop")
+
+        // Give extra time for any async relay to propagate
+        try await Task.sleep(for: .seconds(2))
+
+        // Check again — the relay might be delayed
+        #expect(local.objects(Memory.self).count == 5,
+            "DATA LOSS BUG (delayed): local lost memories due to DELETE relay loop")
+
+        // Verify the correct memories survived on each side
+        let localProjects = Set(local.objects(Memory.self).map(\.project))
+        #expect(localProjects == ["ProjectA", "ProjectB", "ProjectC"],
+            "local should retain all projects including the un-synced one")
+
+        let syncedProjects2 = Set(synced.objects(Memory.self).map(\.project))
+        #expect(syncedProjects2 == ["ProjectA", "ProjectB"],
+            "synced should only have the still-synced projects")
+    }
+
+    // MARK: - Test 9: Full 3-hop relay chain (local → synced → cloud → synced → local)
+    //
+    // Simulates production topology:
+    //   localLattice ←IPC:ch1→ syncedLattice ←IPC:ch2→ cloudLattice
+    //
+    // After filter narrowing, synthetic DELETEs flow local → synced → cloud.
+    // The cloud (in production, the WSS server) might echo them back.
+    // Verifies that localLattice retains its data through the full chain.
+
+    @Test(.timeLimit(.minutes(2)))
+    func ipcRelay_fullRelayChainDoesNotDeleteFromSource() async throws {
+        let ch1 = "engram-chain1-\(UUID().uuidString.prefix(8))"
+        let ch2 = "engram-chain2-\(UUID().uuidString.prefix(8))"
+
+        let localURL = FileManager.default.temporaryDirectory
+            .appending(path: "relay-chain-local-\(UUID().uuidString).sqlite")
+        let syncedURL = FileManager.default.temporaryDirectory
+            .appending(path: "relay-chain-synced-\(UUID().uuidString).sqlite")
+        let cloudURL = FileManager.default.temporaryDirectory
+            .appending(path: "relay-chain-cloud-\(UUID().uuidString).sqlite")
+
+        defer {
+            try? Lattice.delete(for: .init(fileURL: localURL))
+            try? Lattice.delete(for: .init(fileURL: syncedURL))
+            try? Lattice.delete(for: .init(fileURL: cloudURL))
+        }
+
+        // localLattice: source of truth with filtered IPC sync on ch1
+        let syncedProjects = ["ProjectA", "ProjectB", "ProjectC"]
+        var filter = Lattice.SyncFilter()
+        filter.include(Memory.self) { mem in
+            mem.isPrivate == false && mem.project.in(syncedProjects)
+        }
+        filter.include(Edge.self)
+        filter.include(SyncConfig.self)
+
+        var localConfig = Lattice.Configuration(fileURL: localURL)
+        localConfig.ipcTargets = [.init(channel: ch1, syncFilter: filter)]
+        let local = try Lattice(Memory.self, Edge.self, SyncConfig.self, configuration: localConfig)
+
+        try await Task.sleep(for: .milliseconds(100))
+
+        // syncedLattice: relay node with IPC on both ch1 (to local) and ch2 (to cloud)
+        var syncedConfig = Lattice.Configuration(fileURL: syncedURL)
+        syncedConfig.ipcTargets = [
+            .init(channel: ch1),  // bidirectional with local
+            .init(channel: ch2),  // bidirectional with cloud (simulates WSS)
+        ]
+        let synced = try Lattice(Memory.self, Edge.self, SyncConfig.self, configuration: syncedConfig)
+
+        try await Task.sleep(for: .milliseconds(100))
+
+        // cloudLattice: simulates cloud server with IPC on ch2
+        var cloudConfig = Lattice.Configuration(fileURL: cloudURL)
+        cloudConfig.ipcTargets = [.init(channel: ch2)]
+        let cloud = try Lattice(Memory.self, Edge.self, SyncConfig.self, configuration: cloudConfig)
+
+        try await Task.sleep(for: .milliseconds(300))
+
+        // Add 5 memories to localLattice, wait for them to propagate all the way to cloud
+        let syncedInsertTask = await waitForChange(on: syncedConfig, table: "Memory", operation: .insert, count: 5)
+        let cloudInsertTask = await waitForChange(on: cloudConfig, table: "Memory", operation: .insert, count: 5)
+
+        local.add(Memory(content: "A knowledge", project: "ProjectA",
+            embedding: Vector<Float>([Float](repeating: 0.1, count: 384))))
+        local.add(Memory(content: "B knowledge", project: "ProjectB",
+            embedding: Vector<Float>([Float](repeating: 0.2, count: 384))))
+        local.add(Memory(content: "C item 1", project: "ProjectC",
+            embedding: Vector<Float>([Float](repeating: 0.3, count: 384))))
+        local.add(Memory(content: "C item 2", project: "ProjectC",
+            embedding: Vector<Float>([Float](repeating: 0.4, count: 384))))
+        local.add(Memory(content: "C item 3", project: "ProjectC",
+            embedding: Vector<Float>([Float](repeating: 0.5, count: 384))))
+
+        try await syncedInsertTask.value
+        try await cloudInsertTask.value
+
+        #expect(local.objects(Memory.self).count == 5, "Precondition: local has 5")
+        #expect(synced.objects(Memory.self).count == 5, "Precondition: synced has 5")
+        #expect(cloud.objects(Memory.self).count == 5, "Precondition: cloud has 5")
+
+        // Narrow filter: remove ProjectC
+        let remainingProjects = ["ProjectA", "ProjectB"]
+        var newFilter = Lattice.SyncFilter()
+        newFilter.include(Memory.self) { mem in
+            mem.isPrivate == false && mem.project.in(remainingProjects)
+        }
+        newFilter.include(Edge.self)
+        newFilter.include(SyncConfig.self)
+
+        // Wait for DELETEs to propagate through the chain
+        let syncedDeleteTask = await waitForChange(on: syncedConfig, table: "Memory", operation: .delete, count: 3)
+        let cloudDeleteTask = await waitForChange(on: cloudConfig, table: "Memory", operation: .delete, count: 3)
+
+        local.updateSyncFilter(newFilter)
+
+        try await syncedDeleteTask.value
+        try await cloudDeleteTask.value
+
+        // Give time for any relay-back to propagate
+        try await Task.sleep(for: .seconds(3))
+
+        // Synced and cloud should lose ProjectC (correct — they obey the filter)
+        #expect(synced.objects(Memory.self).count == 2, "synced should have 2")
+        #expect(cloud.objects(Memory.self).count == 2, "cloud should have 2")
+
+        // *** CRITICAL ASSERTION ***
+        // localLattice must STILL have all 5 memories.
+        // If the DELETE relays back through the chain (cloud → synced → local),
+        // this assertion catches it.
+        let localCount = local.objects(Memory.self).count
+        #expect(localCount == 5,
+            "DATA LOSS: local has \(localCount) instead of 5 — DELETE relayed back through chain")
+
+        let localProjects = Set(local.objects(Memory.self).map(\.project))
+        #expect(localProjects == ["ProjectA", "ProjectB", "ProjectC"],
+            "local should retain ALL projects including the un-synced one")
+    }
+
+    // MARK: - Test 10: Fresh sync DB should only receive filtered data
+    //
+    // Reproduces the production scenario: user deletes the synced DB and restarts.
+    // The app reconnects with the same filtered IPC (using .in([projects]) predicate
+    // like SyncManager.buildSyncFilter). The fresh synced DB should receive ONLY
+    // the filtered rows — not the entire audit log.
+    //
+    // Uses .in() predicate to match SyncManager production filter shape:
+    //   filter.include(Memory.self) { !$0.isPrivate && $0.project.in(syncedProjects) }
+    //
+    // Verifies:
+    //   1. Fresh synced DB receives only filtered projects (correctness)
+    //   2. Non-filtered projects don't leak through (filter respect)
+    //   3. Upload volume is proportional to filtered data, not entire audit log
+
+    @Test(.timeLimit(.minutes(2)))
+    func ipcRelay_freshSyncDbRespectsFilter() async throws {
+        let channel = "engram-filtfresh-\(UUID().uuidString.prefix(8))"
+
+        let localURL = FileManager.default.temporaryDirectory
+            .appending(path: "relay-filtfresh-local-\(UUID().uuidString).sqlite")
+        let syncedURL = FileManager.default.temporaryDirectory
+            .appending(path: "relay-filtfresh-synced-\(UUID().uuidString).sqlite")
+
+        defer {
+            try? Lattice.delete(for: .init(fileURL: localURL))
+            try? Lattice.delete(for: .init(fileURL: syncedURL))
+        }
+
+        // === Phase 1: Initial sync with .in() filter ===
+        // Filter: only Lattice + engram-server (not ComoHotels, not LocalOnly)
+        // Uses same .in() predicate shape as SyncManager.buildSyncFilter
+        let syncedProjects = ["Lattice", "engram-server"]
+        let memoryPredicate: @Sendable (Query<Memory>) -> Query<Bool> = { mem in
+            return mem.isPrivate == false && mem.project.in(syncedProjects)
+        }
+        var filter = Lattice.SyncFilter()
+        filter.include(Memory.self, where: memoryPredicate)
+        filter.include(Edge.self) { edge in
+            edge.sourceGlobalId.in(\Memory.__globalId, where: memoryPredicate)
+                && edge.targetGlobalId.in(\Memory.__globalId, where: memoryPredicate)
+        }
+        filter.include(SyncConfig.self)
+
+        var localConfig = Lattice.Configuration(fileURL: localURL)
+        localConfig.ipcTargets = [.init(channel: channel, syncFilter: filter)]
+        var local: Lattice! = try Lattice(Memory.self, Edge.self, SyncConfig.self, configuration: localConfig)
+
+        try await Task.sleep(for: .milliseconds(100))
+
+        var syncedConfig = Lattice.Configuration(fileURL: syncedURL)
+        syncedConfig.ipcTargets = [.init(channel: channel)]
+        var synced: Lattice! = try Lattice(Memory.self, Edge.self, SyncConfig.self, configuration: syncedConfig)
+
+        try await Task.sleep(for: .milliseconds(200))
+
+        // Write memories across 4 projects: 2 filtered, 2 not
+        let insertTask = await waitForChange(on: syncedConfig, table: "Memory", operation: .insert, count: 3)
+
+        // Filtered (should sync)
+        local.add(Memory(content: "Lattice arch", project: "Lattice",
+            embedding: Vector<Float>([Float](repeating: 0.1, count: 384))))
+        local.add(Memory(content: "engram-server deploy", project: "engram-server",
+            embedding: Vector<Float>([Float](repeating: 0.2, count: 384))))
+        local.add(Memory(content: "Lattice bugfix", project: "Lattice",
+            embedding: Vector<Float>([Float](repeating: 0.3, count: 384))))
+        await Task.yield()
+
+        // NOT filtered (should NOT sync)
+        local.add(Memory(content: "ComoHotels drag fix", project: "ComoHotels",
+            embedding: Vector<Float>([Float](repeating: 0.4, count: 384))))
+        local.add(Memory(content: "ComoHotels payment", project: "ComoHotels",
+            embedding: Vector<Float>([Float](repeating: 0.5, count: 384))))
+        local.add(Memory(content: "LocalOnly secret", project: "LocalOnly",
+            embedding: Vector<Float>([Float](repeating: 0.6, count: 384)),
+            isPrivate: true))
+
+        try await insertTask.value
+        try await Task.sleep(for: .milliseconds(500))
+
+        // Preconditions
+        #expect(local.objects(Memory.self).count == 6, "local has all 6 memories")
+        #expect(synced.objects(Memory.self).count == 3, "synced has only 3 filtered memories")
+        let phase1Projects = Set(synced.objects(Memory.self).map(\.project))
+        #expect(phase1Projects == ["Lattice", "engram-server"],
+            "Phase 1: only filtered projects on synced")
+
+        // Wait for ACKs (eager cleanup will delete _lattice_sync_state rows)
+        try await Task.sleep(for: .seconds(1))
+
+        // === Phase 2: Delete synced DB, reconnect with SAME filter ===
+        // Match production flow: SyncManager.compactBeforeSync() + connectSync()
+        local = nil
+        synced = nil
+        try await Task.sleep(for: .milliseconds(500))
+
+        try? Lattice.delete(for: .init(fileURL: syncedURL))
+
+        // Recreate local WITHOUT IPC first (to compact like production)
+        var compactConfig = Lattice.Configuration(fileURL: localURL)
+        let compactLocal = try Lattice(Memory.self, Edge.self, SyncConfig.self, configuration: compactConfig)
+
+        // Match production: compactBeforeSync() runs before connectSync()
+        // This creates NEW AuditLog entries with isSynchronized=0
+        compactLocal.compactHistory()
+        compactLocal.vacuum()
+        compactLocal.checkpoint()
+
+        #expect(compactLocal.objects(Memory.self).count == 6,
+            "Phase 2 precondition: local still has 6 after compaction")
+
+        // Reconnect local with the SAME filter + IPC target
+        var localConfig2 = Lattice.Configuration(fileURL: localURL)
+        localConfig2.ipcTargets = [.init(channel: channel, syncFilter: filter)]
+        let local2 = try Lattice(Memory.self, Edge.self, SyncConfig.self, configuration: localConfig2)
+
+        #expect(local2.objects(Memory.self).count == 6,
+            "Phase 2 precondition: local still has 6 before IPC connects")
+
+        try await Task.sleep(for: .milliseconds(100))
+
+        // Create fresh synced DB — triggers IPC connection
+        var syncedConfig2 = Lattice.Configuration(fileURL: syncedURL)
+        syncedConfig2.ipcTargets = [.init(channel: channel)]
+        let synced2 = try Lattice(Memory.self, Edge.self, SyncConfig.self, configuration: syncedConfig2)
+
+        // Wait for data to arrive on synced side
+        let insertTask2 = await waitForChange(on: syncedConfig2, table: "Memory", operation: .insert, count: 3)
+        try await insertTask2.value
+        try await Task.sleep(for: .seconds(2))
+
+        // Read progress AFTER sync settles (IPC synchronizer exists by now)
+        let progress = local2.syncProgress
+        print("[test-freshfilter] Upload progress: total=\(progress.totalUpload) acked=\(progress.acked) pending=\(progress.pendingUpload)")
+
+        // === Assertions ===
+
+        // 1. Correctness: only filtered memories on fresh synced DB
+        let syncedMemories = synced2.objects(Memory.self)
+        let syncedProjectSet = Set(syncedMemories.map(\.project))
+        #expect(syncedProjectSet == ["Lattice", "engram-server"],
+            "FILTER BUG: synced has projects \(syncedProjectSet) — expected only Lattice + engram-server")
+
+        // 2. Exact count: only the 3 filtered memories (2 Lattice + 1 engram-server)
+        #expect(syncedMemories.count == 3,
+            "FILTER BUG: synced has \(syncedMemories.count) memories — expected 3")
+
+        // 3. Non-filtered projects must NOT appear
+        let comoCount = syncedMemories.filter { $0.project == "ComoHotels" }.count
+        #expect(comoCount == 0,
+            "FILTER LEAK: \(comoCount) ComoHotels memories leaked through to fresh synced DB")
+
+        let localOnlyCount = syncedMemories.filter { $0.project == "LocalOnly" }.count
+        #expect(localOnlyCount == 0,
+            "FILTER LEAK: \(localOnlyCount) LocalOnly memories leaked through to fresh synced DB")
+
+        // 4. Upload volume: should be ≤ 3 (only filtered memories), not 6+ (entire audit log)
+        // After compaction, the AuditLog has entries for ALL 6 memories (compacted state).
+        // upload_pending_changes should only process/send the 3 filtered ones.
+        // If totalUpload > 3, the entire audit log is being replayed regardless of filter.
+        #expect(progress.totalUpload <= 3,
+            "AUDIT LOG REPLAY: upload_pending_changes processed \(progress.totalUpload) entries — expected ≤ 3 (only filtered). Entire audit log is being sent on fresh sync DB.")
+
+        // 5. Local must retain all data
+        #expect(local2.objects(Memory.self).count == 6,
+            "DATA LOSS: local lost memories during fresh sync reconnect")
+    }
+
+    // MARK: - Test 11: Delete synced DB and start fresh with narrower filter (data loss check)
+    //
+    // Reproduces the production data-loss scenario:
+    // 1. Sync data through IPC (all projects, ACKs trigger eager cleanup)
+    // 2. Delete the synced DB (user starts fresh)
+    // 3. Reconnect with narrower filter (ComoHotels toggled to local)
+    // 4. upload_pending_changes re-uploads entire AuditLog (eager cleanup
+    //    deleted _lattice_sync_state rows, so entries look "pending" again)
+    // 5. Verify localLattice retains ALL its data
+
+    @Test(.timeLimit(.minutes(2)))
+    func ipcRelay_deleteSyncedDbAndStartFresh() async throws {
+        let channel = "engram-fresh-\(UUID().uuidString.prefix(8))"
+
+        let localURL = FileManager.default.temporaryDirectory
+            .appending(path: "relay-fresh-local-\(UUID().uuidString).sqlite")
+        let syncedURL = FileManager.default.temporaryDirectory
+            .appending(path: "relay-fresh-synced-\(UUID().uuidString).sqlite")
+
+        defer {
+            try? Lattice.delete(for: .init(fileURL: localURL))
+            try? Lattice.delete(for: .init(fileURL: syncedURL))
+        }
+
+        // === Phase 1: Normal sync with wide filter ===
+        let allProjects = ["ProjectA", "ProjectB", "ComoHotels"]
+        var wideFilter = Lattice.SyncFilter()
+        wideFilter.include(Memory.self) { mem in
+            mem.isPrivate == false && mem.project.in(allProjects)
+        }
+        wideFilter.include(Edge.self)
+        wideFilter.include(SyncConfig.self)
+
+        var localConfig = Lattice.Configuration(fileURL: localURL)
+        localConfig.ipcTargets = [.init(channel: channel, syncFilter: wideFilter)]
+        var local: Lattice! = try Lattice(Memory.self, Edge.self, SyncConfig.self, configuration: localConfig)
+
+        try await Task.sleep(for: .milliseconds(100))
+
+        var syncedConfig = Lattice.Configuration(fileURL: syncedURL)
+        syncedConfig.ipcTargets = [.init(channel: channel)]
+        var synced: Lattice! = try Lattice(Memory.self, Edge.self, SyncConfig.self, configuration: syncedConfig)
+
+        try await Task.sleep(for: .milliseconds(200))
+
+        // Sync 5 memories
+        let insertTask = await waitForChange(on: syncedConfig, table: "Memory", operation: .insert, count: 5)
+
+        local.add(Memory(content: "A knowledge", project: "ProjectA",
+            embedding: Vector<Float>([Float](repeating: 0.1, count: 384))))
+        local.add(Memory(content: "B knowledge", project: "ProjectB",
+            embedding: Vector<Float>([Float](repeating: 0.2, count: 384))))
+        local.add(Memory(content: "Como item 1", project: "ComoHotels",
+            embedding: Vector<Float>([Float](repeating: 0.3, count: 384))))
+        local.add(Memory(content: "Como item 2", project: "ComoHotels",
+            embedding: Vector<Float>([Float](repeating: 0.4, count: 384))))
+        local.add(Memory(content: "Como item 3", project: "ComoHotels",
+            embedding: Vector<Float>([Float](repeating: 0.5, count: 384))))
+
+        try await insertTask.value
+        #expect(synced.objects(Memory.self).count == 5, "Phase 1: synced has all 5")
+
+        // Wait for ACKs to arrive and trigger eager cleanup on local
+        try await Task.sleep(for: .seconds(1))
+
+        #expect(local.objects(Memory.self).count == 5, "Phase 1: local still has 5")
+
+        // === Phase 2: Tear down and delete synced DB ===
+        local = nil
+        synced = nil
+        try await Task.sleep(for: .milliseconds(500))
+
+        // Delete the synced DB entirely (user starts fresh)
+        try? Lattice.delete(for: .init(fileURL: syncedURL))
+
+        // === Phase 3: Reconnect with narrower filter ===
+        let narrowProjects = ["ProjectA", "ProjectB"]
+        var narrowFilter = Lattice.SyncFilter()
+        narrowFilter.include(Memory.self) { mem in
+            mem.isPrivate == false && mem.project.in(narrowProjects)
+        }
+        narrowFilter.include(Edge.self)
+        narrowFilter.include(SyncConfig.self)
+
+        // Recreate local with the narrow filter
+        var localConfig2 = Lattice.Configuration(fileURL: localURL)
+        localConfig2.ipcTargets = [.init(channel: channel, syncFilter: narrowFilter)]
+        let local2 = try Lattice(Memory.self, Edge.self, SyncConfig.self, configuration: localConfig2)
+
+        // Precondition: local still has all 5 before IPC connects
+        #expect(local2.objects(Memory.self).count == 5,
+            "Phase 3 precondition: local still has 5 before IPC connects")
+
+        try await Task.sleep(for: .milliseconds(100))
+
+        // Create fresh synced DB — triggers IPC connection
+        var syncedConfig2 = Lattice.Configuration(fileURL: syncedURL)
+        syncedConfig2.ipcTargets = [.init(channel: channel)]
+        let synced2 = try Lattice(Memory.self, Edge.self, SyncConfig.self, configuration: syncedConfig2)
+
+        // Wait for the full re-upload + reconciliation to complete
+        // (the entire AuditLog will be re-processed due to eager cleanup bug)
+        try await Task.sleep(for: .seconds(5))
+
+        // *** CRITICAL: localLattice must retain ALL 5 memories ***
+        let localCount = local2.objects(Memory.self).count
+        print("[test10] local has \(localCount) memories")
+        #expect(localCount == 5,
+            "DATA LOSS: local has \(localCount) instead of 5 — delete synced + fresh start lost data")
+
+        let localProjects = Set(local2.objects(Memory.self).map(\.project))
+        #expect(localProjects == ["ProjectA", "ProjectB", "ComoHotels"],
+            "local should retain all projects including ComoHotels")
+
+        // Synced should ONLY have ProjectA + ProjectB (filter applied)
+        let syncedCount = synced2.objects(Memory.self).count
+        let syncedProjects = Set(synced2.objects(Memory.self).map(\.project))
+        print("[test10] synced has \(syncedCount) memories, projects: \(syncedProjects)")
+        for mem in synced2.objects(Memory.self) {
+            print("[test10]   synced memory: project=\(mem.project ?? "nil") content=\(mem.content)")
+        }
+        #expect(syncedCount == 2,
+            "FILTER BUG: synced has \(syncedCount) instead of 2 — filter not applied on re-upload")
+        #expect(syncedProjects == ["ProjectA", "ProjectB"],
+            "FILTER BUG: synced has projects \(syncedProjects) — ComoHotels should be excluded")
     }
 }

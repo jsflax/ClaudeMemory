@@ -80,6 +80,26 @@ else
 fi
 echo "Installed agent definitions to $AGENTS_DIR"
 
+# Install skills (slash commands)
+echo "Installing skills..."
+SKILLS_DIR="$HOME/.claude/skills"
+if [ "$1" = "--from-source" ]; then
+    SKILLS_SRC="$REPO_DIR/skills"
+else
+    SKILLS_SRC="$INSTALL_DIR/skills"
+fi
+if [ -d "$SKILLS_SRC" ]; then
+    for skill_dir in "$SKILLS_SRC"/*/; do
+        skill_name="$(basename "$skill_dir")"
+        mkdir -p "$SKILLS_DIR/$skill_name"
+        cp "$skill_dir"SKILL.md "$SKILLS_DIR/$skill_name/" 2>/dev/null
+    done
+    [ "$1" != "--from-source" ] && rm -rf "$INSTALL_DIR/skills"
+    echo "Installed skills to $SKILLS_DIR"
+else
+    echo "No skills found to install"
+fi
+
 # Register hooks with Claude Code
 echo "Registering hooks..."
 SETTINGS_FILE="$HOME/.claude/settings.json"

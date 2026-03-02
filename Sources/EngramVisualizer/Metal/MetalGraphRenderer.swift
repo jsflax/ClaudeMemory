@@ -90,12 +90,13 @@ final class MetalGraphRenderer: NSObject {
     var flowVertexCapacity: Int = 0
     var actualFlowParticleCount: Int = 0
 
-    // Mascot
-    var mascotSystem: MascotSystem?
+    // Galaxy registry — used to draw fleet mascots
+    weak var galaxyRegistryRef: GalaxyRegistry?
 
     // Shared state
     var camera: CameraController!
     var animationTime: Float = 0
+    var maintenancePulse: Float = 0
     var frameCount: UInt64 = 0
 
     // Lighting setup (matches Graph3DScene's 3 directional lights)
@@ -548,7 +549,7 @@ final class MetalGraphRenderer: NSObject {
         return (vertices, indices)
     }
 
-    #if DEBUG
+    #if ENGRAM_INSTRUMENTATION
     var drawTimingFile: UnsafeMutablePointer<FILE>? = nil
     var interFrameFile: UnsafeMutablePointer<FILE>? = nil
     var lastDrawEnd: Double = 0
@@ -618,21 +619,21 @@ extension MetalGraphRenderer: MTKViewDelegate {
         animationTime += dtSec
         frameCount &+= 1
 
-        #if DEBUG
+        #if ENGRAM_INSTRUMENTATION
         let drawStart = CFAbsoluteTimeGetCurrent()
         #endif
 
         // Let the scene manager do its per-frame work (input, simulation, data packing)
         onFrameCallback?(dtSec)
 
-        #if DEBUG
+        #if ENGRAM_INSTRUMENTATION
         let afterCallback = CFAbsoluteTimeGetCurrent()
         #endif
 
         // Wait for a free frame slot
         bufferPool.waitForNextFrame()
 
-        #if DEBUG
+        #if ENGRAM_INSTRUMENTATION
         let afterWait = CFAbsoluteTimeGetCurrent()
         #endif
 
@@ -669,7 +670,7 @@ extension MetalGraphRenderer: MTKViewDelegate {
             bgColor: SIMD3<Float>(0.051, 0.067, 0.09),
             fogNear: 0.6,
             fogFar: 7.0,
-            _pad0: 0, _pad1: 0, _pad2: 0
+            maintenancePulse: maintenancePulse, _pad1: 0, _pad2: 0
         )
         bufferPool.updateFrameUniforms(frameUniforms)
         bufferPool.updateLightingUniforms(lightingUniforms)
@@ -710,15 +711,17 @@ extension MetalGraphRenderer: MTKViewDelegate {
             )
         }
 
-        // ── Opaque sub-pass: Mascot ──
-        if let mascot = mascotSystem, let mascotPSO = mascotPipeline {
-            mascot.draw(
-                encoder: encoder,
-                frameUniformBuf: frameUniformBuf,
-                lightUniformBuf: lightUniformBuf,
-                pipeline: mascotPSO,
-                depthState: opaqueDepthState
-            )
+        // ── Opaque sub-pass: Mascot fleet (per-galaxy) ──
+        if let mascotPSO = mascotPipeline, let registry = galaxyRegistryRef {
+            for galaxy in registry.galaxies.values {
+                galaxy.mascotFleet?.drawAll(
+                    encoder: encoder,
+                    frameUniformBuf: frameUniformBuf,
+                    lightUniformBuf: lightUniformBuf,
+                    pipeline: mascotPSO,
+                    depthState: opaqueDepthState
+                )
+            }
         }
 
         // ── Transparent sub-pass ──
@@ -786,40 +789,40 @@ extension MetalGraphRenderer: MTKViewDelegate {
             )
         }
 
-        // Mascot thruster particles
-        if let mascot = mascotSystem {
-            mascot.drawThrusterParticles(
-                encoder: encoder,
-                frameUniformBuf: frameUniformBuf,
-                pipeline: flowPipeline
-            )
+        // Mascot thruster particles (grouped by effect type for minimal pipeline switches)
+        if let registry = galaxyRegistryRef {
+            for galaxy in registry.galaxies.values {
+                galaxy.mascotFleet?.drawAllThrusterParticles(
+                    encoder: encoder, frameUniformBuf: frameUniformBuf, pipeline: flowPipeline
+                )
+            }
         }
 
-        // Mascot arcane circle (additive glow, appears when hovering at a node)
-        if let mascot = mascotSystem, mascot.arcaneVisible, let arcanePSO = arcaneCirclePipeline {
-            mascot.drawArcaneCircle(
-                encoder: encoder,
-                frameUniformBuf: frameUniformBuf,
-                pipeline: arcanePSO
-            )
+        // Mascot arcane circles (additive glow)
+        if let arcanePSO = arcaneCirclePipeline, let registry = galaxyRegistryRef {
+            for galaxy in registry.galaxies.values {
+                galaxy.mascotFleet?.drawAllArcaneCircles(
+                    encoder: encoder, frameUniformBuf: frameUniformBuf, pipeline: arcanePSO
+                )
+            }
         }
 
-        // Node inspection rings (additive glow, orbiting inspected node)
-        if let mascot = mascotSystem, mascot.ringsVisible, let ringPSO = nodeRingPipeline {
-            mascot.drawNodeRings(
-                encoder: encoder,
-                frameUniformBuf: frameUniformBuf,
-                pipeline: ringPSO
-            )
+        // Node inspection rings (additive glow)
+        if let ringPSO = nodeRingPipeline, let registry = galaxyRegistryRef {
+            for galaxy in registry.galaxies.values {
+                galaxy.mascotFleet?.drawAllNodeRings(
+                    encoder: encoder, frameUniformBuf: frameUniformBuf, pipeline: ringPSO
+                )
+            }
         }
 
-        // Mascot holo info screen (alpha blended, appears when hovering at a node)
-        if let mascot = mascotSystem, mascot.holoVisible, let holoPSO = holoScreenPipeline {
-            mascot.drawHoloScreen(
-                encoder: encoder,
-                frameUniformBuf: frameUniformBuf,
-                pipeline: holoPSO
-            )
+        // Mascot holo info screens (alpha blended)
+        if let holoPSO = holoScreenPipeline, let registry = galaxyRegistryRef {
+            for galaxy in registry.galaxies.values {
+                galaxy.mascotFleet?.drawAllHoloScreens(
+                    encoder: encoder, frameUniformBuf: frameUniformBuf, pipeline: holoPSO
+                )
+            }
         }
 
         // Flow particles
@@ -848,7 +851,7 @@ extension MetalGraphRenderer: MTKViewDelegate {
         }
         commandBuffer.commit()
 
-        #if DEBUG
+        #if ENGRAM_INSTRUMENTATION
         let drawEnd = CFAbsoluteTimeGetCurrent()
         let callbackMs = (afterCallback - drawStart) * 1000.0
         let waitMs = (afterWait - afterCallback) * 1000.0

@@ -183,6 +183,7 @@ extension GraphView {
     func graph3DView(colorMap: [String: Color]) -> some View {
         Graph3DView(
             layoutMode: config.layoutMode,
+            showMascots: config.showMascots,
             selectedNode: $selectedMemoryId,
             semanticClusters3D: embeddingProjection.semanticClusters3D,
             simulation3D: simulation3D,
@@ -191,6 +192,7 @@ extension GraphView {
             forcePositionSnapshot3D: forcePositionSnapshot3D,
             transitionProgress: transitionProgress,
             renderStore: renderStore,
+            galaxyRegistry: galaxyRegistry,
             cameraProjectTarget: $cameraProjectTarget
         )
         .transaction { $0.animation = nil }  // prevent overlay animations from resizing the 3D view

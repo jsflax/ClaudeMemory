@@ -71,13 +71,37 @@ extension SidebarView {
                         .font(.system(size: 11, design: .monospaced))
                         Spacer()
                         if syncManager.isSyncing {
-                            HStack(spacing: 4) {
-                                Circle()
-                                    .fill(.green)
-                                    .frame(width: 6, height: 6)
-                                Text("Syncing")
-                                    .font(.system(size: 10, design: .monospaced))
-                                    .foregroundStyle(.white.opacity(0.4))
+                            if syncManager.isSyncUploading {
+                                VStack(alignment: .trailing, spacing: 2) {
+                                    HStack(spacing: 4) {
+                                        ProgressView()
+                                            .controlSize(.mini)
+                                            .scaleEffect(0.6)
+                                        Text("\(syncManager.syncProgressAcked)/\(syncManager.syncProgressTotal)")
+                                            .font(.system(size: 9, design: .monospaced))
+                                            .foregroundStyle(.white.opacity(0.4))
+                                    }
+                                    GeometryReader { geo in
+                                        ZStack(alignment: .leading) {
+                                            RoundedRectangle(cornerRadius: 2)
+                                                .fill(.white.opacity(0.1))
+                                            RoundedRectangle(cornerRadius: 2)
+                                                .fill(.cyan.opacity(0.6))
+                                                .frame(width: geo.size.width * syncManager.syncUploadFraction)
+                                                .animation(.easeInOut(duration: 0.2), value: syncManager.syncUploadFraction)
+                                        }
+                                    }
+                                    .frame(width: 60, height: 3)
+                                }
+                            } else {
+                                HStack(spacing: 4) {
+                                    Circle()
+                                        .fill(.green)
+                                        .frame(width: 6, height: 6)
+                                    Text("Synced")
+                                        .font(.system(size: 10, design: .monospaced))
+                                        .foregroundStyle(.white.opacity(0.4))
+                                }
                             }
                         }
                     }
@@ -113,18 +137,8 @@ extension SidebarView {
                     .font(.system(size: 11, design: .monospaced))
             }
         }
-        .onAppear { autoConnectSync() }
-        .onChange(of: accountService.subscription?.isActive) { _, active in
-            if active == true { autoConnectSync() }
-        }
     }
 
-    func autoConnectSync() {
-        guard let wsURL = accountService.syncWebSocketURL,
-              let token = accountService.token,
-              !syncManager.isSyncing else { return }
-        syncManager.connectSync(wssEndpoint: wsURL, authToken: token)
-    }
 
     func syncProjectRow(_ project: String) -> some View {
         let isOn = syncConfigs.first(where: { $0.project == project })?.policy == .sync

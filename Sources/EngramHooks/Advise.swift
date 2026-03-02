@@ -107,20 +107,31 @@ struct Advise: AsyncParsableCommand {
     private static let maintenanceLogPath = NSHomeDirectory() + "/.claude/memory-maintenance.log"
 
     /// Check if maintenance threshold is crossed and spawn the subprocess if so.
+    /// Uses AuditLog row count since last run — immune to concurrent-process counter clobbering.
     private func spawnMaintenanceIfNeeded(project: String, cwd: String?) {
-        let opCount = Int(getHookState(key: .crudOperationCount) ?? "0") ?? 0
-        let lastOpCount = Int(getHookState(key: .maintenanceLastOpCount) ?? "0") ?? 0
-        let delta = opCount - lastOpCount
+        guard let lattice = openLattice() else { return }
+
+        let lastRunTimestamp = Double(
+            getHookState(key: .maintenanceLastRunTimestamp) ?? "0"
+        ) ?? 0
+        let since = Date(timeIntervalSince1970: lastRunTimestamp)
+
+        let delta = lattice.objects(AuditLog.self)
+            .where { $0.tableName == "Memory" && $0.timestamp > since }
+            .count
 
         guard delta >= maintenanceThreshold else { return }
 
         // Update baseline immediately to prevent re-spawning on next advise call
-        setHookState(key: .maintenanceLastOpCount, value: String(opCount))
+        setHookState(key: .maintenanceLastRunTimestamp, value: String(Date().timeIntervalSince1970))
+
+        // Signal the visualizer that maintenance is active
+        setHookState(key: .maintenanceActive, value: "1")
 
         let prompt = """
         Perform maintenance on the memory database. Focus on project "\(project)".
 
-        Current state: \(opCount) total CRUD operations, \(delta) since last maintenance.
+        Current state: \(delta) Memory writes since last maintenance.
 
         Follow your system prompt workflow: assess, find redundancy, find communities, take action, connect the graph, verify.
         """

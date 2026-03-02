@@ -10,6 +10,8 @@ import Observation
 final class AccountService {
     private static let tokenKey = "auth_token"
     private static let endpointKey = "sync_endpoint"
+    private static let subscriptionStatusKey = "subscription_status"
+    private static let subscriptionTierKey = "subscription_tier"
 
     /// The sync server endpoint. Defaults to production.
     var endpoint: String {
@@ -22,8 +24,18 @@ final class AccountService {
     /// Whether the user is signed in.
     var isSignedIn: Bool { token != nil }
 
-    /// Current subscription status.
-    private(set) var subscription: SubscriptionInfo?
+    /// Current subscription status. Persisted to UserDefaults so sync can auto-connect at launch.
+    private(set) var subscription: SubscriptionInfo? {
+        didSet {
+            if let sub = subscription {
+                UserDefaults.standard.set(sub.status, forKey: Self.subscriptionStatusKey)
+                UserDefaults.standard.set(sub.tier, forKey: Self.subscriptionTierKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: Self.subscriptionStatusKey)
+                UserDefaults.standard.removeObject(forKey: Self.subscriptionTierKey)
+            }
+        }
+    }
 
     /// User profile info from the server.
     private(set) var userProfile: UserProfile?
@@ -37,7 +49,21 @@ final class AccountService {
     init() {
         self.endpoint = UserDefaults.standard.string(forKey: Self.endpointKey)
             ?? "https://api.engram.io"
+        #if TEST_AUTH_TOKEN
+        self.token = ProcessInfo.processInfo.environment["TEST_AUTH_TOKEN"]
+            ?? KeychainHelper.load(for: Self.tokenKey)
+        #else
         self.token = KeychainHelper.load(for: Self.tokenKey)
+        #endif
+
+        // Restore cached subscription so syncWebSocketURL is available synchronously at launch
+        if let status = UserDefaults.standard.string(forKey: Self.subscriptionStatusKey) {
+            self.subscription = SubscriptionInfo(
+                status: status,
+                tier: UserDefaults.standard.string(forKey: Self.subscriptionTierKey),
+                currentPeriodEnd: nil
+            )
+        }
 
         if token != nil {
             Task {
@@ -111,7 +137,7 @@ final class AccountService {
 
     func signOut() {
         token = nil
-        subscription = nil
+        subscription = nil  // didSet clears UserDefaults
         userProfile = nil
         KeychainHelper.delete(for: Self.tokenKey)
     }

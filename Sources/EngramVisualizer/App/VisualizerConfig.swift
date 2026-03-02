@@ -12,4 +12,6 @@ final class VisualizerConfig {
     var notificationsEnabled: Bool = false
     var showActivityLog: Bool = true
     var showStatsOverlay: Bool = false
+    var showMascots: Bool = true
+    var selectedTab: SidebarTab = .visualizer
 }

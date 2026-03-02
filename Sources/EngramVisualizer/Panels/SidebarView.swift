@@ -5,17 +5,18 @@ import UserNotifications
 
 // MARK: - Sidebar (hover-to-peek, click-to-pin)
 
+@LatticeEnum enum SidebarTab: String, CaseIterable, Equatable {
+    case visualizer = "Graph"
+    case settings = "Settings"
+    case account = "Account"
+}
+
 struct SidebarView: View {
-    enum Tab: String, CaseIterable {
-        case visualizer = "Graph"
-        case settings = "Settings"
-        case account = "Account"
-    }
+    typealias Tab = SidebarTab
 
     @Environment(VisualizerConfig.self) private var config
     @Environment(\.lattice) var lattice
     @Environment(SyncManager.self) var syncManager
-    @State private var selectedTab: Tab = .visualizer
     @State private var isCompacting = false
 
     // Visualizer tab
@@ -47,7 +48,7 @@ struct SidebarView: View {
 
             ScrollView(.vertical, showsIndicators: false) {
                 Group {
-                    switch selectedTab {
+                    switch config.selectedTab {
                     case .visualizer: visualizerContent
                     case .settings: settingsContent
                     case .account: accountContent
@@ -82,20 +83,20 @@ struct SidebarView: View {
         HStack(spacing: 2) {
             ForEach(Tab.allCases, id: \.self) { tab in
                 Button {
-                    selectedTab = tab
+                    config.selectedTab = tab
                 } label: {
                     HStack(spacing: 4) {
                         Image(systemName: tabIcon(tab))
                             .font(.system(size: 10))
                         Text(tab.rawValue)
-                            .font(.system(size: 11, weight: selectedTab == tab ? .semibold : .regular, design: .monospaced))
+                            .font(.system(size: 11, weight: config.selectedTab == tab ? .semibold : .regular, design: .monospaced))
                     }
-                    .foregroundStyle(.white.opacity(selectedTab == tab ? 0.9 : 0.4))
+                    .foregroundStyle(.white.opacity(config.selectedTab == tab ? 0.9 : 0.4))
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 7)
                     .background(
                         RoundedRectangle(cornerRadius: 5)
-                            .fill(selectedTab == tab ? .white.opacity(0.1) : .clear)
+                            .fill(config.selectedTab == tab ? .white.opacity(0.1) : .clear)
                     )
                 }
                 .buttonStyle(.plain)
@@ -430,6 +431,13 @@ struct SidebarView: View {
                 ) {
                     config.showStatsOverlay.toggle()
                 }
+                toggleRow(
+                    "Mascot Bots",
+                    icon: config.showMascots ? "figure.walk" : "figure.stand",
+                    isOn: config.showMascots
+                ) {
+                    config.showMascots.toggle()
+                }
             }
 
             section("Audio") {
@@ -477,7 +485,7 @@ struct SidebarView: View {
                         )
                     }
                     .buttonStyle(.plain)
-                    .disabled(isCompacting)
+                    .disabled(isCompacting || syncManager.isSyncing)
                 }
             }
 

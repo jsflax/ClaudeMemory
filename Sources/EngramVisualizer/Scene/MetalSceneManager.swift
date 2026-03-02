@@ -16,28 +16,42 @@ final class MetalSceneManager {
     let camera: CameraController
     let nebulaFog: NebulaFogSystem
     let flowParticles: FlowParticleSystem
-    let mascot: MascotSystem
+    let mascotSharedResources: MascotSharedResources
 
     // External references (set by Graph3DView)
+    weak var camera3DState: Camera3DState?
+
+    /// Galaxy registry — ticks all galaxy simulations and provides merged render data.
+    var galaxyRegistry: GalaxyRegistry? {
+        didSet { renderer.galaxyRegistryRef = galaxyRegistry }
+    }
+
+    // Legacy singular refs — kept for RealityKit path (deprecated) and as fallback.
+    // Metal path reads from galaxyRegistry; these are set by Graph3DViewHost for compat.
     weak var simulation3D: ForceSimulation3D?
     weak var embeddingProjection: EmbeddingProjection?
-    weak var camera3DState: Camera3DState?
     weak var renderStore: GraphRenderStore?
 
-    // Data pushed from SwiftUI (only layout/transition state — visual data comes from renderStore)
+    // Maintenance mode state
+    var isMaintenanceActive: Bool = false
+    private var maintenancePulse: Float = 0  // 0..1 lerp for atmosphere effect
+
+    // Data pushed from SwiftUI (only layout/transition state — visual data comes from registry)
+    var showMascots: Bool = true
     var layoutMode: LayoutMode = .forceDirected
     var semanticClusters3D: [SemanticCluster3D] = []
     var forcePositionSnapshot3D: [UUID: SIMD3<Float>] = [:]
     var transitionProgress: CGFloat = 0
 
-    // Convenience accessors — read from renderStore (no local copies needed)
-    private var glowingNodes: [UUID: Date] { renderStore?.glowingNodes ?? [:] }
-    private var newNodes: [UUID: Date] { renderStore?.newNodeGlows ?? [:] }
-    private var dyingNodes: [UUID: DyingNode] { renderStore?.dyingNodes ?? [:] }
-    private var topicGroups: [TopicGroupInfo] { renderStore?.topicGroups ?? [] }
-    private var clusters: [[UUID]] { renderStore?.clusterGroups ?? [] }
-    private var searchMatchIds: Set<UUID> { renderStore?.searchMatchIds ?? [] }
-    private var isSearchActive: Bool { renderStore?.isSearchActive ?? false }
+    // Per-frame cached visual data — refreshed once at the start of renderTick
+    // to avoid rebuilding merged dictionaries on every access inside per-node loops.
+    private var glowingNodes: [UUID: Date] = [:]
+    private var newNodes: [UUID: Date] = [:]
+    private var dyingNodes: [UUID: DyingNode] = [:]
+    private var topicGroups: [TopicGroupInfo] = []
+    private var clusters: [[UUID]] = []
+    private var searchMatchIds: Set<UUID> = []
+    private var isSearchActive: Bool = false
 
     // Mutable render state
     var positions: [UUID: SIMD3<Float>] = [:]
@@ -69,6 +83,8 @@ final class MetalSceneManager {
     var reticleTarget: UUID?
     /// Callback for SwiftUI to observe reticle target changes (MetalSceneManager is not @Observable).
     var reticleCallback: ((UUID?) -> Void)?
+    /// Callback for SwiftUI to observe teleport label/counter changes (MetalSceneManager is not @Observable).
+    var teleportCallback: ((String?, Int) -> Void)?
     // Teleport state
     var teleportLabel: String?
     var teleportCounter: Int = 0
@@ -98,16 +114,21 @@ final class MetalSceneManager {
     // Label atlas state
     var labelAtlasRects: [UUID: (u0: Float, v0: Float, u1: Float, v1: Float)] = [:]
     var projectLabelAtlasRects: [String: (u0: Float, v0: Float, u1: Float, v1: Float)] = [:]
+    var galaxyLabelAtlasRects: [String: (u0: Float, v0: Float, u1: Float, v1: Float)] = [:]
+    var topicLabelAtlasRects: [String: (u0: Float, v0: Float, u1: Float, v1: Float)] = [:]
     var projectCentroids: [String: (centroid: SIMD3<Float>, radius: Float, maxY: Float)] = [:]
     var labelAtlasNodeIds: Set<UUID> = []
     var labelAtlasHubIds: Set<UUID> = []
     var labelAtlasProjects: Set<String> = []
+    var labelAtlasGalaxyNames: [String] = []
+    private var lastAtlasTopicGroupCount: Int = 0
     private var labelAtlasAspectCorrection: Float = 1.0
     private var labelAtlasAllocW: Int = 0
     private var labelAtlasAllocH: Int = 0
     private var labelAtlasRegenFrame: UInt64 = 0
     private var lastAtlasTopologyVersion: UInt64 = 0
     private var isAtlasGenerating = false
+    private var pendingAtlasRegen = false
 
     // View properties
     var renderViewSize: CGSize = .zero
@@ -118,20 +139,20 @@ final class MetalSceneManager {
 
     // Precomputed cylinder trig (6-sided) — avoids 12 sin/cos per edge per frame
 
-    private var renderNodes: [NodeData] { renderStore?.nodes ?? [] }
-    private var renderEdges: [EdgeData] { renderStore?.edges ?? [] }
-    private var renderHubs: Set<UUID> { renderStore?.hubs ?? [] }
-    private var renderColorMap: [String: Color] { renderStore?.colorMap ?? [:] }
+    private var renderNodes: [NodeData] = []
+    private var renderEdges: [EdgeData] = []
+    private var renderHubs: Set<UUID> = []
+    private var renderColorMap: [String: Color] = [:]
 
     init?(renderer: MetalGraphRenderer) {
         self.renderer = renderer
         self.camera = CameraController()
         self.nebulaFog = NebulaFogSystem(device: renderer.device)
         self.flowParticles = FlowParticleSystem(device: renderer.device)
-        self.mascot = MascotSystem(device: renderer.device)
+        let templateMascot = MascotSystem(device: renderer.device)
+        self.mascotSharedResources = templateMascot.extractSharedResources()
 
         renderer.camera = camera
-        renderer.mascotSystem = mascot
         renderer.onFrameCallback = { [weak self] dt in
             self?.renderTick(dt: dt)
         }
@@ -139,14 +160,14 @@ final class MetalSceneManager {
 
     // MARK: - Render Tick
 
-    #if DEBUG
+    #if ENGRAM_INSTRUMENTATION
     private var lastFrameWallTime: CFAbsoluteTime = 0
     #endif
 
     func renderTick(dt: Float) {
         renderFrameCount &+= 1
         let frameStart = CFAbsoluteTimeGetCurrent()
-        #if DEBUG
+        #if ENGRAM_INSTRUMENTATION
         let wallDt = lastFrameWallTime > 0 ? (frameStart - lastFrameWallTime) * 1000.0 : 0
         lastFrameWallTime = frameStart
         #endif
@@ -162,44 +183,98 @@ final class MetalSceneManager {
             selectionCallback?(selectedNode)
         }
 
-        // Tick simulation + compute positions
+        // Tick ALL galaxy simulations + compute merged positions
         let simStart = CFAbsoluteTimeGetCurrent()
         var didUpdatePositions = false
-        if let sim = simulation3D, let proj = embeddingProjection {
-            sim.tick()
-            proj.tickAnimation3D()
-
-            let newPositions: [UUID: SIMD3<Float>]?
-            if sim.isSettled && proj.is3DAnimationSettled {
-                newPositions = nil
-            } else if layoutMode == .embedding {
-                let tsne3D = proj.projectedPositions3D
-                if tsne3D.isEmpty {
-                    newPositions = sim.positions
-                } else if transitionProgress >= 1.0 {
-                    newPositions = tsne3D
-                } else {
-                    var blended: [UUID: SIMD3<Float>] = [:]
-                    let allIds = Set(forcePositionSnapshot3D.keys).union(tsne3D.keys)
-                    for id in allIds {
-                        let forcePos = forcePositionSnapshot3D[id] ?? sim.positions[id] ?? .zero
-                        let tsnePos = tsne3D[id] ?? forcePos
-                        blended[id] = forcePos + (tsnePos - forcePos) * Float(transitionProgress)
-                    }
-                    newPositions = blended
+        if let registry = galaxyRegistry {
+            var anyActive = false
+            for galaxy in registry.galaxies.values {
+                galaxy.simulation3D.tick()
+                galaxy.embeddingProjection.tickAnimation3D()
+                if !galaxy.simulation3D.isSettled || !galaxy.embeddingProjection.is3DAnimationSettled {
+                    anyActive = true
                 }
-            } else {
-                newPositions = sim.positions
             }
-            if let p = newPositions {
-                positions = p
+            registry.mergeRenderData()
+
+            // Prune expired glow/arrival entries so visualOnlyChanged goes false
+            let now = Date()
+            let recallTotalDuration: TimeInterval = 1.0 + 1.5 + 2.0  // fadeIn + hold + fadeOut
+            let arrivalTotalDuration: TimeInterval = 0.8 + 2.0 + 3.0
+            for galaxy in registry.galaxies.values {
+                galaxy.renderStore.glowingNodes = galaxy.renderStore.glowingNodes.filter {
+                    now.timeIntervalSince($0.value) < recallTotalDuration
+                }
+                galaxy.renderStore.newNodeGlows = galaxy.renderStore.newNodeGlows.filter {
+                    now.timeIntervalSince($0.value) < arrivalTotalDuration
+                }
+            }
+
+            // Cache merged data for this frame — one read per frame,
+            // not per-access (avoids rebuilding dictionaries inside per-node loops)
+            renderNodes = registry.mergedNodes
+            renderEdges = registry.mergedEdges
+            renderHubs = registry.mergedHubs
+            renderColorMap = registry.mergedColorMap
+            glowingNodes = registry.mergedGlowingNodes
+            newNodes = registry.mergedNewNodeGlows
+            dyingNodes = registry.mergedDyingNodes
+            topicGroups = registry.mergedTopicGroups
+            clusters = registry.mergedClusterGroups
+            searchMatchIds = registry.mergedSearchMatchIds
+            isSearchActive = registry.mergedIsSearchActive
+
+            if anyActive {
+                // Compute merged positions — each galaxy's positions are already in world space
+                // because ForceSimulation3D.center is set to galaxy.worldCenter
+                if layoutMode == .forceDirected {
+                    registry.updateMergedPositions()
+                    positions = registry.mergedPositions
+                } else {
+                    // Embedding mode: blend per-galaxy force snapshots with t-SNE projections
+                    var merged: [UUID: SIMD3<Float>] = [:]
+                    for galaxy in registry.galaxies.values {
+                        let proj = galaxy.embeddingProjection
+                        let sim = galaxy.simulation3D
+                        let tsne3D = proj.projectedPositions3D
+                        if tsne3D.isEmpty {
+                            merged.merge(sim.positions) { _, new in new }
+                        } else if transitionProgress >= 1.0 {
+                            merged.merge(tsne3D) { _, new in new }
+                        } else {
+                            let allIds = Set(forcePositionSnapshot3D.keys.filter { registry.nodeToGalaxy[$0] == galaxy.id })
+                                .union(tsne3D.keys)
+                            for id in allIds {
+                                let forcePos = forcePositionSnapshot3D[id] ?? sim.positions[id] ?? .zero
+                                let tsnePos = tsne3D[id] ?? forcePos
+                                merged[id] = forcePos + (tsnePos - forcePos) * Float(transitionProgress)
+                            }
+                        }
+                    }
+                    positions = merged
+                }
                 didUpdatePositions = true
 
                 if cameraStartTime == nil { cameraStartTime = Date() }
                 let elapsed = Date().timeIntervalSince(cameraStartTime!)
-                if (!hasCenteredCamera || elapsed < 3.0) && !isDragging {
+                if (!hasCenteredCamera || elapsed < 3.0) && !isDragging && heldKeys.isEmpty {
                     centerTickCount += 1
                     if centerTickCount % 6 == 0 {
+                        #if ENGRAM_INSTRUMENTATION
+                        if Self.centerLogFile == nil {
+                            Self.centerLogFile = fopen("/tmp/center-log.csv", "w")
+                            if let f = Self.centerLogFile {
+                                fputs("frame,elapsed_s,keys_held,positions,cam_target_x,cam_target_y,cam_target_z,target_pos_x,target_pos_y,target_pos_z\n", f)
+                            }
+                        }
+                        if let f = Self.centerLogFile {
+                            let ct = self.camera.cameraTarget
+                            let tp = self.camera.targetCameraPos
+                            let line = "\(self.renderFrameCount),\(String(format: "%.2f", elapsed)),\(self.heldKeys.count),\(self.positions.count),\(String(format: "%.1f", ct.x)),\(String(format: "%.1f", ct.y)),\(String(format: "%.1f", ct.z)),\(String(format: "%.1f", tp.x)),\(String(format: "%.1f", tp.y)),\(String(format: "%.1f", tp.z))\n"
+                            fputs(line, f)
+                            fflush(f)
+                        }
+                        #endif
                         camera.centerOnGraph(positions: positions)
                     }
                     if elapsed >= 3.0 { hasCenteredCamera = true }
@@ -208,22 +283,25 @@ final class MetalSceneManager {
         }
         let simMs = (CFAbsoluteTimeGetCurrent() - simStart) * 1000.0
 
-        // Consume hub toggles
-        if !pendingHubToggles.isEmpty, let sim = simulation3D {
+        // Consume hub toggles — route to the correct galaxy's simulation
+        if !pendingHubToggles.isEmpty, let registry = galaxyRegistry {
             for toggle in pendingHubToggles {
-                let children = renderEdges.filter { $0.relation == "part_of" && $0.targetId == toggle.hubId }.map(\.sourceId)
-                for childId in children {
-                    if toggle.expanding { sim.pin(childId) } else { sim.unpin(childId) }
+                if let galaxy = registry.galaxyForNode(toggle.hubId) {
+                    let children = galaxy.renderStore.edges.filter { $0.relation == "part_of" && $0.targetId == toggle.hubId }.map(\.sourceId)
+                    for childId in children {
+                        if toggle.expanding { galaxy.simulation3D.pin(childId) } else { galaxy.simulation3D.unpin(childId) }
+                    }
                 }
             }
             pendingHubToggles.removeAll()
         }
 
         // Invalidate color caches when colorMap changes
-        if let version = renderStore?.colorMapVersion, version != lastColorMapVersion {
+        let colorVersion = galaxyRegistry?.mergedColorMapVersion ?? 0
+        if colorVersion != lastColorMapVersion {
             nodeColorCache.removeAll(keepingCapacity: true)
             edgeColorCache.removeAll(keepingCapacity: true)
-            lastColorMapVersion = version
+            lastColorMapVersion = colorVersion
         }
 
         // Determine update needs — split geometry changes from visual-only changes
@@ -235,28 +313,82 @@ final class MetalSceneManager {
         let cameraMoving = camera.isMoving
         let hasInput = !heldKeys.isEmpty
         let geometryChanged = positionsChanged || selectionChanged || searchChanged || hasExpansions
-        let mascotInspecting = mascot.arcaneIntensity > 0.01
+        let fleetInspecting = galaxyRegistry?.galaxies.values.contains { $0.mascotFleet?.anyInspecting ?? false } ?? false
+        let mascotInspecting = fleetInspecting
         let visualOnlyChanged = !glowingNodes.isEmpty || !newNodes.isEmpty || !dyingNodes.isEmpty || mascotInspecting
         let sceneNeedsUpdate = geometryChanged || visualOnlyChanged
 
         // Always advance animation time (shaders need it for scan lines, flicker, etc.)
         renderer.animationTime += dt
 
-        // Always update mascot — it patrols independently of scene changes
-        let mascotStart = CFAbsoluteTimeGetCurrent()
-        let nodeByIdForMascot = renderStore?.nodeById ?? [:]
-        var mascotNodeInfo: [UUID: MascotNodeInfo] = [:]
-        if let targetId = mascot.currentTargetId, let nd = nodeByIdForMascot[targetId] {
-            mascotNodeInfo[targetId] = MascotNodeInfo(
-                content: nd.content, project: nd.project,
-                topic: nd.topic, importance: nd.importance,
-                createdAt: nd.createdAt, lastAccessedAt: nd.lastAccessedAt
-            )
+        // Maintenance pulse: lerp toward target (2s ramp up/down)
+        let maintenanceTarget: Float = isMaintenanceActive ? 1.0 : 0.0
+        let pulseRate: Float = 0.5 * dt  // 1/2s = 2s full transition
+        if maintenancePulse < maintenanceTarget {
+            maintenancePulse = min(maintenancePulse + pulseRate, maintenanceTarget)
+        } else if maintenancePulse > maintenanceTarget {
+            maintenancePulse = max(maintenancePulse - pulseRate, maintenanceTarget)
         }
-        mascot.update(dt: dt, camera: camera, nodePositions: positions, nodeInfo: mascotNodeInfo)
+        renderer.maintenancePulse = maintenancePulse
+
+        // Always update mascots — they patrol independently of scene changes
+        let mascotStart = CFAbsoluteTimeGetCurrent()
+        renderer.galaxyRegistryRef = showMascots ? galaxyRegistry : nil
+        if showMascots, let registry = galaxyRegistry {
+            let nodeByIdForMascot = registry.mergedNodeById
+
+            // Ensure each galaxy has a fleet
+            for galaxy in registry.galaxies.values {
+                if galaxy.mascotFleet == nil {
+                    galaxy.mascotFleet = MascotFleet(
+                        galaxyId: galaxy.id,
+                        device: renderer.device,
+                        sharedResources: mascotSharedResources
+                    )
+                }
+
+                // Compute per-project node positions for this galaxy
+                var nodesByProject: [String: [UUID: SIMD3<Float>]] = [:]
+                for node in galaxy.renderStore.nodes {
+                    if let pos = positions[node.id] {
+                        nodesByProject[node.project, default: [:]][node.id] = pos
+                    }
+                }
+
+                // Active projects in this galaxy
+                let activeProjects = Set(nodesByProject.keys)
+                let colorMap = renderColorMap.compactMapValues { color -> NSColor? in
+                    NSColor(color)
+                }
+
+                galaxy.mascotFleet?.syncProjects(active: activeProjects, colorMap: colorMap)
+
+                // Build node info for all current targets
+                var nodeInfo: [UUID: MascotNodeInfo] = [:]
+                for mascot in galaxy.mascotFleet?.mascots.values ?? [:].values {
+                    if let targetId = mascot.currentTargetId, let nd = nodeByIdForMascot[targetId] {
+                        nodeInfo[targetId] = MascotNodeInfo(
+                            content: nd.content, project: nd.project,
+                            topic: nd.topic, importance: nd.importance,
+                            createdAt: nd.createdAt, lastAccessedAt: nd.lastAccessedAt
+                        )
+                    }
+                }
+
+                galaxy.mascotFleet?.update(
+                    dt: dt, camera: camera, positions: positions,
+                    nodesByProject: nodesByProject, nodeInfo: nodeInfo,
+                    maintenanceActive: isMaintenanceActive
+                )
+            }
+        }
         let mascotMs = (CFAbsoluteTimeGetCurrent() - mascotStart) * 1000.0
 
-        let isActive = sceneNeedsUpdate || cameraMoving || hasInput || !mascot.isSettled
+        let anyMascotActive = galaxyRegistry?.galaxies.values.contains { galaxy in
+            galaxy.mascotFleet?.mascots.values.contains { !$0.isSettled } ?? false
+        } ?? false
+        let maintenanceTransitioning = maintenancePulse > 0.001 && maintenancePulse < 0.999
+        let isActive = sceneNeedsUpdate || cameraMoving || hasInput || anyMascotActive || maintenanceTransitioning
 
         if !isActive {
             if renderFrameCount > 10 && renderFrameCount % 30 != 0 {
@@ -276,11 +408,15 @@ final class MetalSceneManager {
             // Edge and nebula packing only needed when geometry changed
             // (positions, selection, search), not for glow/arrival visual-only changes.
             if geometryChanged {
-                let t1 = CFAbsoluteTimeGetCurrent()
-                packEdgeVertices()
-                edgesMs = (CFAbsoluteTimeGetCurrent() - t1) * 1000.0
-
                 let positionOnly = positionsChanged && !selectionChanged && !searchChanged && !hasExpansions
+                // Edges: throttle to every 2nd frame when only positions change.
+                // At 60fps, 16ms of edge lag is sub-pixel during smooth simulation drift.
+                if !positionOnly || renderFrameCount % 2 == 0 {
+                    let t1 = CFAbsoluteTimeGetCurrent()
+                    packEdgeVertices()
+                    edgesMs = (CFAbsoluteTimeGetCurrent() - t1) * 1000.0
+                }
+
                 if !positionOnly || renderFrameCount % 6 == 0 {
                     let t2 = CFAbsoluteTimeGetCurrent()
                     updateNebulae()
@@ -326,12 +462,17 @@ final class MetalSceneManager {
         let edgeCount = renderEdges.count
 
         // Write CSV for analysis — every frame when active, every 30th when idle
-        #if DEBUG
+        #if ENGRAM_INSTRUMENTATION
         let reason: String
         if positionsChanged && geometryChanged { reason = "sim" }
         else if selectionChanged { reason = "select" }
         else if searchChanged { reason = "search" }
-        else if visualOnlyChanged { reason = "glow" }
+        else if visualOnlyChanged {
+            if mascotInspecting { reason = "glow_mascot" }
+            else if !dyingNodes.isEmpty { reason = "glow_dying" }
+            else if !glowingNodes.isEmpty { reason = "glow_recall" }
+            else { reason = "glow_arrival" }
+        }
         else if cameraMoving { reason = "camera" }
         else { reason = "idle" }
 
@@ -349,8 +490,9 @@ final class MetalSceneManager {
         #endif
     }
 
-    #if DEBUG
+    #if ENGRAM_INSTRUMENTATION
     private var metalTimingFile: UnsafeMutablePointer<FILE>? = nil
+    static var centerLogFile: UnsafeMutablePointer<FILE>? = nil
     #endif
 
     // MARK: - Node Instance Packing
@@ -362,14 +504,42 @@ final class MetalSceneManager {
             return
         }
 
+        #if ENGRAM_INSTRUMENTATION
+        let packStart = CFAbsoluteTimeGetCurrent()
+        #endif
+
         let hubs = renderHubs
         let colorMap = renderColorMap
-        let nodeById = renderStore?.nodeById ?? [:]
+        let nodeById = galaxyRegistry?.mergedNodeById ?? [:]
         let now = Date()
 
         if instanceArray.count < nodeCount {
             instanceArray = [NodeInstance](repeating: NodeInstance(position: .zero, scale: 0, color: .zero), count: max(nodeCount * 2, 512))
         }
+
+        // Pre-compute inspecting nodes and birthing nodes across all galaxies
+        // to avoid O(N×M) galaxy scans inside the per-node loop.
+        var inspectingIntensity: [UUID: Float] = [:]
+        var birthingNodeStarts: [UUID: (date: Date, galaxyId: String)] = [:]
+        if let registry = galaxyRegistry {
+            for galaxy in registry.galaxies.values {
+                if let fleet = galaxy.mascotFleet {
+                    for mascot in fleet.mascots.values where mascot.arcaneIntensity > 0.01 {
+                        if let targetId = mascot.currentTargetId {
+                            inspectingIntensity[targetId] = mascot.arcaneIntensity
+                        }
+                    }
+                }
+                for (nodeId, start) in galaxy.renderStore.birthingNodes {
+                    birthingNodeStarts[nodeId] = (start, galaxy.id)
+                }
+            }
+        }
+
+        #if ENGRAM_INSTRUMENTATION
+        let packPrecomputeMs = (CFAbsoluteTimeGetCurrent() - packStart) * 1000.0
+        let packLoopStart = CFAbsoluteTimeGetCurrent()
+        #endif
 
         // Point lights
         var pointLightCount: Int = 0
@@ -412,11 +582,25 @@ final class MetalSceneManager {
 
             let searchDimmed = isSearchActive && !searchMatchIds.contains(id)
             let searchMatched = isSearchActive && searchMatchIds.contains(id) && id != selectedNode
-            let isInspecting = mascot.ringTargetId == id && mascot.arcaneIntensity > 0.01
+            let isInspecting = inspectingIntensity[id] != nil
+
+            // Check birth/death states from pre-computed map
+            let birthEntry = birthingNodeStarts[id]
+            let isBirthing = birthEntry != nil
+            let birthIntensity: Float = {
+                guard let entry = birthEntry else { return 0 }
+                return min(Float(now.timeIntervalSince(entry.date)) / 1.5, 1.0)  // 0→1 over 1.5s
+            }()
+            // Clean up completed births
+            if birthIntensity >= 1.0, let entry = birthEntry {
+                galaxyRegistry?.galaxies[entry.galaxyId]?.renderStore.birthingNodes.removeValue(forKey: id)
+            }
 
             let curState: Float
             let curIntensity: Float
-            if id == selectedNode {
+            if isBirthing {
+                curState = 6; curIntensity = birthIntensity  // birth: scale 0→1
+            } else if id == selectedNode {
                 curState = 1; curIntensity = 0
             } else if searchMatched {
                 curState = 4; curIntensity = 0
@@ -424,7 +608,7 @@ final class MetalSceneManager {
                 // When search is active, suppress recall/arrival glow on non-matched nodes
                 curState = 0; curIntensity = 0
             } else if isInspecting {
-                curState = 5; curIntensity = mascot.arcaneIntensity
+                curState = 5; curIntensity = inspectingIntensity[id] ?? 0.5
             } else if ri > 0 {
                 curState = 2; curIntensity = ri
             } else if ai > 0 {
@@ -506,6 +690,32 @@ final class MetalSceneManager {
         }
 
         renderer.actualNodeCount = actualNodeCount
+
+        #if ENGRAM_INSTRUMENTATION
+        let packLoopMs = (CFAbsoluteTimeGetCurrent() - packLoopStart) * 1000.0
+        let packTotalMs = (CFAbsoluteTimeGetCurrent() - packStart) * 1000.0
+        if metalTimingFile == nil {
+            metalTimingFile = fopen("/tmp/metal-frame-timing.csv", "w")
+            if let f = metalTimingFile {
+                fputs("frame,dt_ms,wall_dt_ms,total_ms,sim_ms,mascot_ms,nodes_ms,edges_ms,neb_ms,labels_ms,flow_ms,node_count,edge_count,reason\n", f)
+            }
+        }
+        // Append pack timing to a separate CSV for detailed analysis
+        do {
+            struct PackTiming { nonisolated(unsafe) static var file: UnsafeMutablePointer<FILE>? = nil }
+            if PackTiming.file == nil {
+                PackTiming.file = fopen("/tmp/pack-timing.csv", "w")
+                if let f = PackTiming.file {
+                    fputs("frame,pack_precompute_ms,pack_loop_ms,pack_total_ms,node_count\n", f)
+                }
+            }
+            if let f = PackTiming.file {
+                let line = "\(renderFrameCount),\(String(format: "%.2f", packPrecomputeMs)),\(String(format: "%.2f", packLoopMs)),\(String(format: "%.2f", packTotalMs)),\(actualNodeCount)\n"
+                fputs(line, f)
+                fflush(f)
+            }
+        }
+        #endif
     }
 
     private func setPointLight(index: Int, position: SIMD3<Float>, color: SIMD3<Float>, intensity: Float, attenuation: Float) {
@@ -525,8 +735,9 @@ final class MetalSceneManager {
 
     private func packEdgeVertices() {
         let edges = renderEdges
-        let edgeCount = edges.count
-        guard edgeCount > 0 else {
+        let interGalaxyConns = galaxyRegistry?.interGalaxyConnections ?? []
+        let totalEdgeCapacity = edges.count + interGalaxyConns.count
+        guard totalEdgeCapacity > 0 else {
             renderer.actualEdgeCount = 0
             renderer.actualEdgeVertexCount = 0
             return
@@ -551,10 +762,10 @@ final class MetalSceneManager {
             lastTopologyNodeCount = nodes.count
         }
 
-        renderer.ensureEdgeBuffers(edgeCount: edgeCount)
+        renderer.ensureEdgeBuffers(edgeCount: totalEdgeCapacity)
         guard let instanceBuf = renderer.edgeInstanceBuffer else { return }
 
-        let instances = instanceBuf.contents().bindMemory(to: EdgeInstance.self, capacity: edgeCount)
+        let instances = instanceBuf.contents().bindMemory(to: EdgeInstance.self, capacity: totalEdgeCapacity)
 
         let nodeProject = cachedNodeProject
         let nodeRadii = cachedNodeRadii
@@ -606,6 +817,23 @@ final class MetalSceneManager {
             ei += 1
         }
 
+        // Append inter-galaxy connection lines (thick, dim white)
+        for conn in interGalaxyConns {
+            let p1 = conn.from * scaleFactor
+            let p2 = conn.to * scaleFactor
+            let len = simd_length(p2 - p1)
+            guard len > 0.01 else { continue }
+
+            instances[ei] = EdgeInstance(
+                sourcePos: p1,
+                radius: edgeRadius * 4.0,
+                targetPos: p2,
+                state: 2,  // dimmed state
+                color: SIMD4<Float>(0.5, 0.5, 0.6, 0.4)
+            )
+            ei += 1
+        }
+
         renderer.actualEdgeCount = ei
     }
 
@@ -620,26 +848,42 @@ final class MetalSceneManager {
 
         let nodes = renderNodes
         let hubs = renderHubs
-        let storeVersion = renderStore?.topologyVersion ?? 0
+        let storeVersion = galaxyRegistry?.mergedTopologyVersion ?? 0
 
-        // Regen atlas if needed — O(1) version check instead of O(n) Set comparison
-        let atlasNeedsRegen = renderer.labelAtlasTexture == nil || storeVersion != lastAtlasTopologyVersion
+        // Regen atlas if needed — O(1) version checks.
+        // On topology change, set pendingAtlasRegen and dispatch on the NEXT frame
+        // to avoid stacking atlas dispatch overhead on the same frame as the insert.
+        let currentTopicGroupCount = topicGroups.count
+        let atlasNeedsRegen = renderer.labelAtlasTexture == nil
+            || storeVersion != lastAtlasTopologyVersion
+            || currentTopicGroupCount != lastAtlasTopicGroupCount
         if atlasNeedsRegen {
-            let currentNodeIds = Set(positions.keys)
-            let currentProjects = Set(nodes.map(\.project))
             let isFirstAtlas = renderer.labelAtlasTexture == nil
-            let framesSinceRegen = renderFrameCount &- labelAtlasRegenFrame
-            if isFirstAtlas || framesSinceRegen >= 60 {
-                if isFirstAtlas {
-                    // First atlas must be synchronous — nothing to show until it's ready
-                    generateLabelAtlas(nodes: nodes, hubs: hubs, projects: currentProjects)
-                } else if !isAtlasGenerating {
-                    dispatchAtlasRegen(nodes: nodes, hubs: hubs, projects: currentProjects)
-                }
+            if isFirstAtlas {
+                // First atlas must be synchronous — nothing to show until it's ready
+                let currentProjects = Set(nodes.map(\.project))
+                let currentGalaxyNames = galaxyRegistry?.galaxies.values.map(\.displayName) ?? []
+                generateLabelAtlas(nodes: nodes, hubs: hubs, projects: currentProjects,
+                                    galaxyNames: currentGalaxyNames)
                 labelAtlasRegenFrame = renderFrameCount
-                labelAtlasNodeIds = currentNodeIds
-                lastAtlasTopologyVersion = storeVersion
+            } else {
+                // Defer dispatch to next frame — just record that regen is needed
+                pendingAtlasRegen = true
             }
+            lastAtlasTopologyVersion = storeVersion
+            lastAtlasTopicGroupCount = currentTopicGroupCount
+        } else if pendingAtlasRegen && !isAtlasGenerating {
+            // Dispatch the deferred atlas regen (runs on the frame after topology change)
+            let framesSinceRegen = renderFrameCount &- labelAtlasRegenFrame
+            if framesSinceRegen >= 60 {
+                let currentProjects = Set(nodes.map(\.project))
+                let currentGalaxyNames = galaxyRegistry?.galaxies.values.map(\.displayName) ?? []
+                dispatchAtlasRegen(nodes: nodes, hubs: hubs, projects: currentProjects,
+                                    galaxyNames: currentGalaxyNames)
+                labelAtlasRegenFrame = renderFrameCount
+                pendingAtlasRegen = false
+            }
+            // If throttle not met, keep pendingAtlasRegen = true for the next frame
         }
         guard renderer.labelAtlasTexture != nil else { return }
 
@@ -665,7 +909,7 @@ final class MetalSceneManager {
             projectColors[project] = nodeColorFloat3(for: project, colorMap: renderColorMap)
         }
 
-        let nodeById = renderStore?.nodeById ?? [:]
+        let nodeById = galaxyRegistry?.mergedNodeById ?? [:]
         let sf = scaleFactor
         let aspectCorr = labelAtlasAspectCorrection
 
@@ -691,9 +935,10 @@ final class MetalSceneManager {
         let depthRange = max(1.0, maxDepth - minDepth)
 
         let projectLabelCount = projectCentroids.count
-        let maxNodeLabels = max(0, 2048 - projectLabelCount)
+        let maxNodeLabels = max(0, 2048 - projectLabelCount - topicGroups.count)
         var instances = [LabelInstance]()
-        instances.reserveCapacity(min(allPositions.count + projectLabelCount, 2048))
+        let topicLabelCount = topicGroups.count
+        instances.reserveCapacity(min(allPositions.count + projectLabelCount + topicLabelCount, 2048))
 
         for (id, pos3D) in allPositions {
             guard instances.count < maxNodeLabels,
@@ -746,12 +991,69 @@ final class MetalSceneManager {
 
             instances.append(LabelInstance(
                 anchor: anchor,
-                halfH: 0.15,
+                halfH: 0.20,
                 uvRect: SIMD4<Float>(rect.u0, rect.v0, rect.u1, rect.v1),
                 color: SIMD4<Float>(color.x, color.y, color.z, 0.9),
                 textAspect: textAspect,
                 maxVisible: 12000,
                 forwardBias: 0.25,
+                flags: 0
+            ))
+        }
+
+        // Galaxy labels — always visible, positioned above each galaxy's world center
+        if let registry = galaxyRegistry, registry.galaxies.count > 1 {
+            for galaxy in registry.galaxies.values {
+                guard let rect = galaxyLabelAtlasRects[galaxy.displayName] else { continue }
+
+                let center = galaxy.worldCenter * sf
+                let anchor = SIMD3<Float>(center.x, center.y + 0.6, center.z)
+                let textAspect = (rect.u1 - rect.u0) / max(0.001, rect.v1 - rect.v0) * aspectCorr
+
+                instances.append(LabelInstance(
+                    anchor: anchor,
+                    halfH: 0.25,
+                    uvRect: SIMD4<Float>(rect.u0, rect.v0, rect.u1, rect.v1),
+                    color: SIMD4<Float>(0.8, 0.85, 1.0, 0.85),
+                    textAspect: textAspect,
+                    maxVisible: .greatestFiniteMagnitude,
+                    forwardBias: 0.3,
+                    flags: 0
+                ))
+            }
+        }
+
+        // Topic group labels — positioned above each topic cluster's centroid
+        for group in topicGroups {
+            guard group.ids.count >= 3,
+                  let rect = topicLabelAtlasRects[group.topic] else { continue }
+
+            // Compute centroid and max Y from member positions
+            var sum = SIMD3<Float>.zero
+            var maxY: Float = -.greatestFiniteMagnitude
+            var memberCount = 0
+            for id in group.ids {
+                guard let pos = allPositions[id] else { continue }
+                sum += pos
+                maxY = max(maxY, pos.y)
+                memberCount += 1
+            }
+            guard memberCount >= 3 else { continue }
+            let centroid = sum / Float(memberCount)
+
+            let labelY = maxY * sf + 0.06
+            let anchor = SIMD3<Float>(centroid.x * sf, labelY, centroid.z * sf)
+            let textAspect = (rect.u1 - rect.u0) / max(0.001, rect.v1 - rect.v0) * aspectCorr
+            let color = projectColors[group.project] ?? SIMD3<Float>(0.75, 0.82, 0.95)
+
+            instances.append(LabelInstance(
+                anchor: anchor,
+                halfH: 0.06,
+                uvRect: SIMD4<Float>(rect.u0, rect.v0, rect.u1, rect.v1),
+                color: SIMD4<Float>(color.x, color.y, color.z, 0.6),
+                textAspect: textAspect,
+                maxVisible: 1500,
+                forwardBias: 0.15,
                 flags: 0
             ))
         }
@@ -795,31 +1097,41 @@ final class MetalSceneManager {
         let texture: MTLTexture
         let nodeRects: [UUID: (u0: Float, v0: Float, u1: Float, v1: Float)]
         let projectRects: [String: (u0: Float, v0: Float, u1: Float, v1: Float)]
+        let galaxyRects: [String: (u0: Float, v0: Float, u1: Float, v1: Float)]
+        let topicRects: [String: (u0: Float, v0: Float, u1: Float, v1: Float)]
         let aspectCorrection: Float
         let allocW: Int; let allocH: Int
     }
 
     /// Synchronous atlas generation (used for the first atlas only).
-    private func generateLabelAtlas(nodes: [NodeData], hubs: Set<UUID>, projects: Set<String>) {
+    private func generateLabelAtlas(nodes: [NodeData], hubs: Set<UUID>, projects: Set<String>,
+                                     galaxyNames: [String]) {
         let entries = nodes.map { AtlasLabelEntry(id: $0.id, label: $0.label, isHub: hubs.contains($0.id)) }
+        let topicLabels = Array(Set(topicGroups.map(\.topic))).sorted()
         let monoMedium: CTFont = NSFont.monospacedSystemFont(ofSize: 28, weight: .medium) as CTFont
         let monoBold: CTFont = NSFont.monospacedSystemFont(ofSize: 28, weight: .bold) as CTFont
         let projCTFont: CTFont = NSFont.systemFont(ofSize: 40, weight: .bold) as CTFont
         guard let result = Self.renderLabelAtlas(
-            entries: entries, sortedProjects: projects.sorted(), device: renderer.device,
+            entries: entries, sortedProjects: projects.sorted(), galaxyNames: galaxyNames,
+            topicLabels: topicLabels,
+            device: renderer.device,
             monoMedium: monoMedium, monoBold: monoBold, projFont: projCTFont
         ) else { return }
-        applyAtlasResult(result, nodeIds: Set(nodes.map(\.id)), hubs: hubs, projects: projects)
-        frameLog.info("[labelAtlas] \(result.nodeRects.count) node + \(result.projectRects.count) project labels, \(result.allocW/2)x\(result.allocH/2)")
+        applyAtlasResult(result, nodeIds: Set(nodes.map(\.id)), hubs: hubs, projects: projects,
+                          galaxyNames: galaxyNames)
+        frameLog.info("[labelAtlas] \(result.nodeRects.count) node + \(result.projectRects.count) project + \(result.galaxyRects.count) galaxy labels, \(result.allocW/2)x\(result.allocH/2)")
     }
 
     /// Dispatch label atlas regeneration to a background thread. Old atlas stays visible until complete.
-    private func dispatchAtlasRegen(nodes: [NodeData], hubs: Set<UUID>, projects: Set<String>) {
+    private func dispatchAtlasRegen(nodes: [NodeData], hubs: Set<UUID>, projects: Set<String>,
+                                     galaxyNames: [String]) {
         isAtlasGenerating = true
-        let entries = nodes.map { AtlasLabelEntry(id: $0.id, label: $0.label, isHub: hubs.contains($0.id)) }
+        // Minimal main-thread prep: only sorts + font creation (~0.3ms).
+        // O(n) entries mapping and Set creation are deferred to the background thread.
         let sortedProjects = projects.sorted()
+        let topicLabels = Array(Set(topicGroups.map(\.topic))).sorted()
         let device = renderer.device
-        let capturedNodeIds = Set(nodes.map(\.id))
+        let capturedNodes = nodes
         let capturedHubs = hubs
         let capturedProjects = projects
 
@@ -830,31 +1142,38 @@ final class MetalSceneManager {
         let monoBold: CTFont = NSFont.monospacedSystemFont(ofSize: 28, weight: .bold) as CTFont
         let projCTFont: CTFont = NSFont.systemFont(ofSize: 40, weight: .bold) as CTFont
 
-        #if DEBUG
+        #if ENGRAM_INSTRUMENTATION
         let dispatchFrame = renderFrameCount
         #endif
 
         Task.detached(priority: .userInitiated) { [weak self] in
-            #if DEBUG
+            #if ENGRAM_INSTRUMENTATION
             let bgStart = CFAbsoluteTimeGetCurrent()
             #endif
+            // O(n) work done on background thread to reduce insert-frame jitter
+            let entries = capturedNodes.map { AtlasLabelEntry(id: $0.id, label: $0.label, isHub: capturedHubs.contains($0.id)) }
+            let capturedNodeIds = Set(capturedNodes.map(\.id))
+
             let result = Self.renderLabelAtlas(
-                entries: entries, sortedProjects: sortedProjects, device: device,
+                entries: entries, sortedProjects: sortedProjects, galaxyNames: galaxyNames,
+                topicLabels: topicLabels,
+                device: device,
                 monoMedium: monoMedium, monoBold: monoBold, projFont: projCTFont
             )
-            #if DEBUG
+            #if ENGRAM_INSTRUMENTATION
             let bgMs = (CFAbsoluteTimeGetCurrent() - bgStart) * 1000.0
             #endif
             await MainActor.run { [weak self] in
-                #if DEBUG
+                #if ENGRAM_INSTRUMENTATION
                 let applyStart = CFAbsoluteTimeGetCurrent()
                 #endif
                 guard let self else { return }
                 if let result {
-                    self.applyAtlasResult(result, nodeIds: capturedNodeIds, hubs: capturedHubs, projects: capturedProjects)
+                    self.applyAtlasResult(result, nodeIds: capturedNodeIds, hubs: capturedHubs,
+                                           projects: capturedProjects, galaxyNames: galaxyNames)
                 }
                 self.isAtlasGenerating = false
-                #if DEBUG
+                #if ENGRAM_INSTRUMENTATION
                 let applyMs = (CFAbsoluteTimeGetCurrent() - applyStart) * 1000.0
                 let msg = "dispatched=frame\(dispatchFrame) bg=\(String(format: "%.1f", bgMs))ms apply=\(String(format: "%.1f", applyMs))ms currentFrame=\(self.renderFrameCount)\n"
                 if let data = msg.data(using: .utf8) {
@@ -868,16 +1187,20 @@ final class MetalSceneManager {
         }
     }
 
-    private func applyAtlasResult(_ result: AtlasResult, nodeIds: Set<UUID>, hubs: Set<UUID>, projects: Set<String>) {
+    private func applyAtlasResult(_ result: AtlasResult, nodeIds: Set<UUID>, hubs: Set<UUID>,
+                                    projects: Set<String>, galaxyNames: [String]) {
         renderer.labelAtlasTexture = result.texture
         labelAtlasRects = result.nodeRects
         projectLabelAtlasRects = result.projectRects
+        galaxyLabelAtlasRects = result.galaxyRects
+        topicLabelAtlasRects = result.topicRects
         labelAtlasAspectCorrection = result.aspectCorrection
         labelAtlasAllocW = result.allocW
         labelAtlasAllocH = result.allocH
         labelAtlasNodeIds = nodeIds
         labelAtlasHubIds = hubs
         labelAtlasProjects = projects
+        labelAtlasGalaxyNames = galaxyNames
     }
 
     /// Pure rendering work — can run on any thread.
@@ -885,7 +1208,9 @@ final class MetalSceneManager {
     /// to avoid internal AppKit lock contention with the main thread.
     /// Fonts are pre-created on the main thread and passed in (CTFont is immutable, thread-safe).
     nonisolated private static func renderLabelAtlas(
-        entries: [AtlasLabelEntry], sortedProjects: [String], device: MTLDevice,
+        entries: [AtlasLabelEntry], sortedProjects: [String], galaxyNames: [String],
+        topicLabels: [String],
+        device: MTLDevice,
         monoMedium: CTFont, monoBold: CTFont, projFont: CTFont
     ) -> AtlasResult? {
         let atlasW = 4096
@@ -929,6 +1254,25 @@ final class MetalSceneManager {
             projInfos.append(LabelInfo(line: m.line, size: LabelSize(width: w, height: h), ascent: m.ascent))
         }
 
+        // Measure galaxy labels (larger than project labels)
+        var galaxyInfos: [LabelInfo] = []
+        for name in galaxyNames {
+            let m = makeLine(name.uppercased(), font: projFont)
+            let w = ceil(m.width) + padding * 2
+            let h = ceil(m.ascent + m.descent + m.leading) + padding
+            galaxyInfos.append(LabelInfo(line: m.line, size: LabelSize(width: w, height: h), ascent: m.ascent))
+        }
+
+        // Measure topic labels (force-directed topic group labels)
+        let topicFont: CTFont = projFont
+        var topicInfos: [LabelInfo] = []
+        for label in topicLabels {
+            let m = makeLine(label, font: topicFont)
+            let w = ceil(m.width) + padding * 2
+            let h = ceil(m.ascent + m.descent + m.leading) + padding
+            topicInfos.append(LabelInfo(line: m.line, size: LabelSize(width: w, height: h), ascent: m.ascent))
+        }
+
         // Simulate packing
         var cursorX: CGFloat = 2
         var cursorY: CGFloat = 0
@@ -940,6 +1284,18 @@ final class MetalSceneManager {
         }
         cursorX = 2; cursorY += rowHeight + padding; rowHeight = 0
         for info in projInfos {
+            let s = info.size
+            if cursorX + s.width > CGFloat(atlasW) { cursorX = 2; cursorY += rowHeight + padding; rowHeight = 0 }
+            cursorX += s.width + padding; rowHeight = max(rowHeight, s.height)
+        }
+        cursorX = 2; cursorY += rowHeight + padding; rowHeight = 0
+        for info in galaxyInfos {
+            let s = info.size
+            if cursorX + s.width > CGFloat(atlasW) { cursorX = 2; cursorY += rowHeight + padding; rowHeight = 0 }
+            cursorX += s.width + padding; rowHeight = max(rowHeight, s.height)
+        }
+        cursorX = 2; cursorY += rowHeight + padding; rowHeight = 0
+        for info in topicInfos {
             let s = info.size
             if cursorX + s.width > CGFloat(atlasW) { cursorX = 2; cursorY += rowHeight + padding; rowHeight = 0 }
             cursorX += s.width + padding; rowHeight = max(rowHeight, s.height)
@@ -1019,6 +1375,54 @@ final class MetalSceneManager {
             cursorX += s.width + padding; rowHeight = max(rowHeight, s.height)
         }
 
+        // Draw galaxy labels using CTLineDraw
+        var galaxyRects: [String: (u0: Float, v0: Float, u1: Float, v1: Float)] = [:]
+        cursorX = 2; cursorY += rowHeight + padding; rowHeight = 0
+
+        for (i, name) in galaxyNames.enumerated() {
+            let info = galaxyInfos[i]
+            let s = info.size
+            if cursorX + s.width > CGFloat(atlasW) { cursorX = 2; cursorY += rowHeight + padding; rowHeight = 0 }
+            if cursorY + s.height > CGFloat(uvAtlasH) { break }
+
+            ctx.saveGState()
+            ctx.translateBy(x: cursorX + padding, y: cursorY + padding * 0.5 + info.ascent)
+            ctx.scaleBy(x: 1, y: -1)
+            ctx.textPosition = .zero
+            CTLineDraw(info.line, ctx)
+            ctx.restoreGState()
+
+            galaxyRects[name] = (
+                Float(cursorX) / Float(uvAtlasW), Float(cursorY) / Float(uvAtlasH),
+                Float(cursorX + s.width) / Float(uvAtlasW), Float(cursorY + s.height) / Float(uvAtlasH)
+            )
+            cursorX += s.width + padding; rowHeight = max(rowHeight, s.height)
+        }
+
+        // Draw topic labels using CTLineDraw
+        var topicRects: [String: (u0: Float, v0: Float, u1: Float, v1: Float)] = [:]
+        cursorX = 2; cursorY += rowHeight + padding; rowHeight = 0
+
+        for (i, label) in topicLabels.enumerated() {
+            let info = topicInfos[i]
+            let s = info.size
+            if cursorX + s.width > CGFloat(atlasW) { cursorX = 2; cursorY += rowHeight + padding; rowHeight = 0 }
+            if cursorY + s.height > CGFloat(uvAtlasH) { break }
+
+            ctx.saveGState()
+            ctx.translateBy(x: cursorX + padding, y: cursorY + padding * 0.5 + info.ascent)
+            ctx.scaleBy(x: 1, y: -1)
+            ctx.textPosition = .zero
+            CTLineDraw(info.line, ctx)
+            ctx.restoreGState()
+
+            topicRects[label] = (
+                Float(cursorX) / Float(uvAtlasW), Float(cursorY) / Float(uvAtlasH),
+                Float(cursorX + s.width) / Float(uvAtlasW), Float(cursorY + s.height) / Float(uvAtlasH)
+            )
+            cursorX += s.width + padding; rowHeight = max(rowHeight, s.height)
+        }
+
         // Create MTLTexture from CGContext
         guard let pixelData = ctx.data else { return nil }
         let bytesPerRow = allocW * 4
@@ -1048,6 +1452,7 @@ final class MetalSceneManager {
 
         return AtlasResult(
             texture: texture, nodeRects: rects, projectRects: projRects,
+            galaxyRects: galaxyRects, topicRects: topicRects,
             aspectCorrection: aspectCorrection, allocW: allocW, allocH: allocH
         )
     }
@@ -1217,6 +1622,38 @@ final class MetalSceneManager {
                                      hubs: renderHubs, direction: direction)
         teleportLabel = camera.teleportLabel
         teleportCounter = camera.teleportCounter
+        teleportCallback?(teleportLabel, teleportCounter)
+    }
+
+    /// Smoothly drive the camera to a named project using cached render data.
+    func driveToProject(_ project: String) {
+        camera.driveToProject(project, positions: positions, nodes: renderNodes, hubs: renderHubs)
+        teleportLabel = camera.teleportLabel
+        teleportCounter = camera.teleportCounter
+        teleportCallback?(teleportLabel, teleportCounter)
+    }
+
+    var teleportGalaxyIndex: Int = 0
+
+    func teleportToNextGalaxy(direction: Int) {
+        guard let registry = galaxyRegistry else { return }
+        let sorted = registry.galaxies.values.sorted(by: { $0.id < $1.id })
+        guard !sorted.isEmpty else { return }
+        teleportGalaxyIndex = (teleportGalaxyIndex + direction + sorted.count) % sorted.count
+        let galaxy = sorted[teleportGalaxyIndex]
+
+        // Compute radius from galaxy's node spread
+        var maxSpread: Float = 200
+        let galPositions = galaxy.simulation3D.positions
+        let center = galaxy.worldCenter
+        for (_, pos) in galPositions {
+            maxSpread = max(maxSpread, simd_length(pos - center))
+        }
+
+        camera.teleportToGalaxy(center: center, radius: maxSpread * 0.5, label: galaxy.displayName)
+        teleportLabel = camera.teleportLabel
+        teleportCounter = camera.teleportCounter
+        teleportCallback?(teleportLabel, teleportCounter)
     }
 
     // MARK: - Hit Testing
@@ -1225,16 +1662,30 @@ final class MetalSceneManager {
         camera.hitTest(at: location, viewSize: viewSize, positions: positions)
     }
 
-    /// Hit test the mascot — returns true if the tap is within 50px of the mascot's screen position.
-    /// Note: mascot.currentPosition is already in scaled world space, but camera.project()
-    /// applies scaleFactor internally, so we must unscale first to avoid double-scaling.
+    /// Hit test any mascot in any fleet — returns true if the tap is within 50px of a mascot's screen position.
     func hitTestMascot(at location: CGPoint, viewSize: CGSize) -> Bool {
         let sf = camera.scaleFactor
-        guard sf > 0 else { return false }
-        let pos = mascot.currentPosition / sf
-        guard let screenPos = camera.project(point3D: pos, viewSize: viewSize) else { return false }
-        let dist = hypot(location.x - screenPos.x, location.y - screenPos.y)
-        return dist < 50
+        guard sf > 0, let registry = galaxyRegistry else { return false }
+        for galaxy in registry.galaxies.values {
+            for mascot in galaxy.mascotFleet?.mascots.values ?? [:].values {
+                let pos = mascot.currentPosition / sf
+                guard let screenPos = camera.project(point3D: pos, viewSize: viewSize) else { continue }
+                let dist = hypot(location.x - screenPos.x, location.y - screenPos.y)
+                if dist < 50 { return true }
+            }
+        }
+        return false
+    }
+
+    // MARK: - Fleet Chat
+
+    func enterFleetChat() {
+        let camPos = camera.cameraPosition * camera.scaleFactor
+        galaxyRegistry?.galaxies.values.forEach { $0.mascotFleet?.enterChat(cameraPosition: camPos) }
+    }
+
+    func exitFleetChat() {
+        galaxyRegistry?.galaxies.values.forEach { $0.mascotFleet?.exitChat() }
     }
 
     // MARK: - Drag Support

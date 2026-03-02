@@ -711,7 +711,7 @@ final class Graph3DScene {
     var renderLogCounter: UInt64 = 0
     var lastRenderTime: CFAbsoluteTime = 0
 
-    #if DEBUG
+    #if ENGRAM_INSTRUMENTATION
     /// File-based profiling: accumulates frame data, flushes periodically to /tmp/frame-timing.csv
     var profilingLines: [String] = []
     var profilingFileHandle: FileHandle?

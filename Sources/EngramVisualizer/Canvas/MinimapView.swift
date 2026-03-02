@@ -13,6 +13,9 @@ struct MinimapView: View {
     var pipAction: (() -> Void)?
     var isFloating: Bool = false
 
+    // Multi-galaxy support — when set, reads merged nodes/hubs/glows from all galaxies.
+    var galaxyRegistry: GalaxyRegistry? = nil
+
     // 3D mode — when camera3DState is present, renders XZ top-down projection + camera chevron.
     // Camera3DState is @Observable: only MinimapView reads its properties, so only MinimapView
     // re-renders on camera changes — GraphView's body is never re-evaluated.
@@ -28,11 +31,10 @@ struct MinimapView: View {
     private let inlineSize = CGSize(width: 160, height: 120)
 
     var body: some View {
-        // Read from renderStore each evaluation — renderStore is a plain class, so SwiftUI
-        // won't observe it, but the 10fps timer bumps frameCount which forces Canvas redraws
-        // that read current values from renderStore.
-        let nodes = renderStore.nodes
-        let hubIds = renderStore.hubs
+        // Read from galaxyRegistry (merged across all galaxies) when available,
+        // otherwise fall back to the single renderStore.
+        let nodes = galaxyRegistry?.mergedNodes ?? renderStore.nodes
+        let hubIds = galaxyRegistry?.mergedHubs ?? renderStore.hubs
         ZStack(alignment: .topTrailing) {
             minimapCanvas(nodes: nodes, hubIds: hubIds)
 
@@ -97,8 +99,8 @@ struct MinimapView: View {
             let bounds = computeBounds(positions: positions)
             let mapScale = min(size.width / bounds.width, size.height / bounds.height)
 
-            let glows = renderStore.glowingNodes
-            let arrivals = renderStore.newNodeGlows
+            let glows = galaxyRegistry?.mergedGlowingNodes ?? renderStore.glowingNodes
+            let arrivals = galaxyRegistry?.mergedNewNodeGlows ?? renderStore.newNodeGlows
             let now = Date()
             struct MiniDot {
                 let mx: CGFloat; let my: CGFloat; let dotSize: CGFloat
@@ -110,7 +112,8 @@ struct MinimapView: View {
                 guard let pos = positions[node.id] else { continue }
                 let mx = (pos.x - bounds.minX) * mapScale
                 let my = (pos.y - bounds.minY) * mapScale
-                let color = GraphView.projectColor(for: node.project, in: renderStore.colorMap)
+                let colorMap = galaxyRegistry?.mergedColorMap ?? renderStore.colorMap
+                let color = GraphView.projectColor(for: node.project, in: colorMap)
                 let isHub = hubIds.contains(node.id)
                 let dotSize: CGFloat = (isHub ? 4 : 2.5) * dotScale
                 let ri: CGFloat
@@ -169,7 +172,7 @@ struct MinimapView: View {
             }
 
             // Dying node ghosts (red to black fade-out) — 2D only, ghosts store CGPoint positions
-            let dying: [UUID: DyingNode] = is3D ? [:] : renderStore.dyingNodes
+            let dying: [UUID: DyingNode] = is3D ? [:] : (galaxyRegistry?.mergedDyingNodes ?? renderStore.dyingNodes)
             for (_, ghost) in dying {
                 let elapsed = now.timeIntervalSince(ghost.startTime)
                 let flashIn: CGFloat = 0.3, hold: CGFloat = 1.2, fadeOutD: CGFloat = 1.5

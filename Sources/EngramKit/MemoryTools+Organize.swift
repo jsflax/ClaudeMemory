@@ -144,7 +144,6 @@ extension MemoryTools {
         }
 
         log("Organized \(ids.count) memories under '\(label)' → hub [id:\(hubId)]")
-        resetMaintenanceBaseline()
 
         var output = "Organized \(ids.count) memories under '\(label)':\n"
         output += "  Hub: [id:\(hubId)]\n"
