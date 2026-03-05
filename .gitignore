@@ -13,3 +13,4 @@ adapter/checkpoints/
 adapter/output/
 default.profraw
 *.profraw
+*.fmadapter/
