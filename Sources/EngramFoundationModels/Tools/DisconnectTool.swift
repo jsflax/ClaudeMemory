@@ -14,14 +14,14 @@ public struct DisconnectTool: Tool {
 
     @Generable
     public struct Arguments {
-        @Guide(description: "The edge ID to delete directly.")
-        public var id: Int?
+        @Guide(description: "The edge UUID to delete directly.")
+        public var id: String?
 
-        @Guide(description: "The source memory ID (use with 'to').")
-        public var from: Int?
+        @Guide(description: "The source memory UUID (use with 'to').")
+        public var from: String?
 
-        @Guide(description: "The target memory ID (use with 'from').")
-        public var to: Int?
+        @Guide(description: "The target memory UUID (use with 'from').")
+        public var to: String?
 
         @Guide(description: "Optional relation filter when using from/to: relatesTo, contradicts, supersedes, derivedFrom, partOf, or summarizedBy.")
         public var relation: Relation?

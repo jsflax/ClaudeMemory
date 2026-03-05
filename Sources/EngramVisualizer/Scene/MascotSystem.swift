@@ -37,7 +37,6 @@ final class MascotSystem {
         case conjure(nodeId: UUID, phase: Float)
         case absorb(nodeId: UUID, phase: Float)
         case react(nodeId: UUID, ReactionType)
-        case busy
         case chatting
     }
 
@@ -82,7 +81,7 @@ final class MascotSystem {
 
     private let device: MTLDevice
     private(set) var parts: [PartMesh] = []
-    private var uniformBuffer: MTLBuffer?
+    private(set) var uniformBuffer: MTLBuffer?
     private(set) var baseColorTexture: MTLTexture?
     private(set) var metalRoughTexture: MTLTexture?
     private(set) var sampler: MTLSamplerState?
@@ -94,6 +93,9 @@ final class MascotSystem {
     private var idleTimer: Float = 0  // time spent in idle state
     private var nextPatrolThreshold: Float = Float.random(in: 12...30)  // set once on idle entry
 
+    /// Maintenance busy mode — visual overlay only, does NOT block state machine.
+    private(set) var isBusyMode: Bool = false
+
     // Project identity
     var projectId: String = ""
     var projectTint: SIMD3<Float> = SIMD3<Float>(0, 0.8, 1.0)  // default cyan
@@ -103,6 +105,11 @@ final class MascotSystem {
     private(set) var currentPosition: SIMD3<Float> = .zero
     private var initialized = false
     private var currentDynamicScale: Float = 0
+
+    /// Last computed body matrix (for GPU particle spawn generation)
+    private(set) var lastBodyMatrix: simd_float4x4 = matrix_identity_float4x4
+    /// Last computed dynamic scale
+    private(set) var lastDynamicScale: Float = 0
 
     // Backward-compat computed properties
     var isChatting: Bool { if case .chatting = currentState { return true } else { return false } }
@@ -186,14 +193,14 @@ final class MascotSystem {
         }
     }
 
-    /// Enter busy (maintenance) mode. Patrol/idle tasks are paused but create/delete still process.
+    /// Enter busy (maintenance) mode. Visual overlay only — does not block patrol/movement.
     func enterBusyMode() {
-        currentState = .busy
+        isBusyMode = true
     }
 
-    /// Exit busy mode back to idle.
+    /// Exit busy (maintenance) mode.
     func exitBusyMode() {
-        enterIdle()
+        isBusyMode = false
     }
 
     /// Enqueue a task. Maintains sorted order (highest priority first) and caps at maxTaskQueueDepth.
@@ -212,10 +219,12 @@ final class MascotSystem {
     }
 
     /// Enter idle state with a fresh patrol threshold.
-    private func enterIdle() {
+    private func enterIdle(shortPause: Bool = false) {
         currentState = .idle(.awake)
         idleTimer = 0
-        nextPatrolThreshold = Float.random(in: 12...30)
+        // After a patrol cycle, use a short pause (3-8s) before next patrol.
+        // Full idle threshold (12-30s) applies only for initial idle or explicit idle tasks.
+        nextPatrolThreshold = shortPause ? Float.random(in: 3...8) : Float.random(in: 12...30)
         idleYawDrift = 0
     }
 
@@ -237,8 +246,8 @@ final class MascotSystem {
                 enterIdle()
             }
         } else {
-            // Default: idle between patrols so drowsy/sleeping states are reachable
-            enterIdle()
+            // Short pause between patrols so mascot doesn't feel frozen
+            enterIdle(shortPause: true)
         }
     }
 
@@ -716,10 +725,13 @@ final class MascotSystem {
         let sf: Float = camera.scaleFactor
         let dynamicScale: Float = mascotScale
 
-        // ── Initialize on first frame ──
+        // ── Initialize on first frame with positions ──
         if !initialized {
-            let graphCenter: SIMD3<Float> = camera.cameraTarget * sf
-            currentPosition = graphCenter
+            // Wait until we have node positions before initializing
+            guard !nodePositions.isEmpty else { return }
+            let centroid = nodePositions.values.reduce(SIMD3<Float>.zero, +) / Float(nodePositions.count)
+            currentPosition = centroid * sf
+            // Immediately start patrolling instead of idling
             pickNewPatrolTarget(positions: nodePositions, scaleFactor: sf)
             initialized = true
         }
@@ -738,15 +750,6 @@ final class MascotSystem {
             updateAbsorb(dt: dt, nodeId: nodeId, phase: phase, positions: nodePositions, sf: sf)
         case .react(let nodeId, let type):
             updateReact(dt: dt, nodeId: nodeId, type: type, positions: nodePositions, sf: sf)
-        case .busy:
-            // During busy mode, still process create/delete tasks
-            if let first = taskQueue.first {
-                switch first {
-                case .create, .delete:
-                    transitionToNextTask(positions: nodePositions, scaleFactor: sf)
-                default: break
-                }
-            }
         case .chatting:
             break  // stay at current position
         }
@@ -786,7 +789,7 @@ final class MascotSystem {
         let idleSubState: IdleSubState? = {
             if case .idle(let s) = currentState { return s } else { return nil }
         }()
-        let isBusy = { if case .busy = currentState { return true } else { return false } }()
+        let isBusy = isBusyMode
         let bobSpeed: Float = {
             if isBusy { return 6.0 }  // 3x normal during maintenance
             switch idleSubState {
@@ -816,6 +819,8 @@ final class MascotSystem {
         let bodyRot: simd_float4x4 = bodyYaw * bodyLeanZ * bodyLeanX
         let bodyRotScale: simd_float4x4 = bodyRot * bodyScale
         let bodyMatrix: simd_float4x4 = bodyTranslation * bodyRotScale
+        lastBodyMatrix = bodyMatrix
+        lastDynamicScale = dynamicScale
 
         let zp = SIMD3<Float>(0, 0, 0)
 
@@ -910,14 +915,8 @@ final class MascotSystem {
             emissive: SIMD4<Float>(0.2, 0.4, 1.0, bottomPulse), blendPivot: zp, blendRadius: 0
         )
 
-        // ── Thruster particles (skip packing when off-screen for performance) ──
-        let camPos = camera.cameraPosition * sf
-        let camFwd = camera.forward
-        let toMascot = currentPosition - camPos
-        let behindCamera = simd_dot(toMascot, camFwd) < -dynamicScale * 2.0
-        if !behindCamera {
-            updateThrusterParticles(dt: dt, bodyMatrix: bodyMatrix, dynamicScale: dynamicScale)
-        }
+        // Thruster particles are now managed by MascotFleet's GPU particle system.
+        // Spawn generation happens in MascotFleet.collectAndDispatchParticles().
 
         // ── Arcane circle ──
         updateArcaneCircle(dt: dt, bodyMatrix: bodyMatrix, bodyRot: bodyRot, dynamicScale: dynamicScale)
@@ -1027,6 +1026,123 @@ final class MascotSystem {
                 )
             }
         }
+    }
+
+    // MARK: - GPU Animation State Packing
+
+    /// Pack scalar animation state for the GPU matrix compute kernel.
+    /// CPU computes state machine decisions and scalar params; GPU does the matrix math.
+    func packAnimState() -> MascotAnimState {
+        let idleSubState: IdleSubState? = {
+            if case .idle(let s) = currentState { return s } else { return nil }
+        }()
+        let isBusy = isBusyMode
+
+        let bobSpeed: Float = {
+            if isBusy { return 6.0 }
+            switch idleSubState {
+            case .drowsy: return 1.0
+            case .sleeping: return 0.6
+            default: return 2.0
+            }
+        }()
+        let bobAmplitude: Float = {
+            if isBusy { return 0.12 }
+            switch idleSubState {
+            case .sleeping: return 0.08
+            default: return 0.15
+            }
+        }()
+
+        let flyLean: Float = isHovering ? 0.0 : 0.2
+
+        // Arm swing
+        let swingAmplitude: Float = {
+            switch idleSubState {
+            case .sleeping: return 0.05
+            case .drowsy: return 0.2
+            default: return isHovering ? 0.4 : 0.15
+            }
+        }()
+        let leftSwing: Float
+        let rightSwing: Float
+        if conjureArmAngle > 0.01 {
+            leftSwing = -conjureArmAngle
+            rightSwing = -conjureArmAngle
+        } else if isBusy {
+            let busyAngle: Float = -.pi / 4.0
+            leftSwing = busyAngle + sin(time * 4.0) * 0.1
+            rightSwing = busyAngle + sin(time * 4.0 + .pi) * 0.1
+        } else {
+            leftSwing = sin(time * 2.5) * swingAmplitude
+            rightSwing = sin(time * 2.5 + .pi) * swingAmplitude
+        }
+
+        let eyeMax: Float = {
+            if isBusy { return 1.2 }
+            switch idleSubState {
+            case .drowsy: return 0.5
+            case .sleeping: return 0.1
+            default: return 1.0
+            }
+        }()
+        let eyeFreq: Float = isBusy ? 6.0 : 3.0
+
+        return MascotAnimState(
+            currentPosition: currentPosition,
+            currentYaw: currentYaw,
+            time: time,
+            dynamicScale: lastDynamicScale,
+            bobSpeed: bobSpeed,
+            bobAmplitude: bobAmplitude,
+            flyLean: flyLean,
+            leftSwing: leftSwing,
+            rightSwing: rightSwing,
+            eyePulseMax: eyeMax,
+            eyeFreq: eyeFreq,
+            bottomPulse: 0,  // computed on GPU
+            projectTint: projectTint,
+            leftPivot: SIMD3<Float>(-0.68, -0.21, 0.10),
+            rightPivot: SIMD3<Float>(0.67, -0.21, 0.10),
+            _pad0: 0, _pad1: 0
+        )
+    }
+
+    // MARK: - GPU Thruster Spawn Generation
+
+    /// Generate spawn requests for the GPU particle system (replaces CPU particle sim).
+    /// Returns an array of spawn requests to be submitted to the fleet's GPU particle buffer.
+    func generateThrusterSpawns(dt: Float, bodyMatrix: simd_float4x4, dynamicScale: Float) -> [ThrusterSpawnRequest] {
+        // Bottom of the mascot in model space → world space
+        let bottomLocal = SIMD4<Float>(0, -0.85, 0, 1)
+        let bottomWorld4: SIMD4<Float> = bodyMatrix * bottomLocal
+        let emitPos = SIMD3<Float>(bottomWorld4.x, bottomWorld4.y, bottomWorld4.z)
+
+        var spawns: [ThrusterSpawnRequest] = []
+        let spawnRate: Float = 1.0 / 120.0  // 120 particles/sec
+        thrusterSpawnTimer += dt
+        while thrusterSpawnTimer >= spawnRate {
+            thrusterSpawnTimer -= spawnRate
+
+            let spreadX: Float = Float.random(in: -0.3...0.3) * dynamicScale
+            let spreadZ: Float = Float.random(in: -0.3...0.3) * dynamicScale
+            let speedY: Float = -Float.random(in: 0.4...0.9) * dynamicScale
+            let vel = SIMD3<Float>(spreadX, speedY, spreadZ)
+
+            let life: Float = Float.random(in: 0.6...1.2)
+            let size: Float = dynamicScale * Float.random(in: 0.10...0.22)
+
+            let r: Float = Float.random(in: 0.1...0.35)
+            let g: Float = Float.random(in: 0.4...0.75)
+            let b: Float = Float.random(in: 0.8...1.0)
+
+            spawns.append(ThrusterSpawnRequest(
+                position: emitPos, velocity: vel,
+                maxLife: life, size: size,
+                color: SIMD3<Float>(r, g, b), _pad0: 0
+            ))
+        }
+        return spawns
     }
 
     // MARK: - Arcane Circle
@@ -1189,7 +1305,9 @@ final class MascotSystem {
         return df
     }()
 
-    /// Render info card texture using AppKit text rendering. Called only when target node changes.
+    /// Render info card texture using CoreText directly. Called only when target node changes.
+    /// Uses CTLine + CGContext — no NSGraphicsContext/NSString.draw to avoid AppKit lock
+    /// contention during Metal draw callbacks (same fix applied to MetalSceneManager label atlas).
     private func renderHoloTexture(info: MascotNodeInfo) {
         let texW = 512
         let texH = 400
@@ -1212,58 +1330,69 @@ final class MascotSystem {
         // Guarantee zeroed buffer
         ctx.clear(CGRect(x: 0, y: 0, width: allocW, height: allocH))
 
-        // Flip + scale for top-left origin text drawing
-        ctx.translateBy(x: 0, y: CGFloat(allocH))
-        ctx.scaleBy(x: CGFloat(scale), y: CGFloat(-scale))
+        // Scale for retina — CoreText uses bottom-left origin natively,
+        // we convert top-left Y to baseline Y per draw call.
+        ctx.scaleBy(x: CGFloat(scale), y: CGFloat(scale))
 
-        // Wrap CGContext for NSString.draw(at:withAttributes:)
-        NSGraphicsContext.saveGraphicsState()
-        NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx, flipped: true)
+        // Create fonts via NSFont.monospacedSystemFont (resolves SF Mono correctly),
+        // then cast to CTFont (immutable, thread-safe) for CoreText drawing.
+        let topicFont: CTFont = NSFont.monospacedSystemFont(ofSize: 18, weight: .bold) as CTFont
+        let metaFont: CTFont = NSFont.monospacedSystemFont(ofSize: 10, weight: .regular) as CTFont
+        let sepFont: CTFont = NSFont.monospacedSystemFont(ofSize: 8, weight: .regular) as CTFont
+        let contentFont: CTFont = NSFont.monospacedSystemFont(ofSize: 10, weight: .regular) as CTFont
+
+        // Colors (CGColor for CoreText — no NSColor)
+        let topicColor = CGColor(red: 0.3, green: 0.9, blue: 1.0, alpha: 1.0)
+        let metaColor = CGColor(red: 0.45, green: 0.6, blue: 0.7, alpha: 0.7)
+        let sepColor = CGColor(red: 0.3, green: 0.5, blue: 0.6, alpha: 0.4)
+        let contentColor = CGColor(red: 0.65, green: 0.8, blue: 0.9, alpha: 0.85)
+
+        /// Create a CTLine and measure its typographic bounds
+        func makeLine(_ text: String, font: CTFont, color: CGColor) -> (line: CTLine, ascent: CGFloat) {
+            let attrs: [CFString: Any] = [
+                kCTFontAttributeName: font,
+                kCTForegroundColorAttributeName: color
+            ]
+            let attrStr = CFAttributedStringCreate(nil, text as CFString, attrs as CFDictionary)!
+            let line = CTLineCreateWithAttributedString(attrStr)
+            var ascent: CGFloat = 0, descent: CGFloat = 0, leading: CGFloat = 0
+            CTLineGetTypographicBounds(line, &ascent, &descent, &leading)
+            return (line, ascent)
+        }
+
+        /// Draw a CTLine at top-left-origin (x, topY) — converts to CoreText's bottom-left baseline
+        func drawLine(_ line: CTLine, ascent: CGFloat, x: CGFloat, topY: CGFloat) {
+            ctx.textPosition = CGPoint(x: x, y: CGFloat(texH) - topY - ascent)
+            CTLineDraw(line, ctx)
+        }
 
         let margin: CGFloat = 32
         var y: CGFloat = 28
 
         // ── Header: Topic / Project ──
-        let topicFont = NSFont.monospacedSystemFont(ofSize: 18, weight: .bold)
-        let topicAttrs: [NSAttributedString.Key: Any] = [
-            .font: topicFont,
-            .foregroundColor: NSColor(red: 0.3, green: 0.9, blue: 1.0, alpha: 1.0)
-        ]
         let topicStr = "\(info.topic.prefix(24)) / \(info.project.prefix(16))"
-        (topicStr as NSString).draw(at: NSPoint(x: margin, y: y), withAttributes: topicAttrs)
+        let topic = makeLine(topicStr, font: topicFont, color: topicColor)
+        drawLine(topic.line, ascent: topic.ascent, x: margin, topY: y)
         y += 26
 
         // ── Meta: dates ──
-        let metaFont = NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)
-        let metaAttrs: [NSAttributedString.Key: Any] = [
-            .font: metaFont,
-            .foregroundColor: NSColor(red: 0.45, green: 0.6, blue: 0.7, alpha: 0.7)
-        ]
         let metaStr = "created \(Self.holoDateFormatter.string(from: info.createdAt))  |  accessed \(Self.holoDateFormatter.string(from: info.lastAccessedAt))"
-        (metaStr as NSString).draw(at: NSPoint(x: margin, y: y), withAttributes: metaAttrs)
+        let meta = makeLine(metaStr, font: metaFont, color: metaColor)
+        drawLine(meta.line, ascent: meta.ascent, x: margin, topY: y)
         y += 16
 
         // ── Separator ──
-        let sepAttrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedSystemFont(ofSize: 8, weight: .regular),
-            .foregroundColor: NSColor(red: 0.3, green: 0.5, blue: 0.6, alpha: 0.4)
-        ]
         let sep = String(repeating: "\u{2500}", count: 46)
-        (sep as NSString).draw(at: NSPoint(x: margin, y: y), withAttributes: sepAttrs)
+        let sepLine = makeLine(sep, font: sepFont, color: sepColor)
+        drawLine(sepLine.line, ascent: sepLine.ascent, x: margin, topY: y)
         y += 12
 
         // ── Memory content: fill remaining space ──
-        let contentFont = NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)
-        let contentAttrs: [NSAttributedString.Key: Any] = [
-            .font: contentFont,
-            .foregroundColor: NSColor(red: 0.65, green: 0.8, blue: 0.9, alpha: 0.85)
-        ]
         let lineHeight: CGFloat = 14
         let usableWidth = CGFloat(texW) - margin * 2
         let contentCharsPerLine = Int(usableWidth / 6)  // ~6pt per monospace char at size 10
         let maxLines = Int((CGFloat(texH) - y - 20) / lineHeight)
-        // Collapse newlines to spaces — draw(at:withAttributes:) renders \n as
-        // actual line breaks, which overlap with the next word-wrapped line.
+        // Collapse newlines to spaces for word-wrapping
         let content = info.content
             .replacingOccurrences(of: "\n", with: " ")
             .replacingOccurrences(of: "\r", with: " ")
@@ -1282,11 +1411,10 @@ final class MascotSystem {
         if !currentLine.isEmpty { lines.append(currentLine) }
 
         for line in lines.prefix(maxLines) {
-            (line as NSString).draw(at: NSPoint(x: margin, y: y), withAttributes: contentAttrs)
+            let ct = makeLine(line, font: contentFont, color: contentColor)
+            drawLine(ct.line, ascent: ct.ascent, x: margin, topY: y)
             y += lineHeight
         }
-
-        NSGraphicsContext.restoreGraphicsState()
 
         // Create MTLTexture directly from CGContext pixel data
         guard let data = ctx.data else { return }

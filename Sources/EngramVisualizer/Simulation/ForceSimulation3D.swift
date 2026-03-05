@@ -88,6 +88,10 @@ final class ForceSimulation3D {
         isSettled = false
         settledFrameCount = 0
         forceAge = 2
+        // Reset alpha so center gravity and other alpha-scaled forces are meaningful.
+        // Without this, alpha decays to 0.01 after ~15s and never recovers — making
+        // migration animations crawl because center force is 100x weaker.
+        alpha = 1.0
         // Reset smoothedAttenuation so forces apply at meaningful strength immediately.
         // Without this, smoothedAttenuation ramps from near-zero at 4%/frame — taking
         // ~30 frames to reach useful values — causing newly added nodes to appear stuck.

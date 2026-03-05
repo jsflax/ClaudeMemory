@@ -223,6 +223,7 @@ final class AccountService {
         token = loginResponse.token
         userProfile = loginResponse.user
         try KeychainHelper.save(loginResponse.token, for: Self.tokenKey)
+//        writeSyncCredentialFile(token: loginResponse.token)
         await refreshSubscriptionStatus()
     }
 

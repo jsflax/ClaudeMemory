@@ -534,7 +534,7 @@ import Foundation
         .appending(path: "claude-memory-test-\(UUID().uuidString).sqlite")
     let lattice = try Lattice(Memory.self, Edge.self, Checkpoint.self, HookState.self, configuration: .init(fileURL: path))
     let embedder = EmbeddingService(modelPath: "/nonexistent/path")
-    let tools = MemoryTools(ref: lattice.sendableReference, embedder: embedder)
+    let tools = MemoryTools(localRef: lattice.sendableReference, syncedRef: nil, embedder: embedder)
 
     await #expect(throws: MCPError.self) {
         _ = try await tools.handle(CallTool.Parameters(
@@ -657,7 +657,7 @@ import Foundation
     let result = try await tools.handle(CallTool.Parameters(
         name: "update",
         arguments: [
-            "id": .int(id),
+            "id": .string(id),
             "content": .string("Updated content via ID"),
         ]
     ))
@@ -684,7 +684,7 @@ import Foundation
     let result = try await tools.handle(CallTool.Parameters(
         name: "update",
         arguments: [
-            "id": .int(id),
+            "id": .string(id),
             "append": .string("Appended line"),
         ]
     ))
@@ -711,7 +711,7 @@ import Foundation
     let result = try await tools.handle(CallTool.Parameters(
         name: "update",
         arguments: [
-            "id": .int(id),
+            "id": .string(id),
             "prepend": .string("Prepended line"),
         ]
     ))
@@ -738,7 +738,7 @@ import Foundation
     let result = try await tools.handle(CallTool.Parameters(
         name: "update",
         arguments: [
-            "id": .int(id),
+            "id": .string(id),
             "find": .string("Python 2.7"),
             "replace": .string("Python 3.12"),
         ]
@@ -766,7 +766,7 @@ import Foundation
     let result = try await tools.handle(CallTool.Parameters(
         name: "update",
         arguments: [
-            "id": .int(id),
+            "id": .string(id),
             "find": .string("Rust"),
             "replace": .string("Go"),
         ]
@@ -790,7 +790,7 @@ import Foundation
     let result = try await tools.handle(CallTool.Parameters(
         name: "update",
         arguments: [
-            "id": .int(id),
+            "id": .string(id),
             "topic": .string("patterns"),
         ]
     ))
@@ -819,7 +819,7 @@ import Foundation
     let result1 = try await tools.handle(CallTool.Parameters(
         name: "update",
         arguments: [
-            "id": .int(id),
+            "id": .string(id),
             "expires_in_days": .int(7),
         ]
     ))
@@ -829,7 +829,7 @@ import Foundation
     let result2 = try await tools.handle(CallTool.Parameters(
         name: "update",
         arguments: [
-            "id": .int(id),
+            "id": .string(id),
             "expires_in_days": .int(0),
         ]
     ))
@@ -852,7 +852,7 @@ import Foundation
     let result = try await tools.handle(CallTool.Parameters(
         name: "update",
         arguments: [
-            "id": .int(id),
+            "id": .string(id),
             "append": .string("Extra detail added"),
             "topic": .string("architecture"),
         ]
@@ -884,7 +884,7 @@ import Foundation
     await #expect(throws: (any Error).self) {
         try await tools.handle(CallTool.Parameters(
             name: "update",
-            arguments: ["id": .int(id)]
+            arguments: ["id": .string(id)]
         ))
     }
 }
@@ -902,7 +902,7 @@ import Foundation
         try await tools.handle(CallTool.Parameters(
             name: "update",
             arguments: [
-                "id": .int(id),
+                "id": .string(id),
                 "content": .string("full replace"),
                 "append": .string("also append"),
             ]
@@ -916,7 +916,7 @@ import Foundation
     let result = try await tools.handle(CallTool.Parameters(
         name: "update",
         arguments: [
-            "id": .int(99999),
+            "id": .string(UUID().uuidString),
             "content": .string("should not work"),
         ]
     ))
@@ -1093,7 +1093,7 @@ import Foundation
     let result = try await tools.handle(CallTool.Parameters(
         name: "merge",
         arguments: [
-            "ids": .array([.int(id1), .int(id2)]),
+            "ids": .array([.string(id1), .string(id2)]),
             "content": .string("Lattice uses SQLite in WAL mode as its database backend for concurrent access"),
         ]
     ))
@@ -1207,7 +1207,7 @@ import Foundation
         .appending(path: "claude-memory-test-\(UUID().uuidString).sqlite")
     let lattice = try Lattice(Memory.self, Edge.self, Checkpoint.self, HookState.self, configuration: .init(fileURL: path))
     let embedder = EmbeddingService()
-    let tools = MemoryTools(ref: lattice.sendableReference, embedder: embedder)
+    let tools = MemoryTools(localRef: lattice.sendableReference, syncedRef: nil, embedder: embedder)
 
     // Without embedding model, remember should fail rather than store empty vectors
     await #expect(throws: MCPError.self) {
@@ -1286,7 +1286,7 @@ import Foundation
     let result = try await tools.handle(CallTool.Parameters(
         name: "update",
         arguments: [
-            "id": .int(id),
+            "id": .string(id),
             "importance": .int(4),
         ]
     ))
@@ -1487,7 +1487,7 @@ import Foundation
 
     _ = try await tools.handle(CallTool.Parameters(
         name: "connect",
-        arguments: ["from": .int(id1), "to": .int(id2), "relation": .string("part_of")]
+        arguments: ["from": .string(id1), "to": .string(id2), "relation": .string("part_of")]
     ))
 
     let result = try await tools.handle(CallTool.Parameters(
@@ -1547,7 +1547,7 @@ import Foundation
         arguments: [
             "content": .string("Storage layer uses SQLite"),
             "project": .string("TestProj"),
-            "parent_id": .int(hubId),
+            "parent_id": .string(hubId),
         ]
     ))
     let childOutput = text(from: child)
@@ -1557,7 +1557,7 @@ import Foundation
     // Verify edge was created
     let graph = try await tools.handle(CallTool.Parameters(
         name: "graph",
-        arguments: ["id": .int(childId)]
+        arguments: ["id": .string(childId)]
     ))
     let graphOutput = text(from: graph)
     #expect(graphOutput.contains("part_of"))
@@ -1571,7 +1571,7 @@ import Foundation
             name: "remember",
             arguments: [
                 "content": .string("Orphan memory"),
-                "parent_id": .int(99999),
+                "parent_id": .string(UUID().uuidString),
             ]
         ))
     }
@@ -1591,7 +1591,7 @@ import Foundation
         arguments: [
             "content": .string("The database layer uses Lattice ORM with SQLite backend"),
             "project": .string("RecallTest"),
-            "parent_id": .int(hubId),
+            "parent_id": .string(hubId),
         ]
     ))
 
@@ -1662,7 +1662,7 @@ import Foundation
         arguments: [
             "content": .string("Small detail: uses ARC for memory management"),
             "project": .string("DisplayTest"),
-            "parent_id": .int(hubId),
+            "parent_id": .string(hubId),
         ]
     ))
 
@@ -1692,7 +1692,7 @@ import Foundation
         arguments: [
             "content": .string(largeContent),
             "project": .string("LargeTest"),
-            "parent_id": .int(hubId),
+            "parent_id": .string(hubId),
             "force": .bool(true),
         ]
     ))
@@ -1725,7 +1725,7 @@ import Foundation
 
     _ = try await tools.handle(CallTool.Parameters(
         name: "connect",
-        arguments: ["from": .int(id2), "to": .int(id1), "relation": .string("part_of")]
+        arguments: ["from": .string(id2), "to": .string(id1), "relation": .string("part_of")]
     ))
 
     let result = try await tools.handle(CallTool.Parameters(
@@ -1759,11 +1759,11 @@ import Foundation
 
     _ = try await tools.handle(CallTool.Parameters(
         name: "connect",
-        arguments: ["from": .int(idB), "to": .int(idA), "relation": .string("part_of")]
+        arguments: ["from": .string(idB), "to": .string(idA), "relation": .string("part_of")]
     ))
     _ = try await tools.handle(CallTool.Parameters(
         name: "connect",
-        arguments: ["from": .int(idC), "to": .int(idB), "relation": .string("part_of")]
+        arguments: ["from": .string(idC), "to": .string(idB), "relation": .string("part_of")]
     ))
 
     // Recall A with depth 2 — should find B and C
@@ -1807,7 +1807,7 @@ import Foundation
     // Verify auto-link reported in response or edge exists
     let graph = try await tools.handle(CallTool.Parameters(
         name: "graph",
-        arguments: ["id": .int(id2)]
+        arguments: ["id": .string(id2)]
     ))
     let graphOutput = text(from: graph)
     // Should have a relates_to edge connecting to the first memory
@@ -1839,7 +1839,7 @@ import Foundation
     // Verify no relates_to edge to the episode memory
     let edges = try await tools.handle(CallTool.Parameters(
         name: "graph",
-        arguments: ["id": .int(id1)]
+        arguments: ["id": .string(id1)]
     ))
     let edgesOutput = text(from: edges)
     // Should have part_of to episode but NOT relates_to to episode
@@ -1879,7 +1879,7 @@ import Foundation
     // Count relates_to edges from this memory
     let graph = try await tools.handle(CallTool.Parameters(
         name: "graph",
-        arguments: ["id": .int(lastId)]
+        arguments: ["id": .string(lastId)]
     ))
     let graphOutput = text(from: graph)
     let relatesToCount = graphOutput.components(separatedBy: "relates_to").count - 1
@@ -1905,7 +1905,7 @@ import Foundation
         arguments: [
             "content": .string("Payment processing uses Stripe API for credit card transactions"),
             "project": .string("PayTest"),
-            "parent_id": .int(hubId),
+            "parent_id": .string(hubId),
         ]
     ))
     let childId = extractId(from: text(from: child))!
@@ -1913,7 +1913,7 @@ import Foundation
     // Check edges: should have part_of but not relates_to to parent
     let graph = try await tools.handle(CallTool.Parameters(
         name: "graph",
-        arguments: ["id": .int(childId)]
+        arguments: ["id": .string(childId)]
     ))
     let graphOutput = text(from: graph)
     #expect(graphOutput.contains("part_of"))
@@ -1952,7 +1952,7 @@ import Foundation
     // Double check via graph
     let graph = try await tools.handle(CallTool.Parameters(
         name: "graph",
-        arguments: ["id": .int(id2)]
+        arguments: ["id": .string(id2)]
     ))
     let graphOutput = text(from: graph)
     #expect(!graphOutput.contains("[id:\(id1)]"))
@@ -1984,7 +1984,7 @@ import Foundation
     // Manually add a relates_to edge in the same direction (if not already present)
     _ = try await tools.handle(CallTool.Parameters(
         name: "connect",
-        arguments: ["from": .int(id2), "to": .int(id1), "relation": .string("relates_to")]
+        arguments: ["from": .string(id2), "to": .string(id1), "relation": .string("relates_to")]
     ))
 
     // Store third related memory — should not create duplicate edges
@@ -2000,7 +2000,7 @@ import Foundation
     // Verify no duplicate edges between id3 and id1 or id3 and id2
     let graph = try await tools.handle(CallTool.Parameters(
         name: "graph",
-        arguments: ["id": .int(id3), "depth": .int(1)]
+        arguments: ["id": .string(id3), "depth": .int(1)]
     ))
     let graphOutput = text(from: graph)
     // Count relates_to edges — should be at most 2 (one to id1, one to id2), no duplicates
@@ -2062,7 +2062,7 @@ import Foundation
     for id in [id1, id2, id3] {
         _ = try await tools.handle(CallTool.Parameters(
             name: "connect",
-            arguments: ["from": .int(id), "to": .int(hubId), "relation": .string("part_of")]
+            arguments: ["from": .string(id), "to": .string(hubId), "relation": .string("part_of")]
         ))
     }
 
@@ -2080,7 +2080,7 @@ import Foundation
     // Check if the new memory got linked to the hub via part_of
     let graph = try await tools.handle(CallTool.Parameters(
         name: "graph",
-        arguments: ["id": .int(id4)]
+        arguments: ["id": .string(id4)]
     ))
     let graphOutput = text(from: graph)
     // Should have a part_of edge to the hub
@@ -2136,7 +2136,7 @@ import Foundation
     // Check via graph whether auto-connect happened
     let graph = try await tools.handle(CallTool.Parameters(
         name: "graph",
-        arguments: ["id": .int(newId)]
+        arguments: ["id": .string(newId)]
     ))
     let graphOutput = text(from: graph)
     let autoLinkedCount = graphOutput.components(separatedBy: "relates_to").count - 1

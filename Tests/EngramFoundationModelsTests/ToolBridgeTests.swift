@@ -24,18 +24,18 @@ private func makeMemoryTools() async throws -> MemoryTools {
     if await !embedder.isLoaded {
         await embedder.load()
     }
-    return MemoryTools(ref: lattice.sendableReference, embedder: embedder)
+    return MemoryTools(localRef: lattice.sendableReference, syncedRef: nil, embedder: embedder)
 }
 
-/// Extract an integer ID from text like "id: 42" or "id:42"
-private func extractId(from text: String) -> Int? {
-    guard let range = text.range(of: "id: ", options: .literal)
-        ?? text.range(of: "id:", options: .literal) else {
+/// Extract a UUID string from text like "id:550E8400-..." or "id: 550E8400-..."
+private func extractId(from text: String) -> String? {
+    guard let range = text.range(of: "id:", options: .literal) else {
         return nil
     }
-    let after = text[range.upperBound...]
-    let digits = after.prefix(while: { $0.isNumber })
-    return Int(digits)
+    let after = text[range.upperBound...].drop(while: { $0 == " " })
+    let candidate = String(after.prefix(36))
+    guard UUID(uuidString: candidate) != nil else { return nil }
+    return candidate
 }
 
 // MARK: - Factory Tests
@@ -390,6 +390,12 @@ func structuredOutputWithTools() async throws {
     #expect(!ctx.summary.isEmpty, "Summary should not be empty")
     #expect(!ctx.memories.isEmpty, "Should have found at least one memory")
 }
+
+// MARK: - Recall Gate: On-Device Model as Query Classifier
+
+// NOTE: FoundationModels-based RecallGate tests removed — replaced by CoreML
+// RecallGateClassifier in EngramKit (CreateML transfer learning, ~1s latency,
+// 14/14 test accuracy). See RecallImprovementsTests.swift for the new tests.
 
 @Test("On-device model with adapter recalls memories via tools")
 func onDeviceModelWithAdapterRecallsMemories() async throws {

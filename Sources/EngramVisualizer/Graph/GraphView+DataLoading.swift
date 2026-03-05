@@ -26,11 +26,8 @@ extension GraphView {
             let visibleProjects = Set(store.nodes.map(\.project))
             var all: [[UUID]] = []
             for project in visibleProjects {
-                let pkClusters = findMemoryClusters(in: galaxy.lattice, project: project, minClusterSize: 2, neighborLimit: 20).clusters
-                for pkCluster in pkClusters {
-                    let uuidCluster = pkCluster.compactMap { store.pkToGlobalId[$0] }
-                    if uuidCluster.count >= 2 { all.append(uuidCluster) }
-                }
+                let projectClusters = findMemoryClusters(in: galaxy.lattice, project: project, minClusterSize: 2, neighborLimit: 20).clusters
+                all.append(contentsOf: projectClusters)
             }
             store.clusterGroups = all
         }

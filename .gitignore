@@ -8,3 +8,8 @@
 .mcp.json
 xcuserdata/
 *.xcuserstate
+adapter/.venv/
+adapter/checkpoints/
+adapter/output/
+default.profraw
+*.profraw

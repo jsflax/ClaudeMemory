@@ -53,7 +53,28 @@ struct Graph3DView: View {
         if Self.useMetalRenderer { return metalScene } else { return scene }
     }
 
+    #if ENGRAM_INSTRUMENTATION
+    static var bodyEvalCount: UInt64 = 0
+    static var bodyEvalFile: UnsafeMutablePointer<FILE>? = nil
+    #endif
+
     var body: some View {
+        #if ENGRAM_INSTRUMENTATION
+        let _ = {
+            Self.bodyEvalCount &+= 1
+            if Self.bodyEvalFile == nil {
+                Self.bodyEvalFile = fopen("/tmp/swiftui-body-eval.csv", "w")
+                if let f = Self.bodyEvalFile {
+                    fputs("timestamp,body_eval_count\n", f)
+                }
+            }
+            if let f = Self.bodyEvalFile {
+                let line = "\(String(format: "%.3f", CFAbsoluteTimeGetCurrent())),\(Self.bodyEvalCount)\n"
+                fputs(line, f)
+                fflush(f)
+            }
+        }()
+        #endif
         GeometryReader { geo in
             ZStack {
                 Group {
@@ -227,6 +248,7 @@ struct Graph3DView: View {
             let (root, camera) = scene.setup()
             #if ENGRAM_INSTRUMENTATION
             scene.setupProfiling()
+            scene.setupLabelDiag()
             #endif
             content.add(root)
             content.add(camera)
@@ -309,11 +331,15 @@ struct Graph3DView: View {
             selectedNode = newSelection
         }
         mgr.reticleCallback = { newTarget in
-            metalReticleTarget = newTarget
+            if newTarget != metalReticleTarget {
+                metalReticleTarget = newTarget
+            }
         }
         mgr.teleportCallback = { label, counter in
-            metalTeleportLabel = label
-            metalTeleportCounter = counter
+            if label != metalTeleportLabel || counter != metalTeleportCounter {
+                metalTeleportLabel = label
+                metalTeleportCounter = counter
+            }
         }
         pushDataToMetalScene()
         installInputMonitor()
@@ -333,8 +359,7 @@ struct Graph3DView: View {
             case .insert(let pk), .update(let pk):
                 guard let state = bgLattice.object(HookState.self, primaryKey: pk),
                       state.key == .maintenanceActive else { return }
-                let isActive = state.value == "1" &&
-                    state.updatedAt.timeIntervalSinceNow > -600  // 10 min timeout
+                let isActive = state.value == "1"
                 Task { @MainActor [weak mgr] in
                     mgr?.isMaintenanceActive = isActive
                 }
@@ -349,8 +374,7 @@ struct Graph3DView: View {
     private func updateMaintenanceState(mgr: MetalSceneManager) {
         if let state = lattice.objects(HookState.self)
             .where({ $0.key == .maintenanceActive }).first {
-            mgr.isMaintenanceActive = state.value == "1" &&
-                state.updatedAt.timeIntervalSinceNow > -600
+            mgr.isMaintenanceActive = state.value == "1"
         }
     }
 

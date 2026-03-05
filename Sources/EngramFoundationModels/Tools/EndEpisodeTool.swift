@@ -14,8 +14,8 @@ public struct EndEpisodeTool: Tool {
 
     @Generable
     public struct Arguments {
-        @Guide(description: "The episode ID to end. If omitted, ends the currently active episode.")
-        public var episodeId: Int?
+        @Guide(description: "The episode UUID to end. If omitted, ends the currently active episode.")
+        public var episodeId: String?
 
         @Guide(description: "A summary of the episode — what was attempted, what worked, what was decided.")
         public var summary: String?

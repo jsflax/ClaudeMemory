@@ -260,10 +260,12 @@ struct MinimapView: View {
                     lineWidth: 1
                 )
             }
+            #if ENGRAM_INSTRUMENTATION
             let canvasMs = (CFAbsoluteTimeGetCurrent() - canvasStart) * 1000.0
             if frameCount % 60 == 0 || canvasMs > 3 {
                 minimapLog.error("[MINIMAP] draw=\(canvasMs, format: .fixed(precision: 2))ms nodes=\(nodes.count) frame=\(frameCount)")
             }
+            #endif
         }
 
         if isFloating {

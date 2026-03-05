@@ -166,6 +166,14 @@ struct MascotUniforms {
     struct MascotPartUniforms parts[MASCOT_PART_COUNT];
 };
 
+// Per-mascot instance data for instanced drawing (all 5 part transforms + tint).
+#define MAX_FLEET_MASCOTS 10
+struct MascotInstanceData {
+    struct MascotPartUniforms parts[MASCOT_PART_COUNT];
+    simd_float3 projectTint;
+    float       _instancePad;
+};
+
 // Arcane circle orientation (passed to vertex shader for oriented billboard).
 struct ArcaneCircleUniforms {
     simd_float3 center;
@@ -190,6 +198,65 @@ struct HoloScreenUniforms {
     float       _pad0;
     float       _pad1;
     float       _pad2;
+};
+
+// MARK: - GPU Mascot Matrix Compute
+
+// Scalar animation state (CPU → GPU) for mascot_compute_matrices kernel.
+struct MascotAnimState {
+    simd_float3 currentPosition;  // world position
+    float       currentYaw;       // radians
+    float       time;             // animation time
+    float       dynamicScale;     // render-space scale
+    float       bobSpeed;
+    float       bobAmplitude;
+    float       flyLean;          // forward tilt (0 when hovering, 0.2 when flying)
+    float       leftSwing;        // left arm rotation angle
+    float       rightSwing;       // right arm rotation angle
+    float       eyePulseMax;      // eye emissive max intensity
+    float       eyeFreq;          // eye pulse frequency
+    float       bottomPulse;      // bottom thruster glow intensity
+    simd_float3 projectTint;      // per-project tint color
+    simd_float3 leftPivot;        // left arm pivot point in model space
+    simd_float3 rightPivot;       // right arm pivot point in model space
+    float       _pad0;
+    float       _pad1;
+};
+
+// MARK: - GPU Thruster Particles
+
+// Persistent GPU particle state (advected on GPU each frame).
+struct ThrusterParticleGPU {
+    simd_float3 position;    // world space
+    simd_float3 velocity;    // world space
+    float       life;        // 0..maxLife (advanced by dt each frame)
+    float       maxLife;
+    float       size;        // billboard radius
+    simd_float3 color;       // RGB
+    unsigned int alive;      // 1 = alive, 0 = dead/available
+    float       _pad0;
+};
+
+// CPU → GPU spawn request (one per newly spawned particle).
+struct ThrusterSpawnRequest {
+    simd_float3 position;
+    simd_float3 velocity;
+    float       maxLife;
+    float       size;
+    simd_float3 color;
+    float       _pad0;
+};
+
+// Compute kernel params for particle system.
+struct ThrusterComputeParams {
+    float        dt;
+    float        damping;        // velocity damping per second (e.g., 1.5)
+    unsigned int totalParticles; // max capacity of particle buffer
+    unsigned int spawnCount;     // number of spawn requests this frame
+    unsigned int spawnOffset;    // ring buffer write offset into particle buffer
+    float        _pad0;
+    float        _pad1;
+    float        _pad2;
 };
 
 #endif /* SharedTypes_h */

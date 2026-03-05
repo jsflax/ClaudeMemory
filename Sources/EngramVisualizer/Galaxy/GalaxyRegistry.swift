@@ -384,11 +384,16 @@ final class GalaxyRegistry {
         return result
     }
 
-    /// Merged recentNodes (top 50 across all galaxies).
+    /// Merged recentNodes (top 50 across all galaxies, deduplicated by UUID).
     var mergedRecentNodes: [NodeData] {
+        var seen: Set<UUID> = []
         var all: [NodeData] = []
         for galaxy in galaxies.values {
-            all.append(contentsOf: galaxy.renderStore.recentNodes)
+            for node in galaxy.renderStore.recentNodes {
+                if seen.insert(node.id).inserted {
+                    all.append(node)
+                }
+            }
         }
         return Array(all.sorted(by: { $0.createdAt > $1.createdAt }).prefix(50))
     }
@@ -476,7 +481,6 @@ final class GalaxyRegistry {
                             notificationsEnabled: notificationsEnabled
                         )
                         let srcPositions = self.captureWorldPositions(project: project, in: "personal")
-                        let mascot = personal.mascotFleet?.extractMascot(for: project)
                         let extracted = self.migrateProjectOut(project, from: "personal")
                         self.loadExtractedNodesIntoGalaxy(
                             "synced", nodes: extracted.nodes,
@@ -486,10 +490,6 @@ final class GalaxyRegistry {
                             hiddenRelations: hiddenRelations,
                             timeFilter: timeFilter, is3D: is3D
                         )
-                        // Transfer mascot to destination fleet (avoids respawn)
-                        if let mascot, let dstFleet = self.galaxies["synced"]?.mascotFleet {
-                            dstFleet.insertMascot(mascot, for: project)
-                        }
 
                         #if ENGRAM_INSTRUMENTATION
                         let migMs = (CFAbsoluteTimeGetCurrent() - migStart) * 1000.0
@@ -506,7 +506,6 @@ final class GalaxyRegistry {
                             return
                         }
                         let srcPositions = self.captureWorldPositions(project: project, in: "synced")
-                        let mascot = self.galaxies["synced"]?.mascotFleet?.extractMascot(for: project)
                         let extracted = self.migrateProjectOut(project, from: "synced")
                         self.loadExtractedNodesIntoGalaxy(
                             "personal", nodes: extracted.nodes,
@@ -516,10 +515,6 @@ final class GalaxyRegistry {
                             hiddenRelations: hiddenRelations,
                             timeFilter: timeFilter, is3D: is3D
                         )
-                        // Transfer mascot to destination fleet (avoids respawn)
-                        if let mascot, let dstFleet = personal.mascotFleet {
-                            dstFleet.insertMascot(mascot, for: project)
-                        }
 
                         #if ENGRAM_INSTRUMENTATION
                         let migMs = (CFAbsoluteTimeGetCurrent() - migStart) * 1000.0

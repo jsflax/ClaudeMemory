@@ -15,8 +15,8 @@ public struct UpdateTool: Tool {
 
     @Generable
     public struct Arguments {
-        @Guide(description: "Target memory by its ID.")
-        public var id: Int?
+        @Guide(description: "Target memory by its UUID.")
+        public var id: String?
 
         @Guide(description: "Target memory by similarity search query (finds the closest match).")
         public var query: String?

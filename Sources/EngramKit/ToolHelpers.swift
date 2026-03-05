@@ -91,6 +91,68 @@ struct FlexibleIntArray: Decodable {
     }
 }
 
+/// Decodes a UUID from a string. Accepts standard UUID format.
+struct FlexibleUUID: Decodable {
+    let value: UUID
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let string = try container.decode(String.self)
+        guard let uuid = UUID(uuidString: string) else {
+            throw DecodingError.typeMismatch(
+                UUID.self,
+                DecodingError.Context(codingPath: decoder.codingPath, debugDescription: "Expected a valid UUID string, got '\(string)'")
+            )
+        }
+        value = uuid
+    }
+}
+
+/// Decodes an array of UUIDs from either a JSON array of strings or a comma-separated string.
+struct FlexibleUUIDArray: Decodable {
+    let values: [UUID]
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if let array = try? container.decode([String].self) {
+            values = try array.map { str in
+                guard let uuid = UUID(uuidString: str) else {
+                    throw DecodingError.typeMismatch(
+                        UUID.self,
+                        DecodingError.Context(codingPath: decoder.codingPath, debugDescription: "Expected a valid UUID string, got '\(str)'")
+                    )
+                }
+                return uuid
+            }
+        } else if let string = try? container.decode(String.self) {
+            var trimmed = string.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("[") && trimmed.hasSuffix("]") {
+                trimmed = String(trimmed.dropFirst().dropLast())
+            }
+            let parsed = try trimmed.split(separator: ",").map { part -> UUID in
+                let str = part.trimmingCharacters(in: .whitespaces)
+                guard let uuid = UUID(uuidString: str) else {
+                    throw DecodingError.typeMismatch(
+                        UUID.self,
+                        DecodingError.Context(codingPath: decoder.codingPath, debugDescription: "Expected a valid UUID string, got '\(str)'")
+                    )
+                }
+                return uuid
+            }
+            guard !parsed.isEmpty else {
+                throw DecodingError.typeMismatch(
+                    [UUID].self,
+                    DecodingError.Context(codingPath: decoder.codingPath, debugDescription: "Expected an array of UUID strings")
+                )
+            }
+            values = parsed
+        } else {
+            throw DecodingError.typeMismatch(
+                [UUID].self,
+                DecodingError.Context(codingPath: decoder.codingPath, debugDescription: "Expected an array of UUID strings or comma-separated UUID strings")
+            )
+        }
+    }
+}
+
 func parseTemporalDate(_ input: String) -> Date? {
     let now = Date()
     let cal = Calendar.current
@@ -157,7 +219,7 @@ struct RememberArgs: Decodable {
     let expiresInDays: FlexibleInt?
     let force: Bool?
     let importance: FlexibleInt?
-    let parentId: FlexibleInt?
+    let parentId: FlexibleUUID?
     let isPrivate: Bool?
 
     enum CodingKeys: String, CodingKey {
@@ -179,14 +241,14 @@ struct RecallArgs: Decodable {
 }
 
 struct ForgetArgs: Decodable {
-    let id: FlexibleInt?
+    let id: FlexibleUUID?
     let topic: String?
     let project: String?
 }
 
 struct UpdateArgs: Decodable {
     // Targeting (one required)
-    let id: FlexibleInt?
+    let id: FlexibleUUID?
     let query: String?
     let project: String?
 
@@ -214,7 +276,7 @@ struct UpdateArgs: Decodable {
 }
 
 struct MergeArgs: Decodable {
-    let ids: FlexibleIntArray
+    let ids: FlexibleUUIDArray
     let content: String
     let topic: String?
     let project: String?
@@ -229,20 +291,20 @@ struct ListTopicsArgs: Decodable {
 }
 
 struct ConnectArgs: Decodable {
-    let from: FlexibleInt
-    let to: FlexibleInt
+    let from: FlexibleUUID
+    let to: FlexibleUUID
     let relation: String
 }
 
 struct DisconnectArgs: Decodable {
-    let id: FlexibleInt?
-    let from: FlexibleInt?
-    let to: FlexibleInt?
+    let id: FlexibleUUID?      // Edge globalId
+    let from: FlexibleUUID?    // Memory globalId
+    let to: FlexibleUUID?      // Memory globalId
     let relation: String?
 }
 
 struct GraphArgs: Decodable {
-    let id: FlexibleInt
+    let id: FlexibleUUID
     let depth: FlexibleInt?
 }
 
@@ -316,7 +378,7 @@ struct BeginEpisodeArgs: Decodable {
 }
 
 struct EndEpisodeArgs: Decodable {
-    let episodeId: FlexibleInt?
+    let episodeId: FlexibleUUID?
     let summary: String?
     enum CodingKeys: String, CodingKey {
         case summary
@@ -325,7 +387,7 @@ struct EndEpisodeArgs: Decodable {
 }
 
 struct RecallEpisodeArgs: Decodable {
-    let episodeId: FlexibleInt
+    let episodeId: FlexibleUUID
     let limit: FlexibleInt?
     enum CodingKeys: String, CodingKey {
         case episodeId = "episode_id"
@@ -363,14 +425,14 @@ struct DetectCommunitiesArgs: Decodable {
 }
 
 struct OrganizeArgs: Decodable {
-    let ids: FlexibleIntArray
+    let ids: FlexibleUUIDArray
     let label: String
     let project: String?
     let summary: String?
 }
 
 struct ConsolidateArgs: Decodable {
-    let ids: FlexibleIntArray
+    let ids: FlexibleUUIDArray
     let content: String
     let topic: String?
     let project: String?

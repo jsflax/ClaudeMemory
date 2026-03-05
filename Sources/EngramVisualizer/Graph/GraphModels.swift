@@ -40,7 +40,7 @@ func truncateLabel(_ text: String, to maxLen: Int) -> String {
 
 // MARK: - Lightweight data structs (replaces heavy Lattice model objects)
 
-struct NodeData {
+struct NodeData: Sendable {
     let id: UUID
     let project: String
     let topic: String
@@ -51,7 +51,7 @@ struct NodeData {
     let importance: Int
 }
 
-struct EdgeData {
+struct EdgeData: Sendable {
     let id: Int64       // Edge primaryKey (DB-local, for observation identity)
     let sourceId: UUID
     let targetId: UUID

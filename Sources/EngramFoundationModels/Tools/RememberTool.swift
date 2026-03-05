@@ -35,8 +35,8 @@ public struct RememberTool: Tool {
         @Guide(description: "Importance ranking from 1-5. Higher importance boosts recall ranking.")
         public var importance: Int?
 
-        @Guide(description: "ID of a parent memory. Creates a 'part_of' edge automatically for building hierarchies.")
-        public var parentId: Int?
+        @Guide(description: "UUID of a parent memory. Creates a 'part_of' edge automatically for building hierarchies.")
+        public var parentId: String?
 
         @Guide(description: "If true, the memory is private and excluded from team graphs.")
         public var isPrivate: Bool?

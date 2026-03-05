@@ -612,6 +612,18 @@ func seedMultiProjectDatabase(
         }
     }
 
+    // Cross-project edges: connect hub nodes across projects (simulates real cross-project links)
+    let projectKeys = Array(memoriesByProject.keys).sorted()
+    for i in 0..<projectKeys.count {
+        for j in (i + 1)..<projectKeys.count {
+            guard let srcMemories = memoriesByProject[projectKeys[i]],
+                  let tgtMemories = memoriesByProject[projectKeys[j]],
+                  let srcGid = srcMemories.first?.__globalId,
+                  let tgtGid = tgtMemories.first?.__globalId else { continue }
+            lattice.add(Edge(sourceGlobalId: srcGid, targetGlobalId: tgtGid, relation: .relatesTo))
+        }
+    }
+
     for project in withSyncConfig {
         lattice.add(SyncConfig(project: project, policy: .sync))
     }
@@ -637,6 +649,74 @@ func triggerRecall(at path: String, globalIds: [UUID]) {
             m.lastAccessedAt = now
             m.accessCount += 1
         }
+    }
+}
+
+/// Inserts N new memories into the DB at `path`. Returns their globalIds.
+/// The xproc notification triggers the app's live observer → handleNodeInsert.
+@discardableResult
+func insertMemories(at path: String, project: String, count: Int) -> [UUID] {
+    let lattice = try! Lattice(
+        Memory.self, Edge.self, SyncConfig.self,
+        configuration: .init(
+            fileURL: URL(fileURLWithPath: path),
+            migration: engramMigrations
+        )
+    )
+
+    var ids: [UUID] = []
+    let now = Date()
+    for i in 0..<count {
+        var emb = [Float](repeating: 0, count: 384)
+        for j in 0..<384 { emb[j] = sin(Float(i &* 31 &+ j &* 7)) * 0.1 }
+        let m = Memory(
+            content: "[live-insert] \(project) memory \(i): stress test content",
+            topic: "debugging",
+            project: project,
+            source: "perf-test",
+            embedding: Vector<Float>(emb),
+            createdAt: now,
+            lastAccessedAt: now,
+            importance: 3
+        )
+        lattice.add(m)
+        if let gid = m.__globalId { ids.append(gid) }
+    }
+    return ids
+}
+
+/// Deletes memories by globalId from the DB at `path`.
+/// The xproc notification triggers the app's live observer → handleNodeDelete.
+func deleteMemories(at path: String, globalIds: [UUID]) {
+    let lattice = try! Lattice(
+        Memory.self, Edge.self, SyncConfig.self,
+        configuration: .init(
+            fileURL: URL(fileURLWithPath: path),
+            migration: engramMigrations
+        )
+    )
+
+    for gid in globalIds {
+        for m in lattice.objects(Memory.self).where({ $0.__globalId == gid }) {
+            lattice.delete(m)
+        }
+    }
+}
+
+/// Adds cross-galaxy edges between memories in different projects.
+/// Useful for testing cross-galaxy edge rendering under migration.
+func addCrossProjectEdges(at path: String, sourceIds: [UUID], targetIds: [UUID]) {
+    let lattice = try! Lattice(
+        Memory.self, Edge.self, SyncConfig.self,
+        configuration: .init(
+            fileURL: URL(fileURLWithPath: path),
+            migration: engramMigrations
+        )
+    )
+
+    let count = min(sourceIds.count, targetIds.count)
+    for i in 0..<count {
+        lattice.add(Edge(sourceGlobalId: sourceIds[i], targetGlobalId: targetIds[i], relation: .relatesTo))
     }
 }
 

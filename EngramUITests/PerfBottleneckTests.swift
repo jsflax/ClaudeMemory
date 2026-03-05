@@ -29,6 +29,7 @@ final class PerfBottleneckTests: XCTestCase {
     private var localDbPath: String!
     private var syncedDbPath: String!
     private var localIds: [UUID] = []
+    private var syncedIds: [UUID] = []
     private let testUUID = UUID().uuidString
 
     // All CSV paths we collect
@@ -42,14 +43,21 @@ final class PerfBottleneckTests: XCTestCase {
         "/tmp/center-log.csv",
         "/tmp/glow-log.csv",
         "/tmp/galaxy-migration.csv",
+        "/tmp/label-diag.csv",
+        "/tmp/swiftui-jitter.csv",
+        "/tmp/swiftui-body-eval.csv",
     ]
 
     override func setUpWithError() throws {
         continueAfterFailure = false
 
-        let tmpDir = NSTemporaryDirectory()
-        localDbPath = tmpDir + "perf-test-\(testUUID).sqlite"
-        syncedDbPath = (localDbPath as NSString).deletingPathExtension + "-synced.sqlite"
+        let tmpDir = NSTemporaryDirectory() + "perf-test-\(testUUID)/"
+        try FileManager.default.createDirectory(atPath: tmpDir, withIntermediateDirectories: true)
+        localDbPath = tmpDir + "memory.sqlite"
+        // App derives synced path as <localDbDir>/sync/memory-synced.sqlite
+        let syncDir = tmpDir + "sync/"
+        try FileManager.default.createDirectory(atPath: syncDir, withIntermediateDirectories: true)
+        syncedDbPath = syncDir + "memory-synced.sqlite"
 
         // Clean ALL previous timing data
         for path in csvPaths { try? FileManager.default.removeItem(atPath: path) }
@@ -67,10 +75,46 @@ final class PerfBottleneckTests: XCTestCase {
         )
 
         // Seed synced DB for multi-galaxy perf
-        seedMultiProjectDatabase(
+        syncedIds = seedMultiProjectDatabase(
             at: syncedDbPath,
             projects: [("Engram", 80), ("global", 60)],
             staleAge: 10800
+        )
+
+        // Add cross-galaxy edges: link personal galaxy nodes (local-only projects) to
+        // synced galaxy nodes (syncedIds from the synced DB). These are the edges that
+        // mergeRenderData() must resolve across galaxies.
+        //
+        // localIds layout: Engram[0..79], Lattice[80..129], canary-sdk-ios[130..169],
+        //                  canary-sdk-android[170..199], global[200..259], engram-server[260..284]
+        // syncedIds layout: Engram[0..79], global[80..139]
+        //
+        // Edges go into the LOCAL DB because that's where allEdges are stored.
+        // mergeRenderData() merges allEdges from all galaxies against merged visible nodes.
+
+        // Lattice (personal) → Engram (synced DB)
+        addCrossProjectEdges(
+            at: localDbPath,
+            sourceIds: Array(localIds[80..<90]),
+            targetIds: Array(syncedIds[0..<10])
+        )
+        // canary-sdk-ios (personal) → global (synced DB)
+        addCrossProjectEdges(
+            at: localDbPath,
+            sourceIds: Array(localIds[130..<140]),
+            targetIds: Array(syncedIds[80..<90])
+        )
+        // canary-sdk-android (personal) → Engram (synced DB)
+        addCrossProjectEdges(
+            at: localDbPath,
+            sourceIds: Array(localIds[170..<180]),
+            targetIds: Array(syncedIds[10..<20])
+        )
+        // engram-server (personal) → global (synced DB)
+        addCrossProjectEdges(
+            at: localDbPath,
+            sourceIds: Array(localIds[260..<275]),
+            targetIds: Array(syncedIds[80..<95])
         )
 
         app.launchEnvironment["CLAUDE_MEMORY_DB"] = localDbPath
@@ -83,12 +127,9 @@ final class PerfBottleneckTests: XCTestCase {
     }
 
     override func tearDownWithError() throws {
-        for path in [localDbPath!, syncedDbPath!] {
-            try? FileManager.default.removeItem(atPath: path)
-            for suffix in ["-wal", "-shm"] {
-                try? FileManager.default.removeItem(atPath: path + suffix)
-            }
-        }
+        // Clean entire temp directory (contains local DB + sync/ subdirectory)
+        let testDir = (localDbPath! as NSString).deletingLastPathComponent
+        try? FileManager.default.removeItem(atPath: testDir)
     }
 
     // MARK: - Main Test
@@ -165,40 +206,101 @@ final class PerfBottleneckTests: XCTestCase {
         holdKey(VK.j, duration: 0.5)
         sleep(2)
 
+        // ── Phase 7b: Sustained insert/delete churn with camera movement ──
+        // Simulates real usage: memories being stored/deleted while user navigates.
+        // Every 2s for 10 rounds: insert 3, delete 3 (steady state node count).
+        var churnIds: [UUID] = []
+        let churnProjects = ["Engram", "Lattice", "canary-sdk-ios", "global"]
+        for round in 0..<10 {
+            let project = churnProjects[round % churnProjects.count]
+            let newIds = insertMemories(at: localDbPath, project: project, count: 3)
+            churnIds.append(contentsOf: newIds)
+            // Delete the oldest 3 churn IDs if we have enough
+            if churnIds.count >= 6 {
+                let toDelete = Array(churnIds.prefix(3))
+                deleteMemories(at: localDbPath, globalIds: toDelete)
+                churnIds.removeFirst(3)
+            }
+            // Camera movement during churn (~1s of movement + 1s idle = ~2s per round)
+            if round % 2 == 0 {
+                holdKey(VK.w, duration: 1.0)
+            } else {
+                holdKey(VK.j, duration: 1.0)
+            }
+            sleep(1)
+        }
+        // Clean up remaining churn IDs
+        if !churnIds.isEmpty {
+            deleteMemories(at: localDbPath, globalIds: churnIds)
+        }
+        sleep(1)
+        takeScreenshot(name: "perf-07b-churn")
+
         // ── Phase 8: Wait for insert at ~45s from launch ──
-        // (ENGRAM_TEST_INSERT_DELAY=45, we're at ~40s)
+        // (ENGRAM_TEST_INSERT_DELAY=45)
         sleep(8)
         takeScreenshot(name: "perf-08-post-insert")
 
-        // ── Phase 9: Sync toggle (project migration) ──
-        // Toggle "Lattice" project to sync → triggers migration personal→synced
+        // ── Phase 9: Live memory insertion (stress: observer + atlas regen + sim wake) ──
+        let insertedIds = insertMemories(at: localDbPath, project: "Engram", count: 10)
+        sleep(2)
+        holdKey(VK.w, duration: 0.5) // camera movement during settle
+        sleep(2)
+        takeScreenshot(name: "perf-09-live-insert")
+
+        // ── Phase 10: Live memory deletion ──
+        deleteMemories(at: localDbPath, globalIds: insertedIds)
+        sleep(2)
+        takeScreenshot(name: "perf-10-live-delete")
+
+        // ── Phase 11: Sync toggle (project migration) ──
         toggleSyncConfig(at: localDbPath, project: "Lattice", policy: .sync)
         sleep(3)
-        takeScreenshot(name: "perf-09a-sync-on")
+        takeScreenshot(name: "perf-11a-sync-on")
 
-        // Toggle it back to local → triggers migration synced→personal
+        // Toggle back to local
         toggleSyncConfig(at: localDbPath, project: "Lattice", policy: .local)
         sleep(3)
-        takeScreenshot(name: "perf-09b-sync-off")
+        takeScreenshot(name: "perf-11b-sync-off")
 
-        // Rapid toggle stress: toggle canary-sdk-ios on and off quickly
+        // ── Phase 12: Mutation DURING migration ──
+        // Start migration, then immediately insert + delete while it's in progress
         toggleSyncConfig(at: localDbPath, project: "canary-sdk-ios", policy: .sync)
-        usleep(500_000)
-        toggleSyncConfig(at: localDbPath, project: "canary-sdk-ios", policy: .local)
+        usleep(200_000)  // 200ms into migration
+        insertMemories(at: localDbPath, project: "canary-sdk-ios", count: 5)
+        usleep(200_000)
+        deleteMemories(at: localDbPath, globalIds: Array(localIds[130..<135])) // delete some canary nodes
         sleep(3)
-        takeScreenshot(name: "perf-09c-rapid-toggle")
+        takeScreenshot(name: "perf-12a-mutate-during-migration")
 
-        // ── Phase 10: Rapid teleport stress ──
+        // Toggle back with rapid insert
+        toggleSyncConfig(at: localDbPath, project: "canary-sdk-ios", policy: .local)
+        usleep(100_000)
+        insertMemories(at: localDbPath, project: "Lattice", count: 5)
+        sleep(3)
+        takeScreenshot(name: "perf-12b-reverse-with-insert")
+
+        // ── Phase 13: Rapid teleport stress ──
         for _ in 0..<5 {
             window.typeKey("t", modifierFlags: [])
             usleep(400_000)
         }
         sleep(2)
-        takeScreenshot(name: "perf-10-rapid-teleport")
+        takeScreenshot(name: "perf-13-rapid-teleport")
 
-        // ── Phase 11: Final idle ──
+        // ── Phase 14: Galaxy hop with camera movement ──
+        window.typeKey("[", modifierFlags: [])
+        sleep(1)
+        holdKey(VK.w, duration: 1.0)
+        holdKey(VK.j, duration: 0.5)
+        window.typeKey("]", modifierFlags: [])
+        sleep(1)
+        holdKey(VK.w, duration: 1.0)
+        takeScreenshot(name: "perf-14-galaxy-hop")
+
+        // ── Phase 15: Final idle ──
         sleep(5)
-        takeScreenshot(name: "perf-11-final")
+        takeScreenshot(name: "perf-15-final")
 
         // ═══════════════════════════════════════
         //   ANALYSIS
@@ -215,6 +317,8 @@ final class PerfBottleneckTests: XCTestCase {
         report.addSection(analyzeGlowLog())
         report.addSection(analyzeCenterLog())
         report.addSection(analyzeMigrationTiming())
+        report.addSection(analyzeLabelDiag())
+        report.addSection(analyzeSwiftUIJitter())
 
         report.printSummary()
 
@@ -594,6 +698,258 @@ final class PerfBottleneckTests: XCTestCase {
                 section.addLine("⚠️ Heavy migrations (>10ms): \(heavyOps.count)")
             }
         }
+        return section
+    }
+
+    // MARK: - Label Diagnostics
+
+    private func analyzeLabelDiag() -> BottleneckSection {
+        var section = BottleneckSection(title: "LABEL FLICKER DIAGNOSTICS")
+        let path = "/tmp/label-diag.csv"
+        guard let data = FileManager.default.contents(atPath: path),
+              let csv = String(data: data, encoding: .utf8) else {
+            section.addLine("[No data — label-diag.csv not found]")
+            return section
+        }
+
+        // frame,positions,atlasRects,missingRects,instances,atlasRegen,depthRange,minDepth,maxDepth,camX,camY,camZ,projLabels,topicLabels,galaxyLabels,pendingRegen,isGenerating
+        let lines = csv.components(separatedBy: "\n").dropFirst().filter { !$0.isEmpty }
+        guard !lines.isEmpty else { section.addLine("[Empty]"); return section }
+
+        var instanceCounts: [Int] = []
+        var missingRectCounts: [Int] = []
+        var depthRanges: [Double] = []
+        var atlasRegenFrames: [Int] = []
+        var pendingRegenFrames: [Int] = []
+        var generatingFrames: [Int] = []
+        var instanceDrops: [(frame: Int, from: Int, to: Int)] = []
+        var prevInstances = -1
+        var frames: [Int] = []
+        var galaxyLabelCounts: [Int] = []
+
+        for line in lines {
+            let c = line.components(separatedBy: ",")
+            guard c.count >= 17 else { continue }
+            let frame = Int(c[0]) ?? 0
+            let missing = Int(c[3]) ?? 0
+            let instances = Int(c[4]) ?? 0
+            let atlasRegen = Int(c[5]) ?? 0
+            let depthRange = Double(c[6]) ?? 0
+            let pendingRegen = Int(c[15]) ?? 0
+            let isGenerating = Int(c[16]) ?? 0
+            let galaxyLabels = Int(c[14]) ?? 0
+
+            frames.append(frame)
+            instanceCounts.append(instances)
+            missingRectCounts.append(missing)
+            depthRanges.append(depthRange)
+            galaxyLabelCounts.append(galaxyLabels)
+            if atlasRegen == 1 { atlasRegenFrames.append(frame) }
+            if pendingRegen == 1 { pendingRegenFrames.append(frame) }
+            if isGenerating == 1 { generatingFrames.append(frame) }
+
+            if prevInstances > 0 && instances < prevInstances && (prevInstances - instances) > 2 {
+                instanceDrops.append((frame: frame, from: prevInstances, to: instances))
+            }
+            prevInstances = instances
+        }
+
+        let total = Double(lines.count)
+        let avgInst = instanceCounts.isEmpty ? 0.0 : Double(instanceCounts.reduce(0, +)) / total
+        let minInst = instanceCounts.min() ?? 0
+        let maxInst = instanceCounts.max() ?? 0
+        let avgMissing = missingRectCounts.isEmpty ? 0.0 : Double(missingRectCounts.reduce(0, +)) / total
+        let maxMissing = missingRectCounts.max() ?? 0
+        let framesWithMissing = missingRectCounts.filter { $0 > 0 }.count
+
+        section.addLine("Frames: \(lines.count)")
+        section.addLine("Instances: avg=\(f(avgInst))  min=\(minInst)  max=\(maxInst)")
+        section.addLine("Instance drops (>2): \(instanceDrops.count) frames")
+        section.addLine("Missing atlas rects: avg=\(f(avgMissing))  max=\(maxMissing)  frames_with_missing=\(framesWithMissing)")
+        let maxGalaxyLabels = galaxyLabelCounts.max() ?? 0
+        section.addLine("Galaxy labels: max=\(maxGalaxyLabels)")
+        section.addLine("Atlas regens: \(atlasRegenFrames.count)")
+        section.addLine("Pending regen frames: \(pendingRegenFrames.count)")
+        section.addLine("Atlas generating frames: \(generatingFrames.count)")
+
+        let sortedDepth = depthRanges.sorted()
+        let p5 = pct(sortedDepth, 0.05)
+        let p50 = pct(sortedDepth, 0.50)
+        let p95 = pct(sortedDepth, 0.95)
+        section.addLine("Depth range: p5=\(f(p5))  p50=\(f(p50))  p95=\(f(p95))")
+
+        // Jitter: frames where instance count changed from previous
+        var jitter = 0
+        for i in 1..<instanceCounts.count {
+            if instanceCounts[i] != instanceCounts[i - 1] { jitter += 1 }
+        }
+        let jitterPct = total > 1 ? Double(jitter) / (total - 1) * 100 : 0
+        section.addLine("Instance jitter: \(jitter) frames (\(String(format: "%.1f", jitterPct))%)")
+
+        // Correlation: drops near atlas regen
+        let regenSet = Set(atlasRegenFrames)
+        let dropsNearRegen = instanceDrops.filter { drop in
+            regenSet.contains(where: { abs(drop.frame - $0) <= 5 })
+        }
+        section.addLine("Drops near atlas regen (±5 frames): \(dropsNearRegen.count)/\(instanceDrops.count)")
+
+        if !instanceDrops.isEmpty {
+            section.addLine("")
+            section.addLine("Instance drops detail:")
+            for drop in instanceDrops.prefix(20) {
+                section.addLine("  frame=\(drop.frame) \(drop.from)→\(drop.to) (dropped \(drop.from - drop.to))")
+            }
+        }
+
+        if !atlasRegenFrames.isEmpty {
+            section.addLine("")
+            section.addLine("Atlas regen at frames: \(atlasRegenFrames)")
+        }
+
+        if framesWithMissing > 0 {
+            section.addLine("")
+            let worstMissing = zip(frames, missingRectCounts)
+                .filter { $0.1 > 0 }
+                .sorted { $0.1 > $1.1 }
+                .prefix(10)
+            section.addLine("Worst missing-rect frames:")
+            for (fr, cnt) in worstMissing {
+                section.addLine("  frame=\(fr) missing=\(cnt)")
+            }
+        }
+
+        // Flag potential flicker causes
+        if instanceDrops.count > 5 {
+            section.addLine("⚠️ Frequent instance drops (\(instanceDrops.count)) — likely flicker source")
+        }
+        if framesWithMissing > Int(total * 0.1) {
+            section.addLine("⚠️ >10% frames with missing atlas rects — atlas/position desync")
+        }
+        if atlasRegenFrames.count > 3 {
+            section.addLine("⚠️ Multiple atlas regens (\(atlasRegenFrames.count)) — may cause UV mismatch flicker")
+        }
+
+        return section
+    }
+
+    // MARK: - SwiftUI Jitter Analysis
+
+    private func analyzeSwiftUIJitter() -> BottleneckSection {
+        var section = BottleneckSection(title: "SWIFTUI JITTER")
+
+        // Parse jitter CSV
+        let jitterPath = "/tmp/swiftui-jitter.csv"
+        guard let jitterData = FileManager.default.contents(atPath: jitterPath),
+              let jitterCsv = String(data: jitterData, encoding: .utf8) else {
+            section.addLine("[No jitter data]")
+            return section
+        }
+
+        let jitterLines = jitterCsv.components(separatedBy: "\n").dropFirst().filter { !$0.isEmpty }
+        guard jitterLines.count > 1 else { section.addLine("[Empty]"); return section }
+
+        // CSV: frame,wall_dt_ms,total_ms,sim_ms,mascot_ms,nodes_ms,edges_ms,labels_ms,skipped,reason,
+        //      selection_cb,reticle_cb,teleport_cb,positions_changed,geometry_changed,camera_moving,mascot_active,body_eval_count
+        struct JFrame {
+            let frame: Int, wallDt: Double, totalMs: Double
+            let skipped: Bool, reason: String
+            let selectionCb: Bool, reticleCb: Bool, teleportCb: Bool
+            let positionsChanged: Bool, geometryChanged: Bool, cameraMoving: Bool
+            let bodyEvalCount: UInt64
+        }
+
+        var frames: [JFrame] = []
+        for line in jitterLines {
+            let c = line.components(separatedBy: ",")
+            guard c.count >= 18 else { continue }
+            frames.append(JFrame(
+                frame: Int(c[0]) ?? 0,
+                wallDt: Double(c[1]) ?? 0,
+                totalMs: Double(c[2]) ?? 0,
+                skipped: (Int(c[8]) ?? 0) != 0,
+                reason: c[9],
+                selectionCb: (Int(c[10]) ?? 0) != 0,
+                reticleCb: (Int(c[11]) ?? 0) != 0,
+                teleportCb: (Int(c[12]) ?? 0) != 0,
+                positionsChanged: (Int(c[13]) ?? 0) != 0,
+                geometryChanged: (Int(c[14]) ?? 0) != 0,
+                cameraMoving: (Int(c[15]) ?? 0) != 0,
+                bodyEvalCount: UInt64(c[17].trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
+            ))
+        }
+
+        section.addLine("Frames: \(frames.count)")
+
+        // Wall dt percentiles (skip first frame which is 0)
+        let wallDts = frames.dropFirst().map(\.wallDt).sorted()
+        let n = wallDts.count
+        if n > 0 {
+            section.addLine("wall_dt: p50=\(f(pct(wallDts, 0.5)))  p95=\(f(pct(wallDts, 0.95)))  p99=\(f(pct(wallDts, 0.99)))  worst=\(f(wallDts.last ?? 0))")
+        }
+
+        // Jitter counts
+        let jitter20 = frames.filter { $0.wallDt > 20 }.count
+        let jitter33 = frames.filter { $0.wallDt > 33 }.count
+        let jitter50 = frames.filter { $0.wallDt > 50 }.count
+        section.addLine("Jitter: >20ms=\(jitter20)  >33ms=\(jitter33)  >50ms=\(jitter50)")
+
+        // Body eval analysis
+        let totalBodyEvals: UInt64
+        if let last = frames.last, let first = frames.first {
+            totalBodyEvals = last.bodyEvalCount - first.bodyEvalCount
+        } else {
+            totalBodyEvals = 0
+        }
+        section.addLine("SwiftUI body evals: \(totalBodyEvals) total across \(frames.count) frames")
+
+        // Frames where body re-evaluated
+        var evalFrames: [(frame: Int, wallDt: Double, evals: UInt64)] = []
+        for i in 1..<frames.count {
+            let delta = frames[i].bodyEvalCount - frames[i - 1].bodyEvalCount
+            if delta > 0 {
+                evalFrames.append((frames[i].frame, frames[i].wallDt, delta))
+            }
+        }
+        if !evalFrames.isEmpty {
+            let avgWallWithEval = evalFrames.map(\.wallDt).reduce(0, +) / Double(evalFrames.count)
+            let noEvalWalls = (1..<frames.count).compactMap { i -> Double? in
+                let delta = frames[i].bodyEvalCount - frames[i - 1].bodyEvalCount
+                return delta == 0 ? frames[i].wallDt : nil
+            }
+            let avgWallNoEval = noEvalWalls.isEmpty ? 0 : noEvalWalls.reduce(0, +) / Double(noEvalWalls.count)
+            section.addLine("Body eval frames: \(evalFrames.count)  avg_wall_dt=\(f(avgWallWithEval))ms (vs \(f(avgWallNoEval))ms without)")
+
+            if avgWallWithEval > avgWallNoEval * 1.5 {
+                section.addLine("⚠️ Body re-evals correlate with \(String(format: "%.0f", (avgWallWithEval / avgWallNoEval - 1) * 100))% higher wall_dt — SwiftUI layout is a jitter source")
+            }
+        }
+
+        // Callback fires
+        let selCount = frames.filter(\.selectionCb).count
+        let retCount = frames.filter(\.reticleCb).count
+        let telCount = frames.filter(\.teleportCb).count
+        if selCount + retCount + telCount > 0 {
+            section.addLine("Callbacks: selection=\(selCount) reticle=\(retCount) teleport=\(telCount)")
+        }
+
+        // Worst jitter frames detail
+        let worstJitter = frames.filter { $0.wallDt > 33 }.sorted { $0.wallDt > $1.wallDt }
+        if !worstJitter.isEmpty {
+            section.addLine("")
+            section.addLine("Worst jitter frames (>33ms):")
+            for fr in worstJitter.prefix(15) {
+                let evalDelta: UInt64
+                if let idx = frames.firstIndex(where: { $0.frame == fr.frame }), idx > 0 {
+                    evalDelta = frames[idx].bodyEvalCount - frames[idx - 1].bodyEvalCount
+                } else {
+                    evalDelta = 0
+                }
+                section.addLine(String(format: "  frame %5d: wall_dt=%6.1fms total=%6.1fms eval=%d sel=%d ret=%d tel=%d reason=%@",
+                    fr.frame, fr.wallDt, fr.totalMs, evalDelta,
+                    fr.selectionCb ? 1 : 0, fr.reticleCb ? 1 : 0, fr.teleportCb ? 1 : 0, fr.reason))
+            }
+        }
+
         return section
     }
 

@@ -309,10 +309,13 @@ fragment float4 label_fragment(
     half4 texColor = atlas.sample(s, in.uv);
 
     float vertexOpacity = in.color.a;
-    float dist = length(in.worldPos - frame.cameraPosition);
-    float fogFade = max(0.0, 1.0 - fogFactor(dist, frame.fogNear, frame.fogFar) * 0.95);
 
-    float alpha = float(texColor.a) * vertexOpacity * fogFade;
+    // Labels already have depth-based fading from the compute kernel (maxVisible,
+    // depthFade, fadeT).  Scene fog is NOT applied here because fogFar is tuned for
+    // the primary galaxy; multi-galaxy scenes push far-galaxy labels well past fogFar,
+    // resulting in alpha ≈ 0.03 — right at the discard edge, which causes hard binary
+    // flickering as the camera moves.
+    float alpha = float(texColor.a) * vertexOpacity;
     if (alpha < 0.01) {
         discard_fragment();
     }
@@ -539,7 +542,7 @@ kernel void stamp_label_quads(
         return;
     }
 
-    float depthNorm = (depth - params.minDepth) / max(params.depthRange, 0.001f);
+    float depthNorm = saturate((depth - params.minDepth) / max(params.depthRange, 0.001f));
     float depthFade = isSelected ? 1.0 : (1.0 - depthNorm * 0.7);
     float fadeRange = inst.maxVisible * 0.3;
     float fadeT     = isSelected ? 1.0 : saturate((inst.maxVisible - depth) / fadeRange);

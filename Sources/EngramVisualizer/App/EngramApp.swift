@@ -53,22 +53,19 @@ struct EngramApp: App {
             startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil
         )
 
+        #if LATTICE_DEBUG
+        Lattice.setLogLevel(.debug)
+        #endif
+        
         let dbPath = ProcessInfo.processInfo.environment["CLAUDE_MEMORY_DB"]
             ?? NSHomeDirectory() + "/.claude/memory.sqlite"
         self.dbPath = dbPath
 
-        // Local DB — full schema, with IPC target for sync relay.
-        // The IPC channel is inert until syncedLattice connects on the other end.
-        #if TEST_SYNC_CHANNEL
-        let syncChannel = ProcessInfo.processInfo.environment["TEST_SYNC_CHANNEL"] ?? "engram-sync"
-        #else
-        let syncChannel = "engram-sync"
-        #endif
-        var localConfig = Lattice.Configuration(
+        // Local DB — full schema. The sync daemon handles IPC relay separately.
+        let localConfig = Lattice.Configuration(
             fileURL: URL(fileURLWithPath: dbPath),
             migration: engramMigrations
         )
-        localConfig.ipcTargets = [.init(channel: syncChannel)]
         let local = try! Lattice(
             Memory.self, Edge.self, Checkpoint.self, VisualizerConfig.self, SyncConfig.self, HookState.self,
             configuration: localConfig
@@ -119,13 +116,12 @@ struct EngramApp: App {
         guard let wsURL = accountService.syncWebSocketURL,
               let token = accountService.token,
               !syncManager.isSyncing else { return }
-        syncManager.compactBeforeSync()
         syncManager.connectSync(wssEndpoint: wsURL, authToken: token)
     }
 
     var body: some Scene {
         WindowGroup("Engram") {
-            GraphView()
+            GraphView(syncManager: syncManager)
                 .environment(\.lattice, lattice)
                 .environment(config)
                 .environment(accountService)

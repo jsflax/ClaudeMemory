@@ -261,7 +261,7 @@ import Foundation
     let result = try await tools.handle(CallTool.Parameters(
         name: "consolidate",
         arguments: [
-            "ids": .array([.int(id1), .int(id2), .int(id3)]),
+            "ids": .array([.string(id1), .string(id2), .string(id3)]),
             "content": .string("Swift uses Automatic Reference Counting (ARC) for memory management, automatically tracking and freeing unused objects."),
         ]
     ))
@@ -291,7 +291,7 @@ import Foundation
     let result = try await tools.handle(CallTool.Parameters(
         name: "consolidate",
         arguments: [
-            "ids": .array([.int(id1), .int(id2)]),
+            "ids": .array([.string(id1), .string(id2)]),
             "content": .string("Lattice is a Swift ORM that uses SQLite as its backend database."),
         ]
     ))
@@ -318,7 +318,7 @@ import Foundation
     let result = try await tools.handle(CallTool.Parameters(
         name: "consolidate",
         arguments: [
-            "ids": .array([.int(id1), .int(id2)]),
+            "ids": .array([.string(id1), .string(id2)]),
             "content": .string("Combined importance test summary"),
             "importance": .int(5),
         ]
@@ -340,7 +340,7 @@ import Foundation
         try await tools.handle(CallTool.Parameters(
             name: "consolidate",
             arguments: [
-                "ids": .array([.int(id1)]),
+                "ids": .array([.string(id1)]),
                 "content": .string("Summary"),
             ]
         ))
@@ -359,7 +359,7 @@ import Foundation
     let result = try await tools.handle(CallTool.Parameters(
         name: "consolidate",
         arguments: [
-            "ids": .array([.int(id1), .int(99999)]),
+            "ids": .array([.string(id1), .string(UUID().uuidString)]),
             "content": .string("Summary"),
         ]
     ))
@@ -385,7 +385,7 @@ import Foundation
     let consolidateResult = try await tools.handle(CallTool.Parameters(
         name: "consolidate",
         arguments: [
-            "ids": .array([.int(id1), .int(id2)]),
+            "ids": .array([.string(id1), .string(id2)]),
             "content": .string("Combined edge test summary"),
         ]
     ))
@@ -396,13 +396,12 @@ import Foundation
         return
     }
     let afterId = consolidateOutput[idRange.upperBound...]
-    let summaryIdStr = afterId.prefix(while: { $0.isNumber })
-    let summaryId = Int(summaryIdStr)!
+    let summaryId = String(afterId.prefix(36))
 
     // Use graph on one of the originals — should show summarized_by edge to the summary
     let graphResult = try await tools.handle(CallTool.Parameters(
         name: "graph",
-        arguments: ["id": .int(id1)]
+        arguments: ["id": .string(id1)]
     ))
     let graphOutput = text(from: graphResult)
     #expect(graphOutput.contains("summarized_by"))
@@ -435,7 +434,7 @@ import Foundation
     _ = try await tools.handle(CallTool.Parameters(
         name: "consolidate",
         arguments: [
-            "ids": .array([.int(id1), .int(id2)]),
+            "ids": .array([.string(id1), .string(id2)]),
             "content": .string("Rust uses an ownership model with a borrow checker to enforce memory safety and prevent data races at compile time."),
         ]
     ))
@@ -451,14 +450,14 @@ import Foundation
     // Verify originals were actually deprioritized (importance → 0) by reading back via update
     let update1 = try await tools.handle(CallTool.Parameters(
         name: "update",
-        arguments: ["id": .int(id1), "importance": .int(0)]
+        arguments: ["id": .string(id1), "importance": .int(0)]
     ))
     // "importance: 0 → 0" confirms it was already 0 from consolidation
     #expect(text(from: update1).contains("importance: 0 → 0"))
 
     let update2 = try await tools.handle(CallTool.Parameters(
         name: "update",
-        arguments: ["id": .int(id2), "importance": .int(0)]
+        arguments: ["id": .string(id2), "importance": .int(0)]
     ))
     #expect(text(from: update2).contains("importance: 0 → 0"))
 }
@@ -491,6 +490,44 @@ import Foundation
     let output = text(from: result)
     #expect(output.contains("Created summary"))
     #expect(output.contains("Deprioritized 2"))
+}
+
+@Test func findClusters_scalesWithLargeDataset() async throws {
+    let tools = try await makeTools()
+
+    // Create 200 memories: 5 groups of 40, each group on a distinct topic
+    let groups: [(topic: String, prefix: String)] = [
+        ("networking", "HTTP networking in Swift uses URLSession for"),
+        ("databases", "SQLite database operations include"),
+        ("rendering", "Metal GPU rendering pipeline handles"),
+        ("testing", "XCTest framework provides assertions for"),
+        ("concurrency", "Swift structured concurrency uses async/await for"),
+    ]
+
+    for group in groups {
+        for i in 0..<40 {
+            _ = try await tools.handle(CallTool.Parameters(
+                name: "remember",
+                arguments: [
+                    "content": .string("\(group.prefix) \(String.random(length: 20)) variant \(i)"),
+                    "topic": .string(group.topic),
+                    "force": .bool(true),
+                ]
+            ))
+        }
+    }
+
+    // find_clusters on 200 memories must complete within 10 seconds
+    let start = ContinuousClock.now
+    let result = try await tools.handle(CallTool.Parameters(
+        name: "find_clusters",
+        arguments: ["min_cluster_size": .int(3), "distance_threshold": .int(30)]
+    ))
+    let elapsed = ContinuousClock.now - start
+
+    let output = text(from: result)
+    #expect(output.contains("Cluster 1"))
+    #expect(elapsed < .seconds(10), "find_clusters took \(elapsed) on 200 memories — should be under 10s")
 }
 
 @Test func merge_idsAsCommaSeparatedString() async throws {

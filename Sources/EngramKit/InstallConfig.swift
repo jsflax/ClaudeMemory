@@ -35,6 +35,7 @@ public enum InstallConfig {
     /// - Returns: Dictionary ready for JSON serialization.
     public static func hooksSettings(installDir: String) -> [String: Any] {
         [
+            "autoMemoryEnabled": false,
             "permissions": ["allow": ["mcp__memory__*"]],
             "hooks": [
                 "SessionStart": [["hooks": [["type": "command", "command": "\(installDir)/memory-hooks on-start 2>/dev/null", "timeout": 5]]]],

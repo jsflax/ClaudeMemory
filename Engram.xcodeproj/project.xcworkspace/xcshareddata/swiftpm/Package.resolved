@@ -1,5 +1,5 @@
 {
-  "originHash" : "e4a49df5129ea7598f889ceb0f3962f09f04e5c56934129cf578f37ebbd7914c",
+  "originHash" : "758568e91cdccfbb868f6d82ff3d2334c6a54c4c364ac911b4f374ed85f304a6",
   "pins" : [
     {
       "identity" : "appauth-ios",
@@ -42,26 +42,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/mattt/eventsource.git",
       "state" : {
-        "revision" : "bd64824505da71a1a403adb221f6e25413c0bc7f",
-        "version" : "1.4.0"
-      }
-    },
-    {
-      "identity" : "fluent",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/vapor/fluent.git",
-      "state" : {
-        "revision" : "2fe9e36daf4bdb5edcf193e0d0806ba2074d2864",
-        "version" : "4.13.0"
-      }
-    },
-    {
-      "identity" : "fluent-kit",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/vapor/fluent-kit.git",
-      "state" : {
-        "revision" : "f8f38b81009bb84eb2cb017b8914f44d3dde5ed5",
-        "version" : "1.55.0"
+        "revision" : "a3a85a85214caf642abaa96ae664e4c772a59f6e",
+        "version" : "1.4.1"
       }
     },
     {
@@ -101,33 +83,6 @@
       }
     },
     {
-      "identity" : "jwt",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/vapor/jwt.git",
-      "state" : {
-        "revision" : "d65f32bfd08fae5910d603028be5dec4f35b3482",
-        "version" : "4.2.2"
-      }
-    },
-    {
-      "identity" : "jwt-kit",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/vapor/jwt-kit.git",
-      "state" : {
-        "revision" : "13e7513b3ba0afa13967daf77af2fb4ad087306c",
-        "version" : "4.13.5"
-      }
-    },
-    {
-      "identity" : "latticecore",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/jsflax/LatticeCore.git",
-      "state" : {
-        "revision" : "50fa57fcbde71291bf5096c3d1dc09d3ffd093e9",
-        "version" : "0.6.0"
-      }
-    },
-    {
       "identity" : "multipart-kit",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/vapor/multipart-kit.git",
@@ -152,15 +107,6 @@
       "state" : {
         "revision" : "21d8df80440b1ca3b65fa82e40782f1e5a9e6ba2",
         "version" : "2.9.0"
-      }
-    },
-    {
-      "identity" : "sql-kit",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/vapor/sql-kit.git",
-      "state" : {
-        "revision" : "c0ea243ffeb8b5ff9e20a281e44003c6abb8896f",
-        "version" : "3.34.0"
       }
     },
     {
@@ -195,8 +141,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/apple/swift-async-algorithms.git",
       "state" : {
-        "revision" : "2971dd5d9f6e0515664b01044826bcea16e59fac",
-        "version" : "1.1.2"
+        "revision" : "9d349bcc328ac3c31ce40e746b5882742a0d1272",
+        "version" : "1.1.3"
       }
     },
     {
@@ -231,8 +177,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/apple/swift-crypto.git",
       "state" : {
-        "revision" : "95ba0316a9b733e92bb6b071255ff46263bbe7dc",
-        "version" : "3.15.1"
+        "revision" : "6f70fa9eab24c1fd982af18c281c4525d05e3095",
+        "version" : "4.2.0"
       }
     },
     {
@@ -367,7 +313,7 @@
       "location" : "https://github.com/apple/swift-syntax.git",
       "state" : {
         "branch" : "main",
-        "revision" : "abda343c59105cb13a97df8ef72b91eb0ea19fe2"
+        "revision" : "2afc46ddf6aa12411e38908652e50ce23fe124d4"
       }
     },
     {
@@ -394,7 +340,7 @@
       "location" : "https://github.com/jsflax/SwiftLM.git",
       "state" : {
         "branch" : "main",
-        "revision" : "1863161e3af79a354b6e5dc7dd7f91f076040558"
+        "revision" : "8426dfdeefc2fbbd1800af88c8f7a31a5f792256"
       }
     },
     {

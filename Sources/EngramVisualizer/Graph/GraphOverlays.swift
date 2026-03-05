@@ -3,15 +3,11 @@ import Lattice
 import EngramKit
 
 // MARK: - Stats Overlay
-
-struct StatsOverlay: View {
-    let visibleMemoryCount: Int
-    let visibleEdgeCount: Int
-    let totalMemories: Int
+struct StatsOverlay: View, @MainActor Equatable {
+    let galaxyRegistry: GalaxyRegistry
     let hiddenProjects: Set<String>
     let hiddenRelations: Set<String>
     let projects: [String]
-    let allRelationCounts: [(key: String, value: Int)]
     let toggleProject: (String) -> Void
     let toggleRelation: (String) -> Void
     let colorMap: [String: Color]
@@ -20,6 +16,11 @@ struct StatsOverlay: View {
     @Environment(\.lattice) private var lattice
     @State private var isMaintenanceActive: Bool = false
     @State private var maintenanceObserver: AnyObject?
+
+    // LatticeQuery triggers SwiftUI re-renders when Memory/Edge tables change.
+    // Actual displayed values are read from galaxyRegistry (which respects filters).
+//    @LatticeQuery<Memory>(fetchLimit: 0) private var memoryQuery
+//    @LatticeQuery<EngramKit.Edge>(fetchLimit: 0) private var edgeQuery
 
     private var dbFileSize: String {
         let dbPath = ProcessInfo.processInfo.environment["CLAUDE_MEMORY_DB"]
@@ -41,6 +42,13 @@ struct StatsOverlay: View {
     }
 
     var body: some View {
+        // Touch query counts so SwiftUI tracks the @LatticeQuery observations
+//        let _ = memoryQuery.count
+//        let _ = edgeQuery.count
+        let visibleMemoryCount = galaxyRegistry.mergedVisibleNodeIds.count
+        let totalMemories = galaxyRegistry.mergedNodes.count
+        let visibleEdgeCount = galaxyRegistry.mergedEdges.count
+        let allRelationCounts = galaxyRegistry.mergedRelationCounts
         VStack(alignment: .trailing, spacing: 6) {
             if visibleMemoryCount < totalMemories {
                 Text("\(visibleMemoryCount)/\(totalMemories) memories")
@@ -135,7 +143,7 @@ struct StatsOverlay: View {
         // Check initial state
         if let state = lattice.objects(HookState.self)
             .where({ $0.key == .maintenanceActive }).first {
-            isMaintenanceActive = state.updatedAt.timeIntervalSinceNow > -600
+            isMaintenanceActive = state.value == "1"
         }
 
         // Observe changes
@@ -146,12 +154,16 @@ struct StatsOverlay: View {
             case .insert(let pk), .update(let pk):
                 guard let state = bgLattice.object(HookState.self, primaryKey: pk),
                       state.key == .maintenanceActive else { return }
-                let active = state.updatedAt.timeIntervalSinceNow > -600
+                let active = state.value == "1"
                 Task { @MainActor in isMaintenanceActive = active }
             case .delete:
                 Task { @MainActor in isMaintenanceActive = false }
             }
         } as AnyObject
+    }
+    
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        true
     }
 }
 

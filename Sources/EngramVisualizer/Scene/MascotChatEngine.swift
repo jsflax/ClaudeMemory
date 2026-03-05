@@ -67,7 +67,7 @@ final class MascotChatEngine {
 
         let embedder = EmbeddingService()
         if await !embedder.isLoaded { await embedder.load() }
-        self.memoryTools = MemoryTools(ref: lattice.sendableReference, embedder: embedder)
+        self.memoryTools = MemoryTools(localRef: lattice.sendableReference, syncedRef: nil, embedder: embedder)
     }
 
     // MARK: - Send

@@ -15,7 +15,9 @@ extension MemoryTools {
         let project = a.project
 
         // Fetch all non-expired, non-episode memories for the project
-        let allMemories = lattice.objects(Memory.self)
+        let db = readLattice(for: project)
+        let allMemories = db.objects(Memory.self)
+            .distinct(by: \.__globalId)
             .where { $0.project == project && $0.expiresAt > Date() && $0.topic != "episode" }
             .snapshot()
 
@@ -39,7 +41,7 @@ extension MemoryTools {
         var adjacency: [UUID: Set<UUID>] = [:]
         for gid in memoryGlobalIds { adjacency[gid] = [] }
 
-        let edges = lattice.objects(Edge.self).snapshot()
+        let edges = db.objects(Edge.self).distinct(by: \.__globalId).snapshot()
         for edge in edges {
             guard memoryGlobalIds.contains(edge.sourceGlobalId) && memoryGlobalIds.contains(edge.targetGlobalId) else { continue }
             adjacency[edge.sourceGlobalId, default: []].insert(edge.targetGlobalId)
@@ -71,8 +73,7 @@ extension MemoryTools {
                 let topic = mem?.topic ?? "general"
                 let content = mem?.content ?? ""
                 let preview = String(content.prefix(150))
-                let displayId = mem?.primaryKey.map(String.init) ?? "?"
-                output += "\n  [id:\(displayId)] [\(topic)] \(preview)"
+                output += "\n  [id:\(memGlobalId.uuidString)] [\(topic)] \(preview)"
             }
             output += "\n"
         }
@@ -91,7 +92,7 @@ extension MemoryTools {
     /// Simple action: takes memory IDs + label, updates their topics, creates hub, links via part_of.
     func handleOrganize(_ args: [String: Value]?) async throws -> CallTool.Result {
         let a = try args.decode(OrganizeArgs.self)
-        let ids = a.ids.values.map { Int64($0) }
+        let ids = a.ids.values
         let label = a.label
 
         guard !ids.isEmpty else {
@@ -102,15 +103,15 @@ extension MemoryTools {
         }
 
         // Verify memories exist and determine project
-        var memories: [Int64: Memory] = [:]
-        for id in ids {
-            guard let mem = lattice.objects(Memory.self).where({ $0.primaryKey == Int64(id) }).first else {
-                return CallTool.Result(content: [.text("Memory [id:\(id)] not found.")], isError: true)
+        var memories: [UUID: Memory] = [:]
+        for gid in ids {
+            guard let (mem, _) = findMemory(id: gid) else {
+                return CallTool.Result(content: [.text("Memory [id:\(gid.uuidString)] not found.")], isError: true)
             }
-            memories[Int64(id)] = mem
+            memories[gid] = mem
         }
 
-        let project = a.project ?? memories[Int64(ids[0])]?.project ?? "global"
+        let project = a.project ?? memories[ids[0]]?.project ?? "global"
 
         // Create hub memory
         let hubContent = a.summary ?? "Hub: \(label)"
@@ -127,26 +128,23 @@ extension MemoryTools {
         )
         localLattice.add(hub)
 
-        guard let hubId = hub.primaryKey else {
-            return CallTool.Result(content: [.text("Failed to create hub memory.")], isError: true)
-        }
-
-        // Link each memory to hub and update its topic
         guard let hubGlobalId = hub.__globalId else {
             return CallTool.Result(content: [.text("Failed to get hub globalId.")], isError: true)
         }
-        for id in ids {
-            if let mem = memories[Int64(id)], let memGid = mem.__globalId {
-                let edge = Edge(sourceGlobalId: memGid, targetGlobalId: hubGlobalId, relation: .partOf)
+
+        // Link each memory to hub and update its topic
+        for gid in ids {
+            if let mem = memories[gid] {
+                let edge = Edge(sourceGlobalId: gid, targetGlobalId: hubGlobalId, relation: .partOf)
                 localLattice.add(edge)
                 mem.topic = label
             }
         }
 
-        log("Organized \(ids.count) memories under '\(label)' → hub [id:\(hubId)]")
+        log("Organized \(ids.count) memories under '\(label)' → hub [id:\(hubGlobalId.uuidString)]")
 
         var output = "Organized \(ids.count) memories under '\(label)':\n"
-        output += "  Hub: [id:\(hubId)]\n"
+        output += "  Hub: [id:\(hubGlobalId.uuidString)]\n"
         output += "  Topic updated to '\(label)' on all \(ids.count) memories\n"
         output += "  part_of edges created from each memory → hub"
 

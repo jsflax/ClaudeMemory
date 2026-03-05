@@ -57,7 +57,7 @@ import Foundation
     let result = try await tools.handle(CallTool.Parameters(
         name: "update",
         arguments: [
-            "id": .int(id),
+            "id": .string(id),
             "is_private": .bool(true),
         ]
     ))
@@ -80,7 +80,7 @@ import Foundation
     let result = try await tools.handle(CallTool.Parameters(
         name: "update",
         arguments: [
-            "id": .int(id),
+            "id": .string(id),
             "is_private": .bool(false),
         ]
     ))

@@ -3,7 +3,7 @@ import Lattice
 import EngramKit
 
 struct MenuBarActivityFeed: View {
-    @LatticeQuery(sort: \Memory.createdAt, order: .reverse)
+    @LatticeQuery(fetchLimit: 20, sort: \Memory.createdAt, order: .reverse)
     private var memories: TableResults<Memory>
 
     @State private var projectColors: [String: Color] = [:]
@@ -51,7 +51,7 @@ struct MenuBarActivityFeed: View {
                 // Recent memories
                 ScrollView(.vertical, showsIndicators: true) {
                     LazyVStack(alignment: .leading, spacing: 2) {
-                        let recent = Array(memories.prefix(20))
+                        let recent = Array(memories)
                         ForEach(recent, id: \.primaryKey) { memory in
                             MenuBarMemoryRow(
                                 memory: memory,

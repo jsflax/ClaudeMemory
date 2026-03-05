@@ -1,111 +1,93 @@
+import Combine
 import EngramKit
+import EngramModels
 import Foundation
 import Lattice
 import Observation
 
-/// Manages cloud sync via Lattice IPC relay.
+/// Manages cloud sync observation in the Visualizer.
 ///
-/// Architecture:
-/// - `localLattice`: the app's primary Lattice (memory.db) with IPC target + sync filter
-/// - `syncedLattice`: Lattice on memory_synced.db with IPC target + WSS credentials
+/// The sync daemon (`memory-sync`) owns the WSS connection and IPC relay.
+/// The Visualizer opens both databases as plain read-only observers:
+/// - `localLattice`: memory.db — the app's primary Lattice
+/// - `syncedLattice`: memory-synced.db — opened plain for cross-process progress observation
 ///
-/// Write path: MCP → memory.db → localLattice (IPC, filtered) → syncedLattice → WSS → cloud
-/// Read path: cloud → WSS → syncedLattice → IPC → localLattice → MCP sees new data
+/// Sync progress is observed cross-process via Lattice's AuditLog-based fallback.
 @Observable
 @MainActor
 final class SyncManager {
-    /// The app's primary Lattice (memory.db), initialized with IPC target.
+    /// Fires once when sync connects (syncedLattice becomes non-nil).
+    let didConnect = PassthroughSubject<Void, Never>()
+    /// The app's primary Lattice (memory.db).
     var localLattice: Lattice?
     /// Path to the primary database file.
     var dbPath: String?
 
-    /// memory_synced.db with IPC target + WSS — cloud endpoint.
+    /// memory-synced.db opened as a plain Lattice (no WSS, no IPC) for observation.
     /// Exposed (internal) for GalaxyRegistry to create a synced galaxy.
     private(set) var syncedLattice: Lattice?
 
     var teamLattices: [String: Lattice] = [:]  // teamId → Lattice (Phase 2)
     var statusMessage: String?
 
-    /// Whether the IPC relay sync is active.
+    /// Whether sync is configured (daemon may or may not be running).
     var isSyncing: Bool { syncedLattice != nil }
 
-    /// Current sync progress (updated via callback from synchronizer thread).
-    var syncProgressPending: Int = 0
-    var syncProgressTotal: Int = 0
-    var syncProgressAcked: Int = 0
-    var syncProgressReceived: Int = 0
-    var syncUploadFraction: Double { syncProgressTotal > 0 ? Double(syncProgressAcked) / Double(syncProgressTotal) : 1.0 }
-    var isSyncUploading: Bool { syncProgressPending > 0 }
+    /// IPC sync progress (memory.db → synced.db via daemon's IPC relay).
+    var ipcProgress: Lattice.SyncProgress?
 
-    // MARK: - Pre-Sync Compaction
-
-    /// Compact history before first sync to reduce AuditLog entries.
-    /// e.g. 76k entries → ~1.7k after compaction.
-    func compactBeforeSync() {
-        localLattice?.compactHistory()
-        localLattice?.vacuum()
-        localLattice?.checkpoint()
-    }
+    /// WSS sync progress (synced.db → cloud via daemon's WebSocket).
+    /// Cross-process: derived from AuditLog observation.
+    var wssProgress: Lattice.SyncProgress?
 
     // MARK: - Sync Lifecycle
 
-    /// Set up IPC relay sync with cloud credentials.
-    /// Called when the user signs in and has an active subscription.
-    ///
-    /// localLattice is already initialized with an IPC target (channel only).
-    /// This method builds the sync filter, pushes it to localLattice, and
-    /// creates syncedLattice on the other end of the IPC channel.
+    /// Set up sync observation. The daemon owns the actual WSS + IPC connections.
+    /// The Visualizer just opens the synced DB for progress observation and
+    /// starts the daemon if it isn't already running.
     func connectSync(wssEndpoint: URL, authToken: String) {
         guard let dbPath, let localLattice else { return }
 
-        let syncedDbPath = (dbPath as NSString).deletingPathExtension + "-synced.sqlite"
-        #if TEST_SYNC_CHANNEL
-        let channel = ProcessInfo.processInfo.environment["TEST_SYNC_CHANNEL"] ?? "engram-sync"
-        #else
-        let channel = "engram-sync"
-        #endif
-
-        // Build and push sync filter to localLattice (which owns the IPC target)
-        let filter = buildSyncFilter(from: localLattice)
-        localLattice.updateSyncFilter(filter)
-
-        // Synced: memory_synced.db with IPC (no filter) + WSS
-        var syncedConfig = Lattice.Configuration(
-            fileURL: URL(fileURLWithPath: syncedDbPath),
-            authorizationToken: authToken,
-            wssEndpoint: wssEndpoint,
-            migration: engramMigrations
-        )
-        syncedConfig.ipcTargets = [.init(channel: channel)]
+        // Open synced DB as a plain Lattice (no WSS, no IPC) for observation.
+        // The synced DB lives in the daemon-owned sync/ directory.
+        let claudeDir = (dbPath as NSString).deletingLastPathComponent
+        let syncedDbPath = SyncService.syncedDbPath(claudeDir: claudeDir)
         syncedLattice = try? Lattice(
             Memory.self, Edge.self, SyncConfig.self,
-            configuration: syncedConfig
+            configuration: .init(
+                fileURL: URL(fileURLWithPath: syncedDbPath),
+                migration: engramMigrations
+            )
         )
 
         statusMessage = "Connected to sync server"
         wireSyncProgress()
+        CLIInstaller.startDaemon()
+        didConnect.send()
     }
 
-    /// Tear down IPC relay and WSS connection.
+    /// Tear down sync observation and stop daemon.
     func disconnectSync() {
+        CLIInstaller.stopDaemon()
         syncedLattice = nil
         statusMessage = nil
-        syncProgressPending = 0
-        syncProgressTotal = 0
-        syncProgressAcked = 0
-        syncProgressReceived = 0
+        ipcProgress = nil
+        wssProgress = nil
     }
 
     // MARK: - Sync Progress
 
     private func wireSyncProgress() {
+        // IPC progress: cross-process observation of memory.db's IPC relay
+        localLattice?.onSyncProgress { [weak self] progress in
+            Task { @MainActor [weak self] in
+                self?.ipcProgress = progress
+            }
+        }
+        // WSS progress: cross-process observation of synced.db's WSS upload
         syncedLattice?.onSyncProgress { [weak self] progress in
             Task { @MainActor [weak self] in
-                guard let self else { return }
-                self.syncProgressPending = progress.pendingUpload
-                self.syncProgressTotal = progress.totalUpload
-                self.syncProgressAcked = progress.acked
-                self.syncProgressReceived = progress.received
+                self?.wssProgress = progress
             }
         }
     }
@@ -139,7 +121,7 @@ final class SyncManager {
         }
 
         // Rebuild filter and push to localLattice — Lattice's reconcile_sync_filter handles catch-up
-        let filter = buildSyncFilter(from: localLattice)
+        let filter = SyncService.buildSyncFilter(from: localLattice)
         localLattice.updateSyncFilter(filter)
 
         statusMessage = newPolicy == .sync
@@ -160,38 +142,6 @@ final class SyncManager {
             result.insert(config.project)
         }
         return result
-    }
-
-    // MARK: - Sync Filter Construction
-
-    /// Build a SyncFilter from SyncConfig rows in the local database.
-    /// Includes non-private memories for projects with `.sync` policy,
-    /// all edges, and all SyncConfig rows.
-    private func buildSyncFilter(from lattice: Lattice) -> Lattice.SyncFilter {
-        var projects: [String] = []
-        for config in lattice.objects(SyncConfig.self).where({ $0.policy == .sync }) {
-            projects.append(config.project)
-        }
-        let syncedProjects = projects
-
-        var filter = Lattice.SyncFilter()
-
-        if !syncedProjects.isEmpty {
-            let memoryPredicate: @Sendable (Query<Memory>) -> Query<Bool> = { mem in
-                return !mem.isPrivate && mem.project.in(syncedProjects)
-            }
-            filter.include(Memory.self, where: memoryPredicate)
-
-            // Edges: only sync edges where both endpoints are synced memories
-            filter.include(Edge.self) { edge in
-                edge.sourceGlobalId.in(\Memory.__globalId, where: memoryPredicate)
-                    && edge.targetGlobalId.in(\Memory.__globalId, where: memoryPredicate)
-            }
-        }
-        // SyncConfig: replicate sync preferences across devices
-        filter.include(SyncConfig.self)
-
-        return filter
     }
 
     // MARK: - Reconciliation Subprocess

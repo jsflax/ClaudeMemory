@@ -16,8 +16,8 @@ public struct ConsolidateTool: Tool {
 
     @Generable
     public struct Arguments {
-        @Guide(description: "Memory IDs to consolidate.")
-        public var ids: [Int]
+        @Guide(description: "Memory UUIDs to consolidate.")
+        public var ids: [String]
 
         @Guide(description: "Summary content capturing the essential knowledge from the memories.")
         public var content: String

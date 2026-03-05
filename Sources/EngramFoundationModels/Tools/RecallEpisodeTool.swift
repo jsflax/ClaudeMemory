@@ -14,8 +14,8 @@ public struct RecallEpisodeTool: Tool {
 
     @Generable
     public struct Arguments {
-        @Guide(description: "The episode ID to recall.")
-        public var episodeId: Int
+        @Guide(description: "The episode UUID to recall.")
+        public var episodeId: String
 
         @Guide(description: "Maximum number of memories to return from the episode.")
         public var limit: Int?

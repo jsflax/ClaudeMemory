@@ -5,6 +5,51 @@ import EngramKit
 import os
 
 private let flushLog = Logger(subsystem: "io.engram.app", category: "GalaxyLoader")
+private let stallLog = OSLog(subsystem: "io.engram.app", category: "FrameStall")
+
+/// Accumulates observer callback time + counts between frames for stall diagnosis.
+@MainActor
+final class ObserverAccumulator {
+    static let shared = ObserverAccumulator()
+    var totalMs: Double = 0
+    var nodeUpdateCount: Int = 0
+    var nodeInsertCount: Int = 0
+    var nodeDeleteCount: Int = 0
+    var edgeInsertCount: Int = 0
+    var edgeUpdateCount: Int = 0
+    var edgeDeleteCount: Int = 0
+    var otherCount: Int = 0
+    var otherMs: Double = 0  // for non-galaxy-data-loader main-thread work
+
+    func record(_ kind: String, ms: Double) {
+        totalMs += ms
+        switch kind {
+        case "nodeUpdate": nodeUpdateCount += 1
+        case "nodeInsert": nodeInsertCount += 1
+        case "nodeDelete": nodeDeleteCount += 1
+        case "edgeInsert": edgeInsertCount += 1
+        case "edgeUpdate": edgeUpdateCount += 1
+        case "edgeDelete": edgeDeleteCount += 1
+        default: otherCount += 1; otherMs += ms
+        }
+    }
+
+    func drainAndLog() {
+        let total = totalMs
+        let nU = nodeUpdateCount, nI = nodeInsertCount, nD = nodeDeleteCount
+        let eI = edgeInsertCount, eU = edgeUpdateCount, eD = edgeDeleteCount
+        let oC = otherCount, oMs = otherMs
+        totalMs = 0; nodeUpdateCount = 0; nodeInsertCount = 0; nodeDeleteCount = 0
+        edgeInsertCount = 0; edgeUpdateCount = 0; edgeDeleteCount = 0
+        otherCount = 0; otherMs = 0
+        let ops = nU + nI + nD + eI + eU + eD + oC
+        if ops > 0 || total > 1 {
+            os_log(.fault, log: stallLog,
+                   "ACCUM: %.1fms total, %d ops (nUpd=%d nIns=%d nDel=%d eIns=%d eUpd=%d eDel=%d other=%d/%.1fms)",
+                   total, ops, nU, nI, nD, eI, eU, eD, oC, oMs)
+        }
+    }
+}
 
 /// Data loading, observation, and batched flush logic parameterized on a Galaxy.
 /// Extracted from GraphView+DataLoading — same batched loading + observer pattern.
@@ -112,16 +157,13 @@ struct GalaxyDataLoader {
             }
 
             // 5. Cluster computation off main actor
-            let (visibleProjects, pkToGlobalId) = await MainActor.run {
-                (Set(galaxy.renderStore.nodes.map(\.project)), galaxy.renderStore.pkToGlobalId)
+            let visibleProjects = await MainActor.run {
+                Set(galaxy.renderStore.nodes.map(\.project))
             }
             var clusters: [[UUID]] = []
             for project in visibleProjects {
-                let pkClusters = findMemoryClusters(in: bgLattice, project: project, minClusterSize: 2, neighborLimit: 20).clusters
-                for pkCluster in pkClusters {
-                    let uuidCluster = pkCluster.compactMap { pkToGlobalId[$0] }
-                    if uuidCluster.count >= 2 { clusters.append(uuidCluster) }
-                }
+                let projectClusters = findMemoryClusters(in: bgLattice, project: project, minClusterSize: 2, neighborLimit: 20).clusters
+                clusters.append(contentsOf: projectClusters)
             }
             let result = clusters
             await MainActor.run {
@@ -189,6 +231,11 @@ struct GalaxyDataLoader {
 
     // MARK: - Observers
 
+    @globalActor struct GalaxyLatticeActor {
+        actor ActorType {}
+        static let shared = ActorType()
+    }
+    
     static func setupObservers(
         for galaxy: Galaxy,
         hiddenProjects: Set<String>,
@@ -198,62 +245,12 @@ struct GalaxyDataLoader {
         soundEnabled: Bool,
         notificationsEnabled: Bool
     ) {
-        let obsRef = galaxy.lattice.sendableReference
-        let bgLattice = obsRef.resolve()
-
-        galaxy.edgeObserver = galaxy.lattice.objects(MemoryEdge.self).observe { change in
-            guard let bg = bgLattice else { return }
-            switch change {
-            case .insert(let pk):
-                guard let edge = bg.object(MemoryEdge.self, primaryKey: pk) else { return }
-                let data = EdgeData(id: pk, sourceId: edge.sourceGlobalId,
-                                    targetId: edge.targetGlobalId, relation: edge.relation.rawValue)
-                Task { @MainActor in handleEdgeInsert(data, galaxy: galaxy, is3D: is3D, hiddenRelations: hiddenRelations) }
-            case .update(let pk):
-                guard let edge = bg.object(MemoryEdge.self, primaryKey: pk) else { return }
-                let data = EdgeData(id: pk, sourceId: edge.sourceGlobalId,
-                                    targetId: edge.targetGlobalId, relation: edge.relation.rawValue)
-                Task { @MainActor in handleEdgeUpdate(data, galaxy: galaxy) }
-            case .delete(let pk):
-                Task { @MainActor in handleEdgeDelete(pk, galaxy: galaxy) }
-            }
-        }
-
-        galaxy.nodeObserver = galaxy.lattice.objects(Memory.self).observe { change in
-            guard let bg = bgLattice else { return }
-            switch change {
-            case .insert(let pk):
-                guard let memory = bg.object(Memory.self, primaryKey: pk),
-                      let gid = memory.__globalId else { return }
-                // Apply per-galaxy filter
-                if let filter = galaxy.nodeFilter, !filter(memory) { return }
-                let node = NodeData(
-                    id: gid, project: memory.project, topic: memory.topic,
-                    label: extractLabel(content: memory.content, topic: memory.topic),
-                    content: memory.content,
-                    createdAt: memory.createdAt, lastAccessedAt: memory.lastAccessedAt,
-                    importance: memory.importance)
-                Task { @MainActor in handleNodeInsert(pk: pk, node: node, galaxy: galaxy,
-                                                       is3D: is3D, hiddenProjects: hiddenProjects,
-                                                       hiddenRelations: hiddenRelations, timeFilter: timeFilter,
-                                                       soundEnabled: soundEnabled, notificationsEnabled: notificationsEnabled) }
-            case .update(let pk):
-                guard let memory = bg.object(Memory.self, primaryKey: pk),
-                      let gid = memory.__globalId else { return }
-                // Apply per-galaxy filter — prevents synced-project nodes from leaking
-                // into the personal galaxy via updates (matching the .insert filter)
-                if let filter = galaxy.nodeFilter, !filter(memory) { return }
-                let node = NodeData(
-                    id: gid, project: memory.project, topic: memory.topic,
-                    label: extractLabel(content: memory.content, topic: memory.topic),
-                    content: memory.content,
-                    createdAt: memory.createdAt, lastAccessedAt: memory.lastAccessedAt,
-                    importance: memory.importance)
-                Task { @MainActor in handleNodeUpdate(node: node, galaxy: galaxy) }
-            case .delete(let pk):
-                Task { @MainActor in handleNodeDelete(pk, galaxy: galaxy, soundEnabled: soundEnabled, notificationsEnabled: notificationsEnabled) }
-            }
-        }
+        galaxy.setUpObserve(hiddenProjects: hiddenProjects,
+                            hiddenRelations: hiddenRelations,
+                            timeFilter: timeFilter,
+                            is3D: is3D,
+                            soundEnabled: soundEnabled,
+                            notificationsEnabled: notificationsEnabled)
     }
 
     // MARK: - Node Change Handlers
@@ -283,6 +280,8 @@ struct GalaxyDataLoader {
     #endif
 
     static func handleNodeUpdate(node: NodeData, galaxy: Galaxy) {
+        let t0 = CFAbsoluteTimeGetCurrent()
+        defer { ObserverAccumulator.shared.record("nodeUpdate", ms: (CFAbsoluteTimeGetCurrent() - t0) * 1000.0) }
         let store = galaxy.renderStore
         let gid = node.id
         let old = store.allNodes[gid]
@@ -355,6 +354,8 @@ struct GalaxyDataLoader {
 
     static func handleNodeDelete(_ pk: Int64, galaxy: Galaxy,
                                   soundEnabled: Bool, notificationsEnabled: Bool) {
+        let t0 = CFAbsoluteTimeGetCurrent()
+        defer { ObserverAccumulator.shared.record("nodeDelete", ms: (CFAbsoluteTimeGetCurrent() - t0) * 1000.0) }
         let store = galaxy.renderStore
         guard let gid = store.pkToGlobalId[pk] else { return }
 
@@ -403,6 +404,8 @@ struct GalaxyDataLoader {
     }
 
     static func handleEdgeUpdate(_ data: EdgeData, galaxy: Galaxy) {
+        let t0 = CFAbsoluteTimeGetCurrent()
+        defer { ObserverAccumulator.shared.record("edgeUpdate", ms: (CFAbsoluteTimeGetCurrent() - t0) * 1000.0) }
         let store = galaxy.renderStore
         store.allEdges[data.id] = data
         if let idx = store.edges.firstIndex(where: { $0.id == data.id }) {
@@ -411,6 +414,8 @@ struct GalaxyDataLoader {
     }
 
     static func handleEdgeDelete(_ pk: Int64, galaxy: Galaxy) {
+        let t0 = CFAbsoluteTimeGetCurrent()
+        defer { ObserverAccumulator.shared.record("edgeDelete", ms: (CFAbsoluteTimeGetCurrent() - t0) * 1000.0) }
         let store = galaxy.renderStore
         if let old = store.allEdges[pk] {
             // Note: ForceSimulation3D doesn't support surgical removeEdge — see removeNode note.
@@ -441,10 +446,15 @@ struct GalaxyDataLoader {
                                          timeFilter: Date?,
                                          soundEnabled: Bool,
                                          notificationsEnabled: Bool) {
+        let t0 = CFAbsoluteTimeGetCurrent()
         let store = galaxy.renderStore
         let entries = store.pendingNodeInserts
         store.pendingNodeInserts.removeAll(keepingCapacity: true)
         guard !entries.isEmpty else { return }
+        defer {
+            let ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0
+            if ms > 5 { os_log(.fault, log: stallLog, "HOTPATH: flushNodeInserts count=%d %.1fms", entries.count, ms) }
+        }
 
         #if ENGRAM_INSTRUMENTATION
         let flushStart = CFAbsoluteTimeGetCurrent()
@@ -524,10 +534,15 @@ struct GalaxyDataLoader {
     }
 
     static func flushPendingEdgeInserts(galaxy: Galaxy, is3D: Bool, hiddenRelations: Set<String>) {
+        let t0 = CFAbsoluteTimeGetCurrent()
         let store = galaxy.renderStore
         let entries = store.pendingEdgeInserts
         store.pendingEdgeInserts.removeAll(keepingCapacity: true)
         guard !entries.isEmpty else { return }
+        defer {
+            let ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0
+            if ms > 5 { os_log(.fault, log: stallLog, "HOTPATH: flushEdgeInserts count=%d %.1fms", entries.count, ms) }
+        }
 
         #if ENGRAM_INSTRUMENTATION
         let edgeFlushStart = CFAbsoluteTimeGetCurrent()
@@ -579,6 +594,11 @@ struct GalaxyDataLoader {
     // MARK: - Derived Data
 
     static func recomputeDerivedData(for galaxy: Galaxy) {
+        let t0 = CFAbsoluteTimeGetCurrent()
+        defer {
+            let ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0
+            if ms > 5 { os_log(.fault, log: stallLog, "HOTPATH: recomputeDerivedData nodes=%d edges=%d %.1fms", galaxy.renderStore.nodes.count, galaxy.renderStore.allEdges.count, ms) }
+        }
         let store = galaxy.renderStore
 
         // Color map

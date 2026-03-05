@@ -37,12 +37,21 @@ struct Advise: AsyncParsableCommand {
 
         var sections: [String] = []
 
-        // Recall relevant memories
-        if let tools = await initMemoryTools() {
-            hookLog("Advise: initialized memory tools, running directRecall")
+        // Gate: classify whether this prompt is worth recalling memories for.
+        let gate = try? RecallGateClassifier()
+        let shouldRecall = gate?.shouldRecall(query: prompt) ?? true
+        hookLog("Advise: recall gate = \(shouldRecall ? "recall" : "skip")")
+
+        // Recall relevant memories (only if gate says the prompt is topical)
+        if shouldRecall, let tools = await initMemoryTools() {
+            // Extract content words to focus the embedding on key concepts.
+            // Raw prose averages all concepts into a poor vector neighborhood.
+            let contentWords = MemoryTools.extractContentWords(from: prompt)
+            let recallQuery = contentWords.isEmpty ? prompt : contentWords.joined(separator: " ")
+            hookLog("Advise: running directRecall (query: \(String(recallQuery.prefix(80)))...)")
             do {
                 if let result = try await tools.directRecall(
-                    query: prompt,
+                    query: recallQuery,
                     project: project,
                     depth: 1,
                     limit: 5
@@ -55,6 +64,8 @@ struct Advise: AsyncParsableCommand {
             } catch {
                 hookLog("Advise: recall failed: \(error)")
             }
+        } else if !shouldRecall {
+            hookLog("Advise: skipped recall (conversational filler)")
         } else {
             hookLog("Advise: failed to initialize memory tools")
         }
@@ -136,6 +147,8 @@ struct Advise: AsyncParsableCommand {
         Follow your system prompt workflow: assess, find redundancy, find communities, take action, connect the graph, verify.
         """
 
+        let hooksBin = NSHomeDirectory() + "/.claude/bin/memory-hooks"
+
         do {
             try spawnClaudeSubprocess(
                 prompt: prompt,
@@ -144,7 +157,8 @@ struct Advise: AsyncParsableCommand {
                 model: "sonnet",
                 envGuard: (key: "CLAUDE_MEMORY_MAINTENANCE", value: "1"),
                 logPath: Self.maintenanceLogPath,
-                cwd: cwd
+                cwd: cwd,
+                postCommand: "'\(hooksBin)' clear-maintenance"
             )
             hookLog("Advise: spawned memory-maintenance subprocess (ops delta: \(delta))")
         } catch {

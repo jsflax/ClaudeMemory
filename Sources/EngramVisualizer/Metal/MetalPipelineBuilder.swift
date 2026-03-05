@@ -160,9 +160,9 @@ struct MetalPipelineBuilder {
     // MARK: - Mascot Pipeline (opaque, PBR textured, depth-write ON)
 
     static func buildMascotPipeline(device: MTLDevice, library: MTLLibrary) throws -> MTLRenderPipelineState {
-        guard let vertexFn = library.makeFunction(name: "mascot_vertex"),
-              let fragmentFn = library.makeFunction(name: "mascot_fragment") else {
-            throw MetalPipelineError.functionNotFound("mascot_vertex or mascot_fragment")
+        guard let vertexFn = library.makeFunction(name: "mascot_vertex_instanced"),
+              let fragmentFn = library.makeFunction(name: "mascot_fragment_instanced") else {
+            throw MetalPipelineError.functionNotFound("mascot_vertex_instanced or mascot_fragment_instanced")
         }
 
         let desc = MTLRenderPipelineDescriptor()

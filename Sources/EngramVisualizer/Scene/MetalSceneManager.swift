@@ -144,6 +144,13 @@ final class MetalSceneManager {
     private var renderHubs: Set<UUID> = []
     private var renderColorMap: [String: Color] = [:]
 
+    // Mascot inspection change tracking — avoids re-packing all nodes when
+    // the set of inspected nodes hasn't changed between frames.
+    private var lastInspectingNodeIds: Set<UUID> = []
+    // Cached mascot per-galaxy data — only rebuilt when project topology changes
+    private var cachedMascotColorMap: [String: NSColor] = [:]
+    private var lastMascotColorMapVersion: UInt64 = 0
+
     init?(renderer: MetalGraphRenderer) {
         self.renderer = renderer
         self.camera = CameraController()
@@ -181,6 +188,9 @@ final class MetalSceneManager {
 
         if selectedNode != preInputSelection {
             selectionCallback?(selectedNode)
+            #if ENGRAM_INSTRUMENTATION
+            jitterCallbackFired = true
+            #endif
         }
 
         // Tick ALL galaxy simulations + compute merged positions
@@ -197,16 +207,21 @@ final class MetalSceneManager {
             }
             registry.mergeRenderData()
 
-            // Prune expired glow/arrival entries so visualOnlyChanged goes false
+            // Prune expired glow/arrival entries so visualOnlyChanged goes false.
+            // Only allocate new dictionaries when there are entries to filter.
             let now = Date()
             let recallTotalDuration: TimeInterval = 1.0 + 1.5 + 2.0  // fadeIn + hold + fadeOut
             let arrivalTotalDuration: TimeInterval = 0.8 + 2.0 + 3.0
             for galaxy in registry.galaxies.values {
-                galaxy.renderStore.glowingNodes = galaxy.renderStore.glowingNodes.filter {
-                    now.timeIntervalSince($0.value) < recallTotalDuration
+                if !galaxy.renderStore.glowingNodes.isEmpty {
+                    galaxy.renderStore.glowingNodes = galaxy.renderStore.glowingNodes.filter {
+                        now.timeIntervalSince($0.value) < recallTotalDuration
+                    }
                 }
-                galaxy.renderStore.newNodeGlows = galaxy.renderStore.newNodeGlows.filter {
-                    now.timeIntervalSince($0.value) < arrivalTotalDuration
+                if !galaxy.renderStore.newNodeGlows.isEmpty {
+                    galaxy.renderStore.newNodeGlows = galaxy.renderStore.newNodeGlows.filter {
+                        now.timeIntervalSince($0.value) < arrivalTotalDuration
+                    }
                 }
             }
 
@@ -313,9 +328,23 @@ final class MetalSceneManager {
         let cameraMoving = camera.isMoving
         let hasInput = !heldKeys.isEmpty
         let geometryChanged = positionsChanged || selectionChanged || searchChanged || hasExpansions
-        let fleetInspecting = galaxyRegistry?.galaxies.values.contains { $0.mascotFleet?.anyInspecting ?? false } ?? false
-        let mascotInspecting = fleetInspecting
-        let visualOnlyChanged = !glowingNodes.isEmpty || !newNodes.isEmpty || !dyingNodes.isEmpty || mascotInspecting
+        // Track which nodes are being inspected — only flag scene dirty when the set changes,
+        // not when mascots are just holding steady on the same node.
+        var currentInspectingIds = Set<UUID>()
+        if let registry = galaxyRegistry {
+            for galaxy in registry.galaxies.values {
+                if let fleet = galaxy.mascotFleet {
+                    for mascot in fleet.mascots.values where mascot.arcaneIntensity > 0.01 {
+                        if let targetId = mascot.currentTargetId {
+                            currentInspectingIds.insert(targetId)
+                        }
+                    }
+                }
+            }
+        }
+        let inspectionChanged = currentInspectingIds != lastInspectingNodeIds
+        lastInspectingNodeIds = currentInspectingIds
+        let visualOnlyChanged = !glowingNodes.isEmpty || !newNodes.isEmpty || !dyingNodes.isEmpty || inspectionChanged
         let sceneNeedsUpdate = geometryChanged || visualOnlyChanged
 
         // Always advance animation time (shaders need it for scan lines, flicker, etc.)
@@ -331,39 +360,43 @@ final class MetalSceneManager {
         }
         renderer.maintenancePulse = maintenancePulse
 
-        // Always update mascots — they patrol independently of scene changes
+        // Mascot update — they patrol independently of scene changes.
+        // Color map conversion is cached and only rebuilt when topology changes.
         let mascotStart = CFAbsoluteTimeGetCurrent()
         renderer.galaxyRegistryRef = showMascots ? galaxyRegistry : nil
         if showMascots, let registry = galaxyRegistry {
             let nodeByIdForMascot = registry.mergedNodeById
 
-            // Ensure each galaxy has a fleet
+            // Cache NSColor conversion — only rebuild when color map changes
+            let cmVersion = registry.mergedColorMapVersion
+            if cmVersion != lastMascotColorMapVersion {
+                cachedMascotColorMap = renderColorMap.compactMapValues { NSColor($0) }
+                lastMascotColorMapVersion = cmVersion
+            }
+
             for galaxy in registry.galaxies.values {
                 if galaxy.mascotFleet == nil {
                     galaxy.mascotFleet = MascotFleet(
                         galaxyId: galaxy.id,
                         device: renderer.device,
-                        sharedResources: mascotSharedResources
+                        sharedResources: mascotSharedResources,
+                        library: renderer.library
                     )
                 }
 
-                // Compute per-project node positions for this galaxy
+                // Only rebuild nodesByProject when positions have changed
                 var nodesByProject: [String: [UUID: SIMD3<Float>]] = [:]
-                for node in galaxy.renderStore.nodes {
-                    if let pos = positions[node.id] {
-                        nodesByProject[node.project, default: [:]][node.id] = pos
+                if didUpdatePositions {
+                    for node in galaxy.renderStore.nodes {
+                        if let pos = positions[node.id] {
+                            nodesByProject[node.project, default: [:]][node.id] = pos
+                        }
                     }
+                    let activeProjects = Set(nodesByProject.keys)
+                    galaxy.mascotFleet?.syncProjects(active: activeProjects, colorMap: cachedMascotColorMap)
                 }
 
-                // Active projects in this galaxy
-                let activeProjects = Set(nodesByProject.keys)
-                let colorMap = renderColorMap.compactMapValues { color -> NSColor? in
-                    NSColor(color)
-                }
-
-                galaxy.mascotFleet?.syncProjects(active: activeProjects, colorMap: colorMap)
-
-                // Build node info for all current targets
+                // Build node info only for mascots that have targets
                 var nodeInfo: [UUID: MascotNodeInfo] = [:]
                 for mascot in galaxy.mascotFleet?.mascots.values ?? [:].values {
                     if let targetId = mascot.currentTargetId, let nd = nodeByIdForMascot[targetId] {
@@ -392,6 +425,15 @@ final class MetalSceneManager {
 
         if !isActive {
             if renderFrameCount > 10 && renderFrameCount % 30 != 0 {
+                #if ENGRAM_INSTRUMENTATION
+                writeJitterLine(
+                    wallDt: wallDt, totalMs: (CFAbsoluteTimeGetCurrent() - frameStart) * 1000.0,
+                    simMs: simMs, mascotMs: mascotMs, nodesMs: 0, edgesMs: 0, labelsMs: 0,
+                    skipped: true, reason: "idle_skip",
+                    positionsChanged: positionsChanged, geometryChanged: geometryChanged,
+                    cameraMoving: cameraMoving, anyMascotActive: anyMascotActive
+                )
+                #endif
                 return
             }
         }
@@ -468,7 +510,7 @@ final class MetalSceneManager {
         else if selectionChanged { reason = "select" }
         else if searchChanged { reason = "search" }
         else if visualOnlyChanged {
-            if mascotInspecting { reason = "glow_mascot" }
+            if inspectionChanged { reason = "glow_mascot" }
             else if !dyingNodes.isEmpty { reason = "glow_dying" }
             else if !glowingNodes.isEmpty { reason = "glow_recall" }
             else { reason = "glow_arrival" }
@@ -487,12 +529,50 @@ final class MetalSceneManager {
             fputs(line, f)
             fflush(f)
         }
+
+        writeJitterLine(
+            wallDt: wallDt, totalMs: totalMs,
+            simMs: simMs, mascotMs: mascotMs, nodesMs: nodesMs, edgesMs: edgesMs, labelsMs: labelsMs,
+            skipped: false, reason: reason,
+            positionsChanged: positionsChanged, geometryChanged: geometryChanged,
+            cameraMoving: cameraMoving, anyMascotActive: anyMascotActive
+        )
         #endif
     }
 
     #if ENGRAM_INSTRUMENTATION
     private var metalTimingFile: UnsafeMutablePointer<FILE>? = nil
     static var centerLogFile: UnsafeMutablePointer<FILE>? = nil
+    private var labelDiagFile: UnsafeMutablePointer<FILE>? = nil
+    private var jitterFile: UnsafeMutablePointer<FILE>? = nil
+    private var jitterCallbackFired: Bool = false
+    private var jitterReticleCallbackFired: Bool = false
+    private var jitterTeleportCallbackFired: Bool = false
+
+    private func writeJitterLine(
+        wallDt: Double, totalMs: Double,
+        simMs: Double, mascotMs: Double, nodesMs: Double, edgesMs: Double, labelsMs: Double,
+        skipped: Bool, reason: String,
+        positionsChanged: Bool, geometryChanged: Bool,
+        cameraMoving: Bool, anyMascotActive: Bool
+    ) {
+        if jitterFile == nil {
+            jitterFile = fopen("/tmp/swiftui-jitter.csv", "w")
+            if let f = jitterFile {
+                fputs("frame,wall_dt_ms,total_ms,sim_ms,mascot_ms,nodes_ms,edges_ms,labels_ms,skipped,reason,selection_cb,reticle_cb,teleport_cb,positions_changed,geometry_changed,camera_moving,mascot_active,body_eval_count\n", f)
+            }
+        }
+        if let f = jitterFile {
+            let bodyCount = Graph3DView.bodyEvalCount
+            let line = "\(renderFrameCount),\(String(format: "%.2f", wallDt)),\(String(format: "%.2f", totalMs)),\(String(format: "%.2f", simMs)),\(String(format: "%.2f", mascotMs)),\(String(format: "%.2f", nodesMs)),\(String(format: "%.2f", edgesMs)),\(String(format: "%.2f", labelsMs)),\(skipped ? 1 : 0),\(reason),\(jitterCallbackFired ? 1 : 0),\(jitterReticleCallbackFired ? 1 : 0),\(jitterTeleportCallbackFired ? 1 : 0),\(positionsChanged ? 1 : 0),\(geometryChanged ? 1 : 0),\(cameraMoving ? 1 : 0),\(anyMascotActive ? 1 : 0),\(bodyCount)\n"
+            fputs(line, f)
+            fflush(f)
+        }
+        // Reset per-frame callback flags
+        jitterCallbackFired = false
+        jitterReticleCallbackFired = false
+        jitterTeleportCallbackFired = false
+    }
     #endif
 
     // MARK: - Node Instance Packing
@@ -840,6 +920,17 @@ final class MetalSceneManager {
     // MARK: - Label Instance Packing
 
     private func packLabelInstances() {
+        #if ENGRAM_INSTRUMENTATION
+        if labelDiagFile == nil {
+            labelDiagFile = fopen("/tmp/label-diag.csv", "w")
+            if let f = labelDiagFile {
+                fputs("frame,positions,atlasRects,missingRects,instances,atlasRegen,depthRange,minDepth,maxDepth,camX,camY,camZ,projLabels,topicLabels,galaxyLabels,pendingRegen,isGenerating\n", f)
+            }
+        }
+        var diagAtlasRegen = false
+        var diagMissingRects = 0
+        #endif
+
         let nodeCount = positions.count
         guard nodeCount > 0 else {
             renderer.actualLabelCount = 0
@@ -866,6 +957,9 @@ final class MetalSceneManager {
                 generateLabelAtlas(nodes: nodes, hubs: hubs, projects: currentProjects,
                                     galaxyNames: currentGalaxyNames)
                 labelAtlasRegenFrame = renderFrameCount
+                #if ENGRAM_INSTRUMENTATION
+                diagAtlasRegen = true
+                #endif
             } else {
                 // Defer dispatch to next frame — just record that regen is needed
                 pendingAtlasRegen = true
@@ -882,6 +976,9 @@ final class MetalSceneManager {
                                     galaxyNames: currentGalaxyNames)
                 labelAtlasRegenFrame = renderFrameCount
                 pendingAtlasRegen = false
+                #if ENGRAM_INSTRUMENTATION
+                diagAtlasRegen = true
+                #endif
             }
             // If throttle not met, keep pendingAtlasRegen = true for the next frame
         }
@@ -932,7 +1029,10 @@ final class MetalSceneManager {
             minDepth = min(minDepth, d)
             maxDepth = max(maxDepth, d)
         }
-        let depthRange = max(1.0, maxDepth - minDepth)
+        // Floor at 50 world units to prevent extreme depth normalization when
+        // camera is equidistant from multiple galaxies — label anchors above nodes
+        // would otherwise fall outside a tiny depth range, producing negative depthFade.
+        let depthRange = max(50.0, maxDepth - minDepth)
 
         let projectLabelCount = projectCentroids.count
         let maxNodeLabels = max(0, 2048 - projectLabelCount - topicGroups.count)
@@ -944,6 +1044,11 @@ final class MetalSceneManager {
             guard instances.count < maxNodeLabels,
                   let nodeData = nodeById[id],
                   let rect = labelAtlasRects[id] else {
+                #if ENGRAM_INSTRUMENTATION
+                if nodeById[id] != nil && labelAtlasRects[id] == nil {
+                    diagMissingRects += 1
+                }
+                #endif
                 continue
             }
 
@@ -1085,6 +1190,27 @@ final class MetalSceneManager {
         }
 
         renderer.actualLabelCount = actualLabelCount
+
+        #if ENGRAM_INSTRUMENTATION
+        if let f = labelDiagFile {
+            let line = String(format: "%llu,%d,%d,%d,%d,%d,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d\n",
+                renderFrameCount,
+                allPositions.count,
+                labelAtlasRects.count,
+                diagMissingRects,
+                actualLabelCount,
+                diagAtlasRegen ? 1 : 0,
+                depthRange, minDepth, maxDepth,
+                camPos.x, camPos.y, camPos.z,
+                projectCentroids.count,
+                topicGroups.count,
+                (galaxyRegistry?.galaxies.count ?? 0) > 1 ? galaxyRegistry!.galaxies.count : 0,
+                pendingAtlasRegen ? 1 : 0,
+                isAtlasGenerating ? 1 : 0)
+            fputs(line, f)
+            if renderFrameCount % 10 == 0 { fflush(f) }
+        }
+        #endif
     }
 
     // MARK: - Label Atlas Generation (MTLTexture)
@@ -1611,6 +1737,9 @@ final class MetalSceneManager {
             if newTarget != reticleTarget {
                 reticleTarget = newTarget
                 reticleCallback?(newTarget)
+                #if ENGRAM_INSTRUMENTATION
+                jitterReticleCallbackFired = true
+                #endif
             }
         }
     }

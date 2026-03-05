@@ -45,6 +45,7 @@ let package = Package(
             resources: [
                 .copy("Resources/paraphrase-MiniLM-L6-v2_Embedding.mlmodelc"),
                 .copy("Resources/paraphrase-MiniLM-L6-v2_tokenizer"),
+                .copy("Resources/RecallGateClassifier.mlmodelc"),
                 .copy("Resources/session-learner.md"),
                 .copy("Resources/memory-maintenance.md"),
                 .copy("Resources/sync-reconciliation.md"),
@@ -78,11 +79,17 @@ let package = Package(
                 .product(name: "GoogleSignIn", package: "GoogleSignIn-iOS"),
                 .product(name: "GoogleSignInSwift", package: "GoogleSignIn-iOS"),
             ],
+            exclude: [
+                "Info.plist",
+            ],
             resources: [
                 .copy("Resources/under_construction.png"),
                 .copy("Resources/mascot_mesh.bin"),
                 .copy("Resources/mascot_basecolor.jpg"),
                 .copy("Resources/mascot_metalrough.png"),
+                .process("Shaders/MascotShaders.metal"),
+                .process("Shaders/RenderShaders.metal"),
+                .process("Shaders/Shaders.metal"),
             ],
             swiftSettings: [
                 .interoperabilityMode(.Cxx),
@@ -100,6 +107,17 @@ let package = Package(
                 "EngramKit",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
                 .product(name: "Lattice", package: "Lattice"),
+            ],
+            swiftSettings: [
+                .interoperabilityMode(.Cxx),
+            ]
+        ),
+        .executableTarget(
+            name: "EngramDaemon",
+            dependencies: [
+                "EngramKit",
+                .product(name: "Lattice", package: "Lattice"),
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ],
             swiftSettings: [
                 .interoperabilityMode(.Cxx),

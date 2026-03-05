@@ -25,6 +25,7 @@ jobs:
           mkdir -p staging/agents
           cp .build/release/Engram staging/memory
           cp .build/release/EngramHooks staging/memory-hooks
+          cp .build/release/EngramDaemon staging/memory-sync
           cp -R .build/release/Engram_EngramKit.bundle staging/
           cp -R .build/release/swift-transformers_Hub.bundle staging/
           cp -R .build/release/SwiftLM_SwiftLM.bundle staging/
@@ -105,6 +106,7 @@ jobs:
 
           cp .build/release/Engram "$CLI_DIR/memory"
           cp .build/release/EngramHooks "$CLI_DIR/memory-hooks"
+          cp .build/release/EngramDaemon "$CLI_DIR/memory-sync"
           cp -R .build/release/Engram_EngramKit.bundle "$CLI_DIR/"
           cp -R .build/release/swift-transformers_Hub.bundle "$CLI_DIR/"
           cp -R .build/release/SwiftLM_SwiftLM.bundle "$CLI_DIR/"
@@ -118,7 +120,7 @@ jobs:
           }
 
           # Sign CLI binaries
-          for bin in "$CLI_DIR/memory" "$CLI_DIR/memory-hooks"; do
+          for bin in "$CLI_DIR/memory" "$CLI_DIR/memory-hooks" "$CLI_DIR/memory-sync"; do
             sign "$bin"
           done
 

@@ -15,8 +15,8 @@ public struct OrganizeTool: Tool {
 
     @Generable
     public struct Arguments {
-        @Guide(description: "Memory IDs to organize under the label.")
-        public var ids: [Int]
+        @Guide(description: "Memory UUIDs to organize under the label.")
+        public var ids: [String]
 
         @Guide(description: "The topic label to apply (e.g. 'editor-rendering', 'AI-pipeline').")
         public var label: String

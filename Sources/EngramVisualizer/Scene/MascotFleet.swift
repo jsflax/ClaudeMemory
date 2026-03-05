@@ -27,13 +27,117 @@ final class MascotFleet: MascotNotifier {
     private let sharedResources: MascotSharedResources
     private let maxMascots = 10
 
+    /// Instance buffer for batched instanced drawing.
+    private var instanceBuffer: MTLBuffer?
+    private var instanceBufferCapacity: Int = 0
+
+    // MARK: - GPU Thruster Particle System
+
+    private static let maxParticles: Int = 2048
+    private static let maxSpawnsPerFrame: Int = 256  // 10 mascots × ~20 spawns/frame
+
+    private var particleBuffer: MTLBuffer?         // persistent ThrusterParticleGPU[maxParticles]
+    private var spawnRequestBuffer: MTLBuffer?      // ThrusterSpawnRequest[maxSpawnsPerFrame]
+    private var particleOutputBuffer: MTLBuffer?    // FlowParticleVertex[maxParticles] (packed output)
+    private var particleCountBuffer: MTLBuffer?     // atomic_uint (draw count)
+    private var particleIndexBuffer: MTLBuffer?     // pre-filled quad indices
+    private var particleParamsBuffer: MTLBuffer?    // ThrusterComputeParams
+    private var spawnRingOffset: UInt32 = 0         // ring buffer write cursor
+    private(set) var gpuParticleCount: Int = 0      // read back from atomic counter (1-frame latency)
+
+    // Compute pipelines
+    private var advectPipeline: MTLComputePipelineState?
+    private var spawnPipeline: MTLComputePipelineState?
+    private var packPipeline: MTLComputePipelineState?
+
+    // MARK: - GPU Matrix Compute
+    private var animStateBuffer: MTLBuffer?
+    private var animStateCapacity: Int = 0
+    private var matrixComputePipeline: MTLComputePipelineState?
+
     /// Which project's mascot is currently in chat mode (only one at a time).
     private(set) var chattingMascotProject: String?
 
-    init(galaxyId: String, device: MTLDevice, sharedResources: MascotSharedResources) {
+    /// Ordered array of mascots matching instance buffer layout (set each frame).
+    private var orderedMascots: [MascotSystem] = []
+
+    init(galaxyId: String, device: MTLDevice, sharedResources: MascotSharedResources, library: MTLLibrary? = nil) {
         self.galaxyId = galaxyId
         self.device = device
         self.sharedResources = sharedResources
+
+        setupGPUParticles(library: library)
+    }
+
+    private func setupGPUParticles(library: MTLLibrary?) {
+        let maxP = Self.maxParticles
+        let maxS = Self.maxSpawnsPerFrame
+
+        // Persistent particle state buffer (zeroed = all dead)
+        particleBuffer = device.makeBuffer(
+            length: maxP * MemoryLayout<ThrusterParticleGPU>.stride,
+            options: .storageModeShared
+        )
+        // Zero it to mark all particles as dead
+        if let buf = particleBuffer {
+            memset(buf.contents(), 0, buf.length)
+        }
+
+        spawnRequestBuffer = device.makeBuffer(
+            length: maxS * MemoryLayout<ThrusterSpawnRequest>.stride,
+            options: .storageModeShared
+        )
+
+        particleOutputBuffer = device.makeBuffer(
+            length: maxP * MemoryLayout<FlowParticleVertex>.stride,
+            options: .storageModeShared
+        )
+
+        // Atomic counter buffer (single uint32)
+        particleCountBuffer = device.makeBuffer(
+            length: MemoryLayout<UInt32>.stride,
+            options: .storageModeShared
+        )
+
+        particleParamsBuffer = device.makeBuffer(
+            length: MemoryLayout<ThrusterComputeParams>.stride,
+            options: .storageModeShared
+        )
+
+        // Pre-fill quad index buffer for maxParticles quads
+        let idxCount = maxP * 6
+        particleIndexBuffer = device.makeBuffer(
+            length: idxCount * MemoryLayout<UInt32>.stride,
+            options: .storageModeShared
+        )
+        if let buf = particleIndexBuffer {
+            let indices = buf.contents().bindMemory(to: UInt32.self, capacity: idxCount)
+            for i in 0..<maxP {
+                let vBase = UInt32(i * 4)
+                let iBase = i * 6
+                indices[iBase]     = vBase
+                indices[iBase + 1] = vBase + 2
+                indices[iBase + 2] = vBase + 1
+                indices[iBase + 3] = vBase + 1
+                indices[iBase + 4] = vBase + 2
+                indices[iBase + 5] = vBase + 3
+            }
+        }
+
+        // Build compute pipelines
+        guard let lib = library ?? device.makeDefaultLibrary() else { return }
+        if let fn = lib.makeFunction(name: "thruster_advect") {
+            advectPipeline = try? device.makeComputePipelineState(function: fn)
+        }
+        if let fn = lib.makeFunction(name: "thruster_spawn") {
+            spawnPipeline = try? device.makeComputePipelineState(function: fn)
+        }
+        if let fn = lib.makeFunction(name: "thruster_pack_vertices") {
+            packPipeline = try? device.makeComputePipelineState(function: fn)
+        }
+        if let fn = lib.makeFunction(name: "mascot_compute_matrices") {
+            matrixComputePipeline = try? device.makeComputePipelineState(function: fn)
+        }
     }
 
     // MARK: - Project Sync
@@ -80,26 +184,66 @@ final class MascotFleet: MascotNotifier {
                 info[targetId] = ni
             }
 
-            // Handle maintenance state
-            if maintenanceActive {
-                if case .busy = mascot.currentState {
-                    // Already busy
+            // Handle maintenance state — visual overlay only, doesn't block movement
+            if maintenanceActive != mascot.isBusyMode {
+                if maintenanceActive {
+                    mascot.enterBusyMode()
                 } else {
-                    // Enter busy mode unless doing higher-priority work
-                    switch mascot.currentState {
-                    case .conjure, .absorb: break  // don't interrupt
-                    default: mascot.enterBusyMode()
-                    }
+                    mascot.exitBusyMode()
                 }
-            } else if case .busy = mascot.currentState {
-                mascot.exitBusyMode()
             }
 
             mascot.update(dt: dt, camera: camera, nodePositions: projectPositions, nodeInfo: info)
         }
+
+        // Pack instance buffer from CPU-computed matrices
+        packInstanceBuffer()
     }
 
-    // MARK: - Drawing (opaque pass)
+    // MARK: - Instance Buffer Packing
+
+    /// Pack instance data from per-mascot uniformBuffers (CPU-computed matrices).
+    /// GPU matrix compute kernel (mascot_compute_matrices) is available but not yet wired in
+    /// because arcane circle, node rings, and holo screen effects still depend on CPU-side bodyMatrix.
+    private func packInstanceBuffer() {
+        let count = mascots.count
+        guard count > 0 else {
+            orderedMascots = []
+            return
+        }
+
+        // Ensure buffer capacity
+        if instanceBufferCapacity < count {
+            let cap = max(count, 10)
+            instanceBuffer = device.makeBuffer(
+                length: cap * MemoryLayout<MascotInstanceData>.stride,
+                options: .storageModeShared
+            )
+            instanceBufferCapacity = cap
+        }
+
+        guard let buf = instanceBuffer else { return }
+        let ptr = buf.contents().bindMemory(to: MascotInstanceData.self, capacity: count)
+
+        orderedMascots = Array(mascots.values)
+        for (i, mascot) in orderedMascots.enumerated() {
+            guard let uniformBuf = mascot.uniformBuffer else { continue }
+            let uniforms = uniformBuf.contents().bindMemory(to: MascotUniforms.self, capacity: 1).pointee
+            ptr[i].parts = uniforms.parts
+            ptr[i].projectTint = mascot.projectTint
+            ptr[i]._instancePad = 0
+        }
+    }
+
+    /// Dispatch GPU matrix compute kernel to fill instance buffer from anim states.
+    /// Reserved for future use when arcane/holo/ring effects are also GPU-ified.
+    func dispatchMatrixCompute(encoder: MTLComputeCommandEncoder) {
+        // Currently a no-op — instance buffer is packed from CPU-computed matrices.
+        // The GPU kernel (mascot_compute_matrices) and anim state packing infrastructure
+        // are ready to be activated when effect subsystems no longer depend on CPU bodyMatrix.
+    }
+
+    // MARK: - Drawing (opaque pass — instanced)
 
     func drawAll(
         encoder: MTLRenderCommandEncoder,
@@ -108,15 +252,148 @@ final class MascotFleet: MascotNotifier {
         pipeline: MTLRenderPipelineState,
         depthState: MTLDepthStencilState
     ) {
-        for mascot in mascots.values {
-            mascot.draw(
-                encoder: encoder,
-                frameUniformBuf: frameUniformBuf,
-                lightUniformBuf: lightUniformBuf,
-                pipeline: pipeline,
-                depthState: depthState
+        let count = orderedMascots.count
+        guard count > 0,
+              let instBuf = instanceBuffer,
+              let firstMascot = orderedMascots.first,
+              firstMascot.parts.count == 5,
+              let baseTex = firstMascot.baseColorTexture,
+              let mrTex = firstMascot.metalRoughTexture,
+              let samp = firstMascot.sampler else { return }
+
+        encoder.setRenderPipelineState(pipeline)
+        encoder.setDepthStencilState(depthState)
+        encoder.setCullMode(.front)
+
+        // Shared textures and sampler
+        encoder.setFragmentTexture(baseTex, index: 0)
+        encoder.setFragmentTexture(mrTex, index: 1)
+        encoder.setFragmentSamplerState(samp, index: 0)
+
+        // Instance buffer (shared across all parts)
+        encoder.setVertexBuffer(instBuf, offset: 0, index: 2)
+        encoder.setFragmentBuffer(instBuf, offset: 0, index: 2)
+
+        // Frame + lighting uniforms
+        encoder.setVertexBuffer(frameUniformBuf, offset: 0, index: 1)
+        encoder.setFragmentBuffer(frameUniformBuf, offset: 0, index: 0)
+        encoder.setFragmentBuffer(lightUniformBuf, offset: 0, index: 1)
+
+        // Draw each part type with instancing (5 instanced draws instead of N*5)
+        let parts = firstMascot.parts
+        for partIdx in 0..<5 {
+            let part = parts[partIdx]
+            encoder.setVertexBuffer(part.vertexBuffer, offset: 0, index: 0)
+
+            var pidx = UInt32(partIdx)
+            encoder.setVertexBytes(&pidx, length: 4, index: 3)
+
+            encoder.drawIndexedPrimitives(
+                type: .triangle,
+                indexCount: part.indexCount,
+                indexType: .uint32,
+                indexBuffer: part.indexBuffer,
+                indexBufferOffset: 0,
+                instanceCount: count
             )
         }
+    }
+
+    // MARK: - GPU Particle Compute Dispatch
+
+    /// Collect spawn requests from all mascots and dispatch GPU particle compute kernels.
+    /// Call this once per frame, before the render pass.
+    func dispatchParticleCompute(encoder: MTLComputeCommandEncoder, dt: Float, camera: CameraController) {
+        guard let pBuf = particleBuffer,
+              let sBuf = spawnRequestBuffer,
+              let oBuf = particleOutputBuffer,
+              let cBuf = particleCountBuffer,
+              let paramBuf = particleParamsBuffer,
+              let advect = advectPipeline,
+              let spawn = spawnPipeline,
+              let pack = packPipeline else { return }
+
+        let maxP = UInt32(Self.maxParticles)
+        let sf = camera.scaleFactor
+        let camPos = camera.cameraPosition * sf
+        let camFwd = camera.forward
+
+        // Collect spawn requests from all mascots
+        var allSpawns: [ThrusterSpawnRequest] = []
+        for mascot in mascots.values {
+            let toMascot = mascot.currentPosition - camPos
+            let behindCamera = simd_dot(toMascot, camFwd) < -mascot.lastDynamicScale * 2.0
+            guard !behindCamera else { continue }
+            let spawns = mascot.generateThrusterSpawns(
+                dt: dt, bodyMatrix: mascot.lastBodyMatrix, dynamicScale: mascot.lastDynamicScale
+            )
+            allSpawns.append(contentsOf: spawns)
+        }
+
+        let spawnCount = min(allSpawns.count, Self.maxSpawnsPerFrame)
+
+        // Read back previous frame's draw count (1-frame latency)
+        gpuParticleCount = Int(cBuf.contents().bindMemory(to: UInt32.self, capacity: 1).pointee)
+
+        // Reset atomic counter to 0 for this frame
+        cBuf.contents().bindMemory(to: UInt32.self, capacity: 1).pointee = 0
+
+        // Write spawn requests
+        if spawnCount > 0 {
+            let spawnPtr = sBuf.contents().bindMemory(to: ThrusterSpawnRequest.self, capacity: spawnCount)
+            for i in 0..<spawnCount {
+                spawnPtr[i] = allSpawns[i]
+            }
+        }
+
+        // Write params
+        let params = paramBuf.contents().bindMemory(to: ThrusterComputeParams.self, capacity: 1)
+        params.pointee = ThrusterComputeParams(
+            dt: dt, damping: 1.5,
+            totalParticles: maxP,
+            spawnCount: UInt32(spawnCount),
+            spawnOffset: spawnRingOffset,
+            _pad0: 0, _pad1: 0, _pad2: 0
+        )
+        spawnRingOffset = (spawnRingOffset + UInt32(spawnCount)) % maxP
+
+        // Dispatch advect kernel
+        let tgSize = min(advect.maxTotalThreadsPerThreadgroup, 256)
+        let tgCount = (Int(maxP) + tgSize - 1) / tgSize
+
+        encoder.setComputePipelineState(advect)
+        encoder.setBuffer(pBuf, offset: 0, index: 0)
+        encoder.setBuffer(paramBuf, offset: 0, index: 1)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: tgCount, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: tgSize, height: 1, depth: 1)
+        )
+
+        // Dispatch spawn kernel
+        if spawnCount > 0 {
+            let spawnTgSize = min(spawn.maxTotalThreadsPerThreadgroup, 256)
+            let spawnTgCount = (spawnCount + spawnTgSize - 1) / spawnTgSize
+
+            encoder.setComputePipelineState(spawn)
+            encoder.setBuffer(pBuf, offset: 0, index: 0)
+            encoder.setBuffer(sBuf, offset: 0, index: 1)
+            encoder.setBuffer(paramBuf, offset: 0, index: 2)
+            encoder.dispatchThreadgroups(
+                MTLSize(width: spawnTgCount, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: spawnTgSize, height: 1, depth: 1)
+            )
+        }
+
+        // Dispatch pack kernel
+        encoder.setComputePipelineState(pack)
+        encoder.setBuffer(pBuf, offset: 0, index: 0)
+        encoder.setBuffer(oBuf, offset: 0, index: 1)
+        encoder.setBuffer(cBuf, offset: 0, index: 2)
+        encoder.setBuffer(paramBuf, offset: 0, index: 3)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: tgCount, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: tgSize, height: 1, depth: 1)
+        )
     }
 
     // MARK: - Drawing (transparent pass — grouped by effect type)
@@ -126,13 +403,21 @@ final class MascotFleet: MascotNotifier {
         frameUniformBuf: MTLBuffer,
         pipeline: MTLRenderPipelineState
     ) {
-        for mascot in mascots.values {
-            mascot.drawThrusterParticles(
-                encoder: encoder,
-                frameUniformBuf: frameUniformBuf,
-                pipeline: pipeline
-            )
-        }
+        guard gpuParticleCount > 0,
+              let vtxBuf = particleOutputBuffer,
+              let idxBuf = particleIndexBuffer else { return }
+
+        encoder.setRenderPipelineState(pipeline)
+        encoder.setVertexBuffer(vtxBuf, offset: 0, index: 0)
+        encoder.setVertexBuffer(frameUniformBuf, offset: 0, index: 1)
+        let indexCount = min(gpuParticleCount, Self.maxParticles) * 6
+        encoder.drawIndexedPrimitives(
+            type: .triangle,
+            indexCount: indexCount,
+            indexType: .uint32,
+            indexBuffer: idxBuf,
+            indexBufferOffset: 0
+        )
     }
 
     func drawAllArcaneCircles(
@@ -237,21 +522,6 @@ final class MascotFleet: MascotNotifier {
             type = .headTurn
         }
         mascot.enqueueTask(.react(nodeId: nodeId, type: type))
-    }
-
-    // MARK: - Mascot Transfer (migration between galaxies)
-
-    /// Remove and return a project's mascot (for transfer to another fleet).
-    func extractMascot(for project: String) -> MascotSystem? {
-        let mascot = mascots.removeValue(forKey: project)
-        if chattingMascotProject == project { chattingMascotProject = nil }
-        return mascot
-    }
-
-    /// Insert an already-initialized mascot (transferred from another fleet).
-    func insertMascot(_ mascot: MascotSystem, for project: String) {
-        guard mascots.count < maxMascots else { return }
-        mascots[project] = mascot
     }
 
     // MARK: - Query

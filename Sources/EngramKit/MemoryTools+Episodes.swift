@@ -25,15 +25,15 @@ extension MemoryTools {
         let episode = Memory(content: title, topic: "episode", project: project, embedding: embeddingVec)
         localLattice.add(episode)
 
-        guard let episodeId = episode.primaryKey else {
-            throw MCPError.internalError("Failed to persist episode memory — primaryKey is nil after add()")
+        guard let episodeGid = episode.__globalId else {
+            throw MCPError.internalError("Failed to persist episode memory — globalId is nil after add()")
         }
-        activeEpisodeId = episodeId
+        activeEpisodeId = episodeGid
         lastMemoryTime = Date()
 
-        log("Created episode [id:\(episodeId)] \(title)")
+        log("Created episode [id:\(episodeGid.uuidString)] \(title)")
         return CallTool.Result(
-            content: [.text("Created episode (id:\(episodeId), project: \(project)): \(title)")],
+            content: [.text("Created episode (id:\(episodeGid.uuidString), project: \(project)): \(title)")],
             isError: false
         )
     }
@@ -44,22 +44,23 @@ extension MemoryTools {
         let a = try args.decode(EndEpisodeArgs.self)
 
         let episode: Memory
-        if let id = a.episodeId?.value {
-            let id64 = Int64(id)
-            guard let found = lattice.objects(Memory.self).where({ $0.primaryKey == id64 && $0.topic == "episode" }).first else {
-                return CallTool.Result(content: [.text("Episode with id \(id) not found.")], isError: true)
+        let epGid: UUID
+        if let gid = a.episodeId?.value {
+            guard let (found, _) = findMemory(id: gid) else {
+                return CallTool.Result(content: [.text("Episode with id \(gid.uuidString) not found.")], isError: true)
+            }
+            guard found.topic == "episode" else {
+                return CallTool.Result(content: [.text("Memory \(gid.uuidString) is not an episode.")], isError: true)
             }
             episode = found
+            epGid = gid
         } else {
             guard let activeId = activeEpisodeId,
-                  let found = lattice.objects(Memory.self).where({ $0.primaryKey == activeId }).first else {
+                  let (found, _) = findMemory(id: activeId) else {
                 throw MCPError.invalidParams("No active episode. Provide 'episode_id' or start one with begin_episode.")
             }
             episode = found
-        }
-
-        guard let epId = episode.primaryKey else {
-            throw MCPError.internalError("Episode memory has no primaryKey")
+            epGid = activeId
         }
 
         // Append summary to episode content
@@ -68,16 +69,16 @@ extension MemoryTools {
         }
 
         // Clear activeEpisodeId if it matches
-        if activeEpisodeId == epId {
+        if activeEpisodeId == epGid {
             activeEpisodeId = nil
         }
 
-        let memoryCount = countEpisodeMembers(epId)
-        let duration = episodeDuration(epId, startedAt: episode.createdAt)
+        let memoryCount = countEpisodeMembers(epGid)
+        let duration = episodeDuration(epGid, startedAt: episode.createdAt)
 
-        log("Ended episode [id:\(epId)]")
+        log("Ended episode [id:\(epGid.uuidString)]")
         return CallTool.Result(
-            content: [.text("Ended episode (id:\(epId)). Duration: \(duration), memories: \(memoryCount)\(a.summary.map { ", summary: \($0)" } ?? "")")],
+            content: [.text("Ended episode (id:\(epGid.uuidString)). Duration: \(duration), memories: \(memoryCount)\(a.summary.map { ", summary: \($0)" } ?? "")")],
             isError: false
         )
     }
@@ -86,24 +87,24 @@ extension MemoryTools {
 
     func handleRecallEpisode(_ args: [String: Value]?) throws -> CallTool.Result {
         let a = try args.decode(RecallEpisodeArgs.self)
-        let id64 = Int64(a.episodeId.value)
+        let epGid = a.episodeId.value
         let limit = a.limit?.value ?? 200
 
-        guard let episode = lattice.objects(Memory.self).where({ $0.primaryKey == id64 && $0.topic == "episode" }).first else {
-            return CallTool.Result(content: [.text("Episode with id \(a.episodeId.value) not found.")], isError: true)
+        guard let (episode, episodeLattice) = findMemory(id: epGid) else {
+            return CallTool.Result(content: [.text("Episode with id \(epGid.uuidString) not found.")], isError: true)
+        }
+        guard episode.topic == "episode" else {
+            return CallTool.Result(content: [.text("Memory \(epGid.uuidString) is not an episode.")], isError: true)
         }
 
         // Find memories linked via part_of edges to this episode
-        guard let episodeGlobalId = episode.__globalId else {
-            return CallTool.Result(content: [.text("Episode has no globalId.")], isError: true)
-        }
-        let edges = lattice.objects(Edge.self)
-            .where { $0.targetGlobalId == episodeGlobalId && $0.relation == .partOf }
+        let edges = episodeLattice.objects(Edge.self)
+            .where { $0.targetGlobalId == epGid && $0.relation == .partOf }
 
         // Fetch and sort member memories chronologically
         var members: [Memory] = []
         for edge in edges {
-            if let mem = lattice.objects(Memory.self).where({ $0.__globalId == edge.sourceGlobalId && $0.topic != "episode" }).first {
+            if let mem = episodeLattice.objects(Memory.self).where({ $0.__globalId == edge.sourceGlobalId && $0.topic != "episode" }).first {
                 members.append(mem)
             }
         }
@@ -112,8 +113,8 @@ extension MemoryTools {
         let totalCount = members.count
         let limited = Array(members.prefix(limit))
 
-        let isActive = activeEpisodeId == id64
-        let duration = episodeDuration(id64, startedAt: episode.createdAt)
+        let isActive = activeEpisodeId == epGid
+        let duration = episodeDuration(epGid, startedAt: episode.createdAt)
 
         // Parse title and summary from episode content
         let parts = episode.content.components(separatedBy: "\n\nSummary: ")
@@ -121,7 +122,7 @@ extension MemoryTools {
         let summary = parts.count > 1 ? parts[1] : nil
 
         var output = "## Episode: \(title)\n"
-        output += "**ID**: \(id64) | **Project**: \(episode.project) | **Status**: \(isActive ? "active" : "ended") | **Duration**: \(duration)"
+        output += "**ID**: \(epGid.uuidString) | **Project**: \(episode.project) | **Status**: \(isActive ? "active" : "ended") | **Duration**: \(duration)"
         output += "\n**Started**: \(Self.dateFormatter.string(from: episode.createdAt))"
 
         if let summary {
@@ -140,8 +141,8 @@ extension MemoryTools {
 
             for mem in limited {
                 let time = timeFormatter.string(from: mem.createdAt)
-                let memId = mem.primaryKey.map(String.init) ?? "?"
-                output += "\n[id:\(memId)] [\(time)] \(mem.content)"
+                let memGid = mem.__globalId?.uuidString ?? "?"
+                output += "\n[id:\(memGid)] [\(time)] \(mem.content)"
             }
 
             if truncated {
@@ -158,7 +159,8 @@ extension MemoryTools {
         let a = try args.decode(ListEpisodesArgs.self)
         let limit = a.limit?.value ?? 20
 
-        var results = lattice.objects(Memory.self).where { $0.topic == "episode" }
+        let db = readLattice(for: a.project)
+        var results = db.objects(Memory.self).distinct(by: \.__globalId).where { $0.topic == "episode" }
 
         if let project = a.project {
             results = results.where { $0.project == project }
@@ -172,15 +174,15 @@ extension MemoryTools {
         }
 
         let lines = limited.compactMap { ep -> String? in
-            guard let epId = ep.primaryKey else { return nil }
-            let memCount = countEpisodeMembers(epId)
-            let isActive = activeEpisodeId == epId
+            guard let epGid = ep.__globalId else { return nil }
+            let memCount = countEpisodeMembers(epGid)
+            let isActive = activeEpisodeId == epGid
             let startDate = Self.dateFormatter.string(from: ep.createdAt)
 
             // Parse title from content (before any summary)
             let title = ep.content.components(separatedBy: "\n\nSummary: ")[0]
 
-            return "[id:\(epId)] [\(isActive ? "active" : "ended")] \(title) (\(ep.project), \(startDate), \(memCount) memories)"
+            return "[id:\(epGid.uuidString)] [\(isActive ? "active" : "ended")] \(title) (\(ep.project), \(startDate), \(memCount) memories)"
         }
 
         return CallTool.Result(content: [.text(lines.joined(separator: "\n"))], isError: false)
@@ -196,26 +198,29 @@ extension MemoryTools {
     }
 
     /// Count memories linked to an episode via part_of edges.
-    private func countEpisodeMembers(_ episodeId: Int64) -> Int {
-        guard let ep = lattice.objects(Memory.self).where({ $0.primaryKey == episodeId }).first,
-              let epGlobalId = ep.__globalId else { return 0 }
-        return lattice.count(Edge.self, where: { $0.targetGlobalId == epGlobalId && $0.relation == .partOf })
+    private func countEpisodeMembers(_ episodeGid: UUID) -> Int {
+        // Check local first, then synced
+        let localCount = localLattice.count(Edge.self, where: { $0.targetGlobalId == episodeGid && $0.relation == .partOf })
+        if localCount > 0 { return localCount }
+        if let syncedLattice {
+            return syncedLattice.count(Edge.self, where: { $0.targetGlobalId == episodeGid && $0.relation == .partOf })
+        }
+        return 0
     }
 
     /// Compute episode duration from creation to latest member memory (or now if active).
-    private func episodeDuration(_ episodeId: Int64, startedAt: Date) -> String {
-        if activeEpisodeId == episodeId {
+    private func episodeDuration(_ episodeGid: UUID, startedAt: Date) -> String {
+        if activeEpisodeId == episodeGid {
             return formatDuration(from: startedAt, to: Date())
         }
-        // Find latest member memory
-        guard let ep = lattice.objects(Memory.self).where({ $0.primaryKey == episodeId }).first,
-              let epGlobalId = ep.__globalId else {
+        // Find the lattice this episode lives in
+        guard let (_, episodeLattice) = findMemory(id: episodeGid) else {
             return formatDuration(from: startedAt, to: startedAt)
         }
-        let edges = lattice.objects(Edge.self).where { $0.targetGlobalId == epGlobalId && $0.relation == .partOf }
+        let edges = episodeLattice.objects(Edge.self).where { $0.targetGlobalId == episodeGid && $0.relation == .partOf }
         var latest = startedAt
         for edge in edges {
-            if let mem = lattice.objects(Memory.self).where({ $0.__globalId == edge.sourceGlobalId }).first {
+            if let mem = episodeLattice.objects(Memory.self).where({ $0.__globalId == edge.sourceGlobalId }).first {
                 if mem.createdAt > latest { latest = mem.createdAt }
             }
         }

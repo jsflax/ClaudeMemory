@@ -485,7 +485,7 @@ struct SidebarView: View {
                         )
                     }
                     .buttonStyle(.plain)
-                    .disabled(isCompacting || syncManager.isSyncing)
+                    .disabled(isCompacting)
                 }
             }
 

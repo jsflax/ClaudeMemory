@@ -14,8 +14,8 @@ public struct ForgetTool: Tool {
 
     @Generable
     public struct Arguments {
-        @Guide(description: "The specific memory ID to delete.")
-        public var id: Int?
+        @Guide(description: "The specific memory UUID to delete.")
+        public var id: String?
 
         @Guide(description: "Delete all memories with this topic.")
         public var topic: String?

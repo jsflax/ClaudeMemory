@@ -23,8 +23,8 @@ import Foundation
     let result = try await tools.handle(CallTool.Parameters(
         name: "connect",
         arguments: [
-            "from": .int(id1),
-            "to": .int(id2),
+            "from": .string(id1),
+            "to": .string(id2),
             "relation": .string("relates_to"),
         ]
     ))
@@ -52,8 +52,8 @@ import Foundation
         try await tools.handle(CallTool.Parameters(
             name: "connect",
             arguments: [
-                "from": .int(id1),
-                "to": .int(id2),
+                "from": .string(id1),
+                "to": .string(id2),
                 "relation": .string("invalid_relation"),
             ]
         ))
@@ -72,8 +72,8 @@ import Foundation
     let result = try await tools.handle(CallTool.Parameters(
         name: "connect",
         arguments: [
-            "from": .int(id1),
-            "to": .int(99999),
+            "from": .string(id1),
+            "to": .string(UUID().uuidString),
             "relation": .string("relates_to"),
         ]
     ))
@@ -98,8 +98,8 @@ import Foundation
     let result1 = try await tools.handle(CallTool.Parameters(
         name: "connect",
         arguments: [
-            "from": .int(id1),
-            "to": .int(id2),
+            "from": .string(id1),
+            "to": .string(id2),
             "relation": .string("relates_to"),
         ]
     ))
@@ -108,8 +108,8 @@ import Foundation
     let result2 = try await tools.handle(CallTool.Parameters(
         name: "connect",
         arguments: [
-            "from": .int(id1),
-            "to": .int(id2),
+            "from": .string(id1),
+            "to": .string(id2),
             "relation": .string("relates_to"),
         ]
     ))
@@ -135,8 +135,8 @@ import Foundation
     let connectResult = try await tools.handle(CallTool.Parameters(
         name: "connect",
         arguments: [
-            "from": .int(id1),
-            "to": .int(id2),
+            "from": .string(id1),
+            "to": .string(id2),
             "relation": .string("supersedes"),
         ]
     ))
@@ -144,7 +144,7 @@ import Foundation
 
     let result = try await tools.handle(CallTool.Parameters(
         name: "disconnect",
-        arguments: ["id": .int(edgeId)]
+        arguments: ["id": .string(edgeId)]
     ))
     let output = text(from: result)
     #expect(output.contains("Deleted edge"))
@@ -168,8 +168,8 @@ import Foundation
     _ = try await tools.handle(CallTool.Parameters(
         name: "connect",
         arguments: [
-            "from": .int(id1),
-            "to": .int(id2),
+            "from": .string(id1),
+            "to": .string(id2),
             "relation": .string("relates_to"),
         ]
     ))
@@ -177,8 +177,8 @@ import Foundation
     let result = try await tools.handle(CallTool.Parameters(
         name: "disconnect",
         arguments: [
-            "from": .int(id1),
-            "to": .int(id2),
+            "from": .string(id1),
+            "to": .string(id2),
         ]
     ))
     let output = text(from: result)
@@ -208,16 +208,16 @@ import Foundation
 
     _ = try await tools.handle(CallTool.Parameters(
         name: "connect",
-        arguments: ["from": .int(id1), "to": .int(id2), "relation": .string("relates_to")]
+        arguments: ["from": .string(id1), "to": .string(id2), "relation": .string("relates_to")]
     ))
     _ = try await tools.handle(CallTool.Parameters(
         name: "connect",
-        arguments: ["from": .int(id3), "to": .int(id1), "relation": .string("contradicts")]
+        arguments: ["from": .string(id3), "to": .string(id1), "relation": .string("contradicts")]
     ))
 
     let result = try await tools.handle(CallTool.Parameters(
         name: "graph",
-        arguments: ["id": .int(id1)]
+        arguments: ["id": .string(id1)]
     ))
     let output = text(from: result)
     #expect(output.contains("Central concept"))
@@ -237,7 +237,7 @@ import Foundation
 
     let result = try await tools.handle(CallTool.Parameters(
         name: "graph",
-        arguments: ["id": .int(id1)]
+        arguments: ["id": .string(id1)]
     ))
     let output = text(from: result)
     #expect(output.contains("Isolated memory"))
@@ -249,7 +249,7 @@ import Foundation
 
     let result = try await tools.handle(CallTool.Parameters(
         name: "graph",
-        arguments: ["id": .int(99999)]
+        arguments: ["id": .string(UUID().uuidString)]
     ))
     #expect(result.isError == true)
     #expect(text(from: result).contains("not found"))
@@ -273,12 +273,12 @@ import Foundation
 
     _ = try await tools.handle(CallTool.Parameters(
         name: "connect",
-        arguments: ["from": .int(id1), "to": .int(id2), "relation": .string("relates_to")]
+        arguments: ["from": .string(id1), "to": .string(id2), "relation": .string("relates_to")]
     ))
 
     let result = try await tools.handle(CallTool.Parameters(
         name: "forget",
-        arguments: ["id": .int(id1)]
+        arguments: ["id": .string(id1)]
     ))
     let output = text(from: result)
     #expect(output.contains("Deleted memory"))
@@ -286,7 +286,7 @@ import Foundation
 
     let graphResult = try await tools.handle(CallTool.Parameters(
         name: "graph",
-        arguments: ["id": .int(id2)]
+        arguments: ["id": .string(id2)]
     ))
     #expect(text(from: graphResult).contains("No connections."))
 }

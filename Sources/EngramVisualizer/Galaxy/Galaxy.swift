@@ -2,6 +2,7 @@ import SwiftUI
 import Lattice
 import Combine
 import EngramKit
+import os
 
 /// Encapsulates one complete graph data pipeline: Lattice + RenderStore + Simulation + EmbeddingProjection.
 /// Each Galaxy renders as a separate cluster in the 3D world.
@@ -29,10 +30,6 @@ final class Galaxy: Identifiable {
     // @Sendable to allow use from background threads in loadData.
     var nodeFilter: (@Sendable (Memory) -> Bool)?
 
-    // Lattice observers
-    var nodeObserver: AnyCancellable?
-    var edgeObserver: AnyCancellable?
-
     // Per-galaxy mascot fleet (nil until Metal device is available)
     var mascotFleet: MascotFleet?
 
@@ -46,5 +43,110 @@ final class Galaxy: Identifiable {
         self.lattice = lattice
         self.hierarchyLevel = hierarchyLevel
         self.parentGalaxyId = parentGalaxyId
+    }
+    
+    actor GalaxyObserver {
+        var nodeObserver: AnyCancellable?
+        var edgeObserver: AnyCancellable?
+        
+        private let latticeRef: LatticeThreadSafeReference
+        private let bgRef: LatticeThreadSafeReference
+        private let galaxy: Galaxy
+        
+        init(galaxy: Galaxy, latticeRef: LatticeThreadSafeReference) {
+            self.latticeRef = latticeRef
+            self.bgRef = latticeRef
+            self.galaxy = galaxy
+        }
+        
+        func observe(hiddenProjects: Set<String>,
+                     hiddenRelations: Set<String>,
+                     timeFilter: Date?,
+                     is3D: Bool,
+                     soundEnabled: Bool,
+                     notificationsEnabled: Bool) {
+            guard let lattice = latticeRef.resolve() else { fatalError() }
+            
+            edgeObserver = lattice.objects(MemoryEdge.self).observe { change in
+                guard let bg = self.bgRef.resolve() else { fatalError("This should not happen") }
+                switch change {
+                case .insert(let pk):
+                    guard let edge = bg.object(MemoryEdge.self, primaryKey: pk) else { return }
+                    let data = EdgeData(id: pk, sourceId: edge.sourceGlobalId,
+                                        targetId: edge.targetGlobalId, relation: edge.relation.rawValue)
+                    Task { @MainActor in GalaxyDataLoader.handleEdgeInsert(data, galaxy: self.galaxy, is3D: is3D, hiddenRelations: hiddenRelations) }
+                case .update(let pk):
+                    guard let edge = bg.object(MemoryEdge.self, primaryKey: pk) else { return }
+                    let data = EdgeData(id: pk, sourceId: edge.sourceGlobalId,
+                                        targetId: edge.targetGlobalId, relation: edge.relation.rawValue)
+                    Task { @MainActor in GalaxyDataLoader.handleEdgeUpdate(data, galaxy: self.galaxy) }
+                case .delete(let pk):
+                    Task { @MainActor in GalaxyDataLoader.handleEdgeDelete(pk, galaxy: self.galaxy) }
+                }
+            }
+            
+            nodeObserver = lattice.objects(Memory.self).observe { change in
+                guard let bg = self.bgRef.resolve() else { fatalError("This should not happen") }
+                switch change {
+                case .insert(let pk):
+                    guard let memory = bg.object(Memory.self, primaryKey: pk),
+                          let gid = memory.__globalId else { return }
+                    // Apply per-galaxy filter
+                    let node = NodeData(
+                        id: gid, project: memory.project, topic: memory.topic,
+                        label: extractLabel(content: memory.content, topic: memory.topic),
+                        content: memory.content,
+                        createdAt: memory.createdAt, lastAccessedAt: memory.lastAccessedAt,
+                        importance: memory.importance)
+                    Task { @MainActor [memoryRef = memory.sendableReference] in
+                        if let memory = memoryRef.resolve(on: self.galaxy.lattice),
+                           let filter = self.galaxy.nodeFilter, !filter(memory) { return }
+                        GalaxyDataLoader.handleNodeInsert(pk: pk, node: node, galaxy: self.galaxy,
+                                         is3D: is3D, hiddenProjects: hiddenProjects,
+                                         hiddenRelations: hiddenRelations, timeFilter: timeFilter,
+                                         soundEnabled: soundEnabled, notificationsEnabled: notificationsEnabled)
+                    }
+                case .update(let pk):
+                    guard let memory = bg.object(Memory.self, primaryKey: pk),
+                          let gid = memory.__globalId else { return }
+                    // Apply per-galaxy filter — prevents synced-project nodes from leaking
+                    // into the personal galaxy via updates (matching the .insert filter)
+                    let node = NodeData(
+                        id: gid, project: memory.project, topic: memory.topic,
+                        label: extractLabel(content: memory.content, topic: memory.topic),
+                        content: memory.content,
+                        createdAt: memory.createdAt, lastAccessedAt: memory.lastAccessedAt,
+                        importance: memory.importance)
+                    Task { @MainActor [memoryRef = memory.sendableReference] in
+                        if let memory = memoryRef.resolve(on: self.galaxy.lattice),
+                           let filter = self.galaxy.nodeFilter, !filter(memory) { return }
+                        GalaxyDataLoader.handleNodeUpdate(node: node, galaxy: self.galaxy)
+                    }
+                case .delete(let pk):
+                    Task { @MainActor in
+                        GalaxyDataLoader.handleNodeDelete(pk, galaxy: self.galaxy, soundEnabled: soundEnabled, notificationsEnabled: notificationsEnabled)
+                    }
+                }
+            }
+        }
+    }
+    
+    private var observer: GalaxyObserver?
+    
+    func setUpObserve(hiddenProjects: Set<String>,
+                      hiddenRelations: Set<String>,
+                      timeFilter: Date?,
+                      is3D: Bool,
+                      soundEnabled: Bool,
+                      notificationsEnabled: Bool) {
+        self.observer = GalaxyObserver(galaxy: self, latticeRef: self.lattice.sendableReference)
+        Task {
+            await self.observer?.observe(hiddenProjects: hiddenProjects,
+                                         hiddenRelations: hiddenRelations,
+                                         timeFilter: timeFilter,
+                                         is3D: is3D,
+                                         soundEnabled: soundEnabled,
+                                         notificationsEnabled: notificationsEnabled)
+        }
     }
 }

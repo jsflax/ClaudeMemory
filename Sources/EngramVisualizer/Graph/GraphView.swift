@@ -53,7 +53,7 @@ struct GraphView: View {
     @State private var sidebarPeeking: Bool = false
     @State private var sidebarHideTask: Task<Void, Never>?
     @Environment(AccountService.self) private var accountService
-    @Environment(SyncManager.self) var syncManager
+    var syncManager: SyncManager // don't want to observe this
     private var sidebarVisible: Bool { sidebarPinned || sidebarPeeking }
 
     // Minimap PiP
@@ -91,6 +91,7 @@ struct GraphView: View {
     // MARK: - Body
 
     var body: some View {
+        let _ = os_log(.fault, log: OSLog(subsystem: "io.engram.app", category: "FrameStall"), "HOTPATH: GraphView.body eval")
         let _ = bodyLog.warning("[BODY-EVAL] GraphView.body evaluated at frame \(CFAbsoluteTimeGetCurrent())")
         GeometryReader { geo in
             graphContent(size: geo.size)
@@ -100,6 +101,9 @@ struct GraphView: View {
                 .onAppear {
                     loadData()
                     installScrollMonitor()
+                }
+                .onReceive(syncManager.didConnect) {
+                    loadData()
                 }
                 .onDisappear {
                     removeScrollMonitor()
@@ -285,7 +289,7 @@ struct GraphView: View {
         VStack(alignment: .trailing, spacing: 8) {
             if config.showActivityLog, selectedMemoryId == nil {
                 ActivityLogPanel(
-                    renderStore: renderStore,
+                    galaxyRegistry: galaxyRegistry,
                     onSelect: { id in selectedMemoryId = id }
                 )
                 .transition(.opacity)
@@ -295,13 +299,10 @@ struct GraphView: View {
 
             if config.showStatsOverlay {
                 StatsOverlay(
-                    visibleMemoryCount: galaxyRegistry.mergedVisibleNodeIds.count,
-                    visibleEdgeCount: galaxyRegistry.mergedEdges.count,
-                    totalMemories: galaxyRegistry.mergedNodes.count,
+                    galaxyRegistry: galaxyRegistry,
                     hiddenProjects: config.hiddenProjects,
                     hiddenRelations: config.hiddenRelations,
                     projects: uniqueProjects(),
-                    allRelationCounts: galaxyRegistry.mergedRelationCounts,
                     toggleProject: toggleProject,
                     toggleRelation: toggleRelation,
                     colorMap: galaxyRegistry.mergedColorMap,
@@ -501,11 +502,8 @@ struct GraphView: View {
             GalaxyDataLoader.recomputeDerivedData(for: galaxy)
             store.bumpTopology()
 
-            let pkClusters = findMemoryClusters(in: galaxy.lattice, project: project, minClusterSize: 2, neighborLimit: 20).clusters
-            for pkCluster in pkClusters {
-                let uuidCluster = pkCluster.compactMap { store.pkToGlobalId[$0] }
-                if uuidCluster.count >= 2 { store.clusterGroups.append(uuidCluster) }
-            }
+            let projectClusters = findMemoryClusters(in: galaxy.lattice, project: project, minClusterSize: 2, neighborLimit: 20).clusters
+            store.clusterGroups.append(contentsOf: projectClusters)
         }
     }
 

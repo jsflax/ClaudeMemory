@@ -24,6 +24,22 @@ extension Graph3DScene {
         profilingFileHandle?.write(data)
         profilingLines.removeAll(keepingCapacity: true)
     }
+
+    func setupLabelDiag() {
+        let path = "/tmp/label-diag.csv"
+        FileManager.default.createFile(atPath: path, contents: nil)
+        labelDiagFileHandle = FileHandle(forWritingAtPath: path)
+        let header = "frame,positions,atlasRects,missingRects,instances,capacity,atlasRegen,depthRange,minDepth,maxDepth,camX,camY,camZ,partsReplaced,projLabels\n"
+        labelDiagFileHandle?.write(header.data(using: .utf8)!)
+        labelDiagReady = true
+    }
+
+    func flushLabelDiag() {
+        guard labelDiagReady, !labelDiagLines.isEmpty else { return }
+        let data = labelDiagLines.joined().data(using: .utf8)!
+        labelDiagFileHandle?.write(data)
+        labelDiagLines.removeAll(keepingCapacity: true)
+    }
     #endif
 
     // MARK: - Render Tick

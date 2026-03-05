@@ -719,6 +719,11 @@ final class Graph3DScene {
 
     /// Canvas label timing — written by the SwiftUI overlay, read by renderTick
     var lastCanvasLabelMs: Double = 0
+
+    /// Label flicker diagnostics — written by updateLabelBatch, flushed to /tmp/label-diag.csv
+    var labelDiagLines: [String] = []
+    var labelDiagFileHandle: FileHandle?
+    var labelDiagReady = false
     #endif
 
     /// Called every RealityKit render frame (vsync-synchronized).

@@ -33,6 +33,8 @@ func mcpArgs(_ pairs: [(String, (any Sendable)?)]) -> [String: MCP.Value] {
             dict[key] = .bool(b)
         case let arr as [Int]:
             dict[key] = .array(arr.map { .int($0) })
+        case let arr as [String]:
+            dict[key] = .array(arr.map { .string($0) })
         default:
             // Fallback: convert to string
             dict[key] = .string(String(describing: value))

@@ -10,7 +10,7 @@ import Foundation
     let tools = try await makeTools()
 
     // Group 1: networking (3 memories, connected)
-    var netIds: [Int] = []
+    var netIds: [String] = []
     for i in 1...3 {
         let r = try await tools.handle(CallTool.Parameters(
             name: "remember",
@@ -26,13 +26,13 @@ import Foundation
         for j in (i+1)..<netIds.count {
             _ = try await tools.handle(CallTool.Parameters(
                 name: "connect",
-                arguments: ["from": .int(netIds[i]), "to": .int(netIds[j]), "relation": .string("relates_to")]
+                arguments: ["from": .string(netIds[i]), "to": .string(netIds[j]), "relation": .string("relates_to")]
             ))
         }
     }
 
     // Group 2: database (3 memories, connected)
-    var dbIds: [Int] = []
+    var dbIds: [String] = []
     for i in 1...3 {
         let r = try await tools.handle(CallTool.Parameters(
             name: "remember",
@@ -48,7 +48,7 @@ import Foundation
         for j in (i+1)..<dbIds.count {
             _ = try await tools.handle(CallTool.Parameters(
                 name: "connect",
-                arguments: ["from": .int(dbIds[i]), "to": .int(dbIds[j]), "relation": .string("relates_to")]
+                arguments: ["from": .string(dbIds[i]), "to": .string(dbIds[j]), "relation": .string("relates_to")]
             ))
         }
     }
@@ -106,7 +106,7 @@ import Foundation
     let tools = try await makeTools()
 
     // Store 3 memories
-    var memIds: [Int] = []
+    var memIds: [String] = []
     for i in 1...3 {
         let r = try await tools.handle(CallTool.Parameters(
             name: "remember",
@@ -123,7 +123,7 @@ import Foundation
     let result = try await tools.handle(CallTool.Parameters(
         name: "organize",
         arguments: [
-            "ids": .array(memIds.map { Value.int($0) }),
+            "ids": .array(memIds.map { Value.string($0) }),
             "label": .string("compiler-optimization"),
         ]
     ))
@@ -144,7 +144,7 @@ import Foundation
     // Verify part_of edges exist
     let graph = try await tools.handle(CallTool.Parameters(
         name: "graph",
-        arguments: ["id": .int(memIds[0])]
+        arguments: ["id": .string(memIds[0])]
     ))
     let graphOutput = text(from: graph)
     #expect(graphOutput.contains("part_of"))
@@ -154,7 +154,7 @@ import Foundation
     let tools = try await makeTools()
 
     // Store memories with default topic
-    var memIds: [Int] = []
+    var memIds: [String] = []
     for i in 1...2 {
         let r = try await tools.handle(CallTool.Parameters(
             name: "remember",
@@ -171,7 +171,7 @@ import Foundation
     _ = try await tools.handle(CallTool.Parameters(
         name: "organize",
         arguments: [
-            "ids": .array(memIds.map { Value.int($0) }),
+            "ids": .array(memIds.map { Value.string($0) }),
             "label": .string("rendering"),
         ]
     ))
@@ -192,7 +192,7 @@ import Foundation
     let result = try await tools.handle(CallTool.Parameters(
         name: "organize",
         arguments: [
-            "ids": .array([.int(99999)]),
+            "ids": .array([.string(UUID().uuidString)]),
             "label": .string("nonexistent"),
         ]
     ))
@@ -230,7 +230,7 @@ import Foundation
     let result = try await tools.handle(CallTool.Parameters(
         name: "organize",
         arguments: [
-            "ids": .array([.int(memId)]),
+            "ids": .array([.string(memId)]),
             "label": .string("auth"),
         ]
     ))

@@ -23,6 +23,7 @@ do {
 
 // MARK: - Init Lattice
 
+Lattice.setLogLevel(.error)
 let localLattice: Lattice
 
 do {
@@ -39,9 +40,36 @@ do {
 let embedder = EmbeddingService(modelPath: modelPath)
 await embedder.startLoading()
 
+// MARK: - Init Synced Lattice (optional)
+
+let syncedLattice: Lattice?
+let claudeDir = (dbPath as NSString).deletingLastPathComponent
+let syncedDbPath = SyncService.syncedDbPath(claudeDir: claudeDir)
+if FileManager.default.fileExists(atPath: syncedDbPath) {
+    let syncedConfig: Lattice.Configuration = .init(
+        fileURL: URL(fileURLWithPath: syncedDbPath),
+        migration: engramMigrations
+    )
+    syncedLattice = try? Lattice(
+        Memory.self, Edge.self, SyncConfig.self,
+        configuration: syncedConfig
+    )
+    if syncedLattice != nil {
+        log("Synced database at \(syncedDbPath)")
+    } else {
+        log("Failed to open synced database at \(syncedDbPath)")
+    }
+} else {
+    syncedLattice = nil
+}
+
 // MARK: - MCP Server
 
-let tools = MemoryTools(ref: localLattice.sendableReference, embedder: embedder)
+let tools = MemoryTools(
+    localRef: localLattice.sendableReference,
+    syncedRef: syncedLattice?.sendableReference,
+    embedder: embedder
+)
 
 let server = Server(
     name: "memory",

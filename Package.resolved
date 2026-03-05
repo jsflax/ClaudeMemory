@@ -1,5 +1,5 @@
 {
-  "originHash" : "5161789d5f572a623841c3af9979b6a91cf31aaf6c4a62e41c29f8ea1e1a925e",
+  "originHash" : "df5e6f6cf7f073bdf5d5c867ced613049aa1a3bfe163314132d480ff29357b4e",
   "pins" : [
     {
       "identity" : "appauth-ios",
@@ -47,24 +47,6 @@
       }
     },
     {
-      "identity" : "fluent",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/vapor/fluent.git",
-      "state" : {
-        "revision" : "2fe9e36daf4bdb5edcf193e0d0806ba2074d2864",
-        "version" : "4.13.0"
-      }
-    },
-    {
-      "identity" : "fluent-kit",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/vapor/fluent-kit.git",
-      "state" : {
-        "revision" : "f8f38b81009bb84eb2cb017b8914f44d3dde5ed5",
-        "version" : "1.55.0"
-      }
-    },
-    {
       "identity" : "googlesignin-ios",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/google/GoogleSignIn-iOS.git",
@@ -101,21 +83,12 @@
       }
     },
     {
-      "identity" : "jwt",
+      "identity" : "latticecore",
       "kind" : "remoteSourceControl",
-      "location" : "https://github.com/vapor/jwt.git",
+      "location" : "https://github.com/jsflax/LatticeCore.git",
       "state" : {
-        "revision" : "d65f32bfd08fae5910d603028be5dec4f35b3482",
-        "version" : "4.2.2"
-      }
-    },
-    {
-      "identity" : "jwt-kit",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/vapor/jwt-kit.git",
-      "state" : {
-        "revision" : "13e7513b3ba0afa13967daf77af2fb4ad087306c",
-        "version" : "4.13.5"
+        "revision" : "5e8a422a5cda9781a34262120a387e41b100cd37",
+        "version" : "0.8.1"
       }
     },
     {
@@ -143,15 +116,6 @@
       "state" : {
         "revision" : "5581748cef2bae787496fe6d61139aebe0a451f6",
         "version" : "2.8.1"
-      }
-    },
-    {
-      "identity" : "sql-kit",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/vapor/sql-kit.git",
-      "state" : {
-        "revision" : "c0ea243ffeb8b5ff9e20a281e44003c6abb8896f",
-        "version" : "3.34.0"
       }
     },
     {
@@ -385,7 +349,7 @@
       "location" : "https://github.com/jsflax/SwiftLM.git",
       "state" : {
         "branch" : "main",
-        "revision" : "1863161e3af79a354b6e5dc7dd7f91f076040558"
+        "revision" : "8426dfdeefc2fbbd1800af88c8f7a31a5f792256"
       }
     },
     {

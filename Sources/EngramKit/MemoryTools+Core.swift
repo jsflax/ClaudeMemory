@@ -82,7 +82,9 @@ extension MemoryTools {
     // MARK: - remember
 
     func handleRemember(_ args: [String: Value]?) async throws -> CallTool.Result {
+        log("[remember] START")
         let a = try args.decode(RememberArgs.self)
+        log("[remember] decoded args, content length: \(a.content.count)")
         guard !a.content.isEmpty else {
             throw MCPError.invalidParams("'content' is required")
         }
@@ -106,20 +108,31 @@ extension MemoryTools {
             importance = 0
         }
 
+        log("[remember] calling embedder.embed()")
         guard let floats = try await embedder.embed(text: content) else {
             throw MCPError.internalError("Embedding model unavailable — cannot store memory without a vector. Check that the CoreML model is bundled correctly.")
         }
         let embeddingVec = Vector<Float>(floats)
+        log("[remember] embedding done, \(floats.count) dims")
 
         // Conflict detection + auto-connect candidate gathering
         // Search is done outside the force guard so auto-connect candidates survive force=true
         var autoConnectCandidates: [(object: Memory, distance: Double)] = []
 
         if !embeddingVec.isEmpty && topic != "episode" {
-            let candidates = lattice.objects(Memory.self)
+            log("[remember] starting conflict detection query")
+            log("[remember] readLattice for project: \(project)")
+            let latticeRef = readLattice(for: project)
+            log("[remember] got lattice ref, building query")
+            let baseQuery = latticeRef.objects(Memory.self)
+                .distinct(by: \.__globalId)
                 .where { $0.expiresAt > Date() && $0.topic != "episode" }
                 .where { $0.project == project || $0.project == "global" }
+            log("[remember] query built, calling nearest() with embedding dim=\(embeddingVec.count)")
+            let candidates = baseQuery
                 .nearest(to: embeddingVec, on: \.embedding, limit: 8, distance: .l2)
+            log("[remember] nearest() returned")
+            log("[remember] nearest query returned \(candidates.count) candidates")
 
             // Conflict detection (unchanged behavior, just nested under force guard)
             if a.force != true {
@@ -133,15 +146,15 @@ extension MemoryTools {
                     var warning = "⚠️ Near-duplicate memory detected. The new memory was NOT stored.\n\nExisting similar memories:"
                     for match in conflicts {
                         let m = match.object
-                        guard let mId = m.primaryKey else { continue }
+                        guard let mGid = m.__globalId else { continue }
                         let dist = String(format: "%.3f", match.distance)
                         let jaccard = String(format: "%.0f%%", jaccardSimilarity(content, m.content) * 100)
-                        warning += "\n  [id:\(mId)] (distance: \(dist), term overlap: \(jaccard)) \(m.content)"
+                        warning += "\n  [id:\(mGid.uuidString)] (distance: \(dist), term overlap: \(jaccard)) \(m.content)"
                     }
                     warning += "\n\nTo resolve:"
-                    warning += "\n  - Use `update(id: N, ...)` to modify the existing memory"
+                    warning += "\n  - Use `update(id: \"UUID\", ...)` to modify the existing memory"
                     warning += "\n  - Use `remember(..., force: true)` to keep both"
-                    warning += "\n  - Use `forget(id: N)` to remove the old one, then `remember` the new one"
+                    warning += "\n  - Use `forget(id: \"UUID\")` to remove the old one, then `remember` the new one"
                     log("Conflict detected for: \(content.prefix(80))")
                     return CallTool.Result(content: [.text(warning)], isError: false)
                 }
@@ -167,54 +180,50 @@ extension MemoryTools {
 
         let isPrivate = a.isPrivate ?? false
 
+        log("[remember] creating Memory object")
         let memory = Memory(content: content, topic: topic, project: project, source: source, embedding: embeddingVec, expiresAt: expiresAt, importance: importance, isPrivate: isPrivate)
+        log("[remember] calling localLattice.add()")
         localLattice.add(memory)
+        log("[remember] add() complete")
 
-        guard let memoryId = memory.primaryKey else {
-            throw MCPError.internalError("Failed to persist memory — primaryKey is nil after add()")
-        }
         guard let memoryGlobalId = memory.__globalId else {
             throw MCPError.internalError("Failed to persist memory — globalId is nil after add()")
         }
 
         // Auto-create part_of edge when parent_id is provided
         var parentNote = ""
-        if let parentId = a.parentId?.value {
-            let pid = Int64(parentId)
-            guard let parentMem = lattice.objects(Memory.self).where({ $0.primaryKey == pid }).first,
-                  let parentGlobalId = parentMem.__globalId else {
-                throw MCPError.invalidParams("parent_id \(parentId) not found")
+        if let parentGid = a.parentId?.value {
+            guard findMemory(id: parentGid) != nil else {
+                throw MCPError.invalidParams("parent_id \(parentGid.uuidString) not found")
             }
-            let edge = Edge(sourceGlobalId: memoryGlobalId, targetGlobalId: parentGlobalId, relation: .partOf)
+            let edge = Edge(sourceGlobalId: memoryGlobalId, targetGlobalId: parentGid, relation: .partOf)
             localLattice.add(edge)
-            parentNote = ", parent: \(parentId)"
-            log("Auto-created part_of edge: \(memoryId) -> \(parentId)")
+            parentNote = ", parent: \(parentGid.uuidString)"
+            log("Auto-created part_of edge: \(memoryGlobalId.uuidString) -> \(parentGid.uuidString)")
         }
 
         // Link to active episode via part_of edge
-        if let epId = activeEpisodeId,
-           let epMem = lattice.objects(Memory.self).where({ $0.primaryKey == epId }).first,
-           let epGlobalId = epMem.__globalId {
-            let edge = Edge(sourceGlobalId: memoryGlobalId, targetGlobalId: epGlobalId, relation: .partOf)
+        if let epGid = activeEpisodeId,
+           localLattice.objects(Memory.self).where({ $0.__globalId == epGid }).first != nil {
+            let edge = Edge(sourceGlobalId: memoryGlobalId, targetGlobalId: epGid, relation: .partOf)
             localLattice.add(edge)
-            log("Linked memory \(memoryId) to episode \(epId)")
+            log("Linked memory \(memoryGlobalId.uuidString) to episode \(epGid.uuidString)")
         }
 
         // Auto-connect: create relates_to edges to semantically similar memories
-        var autoLinkedIds: [Int64] = []
-        let parentIdValue: Int64? = a.parentId.map { Int64($0.value) }
+        var autoLinkedGids: [UUID] = []
+        let parentGidValue: UUID? = a.parentId?.value
 
         for candidate in autoConnectCandidates {
-            guard let targetId = candidate.object.primaryKey else { continue }
-            // Skip if already linked as parent or episode
-            if let pid = parentIdValue, targetId == pid { continue }
-            if let epId = activeEpisodeId, targetId == epId { continue }
-            // Dedup: check both directions
             guard let candidateGlobalId = candidate.object.__globalId else { continue }
-            let forwardEdge = lattice.objects(Edge.self)
+            // Skip if already linked as parent or episode
+            if let pgid = parentGidValue, candidateGlobalId == pgid { continue }
+            if let epGid = activeEpisodeId, candidateGlobalId == epGid { continue }
+            // Dedup: check both directions
+            let forwardEdge = localLattice.objects(Edge.self)
                 .where { $0.sourceGlobalId == memoryGlobalId && $0.targetGlobalId == candidateGlobalId && $0.relation == .relatesTo }
                 .first != nil
-            let reverseEdge = lattice.objects(Edge.self)
+            let reverseEdge = localLattice.objects(Edge.self)
                 .where { $0.sourceGlobalId == candidateGlobalId && $0.targetGlobalId == memoryGlobalId && $0.relation == .relatesTo }
                 .first != nil
             let hasEdge = forwardEdge || reverseEdge
@@ -222,14 +231,14 @@ extension MemoryTools {
 
             let edge = Edge(sourceGlobalId: memoryGlobalId, targetGlobalId: candidateGlobalId, relation: .relatesTo)
             localLattice.add(edge)
-            autoLinkedIds.append(targetId)
-            log("Auto-connected [\(memoryId)] --[relates_to]--> [\(targetId)] (distance: \(String(format: "%.3f", candidate.distance)))")
+            autoLinkedGids.append(candidateGlobalId)
+            log("Auto-connected [\(memoryGlobalId.uuidString)] --[relates_to]--> [\(candidateGlobalId.uuidString)] (distance: \(String(format: "%.3f", candidate.distance)))")
         }
 
         // Cross-project hub linking: if content mentions another project by name, link to its hub
         if topic != "episode" {
             let allProjects = Set(
-                lattice.objects(Memory.self)
+                localLattice.objects(Memory.self)
                     .snapshot()
                     .map(\.project)
             ).subtracting([project, "global"])
@@ -243,13 +252,13 @@ extension MemoryTools {
                 else { continue }
 
                 // Find hub: the memory with the most incoming part_of edges
-                let projectMemories = lattice.objects(Memory.self)
+                let projectMemories = localLattice.objects(Memory.self)
                     .where { $0.project == otherProject && $0.topic != "episode" }
                     .snapshot()
 
                 var bestHub: (mem: Memory, count: Int)? = nil
                 for mem in projectMemories {
-                    let incomingCount = lattice.objects(Edge.self)
+                    let incomingCount = localLattice.objects(Edge.self)
                         .where { $0.targetGlobalId == mem.__globalId && $0.relation == .partOf }
                         .count
                     if incomingCount > 0 && (bestHub == nil || incomingCount > bestHub!.count) {
@@ -258,20 +267,19 @@ extension MemoryTools {
                 }
 
                 guard let hub = bestHub, let hubGlobalId = hub.mem.__globalId else { continue }
-                let hubDisplayId = hub.mem.primaryKey
 
-                let forwardLinked = lattice.objects(Edge.self)
+                let forwardLinked = localLattice.objects(Edge.self)
                     .where { $0.sourceGlobalId == memoryGlobalId && $0.targetGlobalId == hubGlobalId && $0.relation == .relatesTo }
                     .first != nil
-                let reverseLinked = lattice.objects(Edge.self)
+                let reverseLinked = localLattice.objects(Edge.self)
                     .where { $0.sourceGlobalId == hubGlobalId && $0.targetGlobalId == memoryGlobalId && $0.relation == .relatesTo }
                     .first != nil
                 guard !(forwardLinked || reverseLinked) else { continue }
 
                 let edge = Edge(sourceGlobalId: memoryGlobalId, targetGlobalId: hubGlobalId, relation: .relatesTo)
                 localLattice.add(edge)
-                if let hid = hubDisplayId { autoLinkedIds.append(hid) }
-                log("Cross-project link [\(memoryId)] --[relates_to]--> [\(hubDisplayId.map(String.init) ?? "?")] (project '\(otherProject)' mentioned in content)")
+                autoLinkedGids.append(hubGlobalId)
+                log("Cross-project link [\(memoryGlobalId.uuidString)] --[relates_to]--> [\(hubGlobalId.uuidString)] (project '\(otherProject)' mentioned in content)")
             }
         }
 
@@ -283,16 +291,16 @@ extension MemoryTools {
             for candidate in autoConnectCandidates {
                 guard let candidateGlobalId = candidate.object.__globalId else { continue }
                 // Find hubs this neighbor belongs to (outgoing part_of to non-episode memory)
-                for edge in lattice.objects(Edge.self)
+                for edge in localLattice.objects(Edge.self)
                     .where({ $0.sourceGlobalId == candidateGlobalId && $0.relation == .partOf }) {
-                    if lattice.objects(Memory.self)
+                    if localLattice.objects(Memory.self)
                         .where({ $0.__globalId == edge.targetGlobalId && $0.topic != "episode" }).first != nil {
                         hubCounts[edge.targetGlobalId, default: 0] += 1
                     }
                 }
                 // Check if this neighbor IS a hub (has incoming part_of edges)
                 if candidate.object.topic != "episode" {
-                    let hasIncoming = lattice.objects(Edge.self)
+                    let hasIncoming = localLattice.objects(Edge.self)
                         .where { $0.targetGlobalId == candidateGlobalId && $0.relation == .partOf }
                         .first != nil
                     if hasIncoming {
@@ -309,21 +317,15 @@ extension MemoryTools {
             // Auto-link to hub if >= 2 neighbors share one
             if let (hubGlobalId, count) = hubCounts.max(by: { $0.value < $1.value }),
                count >= 2 {
-                // Check parent exclusion using globalId
-                let parentGlobalId: UUID? = {
-                    guard let pid = parentIdValue else { return nil }
-                    return lattice.objects(Memory.self).where({ $0.primaryKey == pid }).first?.__globalId
-                }()
-                let skipHub = parentGlobalId.map { $0 == hubGlobalId } ?? false
+                let skipHub = parentGidValue.map { $0 == hubGlobalId } ?? false
                 if !skipHub {
-                    let alreadyLinked = lattice.objects(Edge.self)
+                    let alreadyLinked = localLattice.objects(Edge.self)
                         .where { $0.sourceGlobalId == memoryGlobalId && $0.targetGlobalId == hubGlobalId && $0.relation == .partOf }
                         .first != nil
                     if !alreadyLinked {
                         let edge = Edge(sourceGlobalId: memoryGlobalId, targetGlobalId: hubGlobalId, relation: .partOf)
                         localLattice.add(edge)
-                        let hubDisplayId = lattice.objects(Memory.self).where({ $0.__globalId == hubGlobalId }).first?.primaryKey
-                        log("Auto-organized [\(memoryId)] into hub [\(hubDisplayId.map(String.init) ?? "?")]")
+                        log("Auto-organized [\(memoryGlobalId.uuidString)] into hub [\(hubGlobalId.uuidString)]")
                     }
                 }
             }
@@ -333,17 +335,17 @@ extension MemoryTools {
                let (consensusTopic, count) = topicCounts.max(by: { $0.value < $1.value }),
                count >= 2 {
                 memory.topic = consensusTopic
-                log("Auto-inferred topic '\(consensusTopic)' for [\(memoryId)]")
+                log("Auto-inferred topic '\(consensusTopic)' for [\(memoryGlobalId.uuidString)]")
             }
         }
 
         let expiresNote = expiresAt == .distantFuture ? "" : ", expires: \(Self.dateFormatter.string(from: expiresAt))"
         let importanceNote = importance > 0 ? ", importance: \(importance)" : ""
         let privateNote = isPrivate ? ", private: true" : ""
-        let autoLinkNote = autoLinkedIds.isEmpty ? "" : ", auto-linked to \(autoLinkedIds.map { "[id:\($0)]" }.joined(separator: ", "))"
+        let autoLinkNote = autoLinkedGids.isEmpty ? "" : ", auto-linked to \(autoLinkedGids.map { "[id:\($0.uuidString)]" }.joined(separator: ", "))"
         log("Stored memory [\(project)/\(topic)]: \(content.prefix(80))")
 
-        var response = "Stored memory (id: \(memoryId), project: \(project), topic: \(topic)\(parentNote)\(expiresNote)\(importanceNote)\(privateNote)\(autoLinkNote)): \(content.prefix(100))\(content.count > 100 ? "..." : "")"
+        var response = "Stored memory (id: \(memoryGlobalId.uuidString), project: \(project), topic: \(topic)\(parentNote)\(expiresNote)\(importanceNote)\(privateNote)\(autoLinkNote)): \(content.prefix(100))\(content.count > 100 ? "..." : "")"
 
         // Nudge toward atomic memories when content is complex
         let lines = content.components(separatedBy: "\n")
@@ -353,9 +355,10 @@ extension MemoryTools {
                 $0.drop(while: { $0 == "#" || $0 == " " })
             }
             response += "\n\n💡 This memory has \(headers.count) sections (\(names.joined(separator: ", "))). "
-            response += "Consider storing each section as a child memory with `parent_id: \(memoryId)` for more precise recall."
+            response += "Consider storing each section as a child memory with `parent_id: \"\(memoryGlobalId.uuidString)\"` for more precise recall."
         }
 
+        log("[remember] SUCCESS, returning response")
         return CallTool.Result(
             content: [.text(response)],
             isError: false
@@ -376,9 +379,15 @@ extension MemoryTools {
         let depth = min(a.depth?.value ?? 0, 3)
         let hasTemporalFilter = a.since != nil || a.before != nil
 
-        // Build base query — always filter out expired memories
-        var results = lattice.objects(Memory.self)
+        log("[recall] START query=\"\(query.prefix(80))\", project=\(projectFilter ?? "nil"), topic=\(topicFilter ?? "nil"), limit=\(limit), depth=\(depth)")
+
+        // Build base query — route reads to the right DB based on project sync policy
+        let db = readLattice(for: projectFilter)
+        log("[recall] DB selected")
+        var results = db.objects(Memory.self)
+            .distinct(by: \.__globalId)
             .where { $0.expiresAt > Date() }
+        log("[recall] Base query built")
 
         // Topic is still a hard filter (it's a narrow constraint)
         if let topicFilter {
@@ -402,15 +411,20 @@ extension MemoryTools {
         // Vector-first recall: L2 KNN uses the native vec0 index (O(log n)).
         // Embeddings are normalized so L2 and cosine give equivalent rankings.
         // FTS5 is only used as a degraded fallback when the embedding model is unavailable.
+        log("[recall] Embedding query text...")
         if let queryEmbedding = try await embedder.embed(text: query) {
+            log("[recall] Embedding complete, dims=\(queryEmbedding.count)")
             // Soft project boost: fetch wider net, then re-rank
             let fetchLimit = projectFilter != nil ? limit * 3 : limit
             let embedding = Vector<Float>(queryEmbedding)
 
+            log("[recall] Running nearest() with fetchLimit=\(fetchLimit)")
             let nearest = results
                 .nearest(to: embedding, on: \.embedding, limit: fetchLimit, distance: .l2)
+            log("[recall] nearest() returned \(nearest.count) results")
 
             if nearest.isEmpty {
+                log("[recall] No results, returning empty")
                 return CallTool.Result(content: [.text("No memories found.")], isError: false)
             }
 
@@ -454,6 +468,7 @@ extension MemoryTools {
                 return (object: m, distance: distance)
             }
 
+            log("[recall] Boosting complete for \(boosted.count) results")
             // Re-sort by boosted distance and take top `limit`
             let sorted = boosted.sorted { $0.distance < $1.distance }
             let topResults = Array(sorted.prefix(limit))
@@ -470,6 +485,7 @@ extension MemoryTools {
             let p75 = distances[distances.count * 3 / 4]
             let threshold = max(min(p75 * 1.2, bestDistance * 3.0), 1e-9)
             let filtered = topResults.filter { $0.distance <= threshold }
+            log("[recall] After outlier filter: \(filtered.count) results (threshold=\(String(format: "%.3f", threshold)))")
 
             // Bump lastAccessedAt and accessCount on recalled memories
             let accessNow = Date()
@@ -480,12 +496,12 @@ extension MemoryTools {
 
             let lines = filtered.compactMap { match -> String? in
                 let m = match.object
-                guard let mId = m.primaryKey else { return nil }
+                guard let mGid = m.__globalId else { return nil }
                 let dist = String(format: "%.3f", match.distance)
                 let impInfo = m.importance > 0 ? ", importance: \(m.importance)" : ""
                 let expires = m.expiresAt == .distantFuture ? "" : ", expires: \(Self.dateFormatter.string(from: m.expiresAt))"
                 let created = hasTemporalFilter ? ", created: \(Self.dateFormatter.string(from: m.createdAt))" : ""
-                return "[id:\(mId)] [\(m.project)/\(m.topic)] (distance: \(dist)\(impInfo)\(expires)\(created)) \(m.content)"
+                return "[id:\(mGid.uuidString)] [\(m.project)/\(m.topic)] (distance: \(dist)\(impInfo)\(expires)\(created)) \(m.content)"
             }
 
             var output = lines.joined(separator: "\n\n")
@@ -496,67 +512,70 @@ extension MemoryTools {
                 output = "⚠️ Weak recall (avg distance: \(String(format: "%.3f", avgDistance)), count: \(filtered.count)). Results may not be closely related to the query.\n\n" + output
             }
 
+            log("[recall] Output formatted, \(lines.count) lines")
+
             // Graph traversal when depth > 0
             if depth > 0 {
+                log("[recall] Starting graph traversal, depth=\(depth)")
                 let recalledGlobalIds = Set(filtered.compactMap { $0.object.__globalId })
-                let allConnected = traverseGraph(from: recalledGlobalIds, depth: depth, excludeGlobalIds: recalledGlobalIds)
-                // Filter connected memories by relevance to query.
+                // Filter during traversal so filtered-out nodes don't propagate to deeper depths.
                 // Structural edges (part_of, derived_from, supersedes) always pass through.
-                // Loose edges (relates_to, contradicts) require semantic proximity.
+                // Loose edges (relates_to, contradicts) require semantic proximity to the query.
                 let queryVec = Vector<Float>(queryEmbedding)
-                let structuralRelations: Set<Edge.Relation> = [.partOf, .derivedFrom, .supersedes]
-                let connected = allConnected.filter { mem in
-                    guard let memGlobalId = mem.memory.__globalId else { return false }
-                    // Check if any edge connecting this memory to a recalled memory is structural
-                    let hasStructuralEdge = lattice.objects(Edge.self)
-                        .where { ($0.sourceGlobalId == memGlobalId || $0.targetGlobalId == memGlobalId) }
-                        .contains { structuralRelations.contains($0.relation) }
-                    if hasStructuralEdge { return true }
-                    // Loose edges: filter by cosine distance to query
-                    guard mem.memory.embedding.dimensions > 0 else { return false }
-                    return Double(mem.memory.embedding.cosineDistance(to: queryVec)) <= 0.15
-                }
+                let structuralRelations: Set<Edge.Relation> = [.partOf, .derivedFrom, .supersedes, .summarizedBy]
+                let connected = traverseGraph(
+                    from: recalledGlobalIds,
+                    depth: depth,
+                    excludeGlobalIds: recalledGlobalIds,
+                    db: db,
+                    filter: { mem, connectingEdge in
+                        // The connecting edge is the specific edge that reached this memory
+                        if structuralRelations.contains(connectingEdge.relation) { return true }
+                        // Loose edges: filter by cosine distance to query
+                        guard mem.embedding.dimensions > 0 else { return false }
+                        return Double(mem.embedding.cosineDistance(to: queryVec)) <= 0.15
+                    }
+                )
+                log("[recall] Graph traversal returned \(connected.count) connected memories")
                 if !connected.isEmpty {
                     output += "\n\n--- Connected (graph traversal, depth: \(depth)) ---"
                     let connNow = Date()
-                    // Track all known globalIds (recalled + connected so far) for edge lookup at depth>1
-                    var knownGlobalIds = recalledGlobalIds
                     for mem in connected {
                         let m = mem.memory
-                        guard let memId = m.primaryKey, let memGlobalId = m.__globalId else { continue }
+                        guard let memGlobalId = m.__globalId else { continue }
                         m.lastAccessedAt = connNow
                         m.accessCount += 1
 
                         let expires = m.expiresAt == .distantFuture ? "" : ", expires: \(Self.dateFormatter.string(from: m.expiresAt))"
 
-                        // Look up the edge relation connecting this memory to any known memory
-                        var edgeInfo = ""
-                        if let edge = lattice.objects(Edge.self).where({ $0.targetGlobalId == memGlobalId }).first(where: { knownGlobalIds.contains($0.sourceGlobalId) }) {
-                            let sourceDisplayId = lattice.objects(Memory.self).where({ $0.__globalId == edge.sourceGlobalId }).first?.primaryKey.map(String.init) ?? "?"
-                            edgeInfo = " <--[\(edge.relation.rawValue)]-- [id:\(sourceDisplayId)]"
-                        } else if let edge = lattice.objects(Edge.self).where({ $0.sourceGlobalId == memGlobalId }).first(where: { knownGlobalIds.contains($0.targetGlobalId) }) {
-                            let targetDisplayId = lattice.objects(Memory.self).where({ $0.__globalId == edge.targetGlobalId }).first?.primaryKey.map(String.init) ?? "?"
-                            edgeInfo = " --[\(edge.relation.rawValue)]--> [id:\(targetDisplayId)]"
+                        // Use the connecting edge directly from traversal
+                        let edge = mem.connectingEdge
+                        let edgeInfo: String
+                        if edge.targetGlobalId == memGlobalId {
+                            edgeInfo = " <--[\(edge.relation.rawValue)]-- [id:\(edge.sourceGlobalId.uuidString)]"
+                        } else {
+                            edgeInfo = " --[\(edge.relation.rawValue)]--> [id:\(edge.targetGlobalId.uuidString)]"
                         }
-                        knownGlobalIds.insert(memGlobalId)
 
                         // Small memories shown in full; large ones get a compact preview
                         if m.content.count <= 500 {
-                            output += "\n\n[id:\(memId)] [\(m.project)/\(m.topic)]\(expires)\(edgeInfo) \(m.content)"
+                            output += "\n\n[id:\(memGlobalId.uuidString)] [\(m.project)/\(m.topic)]\(expires)\(edgeInfo) \(m.content)"
                         } else {
                             let firstLine = m.content.split(separator: "\n", maxSplits: 1).first.map(String.init) ?? m.content
                             let preview = String(firstLine.prefix(120))
                             let charCount = m.content.count
                             let sectionCount = m.content.components(separatedBy: "\n").filter { $0.hasPrefix("## ") || $0.hasPrefix("### ") }.count
                             let sizeInfo = sectionCount > 0 ? "\(sectionCount) sections, \(charCount) chars" : "\(charCount) chars"
-                            output += "\n\n[id:\(memId)] [\(m.project)/\(m.topic)] (\(sizeInfo)\(expires))\(edgeInfo) \(preview)\(charCount > 120 ? "..." : "")"
+                            output += "\n\n[id:\(memGlobalId.uuidString)] [\(m.project)/\(m.topic)] (\(sizeInfo)\(expires))\(edgeInfo) \(preview)\(charCount > 120 ? "..." : "")"
                         }
                     }
                 }
             }
 
+            log("[recall] DONE, returning \(output.count) chars")
             return CallTool.Result(content: [.text(output)], isError: false)
         } else {
+            log("[recall] No embedding available, falling back to FTS5")
             // Degraded mode: FTS5 full-text search (no embedding model loaded)
             let contentWords = Self.extractContentWords(from: query)
             let ftsTerms = contentWords.isEmpty ? query.split(separator: " ").map(String.init) : contentWords
@@ -572,8 +591,8 @@ extension MemoryTools {
                 let ftsInfo = match.distances["content"].map { " (fts5: \(String(format: "%.3f", $0)))" } ?? ""
                 let expires = m.expiresAt == .distantFuture ? "" : ", expires: \(Self.dateFormatter.string(from: m.expiresAt))"
                 let created = hasTemporalFilter ? ", created: \(Self.dateFormatter.string(from: m.createdAt))" : ""
-                guard let mId = m.primaryKey else { continue }
-                lines.append("[id:\(mId)] [\(m.project)/\(m.topic)]\(ftsInfo)\(expires)\(created) \(m.content)")
+                guard let mGid = m.__globalId else { continue }
+                lines.append("[id:\(mGid.uuidString)] [\(m.project)/\(m.topic)]\(ftsInfo)\(expires)\(created) \(m.content)")
             }
             if lines.isEmpty {
                 return CallTool.Result(content: [.text("No memories found.")], isError: false)
@@ -587,66 +606,62 @@ extension MemoryTools {
     func handleForget(_ args: [String: Value]?) throws -> CallTool.Result {
         let a = try args.decode(ForgetArgs.self)
 
-        // Delete by ID takes priority
-        if let id = a.id?.value {
-            let id64 = Int64(id)
-            let matches = lattice.objects(Memory.self).where { $0.primaryKey == id64 }
-            guard let mem = matches.first else {
-                return CallTool.Result(content: [.text("Memory with id \(id) not found.")], isError: true)
+        // Delete by UUID takes priority
+        if let gid = a.id?.value {
+            guard let (mem, foundLattice) = findMemory(id: gid) else {
+                return CallTool.Result(content: [.text("Memory with id \(gid.uuidString) not found.")], isError: true)
             }
             let summary = mem.content.prefix(80)
 
             // Cascade: delete edges referencing this memory
-            let edgeCount: Int
-            if let memGid = mem.__globalId {
-                edgeCount = deleteEdgesForMemories([memGid])
-            } else {
-                edgeCount = 0
-            }
+            let edgeCount = deleteEdgesForMemories([gid])
 
-            lattice.delete(Memory.self, where: { $0.primaryKey == id64 })
+            foundLattice.delete(Memory.self, where: { $0.__globalId == gid })
             let edgeNote = edgeCount > 0 ? " Removed \(edgeCount) edge(s)." : ""
-            log("Deleted memory [id:\(id)]: \(summary)")
-                return CallTool.Result(
-                content: [.text("Deleted memory (id: \(id), project: \(mem.project), topic: \(mem.topic)): \(summary)\(edgeNote)")],
+            log("Deleted memory [id:\(gid.uuidString)]: \(summary)")
+            return CallTool.Result(
+                content: [.text("Deleted memory (id: \(gid.uuidString), project: \(mem.project), topic: \(mem.topic)): \(summary)\(edgeNote)")],
                 isError: false
             )
         }
 
         switch (a.topic, a.project) {
         case let (topic?, project?):
-            let query = lattice.objects(Memory.self).where { $0.topic == topic && $0.project == project }
+            let db = readLattice(for: project)
+            let query = db.objects(Memory.self).where { $0.topic == topic && $0.project == project }.distinct(by: \.__globalId)
             let memories = query.snapshot()
             let globalIds = memories.compactMap(\.__globalId)
             let edgeCount = deleteEdgesForMemories(globalIds)
             let count = memories.count
-            lattice.delete(Memory.self, where: { $0.topic == topic && $0.project == project })
+            db.delete(Memory.self, where: { $0.topic == topic && $0.project == project })
             let edgeNote = edgeCount > 0 ? " Removed \(edgeCount) edge(s)." : ""
-                return CallTool.Result(
+            return CallTool.Result(
                 content: [.text("Deleted \(count) memories (project: \(project), topic: \(topic)).\(edgeNote)")],
                 isError: false
             )
         case let (topic?, nil):
-            let query = lattice.objects(Memory.self).where { $0.topic == topic }
+            // No project → delete from localLattice only
+            let query = localLattice.objects(Memory.self).where { $0.topic == topic }
             let memories = query.snapshot()
             let globalIds = memories.compactMap(\.__globalId)
             let edgeCount = deleteEdgesForMemories(globalIds)
             let count = memories.count
-            lattice.delete(Memory.self, where: { $0.topic == topic })
+            localLattice.delete(Memory.self, where: { $0.topic == topic })
             let edgeNote = edgeCount > 0 ? " Removed \(edgeCount) edge(s)." : ""
-                return CallTool.Result(
+            return CallTool.Result(
                 content: [.text("Deleted \(count) memories with topic '\(topic)'.\(edgeNote)")],
                 isError: false
             )
         case let (nil, project?):
-            let query = lattice.objects(Memory.self).where { $0.project == project }
+            let db = readLattice(for: project)
+            let query = db.objects(Memory.self).where { $0.project == project }.distinct(by: \.__globalId)
             let memories = query.snapshot()
             let globalIds = memories.compactMap(\.__globalId)
             let edgeCount = deleteEdgesForMemories(globalIds)
             let count = memories.count
-            lattice.delete(Memory.self, where: { $0.project == project })
+            db.delete(Memory.self, where: { $0.project == project })
             let edgeNote = edgeCount > 0 ? " Removed \(edgeCount) edge(s)." : ""
-                return CallTool.Result(
+            return CallTool.Result(
                 content: [.text("Deleted \(count) memories for project '\(project)'.\(edgeNote)")],
                 isError: false
             )
@@ -685,16 +700,15 @@ extension MemoryTools {
 
         // 5. Locate memory
         let mem: Memory
-        if let id = a.id?.value {
-            let id64 = Int64(id)
-            let matches = lattice.objects(Memory.self).where { $0.primaryKey == id64 }
-            guard let found = matches.first else {
-                return CallTool.Result(content: [.text("Memory with id \(id) not found.")], isError: true)
+        if let gid = a.id?.value {
+            guard let found = findMemory(id: gid) else {
+                return CallTool.Result(content: [.text("Memory with id \(gid.uuidString) not found.")], isError: true)
             }
-            mem = found
+            mem = found.memory
         } else {
             let query = a.query!
-            var results = lattice.objects(Memory.self)
+            let db = readLattice(for: a.project)
+            var results = db.objects(Memory.self).distinct(by: \.__globalId)
             if let projectFilter = a.project {
                 results = results.where { $0.project == projectFilter }
             }
@@ -789,14 +803,10 @@ extension MemoryTools {
         // 9. Update lastAccessedAt
         mem.lastAccessedAt = Date()
 
-        let memId = mem.primaryKey.map(String.init) ?? "unknown"
-        log("Updated memory [id:\(memId)] [\(mem.project)/\(mem.topic)]: \(changes.joined(separator: ", "))")
-        // Count as CRUD op unless only the topic changed
-        let hasNonTopicChange = contentChanged || a.setProject != nil || a.source != nil || a.expiresInDays != nil || a.importance != nil || a.isPrivate != nil
-        if hasNonTopicChange {
-            }
+        let memGidStr = mem.__globalId?.uuidString ?? "unknown"
+        log("Updated memory [id:\(memGidStr)] [\(mem.project)/\(mem.topic)]: \(changes.joined(separator: ", "))")
         return CallTool.Result(
-            content: [.text("Updated memory (id: \(memId), project: \(mem.project), topic: \(mem.topic)).\nChanges:\n\(changes.joined(separator: "\n"))")],
+            content: [.text("Updated memory (id: \(memGidStr), project: \(mem.project), topic: \(mem.topic)).\nChanges:\n\(changes.joined(separator: "\n"))")],
             isError: false
         )
     }
@@ -808,25 +818,24 @@ extension MemoryTools {
         guard !a.content.isEmpty else {
             throw MCPError.invalidParams("'content' is required")
         }
-        let ids = a.ids.values.map { Int64($0) }
-        guard ids.count >= 2 else {
+        let gids = a.ids.values
+        guard gids.count >= 2 else {
             throw MCPError.invalidParams("'ids' must contain at least 2 memory IDs to merge")
         }
         let content = a.content
 
-        // Fetch the source memories
-        var sources: [Memory] = []
-        for id in ids {
-            let matches = lattice.objects(Memory.self).where { $0.primaryKey == id }
-            guard let mem = matches.first else {
-                return CallTool.Result(content: [.text("Memory with id \(id) not found.")], isError: true)
+        // Fetch the source memories (may span both DBs)
+        var sources: [(memory: Memory, lattice: Lattice)] = []
+        for gid in gids {
+            guard let found = findMemory(id: gid) else {
+                return CallTool.Result(content: [.text("Memory with id \(gid.uuidString) not found.")], isError: true)
             }
-            sources.append(mem)
+            sources.append(found)
         }
 
         // Use first source for defaults
-        let topic = a.topic ?? sources[0].topic
-        let project = a.project ?? sources[0].project
+        let topic = a.topic ?? sources[0].memory.topic
+        let project = a.project ?? sources[0].memory.project
 
         // Embed the merged content
         guard let floats = try await embedder.embed(text: content) else {
@@ -838,25 +847,26 @@ extension MemoryTools {
         let merged = Memory(content: content, topic: topic, project: project, source: "merged", embedding: embeddingVec)
         localLattice.add(merged)
 
-        guard let mergedId = merged.primaryKey else {
-            throw MCPError.internalError("Failed to persist merged memory — primaryKey is nil after add()")
+        guard let mergedGid = merged.__globalId else {
+            throw MCPError.internalError("Failed to persist merged memory — globalId is nil after add()")
         }
 
         // Collect old content summaries before deleting
-        let oldSummaries = sources.map { "[id:\($0.primaryKey.map(String.init) ?? "?")] \($0.content.prefix(60))" }
+        let oldSummaries = sources.map { "[id:\($0.memory.__globalId?.uuidString ?? "?")] \($0.memory.content.prefix(60))" }
 
         // Clean up edges referencing source memories
-        let edgeCount = deleteEdgesForMemories(sources.compactMap(\.__globalId))
+        let edgeCount = deleteEdgesForMemories(gids)
 
-        // Delete originals
-        for id in ids {
-            lattice.delete(Memory.self, where: { $0.primaryKey == id })
+        // Delete originals from their respective DBs
+        for (_, source) in sources.enumerated() {
+            guard let gid = source.memory.__globalId else { continue }
+            source.lattice.delete(Memory.self, where: { $0.__globalId == gid })
         }
 
         let edgeNote = edgeCount > 0 ? " Removed \(edgeCount) edge(s) from source memories." : ""
-        log("Merged \(ids.count) memories into [id:\(mergedId)]")
+        log("Merged \(gids.count) memories into [id:\(mergedGid.uuidString)]")
         return CallTool.Result(
-            content: [.text("Merged \(ids.count) memories into new memory (id: \(mergedId), project: \(project), topic: \(topic)).\(edgeNote)\n\nDeleted:\n\(oldSummaries.joined(separator: "\n"))\n\nNew:\n\(content)")],
+            content: [.text("Merged \(gids.count) memories into new memory (id: \(mergedGid.uuidString), project: \(project), topic: \(topic)).\(edgeNote)\n\nDeleted:\n\(oldSummaries.joined(separator: "\n"))\n\nNew:\n\(content)")],
             isError: false
         )
     }
@@ -866,8 +876,9 @@ extension MemoryTools {
     func handleStats(_ args: [String: Value]?) throws -> CallTool.Result {
         let a = try args.decode(StatsArgs.self)
         let projectFilter = a.project
+        let db = readLattice(for: projectFilter)
 
-        var base = lattice.objects(Memory.self)
+        var base = db.objects(Memory.self).distinct(by: \.__globalId)
         if let projectFilter {
             base = base.where { $0.project == projectFilter }
         }
@@ -886,7 +897,7 @@ extension MemoryTools {
             let grouped = base.group(by: \.project)
             var projectLines: [String] = []
             for mem in grouped {
-                let count = lattice.count(Memory.self, where: { $0.project == mem.project })
+                let count = db.objects(Memory.self).distinct(by: \.__globalId).where { $0.project == mem.project }.count
                 projectLines.append("  \(mem.project): \(count)")
             }
             projectLines.sort()
@@ -898,7 +909,7 @@ extension MemoryTools {
         let topicGrouped = base.group(by: \.topic)
         var topicLines: [String] = []
         for mem in topicGrouped {
-            var countQuery = lattice.objects(Memory.self).where { $0.topic == mem.topic }
+            var countQuery = db.objects(Memory.self).distinct(by: \.__globalId).where { $0.topic == mem.topic }
             if let projectFilter {
                 countQuery = countQuery.where { $0.project == projectFilter }
             }
@@ -915,8 +926,9 @@ extension MemoryTools {
     func handleListTopics(_ args: [String: Value]?) throws -> CallTool.Result {
         let a = try args.decode(ListTopicsArgs.self)
         let projectFilter = a.project
+        let db = readLattice(for: projectFilter)
 
-        var base = lattice.objects(Memory.self)
+        var base = db.objects(Memory.self).distinct(by: \.__globalId)
         if let projectFilter {
             base = base.where { $0.project == projectFilter }
         }
@@ -928,7 +940,7 @@ extension MemoryTools {
 
         var lines: [String] = []
         for memory in grouped {
-            var countQuery = lattice.objects(Memory.self).where { $0.topic == memory.topic }
+            var countQuery = db.objects(Memory.self).distinct(by: \.__globalId).where { $0.topic == memory.topic }
             if let projectFilter {
                 countQuery = countQuery.where { $0.project == projectFilter }
             }
@@ -955,8 +967,9 @@ extension MemoryTools {
             throw MCPError.invalidParams("'group_by' must be 'day', 'week', or 'month', got '\(groupBy)'")
         }
 
-        // Build query with filters
-        var results = lattice.objects(Memory.self)
+        // Build query with filters — route to right DB based on project
+        var results = readLattice(for: a.project).objects(Memory.self)
+            .distinct(by: \.__globalId)
             .where { $0.expiresAt > Date() }
 
         if let project = a.project {
@@ -1036,8 +1049,8 @@ extension MemoryTools {
             output += "## \(headerFormatter.string(from: group.key)) (\(countLabel))"
             for mem in group.memories {
                 let impInfo = mem.importance > 0 ? " [importance: \(mem.importance)]" : ""
-                let memId = mem.primaryKey.map(String.init) ?? "?"
-                output += "\n[id:\(memId)] [\(mem.project)/\(mem.topic)]\(impInfo) \(mem.content)"
+                let memGid = mem.__globalId?.uuidString ?? "?"
+                output += "\n[id:\(memGid)] [\(mem.project)/\(mem.topic)]\(impInfo) \(mem.content)"
             }
         }
 

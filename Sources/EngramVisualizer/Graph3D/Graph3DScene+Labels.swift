@@ -282,6 +282,12 @@ extension Graph3DScene {
     func updateLabelBatch(positions: [UUID: SIMD3<Float>],
                           nodes: [NodeData], hubs: Set<UUID>,
                           selectedNode: UUID?) {
+        #if ENGRAM_INSTRUMENTATION
+        var diagAtlasRegen = false
+        var diagPartsReplaced = false
+        var diagMissingRects = 0
+        #endif
+
         let nodeCount = positions.count
         guard nodeCount > 0 else {
             if lastLabelPartIndexCount != 0 {
@@ -308,6 +314,9 @@ extension Graph3DScene {
                 // Sync labelAtlasNodeIds to match the comparison source (positions.keys)
                 // to prevent perpetual regen when nodes and positions sets differ.
                 labelAtlasNodeIds = currentNodeIds
+                #if ENGRAM_INSTRUMENTATION
+                diagAtlasRegen = true
+                #endif
             }
         }
         guard labelAtlasTexture != nil else { return }
@@ -364,7 +373,10 @@ extension Graph3DScene {
             minDepth = min(minDepth, d)
             maxDepth = max(maxDepth, d)
         }
-        let depthRange = max(1.0, maxDepth - minDepth)
+        // Floor at 50 world units to prevent extreme depth normalization when
+        // nodes are tightly clustered — label anchors sit above nodes and would
+        // otherwise fall outside a tiny depth range, producing negative depthFade.
+        let depthRange = max(50.0, maxDepth - minDepth)
 
         // --- GPU stamp: Metal compute kernel writes label quad vertices into mesh buffer ---
         // ~500 labels × 64 bytes = ~32KB instance upload (vs 96KB of vertex data previously).
@@ -387,6 +399,11 @@ extension Graph3DScene {
             guard instances.count < maxNodeLabels,
                   let nodeData = nodeById[id],
                   let rect = labelAtlasRects[id] else {
+                #if ENGRAM_INSTRUMENTATION
+                if nodeById[id] != nil && labelAtlasRects[id] == nil {
+                    diagMissingRects += 1
+                }
+                #endif
                 continue
             }
 
@@ -520,6 +537,17 @@ extension Graph3DScene {
                 )
             ])
             lastLabelPartIndexCount = capacityIndexCount
+            #if ENGRAM_INSTRUMENTATION
+            diagPartsReplaced = true
+            #endif
         }
+
+        #if ENGRAM_INSTRUMENTATION
+        if labelDiagReady {
+            let line = "\(renderFrameCount),\(allPositions.count),\(labelAtlasRects.count),\(diagMissingRects),\(actualLabelCount),\(labelBatchCapacity),\(diagAtlasRegen ? 1 : 0),\(String(format: "%.2f", depthRange)),\(String(format: "%.2f", minDepth)),\(String(format: "%.2f", maxDepth)),\(String(format: "%.3f", camPos.x)),\(String(format: "%.3f", camPos.y)),\(String(format: "%.3f", camPos.z)),\(diagPartsReplaced ? 1 : 0),\(projectLabelCount)\n"
+            labelDiagLines.append(line)
+            if renderFrameCount % 10 == 0 { flushLabelDiag() }
+        }
+        #endif
     }
 }

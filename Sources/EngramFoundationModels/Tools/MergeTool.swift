@@ -14,8 +14,8 @@ public struct MergeTool: Tool {
 
     @Generable
     public struct Arguments {
-        @Guide(description: "The memory IDs to merge together.")
-        public var ids: [Int]
+        @Guide(description: "The memory UUIDs to merge together.")
+        public var ids: [String]
 
         @Guide(description: "The merged content — a well-written combination of the source memories.")
         public var content: String

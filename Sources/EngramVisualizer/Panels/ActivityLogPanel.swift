@@ -1,7 +1,7 @@
 import SwiftUI
 
 struct ActivityLogPanel: View {
-    let renderStore: GraphRenderStore
+    let galaxyRegistry: GalaxyRegistry
     let onSelect: (UUID) -> Void
 
     @State private var knownCount: Int = 0
@@ -15,9 +15,9 @@ struct ActivityLogPanel: View {
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 1)) { context in
-            let colorMap = renderStore.colorMap
-            let recent = renderStore.recentNodes
-            let nodeCount = renderStore.nodes.count
+            let colorMap = galaxyRegistry.mergedColorMap
+            let recent = galaxyRegistry.mergedRecentNodes
+            let nodeCount = galaxyRegistry.mergedNodes.count
 
             VStack(alignment: .trailing, spacing: 0) {
                 HStack(spacing: 6) {

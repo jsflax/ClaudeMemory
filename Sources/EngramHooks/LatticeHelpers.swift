@@ -23,7 +23,7 @@ func initMemoryTools() async -> MemoryTools? {
     let embedder = EmbeddingService(modelPath: modelPath)
     await embedder.load()
 
-    return MemoryTools(ref: lattice.sendableReference, embedder: embedder)
+    return MemoryTools(localRef: lattice.sendableReference, syncedRef: nil, embedder: embedder)
 }
 
 /// Get the current total memory count from the database.

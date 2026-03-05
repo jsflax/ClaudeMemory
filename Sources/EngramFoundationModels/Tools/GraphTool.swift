@@ -14,8 +14,8 @@ public struct GraphTool: Tool {
 
     @Generable
     public struct Arguments {
-        @Guide(description: "The memory ID to explore.")
-        public var id: Int
+        @Guide(description: "The memory UUID to explore.")
+        public var id: String
 
         @Guide(description: "Traversal depth (1-3, default 1).")
         public var depth: Int?

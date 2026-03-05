@@ -38,11 +38,11 @@ public struct ConnectTool: Tool {
 
     @Generable
     public struct Arguments {
-        @Guide(description: "The source memory ID.")
-        public var from: Int
+        @Guide(description: "The source memory UUID.")
+        public var from: String
 
-        @Guide(description: "The target memory ID.")
-        public var to: Int
+        @Guide(description: "The target memory UUID.")
+        public var to: String
 
         @Guide(description: "The relationship type: relatesTo, contradicts, supersedes, derivedFrom, partOf, or summarizedBy.")
         public var relation: Relation

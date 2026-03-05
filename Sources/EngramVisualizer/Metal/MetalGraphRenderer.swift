@@ -38,6 +38,11 @@ final class MetalGraphRenderer: NSObject {
 
     // Depth texture
     var depthTexture: MTLTexture?
+
+    // Always-on stall detector — logs to os_log when frame gap exceeds threshold
+    private var lastFrameTime: Double = 0
+    private var stallCanaryScheduleTime: Double = 0
+    private static let stallLog = OSLog(subsystem: "io.engram.app", category: "FrameStall")
     var drawableSize: CGSize = .zero
 
     // Sphere template
@@ -374,7 +379,7 @@ final class MetalGraphRenderer: NSObject {
 
     // MARK: - Stamp Nodes (GPU Compute)
 
-    func stampNodes(commandBuffer: MTLCommandBuffer) {
+    func stampNodes(encoder: MTLComputeCommandEncoder) {
         guard actualNodeCount > 0,
               let pipeline = stampNodePipeline,
               let templateBuf = sphereTemplateBuffer,
@@ -389,7 +394,6 @@ final class MetalGraphRenderer: NSObject {
             nodeCount: UInt32(actualNodeCount)
         )
 
-        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.setComputePipelineState(pipeline)
         encoder.setBuffer(templateBuf, offset: 0, index: 0)
         encoder.setBuffer(instanceBuf, offset: 0, index: 1)
@@ -403,21 +407,11 @@ final class MetalGraphRenderer: NSObject {
             MTLSize(width: threadgroups, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: threadgroupSize, height: 1, depth: 1)
         )
-        encoder.endEncoding()
-
-        // Zero stale vertices
-        let bvStride = MemoryLayout<BatchVertex>.stride
-        let writtenBytes = totalVerts * bvStride
-        let totalBytes = nodeVertexCapacity * vertsPerSphere * bvStride
-        if writtenBytes < totalBytes, let blit = commandBuffer.makeBlitCommandEncoder() {
-            blit.fill(buffer: outputBuf, range: writtenBytes..<totalBytes, value: 0)
-            blit.endEncoding()
-        }
     }
 
     // MARK: - Stamp Edges (GPU Compute)
 
-    func stampEdges(commandBuffer: MTLCommandBuffer) {
+    func stampEdges(encoder: MTLComputeCommandEncoder) {
         guard actualEdgeCount > 0,
               let pipeline = stampEdgePipeline,
               let instanceBuf = edgeInstanceBuffer,
@@ -433,7 +427,6 @@ final class MetalGraphRenderer: NSObject {
             edgeCount: UInt32(actualEdgeCount)
         )
 
-        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.setComputePipelineState(pipeline)
         encoder.setBuffer(instanceBuf, offset: 0, index: 0)
         encoder.setBuffer(paramsBuf, offset: 0, index: 1)
@@ -446,16 +439,6 @@ final class MetalGraphRenderer: NSObject {
             MTLSize(width: threadgroups, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: threadgroupSize, height: 1, depth: 1)
         )
-        encoder.endEncoding()
-
-        // Zero stale vertices
-        let bvStride = MemoryLayout<BatchVertex>.stride
-        let writtenBytes = totalVerts * bvStride
-        let totalBytes = edgeVertexCapacity * Int(vertsPerEdge) * bvStride
-        if writtenBytes < totalBytes, let blit = commandBuffer.makeBlitCommandEncoder() {
-            blit.fill(buffer: outputBuf, range: writtenBytes..<totalBytes, value: 0)
-            blit.endEncoding()
-        }
 
         // Update vertex count for draw call
         actualEdgeVertexCount = totalVerts
@@ -463,14 +446,13 @@ final class MetalGraphRenderer: NSObject {
 
     // MARK: - Stamp Labels (GPU Compute)
 
-    func stampLabels(commandBuffer: MTLCommandBuffer) {
+    func stampLabels(encoder: MTLComputeCommandEncoder) {
         guard actualLabelCount > 0,
               let pipeline = stampLabelPipeline,
               let instanceBuf = labelInstanceBuffer,
               let paramsBuf = labelStampParamsBuffer,
               let outputBuf = labelVertexBuffer else { return }
 
-        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.setComputePipelineState(pipeline)
         encoder.setBuffer(instanceBuf, offset: 0, index: 0)
         encoder.setBuffer(paramsBuf, offset: 0, index: 1)
@@ -482,16 +464,6 @@ final class MetalGraphRenderer: NSObject {
             MTLSize(width: threadgroups, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: threadgroupSize, height: 1, depth: 1)
         )
-        encoder.endEncoding()
-
-        // Zero stale
-        let bvStride2 = MemoryLayout<BatchVertex>.stride
-        let writtenBytes = actualLabelCount * 4 * bvStride2
-        let totalBytes = labelVertexCapacity * 4 * bvStride2
-        if writtenBytes < totalBytes, let blit = commandBuffer.makeBlitCommandEncoder() {
-            blit.fill(buffer: outputBuf, range: writtenBytes..<totalBytes, value: 0)
-            blit.endEncoding()
-        }
     }
 
     // MARK: - Sphere Template Generation
@@ -619,26 +591,64 @@ extension MetalGraphRenderer: MTKViewDelegate {
         animationTime += dtSec
         frameCount &+= 1
 
+        // Always-on stall detection (no build flag needed)
+        let now = CFAbsoluteTimeGetCurrent()
+        if lastFrameTime > 0 {
+            let gapMs = (now - lastFrameTime) * 1000.0
+            let canaryMs = stallCanaryScheduleTime > 0 ? (stallCanaryScheduleTime - lastFrameTime) * 1000.0 : 0
+            // Always drain accumulator to report observer work between frames
+            ObserverAccumulator.shared.drainAndLog()
+            if gapMs > 25 { // >25ms = dropped frame
+                os_log(.fault, log: Self.stallLog,
+                       "STALL: frame_gap=%.1fms canary_delay=%.1fms (main thread blocked %.1fms between frames)",
+                       gapMs, canaryMs, canaryMs)
+            }
+        }
+        lastFrameTime = now
+        // Schedule canary to detect main-thread work between frames
+        DispatchQueue.main.async { [weak self] in
+            self?.stallCanaryScheduleTime = CFAbsoluteTimeGetCurrent()
+        }
+
         #if ENGRAM_INSTRUMENTATION
         let drawStart = CFAbsoluteTimeGetCurrent()
         #endif
 
         // Let the scene manager do its per-frame work (input, simulation, data packing)
+        let cbStart = CFAbsoluteTimeGetCurrent()
         onFrameCallback?(dtSec)
+        let cbMs = (CFAbsoluteTimeGetCurrent() - cbStart) * 1000.0
+        if cbMs > 10 {
+            os_log(.fault, log: Self.stallLog, "HOTPATH: onFrameCallback %.1fms", cbMs)
+        }
 
         #if ENGRAM_INSTRUMENTATION
         let afterCallback = CFAbsoluteTimeGetCurrent()
         #endif
 
         // Wait for a free frame slot
+        let waitStart = CFAbsoluteTimeGetCurrent()
         bufferPool.waitForNextFrame()
+        let waitMs = (CFAbsoluteTimeGetCurrent() - waitStart) * 1000.0
+        if waitMs > 10 {
+            os_log(.fault, log: Self.stallLog, "HOTPATH: bufferPool.wait %.1fms", waitMs)
+        }
 
         #if ENGRAM_INSTRUMENTATION
         let afterWait = CFAbsoluteTimeGetCurrent()
         #endif
 
-        guard let drawable = view.currentDrawable,
-              drawable.texture.width > 0,
+        let drawableStart = CFAbsoluteTimeGetCurrent()
+        guard let drawable = view.currentDrawable else {
+            bufferPool.signalFrameComplete()
+            return
+        }
+        let drawableMs = (CFAbsoluteTimeGetCurrent() - drawableStart) * 1000.0
+        if drawableMs > 5 {
+            os_log(.fault, log: Self.stallLog, "HOTPATH: currentDrawable %.1fms", drawableMs)
+        }
+        let encodeStart = CFAbsoluteTimeGetCurrent()
+        guard drawable.texture.width > 0,
               drawable.texture.height > 0,
               let renderPassDesc = view.currentRenderPassDescriptor,
               let commandBuffer = commandQueue.makeCommandBuffer() else {
@@ -675,10 +685,24 @@ extension MetalGraphRenderer: MTKViewDelegate {
         bufferPool.updateFrameUniforms(frameUniforms)
         bufferPool.updateLightingUniforms(lightingUniforms)
 
-        // GPU compute: stamp node spheres, edge cylinders, label quads
-        stampNodes(commandBuffer: commandBuffer)
-        stampEdges(commandBuffer: commandBuffer)
-        stampLabels(commandBuffer: commandBuffer)
+        // GPU compute: stamp node spheres, edge cylinders, label quads + thruster particles (single shared encoder)
+        if let computeEncoder = commandBuffer.makeComputeCommandEncoder() {
+            stampNodes(encoder: computeEncoder)
+            stampEdges(encoder: computeEncoder)
+            stampLabels(encoder: computeEncoder)
+
+            // Dispatch GPU mascot matrix compute + thruster particle compute for each galaxy's fleet
+            if let registry = galaxyRegistryRef {
+                for galaxy in registry.galaxies.values {
+                    galaxy.mascotFleet?.dispatchMatrixCompute(encoder: computeEncoder)
+                    galaxy.mascotFleet?.dispatchParticleCompute(
+                        encoder: computeEncoder, dt: dtSec, camera: camera
+                    )
+                }
+            }
+
+            computeEncoder.endEncoding()
+        }
 
         // Render pass
         guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDesc) else {
@@ -850,6 +874,11 @@ extension MetalGraphRenderer: MTKViewDelegate {
             pool.signalFrameComplete()
         }
         commandBuffer.commit()
+
+        let encodeMs = (CFAbsoluteTimeGetCurrent() - encodeStart) * 1000.0
+        if encodeMs > 10 {
+            os_log(.fault, log: Self.stallLog, "HOTPATH: encode+present %.1fms", encodeMs)
+        }
 
         #if ENGRAM_INSTRUMENTATION
         let drawEnd = CFAbsoluteTimeGetCurrent()

@@ -31,7 +31,7 @@ enum CLIInstaller {
             try fm.createDirectory(atPath: installDir, withIntermediateDirectories: true)
 
             // Copy CLI binaries
-            let binaries = ["memory", "memory-hooks"]
+            let binaries = ["memory", "memory-hooks", "memory-sync"]
             for binary in binaries {
                 let src = cliDir.appendingPathComponent(binary)
                 let dst = URL(fileURLWithPath: installDir).appendingPathComponent(binary)
@@ -86,6 +86,9 @@ enum CLIInstaller {
                 }
             }
 
+            // Install sync daemon launchd plist
+            installDaemonPlist()
+
             // Write version marker
             try bundledVersion.write(toFile: versionFile, atomically: true, encoding: .utf8)
 
@@ -98,6 +101,68 @@ enum CLIInstaller {
         } catch {
             // Best-effort — don't crash the app if CLI sync fails
         }
+    }
+
+    // MARK: - Sync Daemon
+
+    private static let daemonLabel = "io.engram.sync"
+    private static let daemonPlistPath = NSHomeDirectory() + "/Library/LaunchAgents/io.engram.sync.plist"
+    private static let daemonBinary = installDir + "/memory-sync"
+    private static let uid = getuid()
+
+    private static func installDaemonPlist() {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: daemonBinary) else { return }
+
+        let launchAgentsDir = NSHomeDirectory() + "/Library/LaunchAgents"
+        try? fm.createDirectory(atPath: launchAgentsDir, withIntermediateDirectories: true)
+
+        let plist: [String: Any] = [
+            "Label": daemonLabel,
+            "ProgramArguments": [daemonBinary],
+            "KeepAlive": ["SuccessfulExit": false],
+            "ThrottleInterval": 30,
+            "StandardErrorPath": claudeDir + "/sync-daemon-launchd.log",
+            "ProcessType": "Background",
+        ]
+
+        guard let data = try? PropertyListSerialization.data(
+            fromPropertyList: plist, format: .xml, options: 0
+        ) else { return }
+
+        // Bootout existing before overwriting
+        launchctl(["bootout", "gui/\(uid)/\(daemonLabel)"])
+
+        // Clean up old label if present
+        let oldPlist = NSHomeDirectory() + "/Library/LaunchAgents/io.engram.sync-daemon.plist"
+        if fm.fileExists(atPath: oldPlist) {
+            launchctl(["bootout", "gui/\(uid)/io.engram.sync-daemon"])
+            try? fm.removeItem(atPath: oldPlist)
+        }
+
+        fm.createFile(atPath: daemonPlistPath, contents: data)
+
+        launchctl(["bootstrap", "gui/\(uid)", daemonPlistPath])
+    }
+
+    /// Start the daemon via launchctl (called on sign-in).
+    static func startDaemon() {
+        launchctl(["bootstrap", "gui/\(uid)", daemonPlistPath])
+    }
+
+    /// Unload the daemon (called on sign-out).
+    static func stopDaemon() {
+        launchctl(["bootout", "gui/\(uid)/\(daemonLabel)"])
+    }
+
+    @discardableResult
+    private static func launchctl(_ arguments: [String]) -> Int32 {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        proc.arguments = arguments
+        try? proc.run()
+        proc.waitUntilExit()
+        return proc.terminationStatus
     }
 
     // MARK: - MCP Server Registration
