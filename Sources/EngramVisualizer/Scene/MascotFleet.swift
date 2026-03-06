@@ -27,6 +27,9 @@ final class MascotFleet: MascotNotifier {
     private let sharedResources: MascotSharedResources
     private let maxMascots = 10
 
+    /// Cached per-project positions — persists across frames when simulation is settled.
+    var cachedNodesByProject: [String: [UUID: SIMD3<Float>]] = [:]
+
     /// Instance buffer for batched instanced drawing.
     private var instanceBuffer: MTLBuffer?
     private var instanceBufferCapacity: Int = 0

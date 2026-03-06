@@ -385,15 +385,16 @@ final class MetalSceneManager {
                 }
 
                 // Only rebuild nodesByProject when positions have changed
-                var nodesByProject: [String: [UUID: SIMD3<Float>]] = [:]
-                if didUpdatePositions {
+                if didUpdatePositions, let fleet = galaxy.mascotFleet {
+                    var nodesByProject: [String: [UUID: SIMD3<Float>]] = [:]
                     for node in galaxy.renderStore.nodes {
                         if let pos = positions[node.id] {
                             nodesByProject[node.project, default: [:]][node.id] = pos
                         }
                     }
+                    fleet.cachedNodesByProject = nodesByProject
                     let activeProjects = Set(nodesByProject.keys)
-                    galaxy.mascotFleet?.syncProjects(active: activeProjects, colorMap: cachedMascotColorMap)
+                    fleet.syncProjects(active: activeProjects, colorMap: cachedMascotColorMap)
                 }
 
                 // Build node info only for mascots that have targets
@@ -410,7 +411,8 @@ final class MetalSceneManager {
 
                 galaxy.mascotFleet?.update(
                     dt: dt, camera: camera, positions: positions,
-                    nodesByProject: nodesByProject, nodeInfo: nodeInfo,
+                    nodesByProject: galaxy.mascotFleet?.cachedNodesByProject ?? [:],
+                    nodeInfo: nodeInfo,
                     maintenanceActive: isMaintenanceActive
                 )
             }

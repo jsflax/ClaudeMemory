@@ -51,11 +51,6 @@ struct SampleGate: AsyncParsableCommand {
     private static let gateLogPath = NSHomeDirectory() + "/.claude/sample-gate.log"
 
     func run() async throws {
-        // Guard against recursion
-        if ProcessInfo.processInfo.environment["CLAUDE_MEMORY_LEARNER"] != nil {
-            return
-        }
-
         gateLog("sample-gate: starting for project \(project), transcript: \(transcriptPath)")
 
         // Verify transcript exists
@@ -74,7 +69,9 @@ struct SampleGate: AsyncParsableCommand {
 
         let modelPath = ProcessInfo.processInfo.environment["CLAUDE_MEMORY_MODEL"]
         let embedder = EmbeddingService(modelPath: modelPath)
+        let loadStart = Date()
         await embedder.load()
+        gateLog("sample-gate: embedder loaded in \(String(format: "%.2f", Date().timeIntervalSince(loadStart)))s")
 
         // Fail-open if embedding model didn't load (missing CoreML model, etc.)
         guard await embedder.isLoaded else {
@@ -84,11 +81,13 @@ struct SampleGate: AsyncParsableCommand {
         }
 
         // Run the sampler
+        let sampleStart = Date()
         let excerpts = await TranscriptSampler.sample(
             transcriptPath: transcriptPath,
             lattice: lattice,
             embedder: embedder
         )
+        gateLog("sample-gate: sampler finished in \(String(format: "%.2f", Date().timeIntervalSince(sampleStart)))s, \(excerpts.count) excerpt(s)")
 
         if excerpts.isEmpty {
             gateLog("sample-gate: no novel excerpts found, skipping learner for project \(project)")

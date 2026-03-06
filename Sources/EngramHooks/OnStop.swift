@@ -80,6 +80,9 @@ struct OnStop: AsyncParsableCommand {
         let sh = Process()
         sh.executableURL = URL(fileURLWithPath: "/bin/sh")
         sh.arguments = ["-c", shellCommand]
+        // Pass CLAUDE_MEMORY_LEARNER so the session-learner's claude subprocess
+        // inherits it, and when that subprocess's Stop hook fires OnStop,
+        // the guard at the top of run() prevents infinite recursion.
         sh.environment = ProcessInfo.processInfo.environment.merging(
             ["CLAUDE_MEMORY_LEARNER": "1"],
             uniquingKeysWith: { _, new in new }
