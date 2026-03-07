@@ -190,7 +190,8 @@ final class CameraController {
         return CGPoint(x: screenX, y: screenY)
     }
 
-    func hitTest(at location: CGPoint, viewSize: CGSize, positions: [UUID: SIMD3<Float>]) -> UUID? {
+    func hitTest(at location: CGPoint, viewSize: CGSize, positions: [UUID: SIMD3<Float>],
+                 currentTarget: UUID? = nil) -> UUID? {
         var closest: UUID?
         var closestDist: CGFloat = 30
 
@@ -202,6 +203,18 @@ final class CameraController {
                 closest = id
             }
         }
+
+        // Hysteresis: keep the current target if it's still within a larger radius,
+        // even if nothing new was acquired within the tighter 30px radius.
+        if closest == nil, let current = currentTarget,
+           let pos = positions[current],
+           let screenPos = project(point3D: pos, viewSize: viewSize) {
+            let dist = hypot(location.x - screenPos.x, location.y - screenPos.y)
+            if dist < 45 {
+                return current
+            }
+        }
+
         return closest
     }
 

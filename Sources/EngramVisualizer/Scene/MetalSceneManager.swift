@@ -1735,7 +1735,8 @@ final class MetalSceneManager {
         // Reticle hit test — guard write to avoid per-frame callback spam
         if renderViewSize.width > 0 {
             let center = CGPoint(x: renderViewSize.width / 2, y: renderViewSize.height / 2)
-            let newTarget = camera.hitTest(at: center, viewSize: renderViewSize, positions: positions)
+            let newTarget = camera.hitTest(at: center, viewSize: renderViewSize, positions: positions,
+                                              currentTarget: reticleTarget)
             if newTarget != reticleTarget {
                 reticleTarget = newTarget
                 reticleCallback?(newTarget)

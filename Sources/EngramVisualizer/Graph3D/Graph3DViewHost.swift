@@ -496,7 +496,7 @@ struct Graph3DView: View {
     private var reticleOverlay: some View {
         let reticleTarget = Self.useMetalRenderer ? metalReticleTarget : scene.reticleTarget
         let hasTarget = reticleTarget != nil
-        let nodeById = renderStore.nodeById
+        let nodeById = galaxyRegistry.mergedNodeById
 
         ZStack {
             // Crosshair lines
