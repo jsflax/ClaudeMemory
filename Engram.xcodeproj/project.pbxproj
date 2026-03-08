@@ -192,7 +192,7 @@
 			packageReferences = (
 				D4E5F60000000000000030 /* XCRemoteSwiftPackageReference "Sparkle" */,
 				D4E5F60000000000000040 /* XCRemoteSwiftPackageReference "GoogleSignIn-iOS" */,
-				53DCFB6D2F55D76C0021613A /* XCLocalSwiftPackageReference "../Engram" */,
+				53DCFB6D2F55D76C0021613A /* XCLocalSwiftPackageReference "." */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = F6A1B2C300000000000003 /* Products */;
@@ -297,7 +297,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = 5Q68UZPXQG;
+				DEVELOPMENT_TEAM = 2Z8M9MTEVV;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Sources/EngramVisualizer/Info.plist;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
@@ -326,7 +326,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = 5Q68UZPXQG;
+				DEVELOPMENT_TEAM = 2Z8M9MTEVV;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Sources/EngramVisualizer/Info.plist;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
@@ -382,7 +382,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = 5Q68UZPXQG;
+				DEVELOPMENT_TEAM = 2Z8M9MTEVV;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Sources/EngramVisualizer/Info.plist;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
@@ -486,9 +486,9 @@
 /* End XCConfigurationList section */
 
 /* Begin XCLocalSwiftPackageReference section */
-		53DCFB6D2F55D76C0021613A /* XCLocalSwiftPackageReference "../Engram" */ = {
+		53DCFB6D2F55D76C0021613A /* XCLocalSwiftPackageReference "." */ = {
 			isa = XCLocalSwiftPackageReference;
-			relativePath = ../Engram;
+			relativePath = .;
 		};
 /* End XCLocalSwiftPackageReference section */
 
