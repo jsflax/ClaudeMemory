@@ -7,6 +7,7 @@ import UserNotifications
 
 @LatticeEnum enum SidebarTab: String, CaseIterable, Equatable {
     case visualizer = "Graph"
+    case logs = "Logs"
     case settings = "Settings"
     case account = "Account"
 }
@@ -46,15 +47,22 @@ struct SidebarView: View {
             tabBar
             Divider().overlay(Color.white.opacity(0.08))
 
-            ScrollView(.vertical, showsIndicators: false) {
-                Group {
-                    switch config.selectedTab {
-                    case .visualizer: visualizerContent
-                    case .settings: settingsContent
-                    case .account: accountContent
+            switch config.selectedTab {
+            case .logs:
+                LogsContentView()
+                    .padding(16)
+            default:
+                ScrollView(.vertical, showsIndicators: false) {
+                    Group {
+                        switch config.selectedTab {
+                        case .visualizer: visualizerContent
+                        case .settings: settingsContent
+                        case .account: accountContent
+                        case .logs: EmptyView()
+                        }
                     }
+                    .padding(16)
                 }
-                .padding(16)
             }
         }
         .frame(width: 260)
@@ -108,6 +116,7 @@ struct SidebarView: View {
     private func tabIcon(_ tab: Tab) -> String {
         switch tab {
         case .visualizer: "cube.transparent"
+        case .logs: "doc.text"
         case .settings: "gearshape"
         case .account: "person.circle"
         }
