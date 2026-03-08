@@ -14,6 +14,7 @@ private let frameLog = Logger(subsystem: "com.claudememory.visualizer", category
 struct Graph3DView: View {
     let layoutMode: LayoutMode
     let showMascots: Bool
+    let soundEnabled: Bool
     @Binding var selectedNode: UUID?
     let semanticClusters3D: [SemanticCluster3D]
     /// Direct references for renderTick — avoids closures crossing SwiftUI observation boundary.
@@ -202,6 +203,18 @@ struct Graph3DView: View {
         .accessibilityIdentifier("graph-3d-view")
         .onAppear { if !Self.useMetalRenderer { installInputMonitor() } }
         .onDisappear { removeInputMonitor() }
+        .onChange(of: soundEnabled) { _, enabled in
+            if Self.useMetalRenderer, let ms = metalScene {
+                if enabled {
+                    let audio = SpatialAudioEngine()
+                    ms.spatialAudio = audio
+                    audio.start()
+                } else {
+                    ms.spatialAudio?.stop()
+                    ms.spatialAudio = nil
+                }
+            }
+        }
         .onChange(of: selectedNode) { _, newValue in
             if Self.useMetalRenderer {
                 if newValue != metalScene?.selectedNode {
@@ -344,6 +357,13 @@ struct Graph3DView: View {
         pushDataToMetalScene()
         installInputMonitor()
         setupMaintenanceObserver(mgr: mgr)
+
+        // Start spatial audio if already enabled
+        if soundEnabled {
+            let audio = SpatialAudioEngine()
+            mgr.spatialAudio = audio
+            audio.start()
+        }
     }
 
     private func setupMaintenanceObserver(mgr: MetalSceneManager) {

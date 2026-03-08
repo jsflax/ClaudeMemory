@@ -184,6 +184,7 @@ extension GraphView {
         Graph3DView(
             layoutMode: config.layoutMode,
             showMascots: config.showMascots,
+            soundEnabled: config.soundEnabled,
             selectedNode: $selectedMemoryId,
             semanticClusters3D: embeddingProjection.semanticClusters3D,
             simulation3D: simulation3D,

@@ -56,7 +56,7 @@ final class ForceSimulation3D {
     private let damping: Float = 0.78
     private let maxSpeed: Float = 12.0
 
-    private var alpha: Float = 1.0
+    private(set) var alpha: Float = 1.0
     private let alphaDecay: Float = 0.995
     private let alphaFloor: Float = 0.01
     private var tickInFlight = false

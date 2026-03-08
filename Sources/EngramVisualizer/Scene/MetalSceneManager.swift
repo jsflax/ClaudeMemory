@@ -18,6 +18,9 @@ final class MetalSceneManager {
     let flowParticles: FlowParticleSystem
     let mascotSharedResources: MascotSharedResources
 
+    /// Spatial audio engine — nil when sound is disabled.
+    var spatialAudio: SpatialAudioEngine?
+
     // External references (set by Graph3DView)
     weak var camera3DState: Camera3DState?
 
@@ -45,9 +48,9 @@ final class MetalSceneManager {
 
     // Per-frame cached visual data — refreshed once at the start of renderTick
     // to avoid rebuilding merged dictionaries on every access inside per-node loops.
-    private var glowingNodes: [UUID: Date] = [:]
-    private var newNodes: [UUID: Date] = [:]
-    private var dyingNodes: [UUID: DyingNode] = [:]
+    private(set) var glowingNodes: [UUID: Date] = [:]
+    private(set) var newNodes: [UUID: Date] = [:]
+    private(set) var dyingNodes: [UUID: DyingNode] = [:]
     private var topicGroups: [TopicGroupInfo] = []
     private var clusters: [[UUID]] = []
     private var searchMatchIds: Set<UUID> = []
@@ -139,10 +142,10 @@ final class MetalSceneManager {
 
     // Precomputed cylinder trig (6-sided) — avoids 12 sin/cos per edge per frame
 
-    private var renderNodes: [NodeData] = []
-    private var renderEdges: [EdgeData] = []
-    private var renderHubs: Set<UUID> = []
-    private var renderColorMap: [String: Color] = [:]
+    private(set) var renderNodes: [NodeData] = []
+    private(set) var renderEdges: [EdgeData] = []
+    private(set) var renderHubs: Set<UUID> = []
+    private(set) var renderColorMap: [String: Color] = [:]
 
     // Mascot inspection change tracking — avoids re-packing all nodes when
     // the set of inspected nodes hasn't changed between frames.
@@ -500,6 +503,9 @@ final class MetalSceneManager {
             if camera.cameraTarget != camState.target { camState.target = camera.cameraTarget }
             if didUpdatePositions { camState.positions = positions }
         }
+
+        // Spatial audio tick — reads all state computed above
+        spatialAudio?.tick(dt: dt, scene: self)
 
         let totalMs = (CFAbsoluteTimeGetCurrent() - frameStart) * 1000.0
         let nodeCount = positions.count
