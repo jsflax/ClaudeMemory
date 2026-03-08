@@ -52,7 +52,7 @@ struct NodeData: Sendable {
 }
 
 struct EdgeData: Sendable {
-    let id: Int64       // Edge primaryKey (DB-local, for observation identity)
+    let id: UUID        // Edge globalId (stable across DBs for cross-galaxy dedup)
     let sourceId: UUID
     let targetId: UUID
     let relation: String
@@ -98,10 +98,11 @@ final class GraphRenderStore {
 
     // Internal data — never triggers SwiftUI body re-evaluation.
     var allNodes: [UUID: NodeData] = [:]
-    var allEdges: [Int64: EdgeData] = [:]
+    var allEdges: [UUID: EdgeData] = [:]
     var edgesByNode: [UUID: [EdgeData]] = [:]
     var pkToGlobalId: [Int64: UUID] = [:]
-    var filteredEdgeIds: Set<Int64> = []
+    var edgePkToGlobalId: [Int64: UUID] = [:]
+    var filteredEdgeIds: Set<UUID> = []
     var visibleNodeIds: Set<UUID> = []
     var edgeCountByNode: [UUID: Int] = [:]
 
@@ -124,7 +125,7 @@ final class GraphRenderStore {
     // Batched observer coalescing — accumulates inserts (pre-built on background thread)
     // and flushes once per run loop iteration. No Lattice reads on main thread.
     var pendingNodeInserts: [(pk: Int64, node: NodeData)] = []
-    var pendingEdgeInserts: [(pk: Int64, edge: EdgeData)] = []
+    var pendingEdgeInserts: [(pk: UUID, edge: EdgeData)] = []
     var pendingNodeFlush: Task<Void, Never>?
     var pendingEdgeFlush: Task<Void, Never>?
 }

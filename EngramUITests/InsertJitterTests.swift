@@ -10,17 +10,6 @@ import Lattice
 final class InsertJitterTests: XCTestCase {
     let app = XCUIApplication()
 
-    // macOS virtual key codes
-    private enum VK {
-        static let w: CGKeyCode = 13
-        static let s: CGKeyCode = 1
-        static let q: CGKeyCode = 12
-        static let e: CGKeyCode = 14
-        static let i: CGKeyCode = 34
-        static let k: CGKeyCode = 40
-        static let t: CGKeyCode = 17
-    }
-
     override func setUpWithError() throws {
         continueAfterFailure = false
         // Clean previous timing data
@@ -82,17 +71,6 @@ final class InsertJitterTests: XCTestCase {
         analyzeAtlasTiming()
         analyzeCenterLog()
         analyzeGlowLog()
-    }
-
-    // MARK: - Screenshot Helper
-
-    private func takeScreenshot(name: String) {
-        let screenshot = XCUIScreen.main.screenshot()
-        let attachment = XCTAttachment(screenshot: screenshot)
-        attachment.name = name
-        attachment.lifetime = .keepAlways
-        add(attachment)
-        try? screenshot.pngRepresentation.write(to: URL(fileURLWithPath: "/tmp/\(name).png"))
     }
 
     // MARK: - Metal Frame Timing Analysis
@@ -436,23 +414,6 @@ final class InsertJitterTests: XCTestCase {
         print("")
     }
 
-    // MARK: - Key Holding Helper
-
-    private nonisolated func holdKey(_ keyCode: CGKeyCode, duration: TimeInterval) {
-        let src = CGEventSource(stateID: .combinedSessionState)
-        let down = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: true)
-        let up = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: false)
-        down?.post(tap: .cgSessionEventTap)
-        Thread.sleep(forTimeInterval: duration)
-        up?.post(tap: .cgSessionEventTap)
-        usleep(50_000) // brief gap between inputs
-    }
-
-    private func percentile(_ sorted: [Double], _ p: Double) -> Double {
-        guard !sorted.isEmpty else { return 0 }
-        let idx = min(Int(Double(sorted.count) * p), sorted.count - 1)
-        return sorted[idx]
-    }
 }
 
 // MARK: - Mock Sync Server
@@ -498,259 +459,7 @@ final class MockSyncServer: @unchecked Sendable {
     func stop() { listener?.cancel() }
 }
 
-// MARK: - Test Database Seeding
-
-/// Creates a sandboxed Lattice database at the given path, seeded with test memories.
-/// Returns the globalIds of the inserted memories.
-@discardableResult
-func seedDatabase(
-    at path: String,
-    project: String,
-    memoryCount: Int,
-    staleAge: TimeInterval,
-    withSyncConfig: Bool = false
-) -> [UUID] {
-    let lattice = try! Lattice(
-        Memory.self, Edge.self, SyncConfig.self,
-        configuration: .init(
-            fileURL: URL(fileURLWithPath: path),
-            migration: engramMigrations
-        )
-    )
-
-    var globalIds: [UUID] = []
-    let now = Date()
-    let topics = ["architecture", "debugging", "patterns", "conventions", "workflow",
-                  "testing", "performance", "rendering", "networking", "ui-components"]
-    for i in 0..<memoryCount {
-        // Vary embedding so nodes get distinct positions in force simulation
-        var embValues = [Float](repeating: 0, count: 384)
-        for j in 0..<384 { embValues[j] = sin(Float(i * 17 + j * 3)) * 0.1 }
-
-        let m = Memory(
-            content: "Test memory \(i) for \(project): \(topics[i % topics.count]) insight about the codebase",
-            topic: topics[i % topics.count],
-            project: project,
-            source: "e2e-test",
-            embedding: Vector<Float>(embValues),
-            createdAt: now.addingTimeInterval(Double(-3600 - i * 120)),
-            lastAccessedAt: now.addingTimeInterval(-staleAge),
-            importance: max(1, (i % 5) + 1)
-        )
-        lattice.add(m)
-        if let gid = m.__globalId {
-            globalIds.append(gid)
-        }
-    }
-
-    if withSyncConfig {
-        lattice.add(SyncConfig(project: project, policy: .sync))
-    }
-
-    return globalIds
-}
-
-/// Seeds a database with multiple projects, returning all globalIds.
-/// Creates a more realistic graph with edges between related memories.
-@discardableResult
-func seedMultiProjectDatabase(
-    at path: String,
-    projects: [(name: String, count: Int)],
-    staleAge: TimeInterval,
-    withSyncConfig: [String] = []
-) -> [UUID] {
-    let lattice = try! Lattice(
-        Memory.self, Edge.self, SyncConfig.self,
-        configuration: .init(
-            fileURL: URL(fileURLWithPath: path),
-            migration: engramMigrations
-        )
-    )
-
-    var allIds: [UUID] = []
-    var memoriesByProject: [String: [Memory]] = [:]
-    let now = Date()
-    let topics = ["architecture", "debugging", "patterns", "conventions", "workflow",
-                  "testing", "performance", "rendering", "networking", "ui-components"]
-
-    for (project, count) in projects {
-        var projectMemories: [Memory] = []
-        for i in 0..<count {
-            var embValues = [Float](repeating: 0, count: 384)
-            let seed = project.hashValue &+ i
-            for j in 0..<384 { embValues[j] = sin(Float(seed &* 17 &+ j &* 3)) * 0.1 }
-
-            let m = Memory(
-                content: "[\(project)] Memory \(i): \(topics[i % topics.count]) — detailed content about \(project) codebase",
-                topic: topics[i % topics.count],
-                project: project,
-                source: "e2e-test",
-                embedding: Vector<Float>(embValues),
-                createdAt: now.addingTimeInterval(Double(-7200 - i * 60)),
-                lastAccessedAt: now.addingTimeInterval(-staleAge),
-                importance: max(1, (i % 5) + 1)
-            )
-            lattice.add(m)
-            projectMemories.append(m)
-            if let gid = m.__globalId { allIds.append(gid) }
-        }
-        memoriesByProject[project] = projectMemories
-    }
-
-    // Add edges: part_of from first 3 to memory[0] as hub,
-    // relates_to between consecutive memories in each project
-    for (_, memories) in memoriesByProject where memories.count >= 3 {
-        guard let hubGid = memories[0].__globalId else { continue }
-        for i in 1..<min(memories.count, 4) {
-            guard let srcGid = memories[i].__globalId else { continue }
-            lattice.add(Edge(sourceGlobalId: srcGid, targetGlobalId: hubGid, relation: .partOf))
-        }
-        for i in 1..<memories.count {
-            guard let srcGid = memories[i].__globalId,
-                  let tgtGid = memories[i - 1].__globalId else { continue }
-            lattice.add(Edge(sourceGlobalId: srcGid, targetGlobalId: tgtGid, relation: .relatesTo))
-        }
-    }
-
-    // Cross-project edges: connect hub nodes across projects (simulates real cross-project links)
-    let projectKeys = Array(memoriesByProject.keys).sorted()
-    for i in 0..<projectKeys.count {
-        for j in (i + 1)..<projectKeys.count {
-            guard let srcMemories = memoriesByProject[projectKeys[i]],
-                  let tgtMemories = memoriesByProject[projectKeys[j]],
-                  let srcGid = srcMemories.first?.__globalId,
-                  let tgtGid = tgtMemories.first?.__globalId else { continue }
-            lattice.add(Edge(sourceGlobalId: srcGid, targetGlobalId: tgtGid, relation: .relatesTo))
-        }
-    }
-
-    for project in withSyncConfig {
-        lattice.add(SyncConfig(project: project, policy: .sync))
-    }
-
-    return allIds
-}
-
-/// Opens a separate Lattice connection to the DB at `path` and updates
-/// `lastAccessedAt = Date()` on the specified memories. The xproc notification
-/// triggers the app's localLattice → IPC → synced observer pipeline.
-func triggerRecall(at path: String, globalIds: [UUID]) {
-    let lattice = try! Lattice(
-        Memory.self, Edge.self, SyncConfig.self,
-        configuration: .init(
-            fileURL: URL(fileURLWithPath: path),
-            migration: engramMigrations
-        )
-    )
-
-    let now = Date()
-    for gid in globalIds {
-        for m in lattice.objects(Memory.self).where({ $0.__globalId == gid }) {
-            m.lastAccessedAt = now
-            m.accessCount += 1
-        }
-    }
-}
-
-/// Inserts N new memories into the DB at `path`. Returns their globalIds.
-/// The xproc notification triggers the app's live observer → handleNodeInsert.
-@discardableResult
-func insertMemories(at path: String, project: String, count: Int) -> [UUID] {
-    let lattice = try! Lattice(
-        Memory.self, Edge.self, SyncConfig.self,
-        configuration: .init(
-            fileURL: URL(fileURLWithPath: path),
-            migration: engramMigrations
-        )
-    )
-
-    var ids: [UUID] = []
-    let now = Date()
-    for i in 0..<count {
-        var emb = [Float](repeating: 0, count: 384)
-        for j in 0..<384 { emb[j] = sin(Float(i &* 31 &+ j &* 7)) * 0.1 }
-        let m = Memory(
-            content: "[live-insert] \(project) memory \(i): stress test content",
-            topic: "debugging",
-            project: project,
-            source: "perf-test",
-            embedding: Vector<Float>(emb),
-            createdAt: now,
-            lastAccessedAt: now,
-            importance: 3
-        )
-        lattice.add(m)
-        if let gid = m.__globalId { ids.append(gid) }
-    }
-    return ids
-}
-
-/// Deletes memories by globalId from the DB at `path`.
-/// The xproc notification triggers the app's live observer → handleNodeDelete.
-func deleteMemories(at path: String, globalIds: [UUID]) {
-    let lattice = try! Lattice(
-        Memory.self, Edge.self, SyncConfig.self,
-        configuration: .init(
-            fileURL: URL(fileURLWithPath: path),
-            migration: engramMigrations
-        )
-    )
-
-    for gid in globalIds {
-        for m in lattice.objects(Memory.self).where({ $0.__globalId == gid }) {
-            lattice.delete(m)
-        }
-    }
-}
-
-/// Adds cross-galaxy edges between memories in different projects.
-/// Useful for testing cross-galaxy edge rendering under migration.
-func addCrossProjectEdges(at path: String, sourceIds: [UUID], targetIds: [UUID]) {
-    let lattice = try! Lattice(
-        Memory.self, Edge.self, SyncConfig.self,
-        configuration: .init(
-            fileURL: URL(fileURLWithPath: path),
-            migration: engramMigrations
-        )
-    )
-
-    let count = min(sourceIds.count, targetIds.count)
-    for i in 0..<count {
-        lattice.add(Edge(sourceGlobalId: sourceIds[i], targetGlobalId: targetIds[i], relation: .relatesTo))
-    }
-}
-
-// MARK: - Glow Event Parser
-
-struct GlowEvent {
-    let timestamp: Double
-    let galaxy: String
-    let nodeLabel: String
-    let deltaSeconds: Double
-    let stalenessSeconds: Double
-    let alreadyGlowing: Bool
-    let glowCount: Int
-}
-
-func parseGlowLog() -> [GlowEvent] {
-    let path = "/tmp/glow-log.csv"
-    guard let data = FileManager.default.contents(atPath: path),
-          let csv = String(data: data, encoding: .utf8) else { return [] }
-
-    return csv.components(separatedBy: "\n").dropFirst().compactMap { line in
-        let cols = line.components(separatedBy: ",")
-        guard cols.count >= 9 else { return nil }
-        return GlowEvent(
-            timestamp: Double(cols[0]) ?? 0,
-            galaxy: cols[1],
-            nodeLabel: cols[2],
-            deltaSeconds: Double(cols[5]) ?? 0,
-            stalenessSeconds: Double(cols[6]) ?? 0,
-            alreadyGlowing: cols[7].trimmingCharacters(in: .whitespacesAndNewlines) == "true",
-            glowCount: Int(cols[8].trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
-        )
-    }
-}
+// Test helpers moved to TestHelpers.swift
 
 // MARK: - Glow Sync E2E Tests
 
@@ -810,9 +519,11 @@ final class GlowSyncTests: XCTestCase {
     /// causing mass glow events with high staleness values.
     /// Seeds a realistic multi-project graph to stress the renderer.
     func testCatchUpStaleGlows() throws {
+        // Counts mirror the live synced DB distribution (~3,400 total memories)
         let projects: [(name: String, count: Int)] = [
-            ("Engram", 80), ("Lattice", 50), ("canary-sdk-ios", 40),
-            ("canary-sdk-android", 30), ("global", 60), ("engram-server", 25)
+            ("Engram", 900), ("Lattice", 450), ("ClaudeMemory", 200),
+            ("engram-server", 120), ("sidescroller", 100), ("global", 200),
+            ("LatticeCore", 40), ("SwiftLM", 25)
         ]
 
         // Seed local DB: multi-project, lastAccessedAt = 1hr ago
@@ -826,13 +537,13 @@ final class GlowSyncTests: XCTestCase {
         // Seed synced DB: same projects (synced ones), lastAccessedAt = 2hrs ago (staler)
         seedMultiProjectDatabase(
             at: syncedDbPath,
-            projects: [("Engram", 80), ("Lattice", 50), ("global", 60)],
+            projects: [("Engram", 900), ("Lattice", 450), ("global", 200)],
             staleAge: 7200
         )
 
         // Launch app — IPC catch-up pushes newer timestamps from local → synced
         launchApp()
-        sleep(15) // wait for load + IPC catch-up + glow processing (larger graph)
+        sleep(20) // wait for load + IPC catch-up + glow processing (~2,000 node graph)
 
         // Take screenshot for visual inspection
         let screenshot = XCUIScreen.main.screenshot()
@@ -902,9 +613,10 @@ final class GlowSyncTests: XCTestCase {
     /// with low staleness and no re-fires.
     /// Seeds a realistic multi-project graph.
     func testLiveRecallGlow() throws {
+        // Counts mirror the live synced DB distribution (~3,400 total memories)
         let projects: [(name: String, count: Int)] = [
-            ("Engram", 60), ("Lattice", 40), ("canary-sdk-ios", 30),
-            ("global", 50), ("engram-server", 20)
+            ("Engram", 900), ("Lattice", 450), ("ClaudeMemory", 200),
+            ("engram-server", 120), ("global", 200)
         ]
 
         // Seed local DB: multi-project, lastAccessedAt = 1hr ago (old enough to not glow)
@@ -915,7 +627,7 @@ final class GlowSyncTests: XCTestCase {
         )
 
         launchApp()
-        sleep(12) // wait for full load + simulation settle (200 nodes)
+        sleep(20) // wait for full load + simulation settle (~1,870 nodes)
 
         // Clean glow log AFTER initial load to isolate live recalls
         try? FileManager.default.removeItem(atPath: "/tmp/glow-log.csv")

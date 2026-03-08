@@ -150,14 +150,14 @@ final class GalaxyRegistry {
             // Single galaxy fast path — use per-galaxy filtered edges directly
             edges = only.renderStore.edges
         } else {
-            // Multi-galaxy: iterate ALL galaxies' allEdges, dedup by pk,
+            // Multi-galaxy: iterate ALL galaxies' allEdges, dedup by globalId,
             // filter against merged visible node set + hiddenRelations.
             let mergedVisibleIds = Set(nodes.map(\.id))
-            var seen = Set<Int64>()
+            var seen = Set<UUID>()
             var crossEdges: [EdgeData] = []
             for galaxy in galaxies.values {
-                for (pk, edge) in galaxy.renderStore.allEdges {
-                    guard seen.insert(pk).inserted else { continue }
+                for (gid, edge) in galaxy.renderStore.allEdges {
+                    guard seen.insert(gid).inserted else { continue }
                     guard mergedVisibleIds.contains(edge.sourceId),
                           mergedVisibleIds.contains(edge.targetId) else { continue }
                     guard !hiddenRelations.contains(edge.relation) else { continue }
@@ -239,8 +239,8 @@ final class GalaxyRegistry {
     }
 
     /// Merged allEdges from all galaxies.
-    var mergedAllEdges: [Int64: EdgeData] {
-        var result: [Int64: EdgeData] = [:]
+    var mergedAllEdges: [UUID: EdgeData] {
+        var result: [UUID: EdgeData] = [:]
         for galaxy in galaxies.values {
             result.merge(galaxy.renderStore.allEdges) { _, new in new }
         }
@@ -399,8 +399,8 @@ final class GalaxyRegistry {
     }
 
     /// Merged filteredEdgeIds.
-    var mergedFilteredEdgeIds: Set<Int64> {
-        var result: Set<Int64> = []
+    var mergedFilteredEdgeIds: Set<UUID> {
+        var result: Set<UUID> = []
         for galaxy in galaxies.values {
             result.formUnion(galaxy.renderStore.filteredEdgeIds)
         }
@@ -584,7 +584,7 @@ final class GalaxyRegistry {
         // Collect intra-project edges from store.edgesByNode (O(removed·degree))
         // instead of scanning allEdges (O(allEdges))
         var intraEdges: [EdgeData] = []
-        var intraEdgeIds = Set<Int64>()
+        var intraEdgeIds = Set<UUID>()
         for id in removedIds {
             for edge in store.edgesByNode[id] ?? [] {
                 guard removedIds.contains(edge.sourceId) && removedIds.contains(edge.targetId) else { continue }

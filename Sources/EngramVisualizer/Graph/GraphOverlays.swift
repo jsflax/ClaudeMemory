@@ -19,8 +19,8 @@ struct StatsOverlay: View, @MainActor Equatable {
 
     // LatticeQuery triggers SwiftUI re-renders when Memory/Edge tables change.
     // Actual displayed values are read from galaxyRegistry (which respects filters).
-//    @LatticeQuery<Memory>(fetchLimit: 0) private var memoryQuery
-//    @LatticeQuery<EngramKit.Edge>(fetchLimit: 0) private var edgeQuery
+    @LatticeQuery<Memory>(fetchLimit: 0) private var memoryQuery
+    @LatticeQuery<EngramKit.Edge>(fetchLimit: 0) private var edgeQuery
 
     private var dbFileSize: String {
         let dbPath = ProcessInfo.processInfo.environment["CLAUDE_MEMORY_DB"]

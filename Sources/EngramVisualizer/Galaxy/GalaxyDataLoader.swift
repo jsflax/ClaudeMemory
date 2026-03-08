@@ -81,17 +81,18 @@ struct GalaxyDataLoader {
             guard let bgLattice = ref.resolve() else { return }
 
             // 1. Read all edges off main actor
-            var allEdgeBatch: [EdgeData] = []
+            var allEdgeBatch: [(EdgeData, Int64)] = []  // (data, pk) — pk for observer delete routing
             for e in bgLattice.objects(MemoryEdge.self) {
-                guard let pk = e.primaryKey else { continue }
-                allEdgeBatch.append(EdgeData(id: pk, sourceId: e.sourceGlobalId,
-                                              targetId: e.targetGlobalId, relation: e.relation.rawValue))
+                guard let pk = e.primaryKey, let gid = e.__globalId else { continue }
+                allEdgeBatch.append((EdgeData(id: gid, sourceId: e.sourceGlobalId,
+                                              targetId: e.targetGlobalId, relation: e.relation.rawValue), pk))
             }
 
             await MainActor.run {
                 let store = galaxy.renderStore
-                for ed in allEdgeBatch {
+                for (ed, pk) in allEdgeBatch {
                     store.allEdges[ed.id] = ed
+                    store.edgePkToGlobalId[pk] = ed.id
                     store.edgesByNode[ed.sourceId, default: []].append(ed)
                     store.edgesByNode[ed.targetId, default: []].append(ed)
                 }
@@ -413,24 +414,24 @@ struct GalaxyDataLoader {
         }
     }
 
-    static func handleEdgeDelete(_ pk: Int64, galaxy: Galaxy) {
+    static func handleEdgeDelete(_ gid: UUID, galaxy: Galaxy) {
         let t0 = CFAbsoluteTimeGetCurrent()
         defer { ObserverAccumulator.shared.record("edgeDelete", ms: (CFAbsoluteTimeGetCurrent() - t0) * 1000.0) }
         let store = galaxy.renderStore
-        if let old = store.allEdges[pk] {
+        if let old = store.allEdges[gid] {
             // Note: ForceSimulation3D doesn't support surgical removeEdge — see removeNode note.
-            store.filteredEdgeIds.remove(pk)
-            store.edges.removeAll { $0.id == pk }
-            store.edgesByNode[old.sourceId]?.removeAll { $0.id == pk }
-            store.edgesByNode[old.targetId]?.removeAll { $0.id == pk }
+            store.filteredEdgeIds.remove(gid)
+            store.edges.removeAll { $0.id == gid }
+            store.edgesByNode[old.sourceId]?.removeAll { $0.id == gid }
+            store.edgesByNode[old.targetId]?.removeAll { $0.id == gid }
             store.edgeCountByNode[old.sourceId, default: 1] -= 1
             store.edgeCountByNode[old.targetId, default: 1] -= 1
             if old.relation == "part_of" {
-                let stillHub = store.allEdges.values.contains { $0.id != pk && $0.relation == "part_of" && $0.targetId == old.targetId }
+                let stillHub = store.allEdges.values.contains { $0.id != gid && $0.relation == "part_of" && $0.targetId == old.targetId }
                 if !stillHub { store.hubs.remove(old.targetId) }
             }
         }
-        store.allEdges.removeValue(forKey: pk)
+        store.allEdges.removeValue(forKey: gid)
     }
 
     // MARK: - Batched Flush

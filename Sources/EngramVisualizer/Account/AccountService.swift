@@ -48,7 +48,7 @@ final class AccountService {
 
     init() {
         self.endpoint = UserDefaults.standard.string(forKey: Self.endpointKey)
-            ?? "https://api.engram.io"
+            ?? "https://engram.io"
         #if TEST_AUTH_TOKEN
         self.token = ProcessInfo.processInfo.environment["TEST_AUTH_TOKEN"]
             ?? KeychainHelper.load(for: Self.tokenKey)

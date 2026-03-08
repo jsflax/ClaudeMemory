@@ -71,17 +71,26 @@ final class Galaxy: Identifiable {
                 guard let bg = self.bgRef.resolve() else { fatalError("This should not happen") }
                 switch change {
                 case .insert(let pk):
-                    guard let edge = bg.object(MemoryEdge.self, primaryKey: pk) else { return }
-                    let data = EdgeData(id: pk, sourceId: edge.sourceGlobalId,
+                    guard let edge = bg.object(MemoryEdge.self, primaryKey: pk),
+                          let gid = edge.__globalId else { return }
+                    let data = EdgeData(id: gid, sourceId: edge.sourceGlobalId,
                                         targetId: edge.targetGlobalId, relation: edge.relation.rawValue)
-                    Task { @MainActor in GalaxyDataLoader.handleEdgeInsert(data, galaxy: self.galaxy, is3D: is3D, hiddenRelations: hiddenRelations) }
+                    Task { @MainActor in
+                        self.galaxy.renderStore.edgePkToGlobalId[pk] = gid
+                        GalaxyDataLoader.handleEdgeInsert(data, galaxy: self.galaxy, is3D: is3D, hiddenRelations: hiddenRelations)
+                    }
                 case .update(let pk):
-                    guard let edge = bg.object(MemoryEdge.self, primaryKey: pk) else { return }
-                    let data = EdgeData(id: pk, sourceId: edge.sourceGlobalId,
+                    guard let edge = bg.object(MemoryEdge.self, primaryKey: pk),
+                          let gid = edge.__globalId else { return }
+                    let data = EdgeData(id: gid, sourceId: edge.sourceGlobalId,
                                         targetId: edge.targetGlobalId, relation: edge.relation.rawValue)
                     Task { @MainActor in GalaxyDataLoader.handleEdgeUpdate(data, galaxy: self.galaxy) }
                 case .delete(let pk):
-                    Task { @MainActor in GalaxyDataLoader.handleEdgeDelete(pk, galaxy: self.galaxy) }
+                    Task { @MainActor in
+                        // Resolve pk → globalId since the object is already deleted
+                        guard let gid = self.galaxy.renderStore.edgePkToGlobalId.removeValue(forKey: pk) else { return }
+                        GalaxyDataLoader.handleEdgeDelete(gid, galaxy: self.galaxy)
+                    }
                 }
             }
             

@@ -5,23 +5,6 @@ import CoreGraphics
 final class FrameTimingTests: XCTestCase {
     let app = XCUIApplication()
 
-    // macOS virtual key codes for WASD/IJKL/QE/TR controls
-    private enum VK {
-        static let w: CGKeyCode = 13
-        static let a: CGKeyCode = 0
-        static let s: CGKeyCode = 1
-        static let d: CGKeyCode = 2
-        static let q: CGKeyCode = 12
-        static let e: CGKeyCode = 14
-        static let i: CGKeyCode = 34
-        static let j: CGKeyCode = 38
-        static let k: CGKeyCode = 40
-        static let l: CGKeyCode = 37
-        static let t: CGKeyCode = 17
-        static let r: CGKeyCode = 15
-        static let shift: CGKeyCode = 56
-    }
-
     override func setUpWithError() throws {
         continueAfterFailure = false
         app.launch()
@@ -106,67 +89,30 @@ final class FrameTimingTests: XCTestCase {
     // MARK: - Teleport Proximity Test
 
     func testTeleportProximity() throws {
-        // 3D mode is the default — no button click needed
         let window = app.windows.firstMatch
         XCTAssertTrue(window.exists)
         sleep(5) // let force sim settle
 
-        // Clean up any previous teleport log
         try? FileManager.default.removeItem(atPath: "/tmp/teleport-log.csv")
 
         takeScreenshot(name: "teleport-01-initial")
 
-        // Teleport through projects using T key
         let teleportCount = 5
         for i in 0..<teleportCount {
             window.typeKey("t", modifierFlags: [])
-            sleep(2) // let camera settle
+            sleep(2)
             takeScreenshot(name: "teleport-\(String(format: "%02d", i + 2))-after-t\(i + 1)")
         }
 
         // Rapid teleport test (label stomping)
         for _ in 0..<3 {
             window.typeKey("t", modifierFlags: [])
-            usleep(300_000) // 300ms between — should NOT stomp previous label
+            usleep(300_000)
         }
         sleep(2)
         takeScreenshot(name: "teleport-rapid-final")
 
-        // Verify teleport log
         analyzeTeleportLog(expectedMinTeleports: teleportCount)
-    }
-
-    // MARK: - Key Holding Helpers
-
-    /// Hold a single key for a specified duration using CGEvent.
-    /// CGEvent posts directly to the session event tap, so the app receives
-    /// a real keyDown followed by keyUp with the key held for `duration` seconds.
-    private nonisolated func holdKey(_ keyCode: CGKeyCode, duration: TimeInterval) {
-        let src = CGEventSource(stateID: .combinedSessionState)
-        let down = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: true)
-        let up = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: false)
-        down?.post(tap: .cgSessionEventTap)
-        Thread.sleep(forTimeInterval: duration)
-        up?.post(tap: .cgSessionEventTap)
-        Thread.sleep(forTimeInterval: 0.05) // brief settle after release
-    }
-
-    /// Hold multiple keys simultaneously for a specified duration.
-    /// Useful for Shift+W (sprint), etc.
-    private nonisolated func holdKeys(_ keyCodes: [CGKeyCode], duration: TimeInterval) {
-        let src = CGEventSource(stateID: .combinedSessionState)
-        // Press all keys
-        for kc in keyCodes {
-            CGEvent(keyboardEventSource: src, virtualKey: kc, keyDown: true)?
-                .post(tap: .cgSessionEventTap)
-        }
-        Thread.sleep(forTimeInterval: duration)
-        // Release all keys (reverse order)
-        for kc in keyCodes.reversed() {
-            CGEvent(keyboardEventSource: src, virtualKey: kc, keyDown: false)?
-                .post(tap: .cgSessionEventTap)
-        }
-        Thread.sleep(forTimeInterval: 0.05)
     }
 
     // MARK: - Teleport Log Analysis
@@ -191,31 +137,17 @@ final class FrameTimingTests: XCTestCase {
             let cols = line.components(separatedBy: ",")
             guard cols.count >= 7 else { continue }
             let project = cols[0]
-            let orbitRadius = Double(cols[4]) ?? 0
             let rkDistance = Double(cols[5]) ?? 0
             let nodeCount = Int(cols[6]) ?? 0
+            let orbitRadius = Double(cols[4]) ?? 0
 
-            let maxAllowedDistance: Double = 2.0
-            XCTAssertLessThan(rkDistance, maxAllowedDistance,
-                "Teleport to '\(project)' landed \(String(format: "%.3f", rkDistance)) RK units away (max \(maxAllowedDistance))")
+            XCTAssertLessThan(rkDistance, 2.0,
+                "Teleport to '\(project)' landed \(String(format: "%.3f", rkDistance)) RK units away (max 2.0)")
 
             print("║ \(project.padding(toLength: 20, withPad: " ", startingAt: 0)) nodes=\(String(format: "%3d", nodeCount)) orbit=\(String(format: "%6.0f", orbitRadius)) dist=\(String(format: "%.3f", rkDistance)) ║")
         }
 
         print("╚══════════════════════════════════════════════════════╝\n")
-    }
-
-    // MARK: - Screenshot Helper
-
-    private func takeScreenshot(name: String) {
-        let screenshot = XCUIScreen.main.screenshot()
-        let attachment = XCTAttachment(screenshot: screenshot)
-        attachment.name = name
-        attachment.lifetime = .keepAlways
-        add(attachment)
-        // Also save to /tmp for easy CLI viewing
-        let data = screenshot.pngRepresentation
-        try? data.write(to: URL(fileURLWithPath: "/tmp/\(name).png"))
     }
 
     // MARK: - Profiling Data Analysis
@@ -231,8 +163,7 @@ final class FrameTimingTests: XCTestCase {
         let lines = csv.components(separatedBy: "\n").dropFirst().filter { !$0.isEmpty }
         guard !lines.isEmpty else { XCTFail("No frame data collected"); return }
 
-        // Parse CSV columns:
-        // frame,dt_ms,work_ms,expand_ms,nodes_ms,edges_ms,neb_ms,node_count,edge_count,labels_ms,flow_ms,idle,entities
+        // CSV: frame,dt_ms,work_ms,expand_ms,nodes_ms,edges_ms,neb_ms,node_count,edge_count,labels_ms,flow_ms,idle,entities
         var dts: [Double] = [], works: [Double] = [], expands: [Double] = []
         var nodes: [Double] = [], edges: [Double] = [], nebs: [Double] = [], labels: [Double] = []
         var flows: [Double] = []
@@ -257,14 +188,9 @@ final class FrameTimingTests: XCTestCase {
             let idle = cols.count > 11 ? (Int(cols[11]) ?? 0) : 0
             let ent = cols.count > 12 ? (Int(cols[12]) ?? 0) : 0
 
-            dts.append(dt)
-            works.append(work)
-            expands.append(expand)
-            nodes.append(node)
-            edges.append(edge)
-            nebs.append(neb)
-            labels.append(label)
-            flows.append(flow)
+            dts.append(dt); works.append(work); expands.append(expand)
+            nodes.append(node); edges.append(edge); nebs.append(neb)
+            labels.append(label); flows.append(flow)
             if dt > 20 { slowFrames += 1 }
             if dt > 50 { verySlowFrames += 1 }
             if idle == 1 { idleCount += 1 }
@@ -287,13 +213,12 @@ final class FrameTimingTests: XCTestCase {
 
         let sortedDt = dts.sorted()
         let sortedWork = works.sorted()
-        let p50Dt = sortedDt[Int(count * 0.50)]
-        let p95Dt = sortedDt[Int(count * 0.95)]
-        let p99Dt = sortedDt[min(Int(count * 0.99), sortedDt.count - 1)]
-        let p95Work = sortedWork[Int(count * 0.95)]
-        let p99Work = sortedWork[min(Int(count * 0.99), sortedWork.count - 1)]
+        let p50Dt = percentile(sortedDt, 0.50)
+        let p95Dt = percentile(sortedDt, 0.95)
+        let p99Dt = percentile(sortedDt, 0.99)
+        let p95Work = percentile(sortedWork, 0.95)
+        let p99Work = percentile(sortedWork, 0.99)
 
-        // Identify active frames only (dt < 100ms, likely not idle-skipped)
         let activeFrames = dts.filter { $0 < 100 && $0 > 0.1 }
         let activeAvgDt = activeFrames.isEmpty ? 0 : activeFrames.reduce(0, +) / Double(activeFrames.count)
         let activeFps = activeAvgDt > 0 ? 1000.0 / activeAvgDt : 0
@@ -325,25 +250,11 @@ final class FrameTimingTests: XCTestCase {
 
         """)
 
-        // Reason breakdown: count frames by reason flags
-        var reasonCounts: [String: Int] = [:]
-        for line in lines {
-            let cols = line.components(separatedBy: ",")
-            let reason = cols.count > 13 ? cols[13] : "?"
-            reasonCounts[reason, default: 0] += 1
-        }
-        print("        Update reasons:")
-        for (reason, count) in reasonCounts.sorted(by: { $0.value > $1.value }) {
-            let total = Double(dts.count)
-            print("          \(reason): \(count) frames (\(String(format: "%.1f", Double(count)/total*100))%)")
-        }
-        print("")
-
-        // Dump the worst 20 frames for detailed analysis
+        // Worst 20 frames
         let indexedDts = dts.enumerated().map { ($0.offset, $0.element) }
-        let worstFrames = indexedDts.sorted { $0.1 > $1.1 }.prefix(20)
+        let worstFramesList = indexedDts.sorted { $0.1 > $1.1 }.prefix(20)
         print("        Worst 20 frames:")
-        for (idx, dt) in worstFrames {
+        for (idx, dt) in worstFramesList {
             let cols = lines[idx].components(separatedBy: ",")
             let work = cols.count > 2 ? cols[2] : "?"
             let n = cols.count > 4 ? cols[4] : "?"

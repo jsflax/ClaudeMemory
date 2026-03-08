@@ -35,6 +35,7 @@ final class MetalGraphRenderer: NSObject {
     var stampNodePipeline: MTLComputePipelineState!
     var stampLabelPipeline: MTLComputePipelineState!
     var stampEdgePipeline: MTLComputePipelineState!
+    var packEdgePipeline: MTLComputePipelineState!
 
     // Depth texture
     var depthTexture: MTLTexture?
@@ -69,6 +70,15 @@ final class MetalGraphRenderer: NSObject {
     var edgeInstanceCapacity: Int = 0
     var actualEdgeCount: Int = 0
     var actualEdgeVertexCount: Int = 0
+    /// Set by MetalSceneManager when edge data changes; cleared after GPU dispatch.
+    var edgeDataDirty: Bool = false
+
+    // GPU edge packing buffers
+    var edgeDescriptorBuffer: MTLBuffer?
+    var edgeDescriptorCapacity: Int = 0
+    var nodePositionBuffer: MTLBuffer?
+    var nodePositionCapacity: Int = 0
+    var packEdgeParamsBuffer: MTLBuffer?
 
     // Label batch buffers
     var labelVertexBuffer: MTLBuffer?
@@ -139,6 +149,7 @@ final class MetalGraphRenderer: NSObject {
         nodeStampParamsBuffer = device.makeBuffer(length: MemoryLayout<StampParams>.stride, options: .storageModeShared)
         labelStampParamsBuffer = device.makeBuffer(length: MemoryLayout<LabelStampParams>.stride, options: .storageModeShared)
         edgeStampParamsBuffer = device.makeBuffer(length: MemoryLayout<EdgeStampParams>.stride, options: .storageModeShared)
+        packEdgeParamsBuffer = device.makeBuffer(length: MemoryLayout<PackEdgeParams>.stride, options: .storageModeShared)
 
         renderLog.info("[MetalGraphRenderer] Initialized with device: \(device.name)")
     }
@@ -172,6 +183,9 @@ final class MetalGraphRenderer: NSObject {
         }
         if let fn = library.makeFunction(name: "stamp_edge_cylinders") {
             stampEdgePipeline = try? device.makeComputePipelineState(function: fn)
+        }
+        if let fn = library.makeFunction(name: "pack_edge_instances") {
+            packEdgePipeline = try? device.makeComputePipelineState(function: fn)
         }
     }
 
@@ -403,6 +417,52 @@ final class MetalGraphRenderer: NSObject {
         let totalVerts = actualNodeCount * vertsPerSphere
         let threadgroupSize = min(pipeline.maxTotalThreadsPerThreadgroup, 256)
         let threadgroups = (totalVerts + threadgroupSize - 1) / threadgroupSize
+        encoder.dispatchThreadgroups(
+            MTLSize(width: threadgroups, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: threadgroupSize, height: 1, depth: 1)
+        )
+    }
+
+    // MARK: - GPU Edge Packing Buffers
+
+    func ensureEdgeDescriptorBuffer(count: Int) {
+        guard count > edgeDescriptorCapacity else { return }
+        let needed = max(count * 2, 2048)
+        edgeDescriptorBuffer = device.makeBuffer(
+            length: needed * MemoryLayout<EdgeDescriptor>.stride,
+            options: .storageModeShared
+        )
+        edgeDescriptorCapacity = needed
+    }
+
+    func ensureNodePositionBuffer(count: Int) {
+        guard count > nodePositionCapacity else { return }
+        let needed = max(count * 2, 512)
+        nodePositionBuffer = device.makeBuffer(
+            length: needed * MemoryLayout<SIMD3<Float>>.stride,
+            options: .storageModeShared
+        )
+        nodePositionCapacity = needed
+    }
+
+    // MARK: - Pack Edges (GPU Compute)
+
+    func packEdgesGPU(encoder: MTLComputeCommandEncoder) {
+        guard actualEdgeCount > 0,
+              let pipeline = packEdgePipeline,
+              let descBuf = edgeDescriptorBuffer,
+              let posBuf = nodePositionBuffer,
+              let paramsBuf = packEdgeParamsBuffer,
+              let outputBuf = edgeInstanceBuffer else { return }
+
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(descBuf, offset: 0, index: 0)
+        encoder.setBuffer(posBuf, offset: 0, index: 1)
+        encoder.setBuffer(paramsBuf, offset: 0, index: 2)
+        encoder.setBuffer(outputBuf, offset: 0, index: 3)
+
+        let threadgroupSize = min(pipeline.maxTotalThreadsPerThreadgroup, 256)
+        let threadgroups = (actualEdgeCount + threadgroupSize - 1) / threadgroupSize
         encoder.dispatchThreadgroups(
             MTLSize(width: threadgroups, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: threadgroupSize, height: 1, depth: 1)
@@ -688,7 +748,15 @@ extension MetalGraphRenderer: MTKViewDelegate {
         // GPU compute: stamp node spheres, edge cylinders, label quads + thruster particles (single shared encoder)
         if let computeEncoder = commandBuffer.makeComputeCommandEncoder() {
             stampNodes(encoder: computeEncoder)
-            stampEdges(encoder: computeEncoder)
+            if edgeDataDirty {
+                packEdgesGPU(encoder: computeEncoder)
+                // Barrier: stampEdges reads edgeInstanceBuffer that packEdgesGPU just wrote
+                if let buf = edgeInstanceBuffer, actualEdgeCount > 0 {
+                    computeEncoder.memoryBarrier(resources: [buf])
+                }
+                stampEdges(encoder: computeEncoder)
+                edgeDataDirty = false
+            }
             stampLabels(encoder: computeEncoder)
 
             // Dispatch GPU mascot matrix compute + thruster particle compute for each galaxy's fleet
@@ -883,8 +951,8 @@ extension MetalGraphRenderer: MTKViewDelegate {
         #if ENGRAM_INSTRUMENTATION
         let drawEnd = CFAbsoluteTimeGetCurrent()
         let callbackMs = (afterCallback - drawStart) * 1000.0
-        let waitMs = (afterWait - afterCallback) * 1000.0
-        let encodeMs = (drawEnd - afterWait) * 1000.0
+        let instWaitMs = (afterWait - afterCallback) * 1000.0
+        let instEncodeMs = (drawEnd - afterWait) * 1000.0
         let totalDrawMs = (drawEnd - drawStart) * 1000.0
 
         // Inter-frame analysis: how long between drawFrame end and next drawFrame start
@@ -922,7 +990,7 @@ extension MetalGraphRenderer: MTKViewDelegate {
             }
         }
         if let f = drawTimingFile {
-            let line = "\(frameCount),\(String(format: "%.2f", totalDrawMs)),\(String(format: "%.2f", callbackMs)),\(String(format: "%.2f", waitMs)),\(String(format: "%.2f", encodeMs)),\(String(format: "%.2f", interFrameMs)),\(String(format: "%.2f", canaryDelayMs))\n"
+            let line = "\(frameCount),\(String(format: "%.2f", totalDrawMs)),\(String(format: "%.2f", callbackMs)),\(String(format: "%.2f", instWaitMs)),\(String(format: "%.2f", instEncodeMs)),\(String(format: "%.2f", interFrameMs)),\(String(format: "%.2f", canaryDelayMs))\n"
             fputs(line, f)
             fflush(f)
         }

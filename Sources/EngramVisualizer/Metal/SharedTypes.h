@@ -119,6 +119,28 @@ struct EdgeStampParams {
     unsigned int edgeCount;
 };
 
+// Per-edge descriptor for GPU edge packing (rebuilt on topology/selection change).
+// The pack_edge_instances kernel reads these + a position buffer → outputs EdgeInstance.
+struct EdgeDescriptor {
+    unsigned int sourceIdx;      // index into position buffer
+    unsigned int targetIdx;      // index into position buffer
+    float        sourceRadius;   // node radius (for inset calculation)
+    float        targetRadius;   // node radius (for inset calculation)
+    simd_float4  color;          // (r, g, b, 1)
+    float        baseRadius;     // cylinder radius
+    float        state;          // 0=normal, 1=connected, 2=dimmed, 3=semantic
+    float        _pad0;
+    float        _pad1;
+};                               // Total: 48 bytes
+
+// Dispatch parameters for pack_edge_instances compute kernel.
+struct PackEdgeParams {
+    unsigned int edgeCount;
+    float        scaleFactor;    // world-space scale (1/200)
+    float        _pad0;
+    float        _pad1;
+};
+
 // Nebula billboard vertex (used by NebulaFogSystem).
 struct NebulaQuadVertex {
     simd_float3 position;    // billboard center (world space)

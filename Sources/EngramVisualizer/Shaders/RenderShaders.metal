@@ -592,6 +592,51 @@ kernel void stamp_label_quads(
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// MARK: - Compute: Pack Edge Instances (GPU-side position lookup + inset)
+//
+// Reads EdgeDescriptor[] + node positions[] → writes EdgeInstance[].
+// Replaces per-frame O(edges) UUID dictionary lookups on CPU.
+// ──────────────────────────────────────────────────────────────────────────────
+
+kernel void pack_edge_instances(
+    device const EdgeDescriptor*  descriptors [[buffer(0)]],
+    device const float3*          positions   [[buffer(1)]],  // SIMD3<Float> from Swift (16-byte stride)
+    constant     PackEdgeParams&  params      [[buffer(2)]],
+    device       EdgeInstance*    output      [[buffer(3)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid >= params.edgeCount) return;
+
+    EdgeDescriptor desc = descriptors[tid];
+    float3 from = positions[desc.sourceIdx] * params.scaleFactor;
+    float3 to   = positions[desc.targetIdx] * params.scaleFactor;
+    float3 delta = to - from;
+    float  len = length(delta);
+
+    // Degenerate or overlapping — write zero instance (stamp kernel collapses it)
+    if (len <= desc.sourceRadius + desc.targetRadius) {
+        EdgeInstance inst;
+        inst.sourcePos = float3(0);
+        inst.radius = 0;
+        inst.targetPos = float3(0);
+        inst.state = 0;
+        inst.color = float4(0);
+        output[tid] = inst;
+        return;
+    }
+
+    float3 dir = delta / len;
+
+    EdgeInstance inst;
+    inst.sourcePos = from + dir * desc.sourceRadius;
+    inst.radius    = desc.baseRadius;
+    inst.targetPos = to   - dir * desc.targetRadius;
+    inst.state     = desc.state;
+    inst.color     = desc.color;
+    output[tid] = inst;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // MARK: - Compute: Stamp Edge Cylinders
 //
 // Each thread handles one vertex of one edge's cylinder (12 verts per edge).

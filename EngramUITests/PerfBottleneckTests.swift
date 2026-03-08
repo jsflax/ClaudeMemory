@@ -11,21 +11,6 @@ import Lattice
 final class PerfBottleneckTests: XCTestCase {
     let app = XCUIApplication()
 
-    private enum VK {
-        static let w: CGKeyCode = 13
-        static let a: CGKeyCode = 0
-        static let s: CGKeyCode = 1
-        static let d: CGKeyCode = 2
-        static let q: CGKeyCode = 12
-        static let e: CGKeyCode = 14
-        static let i: CGKeyCode = 34
-        static let j: CGKeyCode = 38
-        static let k: CGKeyCode = 40
-        static let l: CGKeyCode = 37
-        static let t: CGKeyCode = 17
-        static let shift: CGKeyCode = 56
-    }
-
     private var localDbPath: String!
     private var syncedDbPath: String!
     private var localIds: [UUID] = []
@@ -62,59 +47,52 @@ final class PerfBottleneckTests: XCTestCase {
         // Clean ALL previous timing data
         for path in csvPaths { try? FileManager.default.removeItem(atPath: path) }
 
-        // Seed a realistically large multi-project database
+        // Seed a realistically large multi-project database.
+        // Counts mirror the live DB distribution (~3,400 local, ~3,200 synced).
+        // Real DB: 61MB local (3,406 memories, 29,104 edges),
+        //          52MB synced (3,243 memories, 11,440 edges).
         let projects: [(name: String, count: Int)] = [
-            ("Engram", 80), ("Lattice", 50), ("canary-sdk-ios", 40),
-            ("canary-sdk-android", 30), ("global", 60), ("engram-server", 25),
+            ("Engram", 1000), ("Lattice", 500), ("ClaudeMemory", 200),
+            ("engram-server", 120), ("sidescroller", 100), ("global", 200),
+            ("LatticeCore", 40), ("SwiftLM", 25),
         ]
         localIds = seedMultiProjectDatabase(
             at: localDbPath,
             projects: projects,
             staleAge: 7200,
-            withSyncConfig: ["Engram", "global"]
+            withSyncConfig: ["Engram", "Lattice", "ClaudeMemory", "engram-server", "LatticeCore", "SwiftLM"]
         )
 
-        // Seed synced DB for multi-galaxy perf
+        // Seed synced DB — mirrors real synced DB: nearly everything syncs
+        // except global, sidescroller, moscow, LatticeJS.
         syncedIds = seedMultiProjectDatabase(
             at: syncedDbPath,
-            projects: [("Engram", 80), ("global", 60)],
+            projects: [
+                ("Engram", 1000), ("Lattice", 500), ("ClaudeMemory", 200),
+                ("engram-server", 120), ("LatticeCore", 40), ("SwiftLM", 25),
+            ],
             staleAge: 10800
         )
 
-        // Add cross-galaxy edges: link personal galaxy nodes (local-only projects) to
-        // synced galaxy nodes (syncedIds from the synced DB). These are the edges that
-        // mergeRenderData() must resolve across galaxies.
+        // Add cross-galaxy edges: link personal-only galaxy nodes to synced galaxy nodes.
+        // mergeRenderData() must resolve these across galaxies.
         //
-        // localIds layout: Engram[0..79], Lattice[80..129], canary-sdk-ios[130..169],
-        //                  canary-sdk-android[170..199], global[200..259], engram-server[260..284]
-        // syncedIds layout: Engram[0..79], global[80..139]
+        // localIds layout: Engram[0..999], Lattice[1000..1499], ClaudeMemory[1500..1699],
+        //                  engram-server[1700..1819], sidescroller[1820..1919],
+        //                  global[1920..2119], LatticeCore[2120..2159], SwiftLM[2160..2184]
+        // syncedIds layout: Engram[0..999], Lattice[1000..1499], ClaudeMemory[1500..1699],
+        //                  engram-server[1700..1819], LatticeCore[1820..1859], SwiftLM[1860..1884]
         //
-        // Edges go into the LOCAL DB because that's where allEdges are stored.
-        // mergeRenderData() merges allEdges from all galaxies against merged visible nodes.
-
-        // Lattice (personal) → Engram (synced DB)
+        // sidescroller + global are personal-only → cross-galaxy edges to synced projects
         addCrossProjectEdges(
             at: localDbPath,
-            sourceIds: Array(localIds[80..<90]),
-            targetIds: Array(syncedIds[0..<10])
+            sourceIds: Array(localIds[1820..<1840]),
+            targetIds: Array(syncedIds[0..<20])
         )
-        // canary-sdk-ios (personal) → global (synced DB)
         addCrossProjectEdges(
             at: localDbPath,
-            sourceIds: Array(localIds[130..<140]),
-            targetIds: Array(syncedIds[80..<90])
-        )
-        // canary-sdk-android (personal) → Engram (synced DB)
-        addCrossProjectEdges(
-            at: localDbPath,
-            sourceIds: Array(localIds[170..<180]),
-            targetIds: Array(syncedIds[10..<20])
-        )
-        // engram-server (personal) → global (synced DB)
-        addCrossProjectEdges(
-            at: localDbPath,
-            sourceIds: Array(localIds[260..<275]),
-            targetIds: Array(syncedIds[80..<95])
+            sourceIds: Array(localIds[1920..<1940]),
+            targetIds: Array(syncedIds[1000..<1020])
         )
 
         app.launchEnvironment["CLAUDE_MEMORY_DB"] = localDbPath
@@ -139,7 +117,7 @@ final class PerfBottleneckTests: XCTestCase {
 
         let window = app.windows.firstMatch
         XCTAssertTrue(window.waitForExistence(timeout: 15), "App window not found")
-        sleep(5) // simulation settle for ~285 nodes
+        sleep(15) // simulation settle for ~4,000 merged nodes
 
         // Defocus search bar
         app.typeKey(.escape, modifierFlags: [])
@@ -306,7 +284,7 @@ final class PerfBottleneckTests: XCTestCase {
         //   ANALYSIS
         // ═══════════════════════════════════════
 
-        let report = BottleneckReport()
+        var report = BottleneckReport()
 
         report.addSection(analyzeMetalFrames())
         report.addSection(analyzeDrawPipeline())
@@ -953,43 +931,10 @@ final class PerfBottleneckTests: XCTestCase {
         return section
     }
 
-    // MARK: - Helpers
+    // MARK: - Local Formatting Aliases (delegate to shared helpers)
 
-    private nonisolated func holdKey(_ keyCode: CGKeyCode, duration: TimeInterval) {
-        let src = CGEventSource(stateID: .combinedSessionState)
-        CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: true)?.post(tap: .cgSessionEventTap)
-        Thread.sleep(forTimeInterval: duration)
-        CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: false)?.post(tap: .cgSessionEventTap)
-        Thread.sleep(forTimeInterval: 0.05)
-    }
-
-    private nonisolated func holdKeys(_ keyCodes: [CGKeyCode], duration: TimeInterval) {
-        let src = CGEventSource(stateID: .combinedSessionState)
-        for kc in keyCodes {
-            CGEvent(keyboardEventSource: src, virtualKey: kc, keyDown: true)?.post(tap: .cgSessionEventTap)
-        }
-        Thread.sleep(forTimeInterval: duration)
-        for kc in keyCodes.reversed() {
-            CGEvent(keyboardEventSource: src, virtualKey: kc, keyDown: false)?.post(tap: .cgSessionEventTap)
-        }
-        Thread.sleep(forTimeInterval: 0.05)
-    }
-
-    private func takeScreenshot(name: String) {
-        let screenshot = XCUIScreen.main.screenshot()
-        let attachment = XCTAttachment(screenshot: screenshot)
-        attachment.name = name
-        attachment.lifetime = .keepAlways
-        add(attachment)
-        try? screenshot.pngRepresentation.write(to: URL(fileURLWithPath: "/tmp/\(name).png"))
-    }
-
-    private func f(_ v: Double) -> String { String(format: "%7.2f", v) }
-
-    private func pct(_ sorted: [Double], _ p: Double) -> Double {
-        guard !sorted.isEmpty else { return 0 }
-        return sorted[min(Int(Double(sorted.count) * p), sorted.count - 1)]
-    }
+    private func f(_ v: Double) -> String { fmt(v) }
+    private func pct(_ sorted: [Double], _ p: Double) -> Double { percentile(sorted, p) }
 }
 
 // MARK: - Sync Config Toggle Helper
@@ -1005,61 +950,11 @@ func toggleSyncConfig(at path: String, project: String, policy: SyncConfig.Polic
         )
     )
 
-    // Check if config exists
     let existing = lattice.objects(SyncConfig.self).first(where: { $0.project == project })
     if let existing {
         existing.policy = policy
         existing.updatedAt = Date()
     } else {
         lattice.add(SyncConfig(project: project, policy: policy))
-    }
-}
-
-// MARK: - Report Infrastructure
-
-private struct BottleneckSection {
-    let title: String
-    var lines: [String] = []
-    var metalP95: Double?
-
-    init(title: String) { self.title = title }
-
-    mutating func addLine(_ line: String) { lines.append(line) }
-}
-
-private class BottleneckReport {
-    private var sections: [BottleneckSection] = []
-    var metalP95: Double?
-
-    func addSection(_ section: BottleneckSection) {
-        sections.append(section)
-        if let p = section.metalP95 { metalP95 = p }
-    }
-
-    func printSummary() {
-        print("")
-        print("╔═══════════════════════════════════════════════════════════════════════════╗")
-        print("║                    PERFORMANCE BOTTLENECK REPORT                         ║")
-        print("╠═══════════════════════════════════════════════════════════════════════════╣")
-
-        for section in sections {
-            print("║                                                                           ║")
-            print("║  ── \(section.title) \(String(repeating: "─", count: max(0, 55 - section.title.count)))  ║")
-            for line in section.lines {
-                print("  \(line)")
-            }
-        }
-
-        // Summary: collect all warnings
-        let warnings = sections.flatMap { s in s.lines.filter { $0.contains("⚠️") } }
-        if !warnings.isEmpty {
-            print("")
-            print("║  ── WARNINGS ────────────────────────────────────────────────  ║")
-            for w in warnings { print("  \(w)") }
-        }
-
-        print("║                                                                           ║")
-        print("╚═══════════════════════════════════════════════════════════════════════════╝")
-        print("")
     }
 }

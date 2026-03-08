@@ -74,10 +74,14 @@ final class ForceSimulation3D {
     var center: SIMD3<Float> = .zero
     var isActive: Bool = true
 
-    /// True when the simulation has converged (velocities near-zero for 30 consecutive frames).
+    /// True when the simulation has converged (velocities near-zero for consecutive frames).
     /// When settled, tick() skips force dispatch and position sync to save CPU/GPU.
     private(set) var isSettled = false
     private var settledFrameCount = 0
+    private var framesSinceWake = 0
+    /// Minimum frames after wake() before settle is allowed. Prevents premature settling
+    /// when the first async force results haven't arrived yet.
+    private let settleGuardFrames = 30  // ~0.5s at 60fps
 
     /// Max speed² from the last tick. Used by the Timer to throttle visual updates
     /// when nodes are barely moving (convergence tail).
@@ -87,6 +91,7 @@ final class ForceSimulation3D {
     func wake() {
         isSettled = false
         settledFrameCount = 0
+        framesSinceWake = 0
         forceAge = 2
         // Reset alpha so center gravity and other alpha-scaled forces are meaningful.
         // Without this, alpha decays to 0.01 after ~15s and never recovers — making
@@ -383,11 +388,11 @@ final class ForceSimulation3D {
 
         let hasForcesComputed = storedFx.count == n
         let rawAttenuation = pow(damping, Float(forceAge))
-        // Blend=0.04: with off-MainActor dispatch, forces arrive every 1-2 frames,
-        // so forceAge oscillates 2→3→2. Heavy smoothing flattens the sawtooth into
-        // near-constant application. Settling still works because isSettled returns
-        // early before this code runs, and forceAge grows unbounded when forces stop.
-        smoothedAttenuation += (rawAttenuation - smoothedAttenuation) * 0.04
+        // Blend=0.12: with off-MainActor dispatch, forces arrive every 1-3 frames
+        // (longer at high node counts due to O(n²) GPU charge computation).
+        // The blend rate smooths the forceAge sawtooth (2→3→4→2) into near-constant
+        // force application, preventing visible jitter from magnitude oscillations.
+        smoothedAttenuation += (rawAttenuation - smoothedAttenuation) * 0.12
         let attenuation = smoothedAttenuation
         forceAge += 1
 
@@ -411,16 +416,21 @@ final class ForceSimulation3D {
         }
         alpha = max(alpha * alphaDecay, alphaFloor)
         lastMaxSpeedSq = maxSpeedSq
+        framesSinceWake += 1
 
-        // Settle detection: all nodes nearly stationary for 30 consecutive frames.
-        if hasForcesComputed && maxSpeedSq < 0.01 {
+        // Settle detection: all nodes nearly stationary for 30 consecutive frames,
+        // AND at least settleGuardFrames since last wake (prevents premature settling
+        // before async force results have propagated through the graph).
+        if hasForcesComputed
+            && framesSinceWake >= settleGuardFrames
+            && maxSpeedSq < 0.01 {
             settledFrameCount += 1
             if settledFrameCount >= 30 {
                 isSettled = true
                 syncPositions()  // one final sync
                 return
             }
-        } else {
+        } else if maxSpeedSq >= 0.01 {
             settledFrameCount = 0
         }
 

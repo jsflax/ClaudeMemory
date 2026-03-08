@@ -106,7 +106,7 @@ extension SidebarView {
             }
 
             section("Endpoint") {
-                TextField("https://api.engram.io", text: $accountService.endpoint)
+                TextField("https://engram.io", text: $accountService.endpoint)
                     .textFieldStyle(.roundedBorder)
                     .font(.system(size: 11, design: .monospaced))
             }
@@ -260,7 +260,7 @@ extension SidebarView {
                     Text("Endpoint")
                         .font(.system(size: 10, design: .monospaced))
                         .foregroundStyle(.white.opacity(0.35))
-                    TextField("https://api.engram.io", text: $accountService.endpoint)
+                    TextField("https://engram.io", text: $accountService.endpoint)
                         .textFieldStyle(.roundedBorder)
                         .font(.system(size: 11, design: .monospaced))
                 }

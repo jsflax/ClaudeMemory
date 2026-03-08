@@ -273,14 +273,4 @@ final class SyncMigrationTests: XCTestCase {
         """)
     }
 
-    // MARK: - Screenshot
-
-    private func takeScreenshot(name: String) {
-        let screenshot = XCUIScreen.main.screenshot()
-        let attachment = XCTAttachment(screenshot: screenshot)
-        attachment.name = name
-        attachment.lifetime = .keepAlways
-        add(attachment)
-        try? screenshot.pngRepresentation.write(to: URL(fileURLWithPath: "/tmp/\(name).png"))
-    }
 }

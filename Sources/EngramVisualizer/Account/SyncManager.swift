@@ -66,10 +66,23 @@ final class SyncManager {
         didConnect.send()
     }
 
-    /// Tear down sync observation and stop daemon.
+    /// Tear down sync: stop daemon, delete synced DB so next sign-in starts fresh.
     func disconnectSync() {
         CLIInstaller.stopDaemon()
         syncedLattice = nil
+
+        // Delete the synced DB (closes connections, removes DB + WAL + SHM)
+        if let dbPath {
+            let claudeDir = (dbPath as NSString).deletingLastPathComponent
+            let syncedDbPath = SyncService.syncedDbPath(claudeDir: claudeDir)
+            let config = Lattice.Configuration(fileURL: URL(fileURLWithPath: syncedDbPath))
+            try? Lattice.delete(for: config)
+        }
+
+        // Clear sync state on local DB so next sign-in does a full re-sync.
+        // Without this, the local DB thinks rows are already synced to a DB that no longer exists.
+        localLattice?.updateSyncFilter(nil)
+
         statusMessage = nil
         ipcProgress = nil
         wssProgress = nil
