@@ -39,6 +39,7 @@ final class ForceSimulation3D {
     private let pendingForces = OSAllocatedUnfairLock<ForceResult?>(initialState: nil)
 
     private(set) var positions: [UUID: SIMD3<Float>] = [:]
+    var nodeCount: Int { ids.count }
 
     // Force parameters (tuned for 3D — slightly stronger since space is larger)
     private let springLength: Float = 240
@@ -59,9 +60,9 @@ final class ForceSimulation3D {
     private(set) var alpha: Float = 1.0
     private let alphaDecay: Float = 0.995
     private let alphaFloor: Float = 0.01
-    private var tickInFlight = false
-    private var forceAge: Int = 100
-    private var smoothedAttenuation: Float = 0.001
+    private(set) var tickInFlight = false
+    private(set) var forceAge: Int = 100
+    private(set) var smoothedAttenuation: Float = 0.001
     private var topologyVersion: UInt64 = 0
 
     /// Set by addNode/addEdge, drained by tick(). Coalesces multiple topology changes
@@ -77,8 +78,8 @@ final class ForceSimulation3D {
     /// True when the simulation has converged (velocities near-zero for consecutive frames).
     /// When settled, tick() skips force dispatch and position sync to save CPU/GPU.
     private(set) var isSettled = false
-    private var settledFrameCount = 0
-    private var framesSinceWake = 0
+    private(set) var settledFrameCount = 0
+    private(set) var framesSinceWake = 0
     /// Minimum frames after wake() before settle is allowed. Prevents premature settling
     /// when the first async force results haven't arrived yet.
     private let settleGuardFrames = 30  // ~0.5s at 60fps
@@ -437,6 +438,13 @@ final class ForceSimulation3D {
         syncPositions()
 
         // Dispatch force computation whenever the pipeline is idle.
+        // Safety: if the GPU force computation hangs (command buffer never completes),
+        // tickInFlight stays true forever, permanently blocking new dispatches.
+        // Reset after 10 frames (~170ms) — more than enough for any GPU computation.
+        if tickInFlight && forceAge > 12 {
+            forceSimLog.warning("Force computation timed out after \(self.forceAge) frames (n=\(n)) — resetting tickInFlight")
+            tickInFlight = false
+        }
         if !tickInFlight {
             dispatchForceComputation()
         }
@@ -493,7 +501,9 @@ final class ForceSimulation3D {
             // Run entire force pipeline off MainActor — MetalForceCompute is @unchecked Sendable
             // and Metal device/queue/pipeline are thread-safe. The tickInFlight flag ensures
             // at most one concurrent dispatch, so buffer access is safe.
+            let dispatchN = n
             Task.detached(priority: .userInitiated) { [pendingForces] in
+                let t0 = CFAbsoluteTimeGetCurrent()
                 async let chargeResult = metal.dispatchChargeForces(
                     positions: positions,
                     projectGroups: projGroups,
@@ -506,6 +516,10 @@ final class ForceSimulation3D {
                 // Run CPU forces concurrently with GPU charge forces
                 let cpuForces = ForceSimulation3D.computeCPUOnlyForces(state)
                 let charge = await chargeResult
+                let gpuMs = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0
+                if gpuMs > 50 {
+                    print("FORCE_COMPUTE: n=\(dispatchN) gpu+cpu=\(String(format: "%.1f", gpuMs))ms charge_fx=\(charge.fx.count) cpu_fx=\(cpuForces.fx.count)")
+                }
 
                 let nn = min(charge.fx.count, cpuForces.fx.count)
                 var combinedFx = [Float](repeating: 0, count: nn)
@@ -531,9 +545,13 @@ final class ForceSimulation3D {
     }
 
     /// Compute CPU-only forces (spring attraction, topic/project cohesion, center gravity).
-    /// These are O(n) or O(groups²) and not worth GPU-offloading.
     /// CPU-only forces (springs, cohesion, center) — nonisolated static so it can run off MainActor.
     /// Used by GPU path to combine with GPU-computed charge forces.
+    ///
+    /// Performance: centroid repulsion uses precomputed per-group index lists to avoid
+    /// O(groups² × n) full scans. Without this, 3248 nodes with hundreds of topic groups
+    /// causes multi-second stalls (the old code did `for i in 0..<n where topicGroup[i] == g`
+    /// inside a pairwise loop).
     private nonisolated static func computeCPUOnlyForces(_ s: SimState) -> ForceResult {
         let n = s.n
         let x = s.x, y = s.y, z = s.z
@@ -565,9 +583,12 @@ final class ForceSimulation3D {
             var tSumY = [Float](repeating: 0, count: topicN)
             var tSumZ = [Float](repeating: 0, count: topicN)
             var tCount = [Int](repeating: 0, count: topicN)
+            // Build per-group index lists (O(n) once, avoids O(n) scan per pair)
+            var topicMembers = [[Int]](repeating: [], count: topicN)
             for i in 0..<n {
                 let g = topicGroup[i]
                 tSumX[g] += x[i]; tSumY[g] += y[i]; tSumZ[g] += z[i]; tCount[g] += 1
+                topicMembers[g].append(i)
             }
             for i in 0..<n {
                 let g = topicGroup[i]; let cnt = Float(tCount[g])
@@ -578,6 +599,10 @@ final class ForceSimulation3D {
                 fz[i] += (cz - z[i]) * s.topicCohesionStrength
             }
             let tpg = s.topicProjectGroup
+            // Accumulate per-group force vectors, then distribute in one pass
+            var topicForceX = [Float](repeating: 0, count: topicN)
+            var topicForceY = [Float](repeating: 0, count: topicN)
+            var topicForceZ = [Float](repeating: 0, count: topicN)
             for g1 in 0..<topicN {
                 guard tCount[g1] > 0 else { continue }
                 let c1x = tSumX[g1] / Float(tCount[g1])
@@ -595,12 +620,16 @@ final class ForceSimulation3D {
                     let force = s.topicCentroidRepulsion / (tdist * tdist)
                     let tfx = (tdx / tdist) * force, tfy = (tdy / tdist) * force, tfz = (tdz / tdist) * force
                     let f1 = 1.0 / Float(tCount[g1]), f2 = 1.0 / Float(tCount[g2])
-                    for i in 0..<n where topicGroup[i] == g1 {
-                        fx[i] += tfx * f1; fy[i] += tfy * f1; fz[i] += tfz * f1
-                    }
-                    for i in 0..<n where topicGroup[i] == g2 {
-                        fx[i] -= tfx * f2; fy[i] -= tfy * f2; fz[i] -= tfz * f2
-                    }
+                    topicForceX[g1] += tfx * f1; topicForceY[g1] += tfy * f1; topicForceZ[g1] += tfz * f1
+                    topicForceX[g2] -= tfx * f2; topicForceY[g2] -= tfy * f2; topicForceZ[g2] -= tfz * f2
+                }
+            }
+            // Distribute accumulated per-group forces to members (O(n) total)
+            for g in 0..<topicN where tCount[g] > 0 {
+                let tfx = topicForceX[g], tfy = topicForceY[g], tfz = topicForceZ[g]
+                if tfx == 0 && tfy == 0 && tfz == 0 { continue }
+                for i in topicMembers[g] {
+                    fx[i] += tfx; fy[i] += tfy; fz[i] += tfz
                 }
             }
         }
@@ -613,9 +642,12 @@ final class ForceSimulation3D {
                 var gSumY = [Float](repeating: 0, count: groupN)
                 var gSumZ = [Float](repeating: 0, count: groupN)
                 var gCount = [Int](repeating: 0, count: groupN)
+                // Build per-group index lists
+                var projMembers = [[Int]](repeating: [], count: groupN)
                 for i in 0..<n {
                     let g = projectGroup[i]
                     gSumX[g] += x[i]; gSumY[g] += y[i]; gSumZ[g] += z[i]; gCount[g] += 1
+                    projMembers[g].append(i)
                 }
 
                 // Compute per-group 75th percentile radius for non-linear cohesion
@@ -649,6 +681,10 @@ final class ForceSimulation3D {
                     fz[i] += dz * cohStr * scale
                 }
 
+                // Accumulate per-group centroid repulsion, then distribute
+                var projForceX = [Float](repeating: 0, count: groupN)
+                var projForceY = [Float](repeating: 0, count: groupN)
+                var projForceZ = [Float](repeating: 0, count: groupN)
                 for g1 in 0..<groupN {
                     guard gCount[g1] > 0 else { continue }
                     let c1 = SIMD3<Float>(gSumX[g1], gSumY[g1], gSumZ[g1]) / Float(gCount[g1])
@@ -661,12 +697,16 @@ final class ForceSimulation3D {
                         let force = s.centroidRepulsion / (pdist * pdist)
                         let fVec = (delta / pdist) * force
                         let f1 = 1.0 / Float(gCount[g1]), f2 = 1.0 / Float(gCount[g2])
-                        for i in 0..<n where projectGroup[i] == g1 {
-                            fx[i] += fVec.x * f1; fy[i] += fVec.y * f1; fz[i] += fVec.z * f1
-                        }
-                        for i in 0..<n where projectGroup[i] == g2 {
-                            fx[i] -= fVec.x * f2; fy[i] -= fVec.y * f2; fz[i] -= fVec.z * f2
-                        }
+                        projForceX[g1] += fVec.x * f1; projForceY[g1] += fVec.y * f1; projForceZ[g1] += fVec.z * f1
+                        projForceX[g2] -= fVec.x * f2; projForceY[g2] -= fVec.y * f2; projForceZ[g2] -= fVec.z * f2
+                    }
+                }
+                // Distribute accumulated per-group forces to members (O(n) total)
+                for g in 0..<groupN where gCount[g] > 0 {
+                    let pfx = projForceX[g], pfy = projForceY[g], pfz = projForceZ[g]
+                    if pfx == 0 && pfy == 0 && pfz == 0 { continue }
+                    for i in projMembers[g] {
+                        fx[i] += pfx; fy[i] += pfy; fz[i] += pfz
                     }
                 }
             }
@@ -758,9 +798,11 @@ final class ForceSimulation3D {
             var tSumY = [Float](repeating: 0, count: topicN)
             var tSumZ = [Float](repeating: 0, count: topicN)
             var tCount = [Int](repeating: 0, count: topicN)
+            var topicMembers = [[Int]](repeating: [], count: topicN)
             for i in 0..<n {
                 let g = topicGroup[i]
                 tSumX[g] += x[i]; tSumY[g] += y[i]; tSumZ[g] += z[i]; tCount[g] += 1
+                topicMembers[g].append(i)
             }
             let topicCoh = s.topicCohesionStrength
             for i in 0..<n {
@@ -773,6 +815,9 @@ final class ForceSimulation3D {
             }
             let tpg = s.topicProjectGroup
             let topicCentRep = s.topicCentroidRepulsion
+            var topicForceX = [Float](repeating: 0, count: topicN)
+            var topicForceY = [Float](repeating: 0, count: topicN)
+            var topicForceZ = [Float](repeating: 0, count: topicN)
             for g1 in 0..<topicN {
                 guard tCount[g1] > 0 else { continue }
                 let c1x = tSumX[g1] / Float(tCount[g1])
@@ -790,12 +835,15 @@ final class ForceSimulation3D {
                     let force = topicCentRep / (tdist * tdist)
                     let tfx = (tdx / tdist) * force, tfy = (tdy / tdist) * force, tfz = (tdz / tdist) * force
                     let f1 = 1.0 / Float(tCount[g1]), f2 = 1.0 / Float(tCount[g2])
-                    for i in 0..<n where topicGroup[i] == g1 {
-                        fx[i] += tfx * f1; fy[i] += tfy * f1; fz[i] += tfz * f1
-                    }
-                    for i in 0..<n where topicGroup[i] == g2 {
-                        fx[i] -= tfx * f2; fy[i] -= tfy * f2; fz[i] -= tfz * f2
-                    }
+                    topicForceX[g1] += tfx * f1; topicForceY[g1] += tfy * f1; topicForceZ[g1] += tfz * f1
+                    topicForceX[g2] -= tfx * f2; topicForceY[g2] -= tfy * f2; topicForceZ[g2] -= tfz * f2
+                }
+            }
+            for g in 0..<topicN where tCount[g] > 0 {
+                let tfx = topicForceX[g], tfy = topicForceY[g], tfz = topicForceZ[g]
+                if tfx == 0 && tfy == 0 && tfz == 0 { continue }
+                for i in topicMembers[g] {
+                    fx[i] += tfx; fy[i] += tfy; fz[i] += tfz
                 }
             }
         }
@@ -808,9 +856,11 @@ final class ForceSimulation3D {
                 var gSumY = [Float](repeating: 0, count: groupN)
                 var gSumZ = [Float](repeating: 0, count: groupN)
                 var gCount = [Int](repeating: 0, count: groupN)
+                var projMembers = [[Int]](repeating: [], count: groupN)
                 for i in 0..<n {
                     let g = projectGroup[i]
                     gSumX[g] += x[i]; gSumY[g] += y[i]; gSumZ[g] += z[i]; gCount[g] += 1
+                    projMembers[g].append(i)
                 }
 
                 // Compute per-group 75th percentile radius for non-linear cohesion
@@ -845,6 +895,9 @@ final class ForceSimulation3D {
                 }
 
                 let centRep = s.centroidRepulsion
+                var projForceX = [Float](repeating: 0, count: groupN)
+                var projForceY = [Float](repeating: 0, count: groupN)
+                var projForceZ = [Float](repeating: 0, count: groupN)
                 for g1 in 0..<groupN {
                     guard gCount[g1] > 0 else { continue }
                     let c1 = SIMD3<Float>(gSumX[g1], gSumY[g1], gSumZ[g1]) / Float(gCount[g1])
@@ -857,12 +910,15 @@ final class ForceSimulation3D {
                         let force = centRep / (pdist * pdist)
                         let fVec = (delta / pdist) * force
                         let f1 = 1.0 / Float(gCount[g1]), f2 = 1.0 / Float(gCount[g2])
-                        for i in 0..<n where projectGroup[i] == g1 {
-                            fx[i] += fVec.x * f1; fy[i] += fVec.y * f1; fz[i] += fVec.z * f1
-                        }
-                        for i in 0..<n where projectGroup[i] == g2 {
-                            fx[i] -= fVec.x * f2; fy[i] -= fVec.y * f2; fz[i] -= fVec.z * f2
-                        }
+                        projForceX[g1] += fVec.x * f1; projForceY[g1] += fVec.y * f1; projForceZ[g1] += fVec.z * f1
+                        projForceX[g2] -= fVec.x * f2; projForceY[g2] -= fVec.y * f2; projForceZ[g2] -= fVec.z * f2
+                    }
+                }
+                for g in 0..<groupN where gCount[g] > 0 {
+                    let pfx = projForceX[g], pfy = projForceY[g], pfz = projForceZ[g]
+                    if pfx == 0 && pfy == 0 && pfz == 0 { continue }
+                    for i in projMembers[g] {
+                        fx[i] += pfx; fy[i] += pfy; fz[i] += pfz
                     }
                 }
             }

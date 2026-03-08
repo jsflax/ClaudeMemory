@@ -691,13 +691,20 @@ final class GalaxyRegistry {
 
         // Override with source positions so nodes start where they were and
         // the force simulation pulls them toward the destination galaxy center
-        if !sourcePositions.isEmpty {
-            for (id, pos) in sourcePositions {
-                galaxy.simulation3D.setPosition(id, to: pos)
-            }
-            // Ensure simulation is awake to animate the migration
-            galaxy.simulation3D.wake()
+        for (id, pos) in sourcePositions {
+            galaxy.simulation3D.setPosition(id, to: pos)
         }
+
+        // Always wake the sim after adding nodes — without this, the sim stays
+        // in its default state with decayed alpha and near-zero smoothedAttenuation,
+        // producing negligible force application even though isSettled gets cleared
+        // by hasPendingTopologyChanges on the first tick.
+        galaxy.simulation3D.wake()
+
+        // Mark initial load complete so renderTick ticks this galaxy's sim.
+        // loadData (async) may not have finished yet for newly created galaxies,
+        // but migration has populated the sim — it must tick to animate.
+        galaxy.isInitialLoad = false
 
         // insertNodeBatch already maintains visibleNodeIds, nodeById, colorMap, hubs, edges.
         // Only rebuild stats (relation counts, topic groups, edge counts).

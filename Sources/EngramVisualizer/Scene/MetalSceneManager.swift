@@ -224,6 +224,15 @@ final class MetalSceneManager {
                     anyActive = true
                 }
             }
+
+            // Diagnostic: log per-galaxy sim state once per second
+            if renderFrameCount % 60 == 0 && registry.galaxies.count > 1 {
+                for galaxy in registry.galaxies.values {
+                    let sim = galaxy.simulation3D
+                    print("SIM[\(galaxy.id)] frame=\(renderFrameCount) initLoad=\(galaxy.isInitialLoad) settled=\(sim.isSettled) nodes=\(sim.nodeCount) positions=\(sim.positions.count) alpha=\(String(format: "%.4f", sim.alpha)) maxSpeedSq=\(String(format: "%.4f", sim.lastMaxSpeedSq)) atten=\(String(format: "%.4f", sim.smoothedAttenuation)) forceAge=\(sim.forceAge) tickInFlight=\(sim.tickInFlight) framesSinceWake=\(sim.framesSinceWake) center=(\(String(format: "%.0f", sim.center.x)),\(String(format: "%.0f", sim.center.y)),\(String(format: "%.0f", sim.center.z)))")
+                }
+            }
+
             registry.mergeRenderData()
 
             // Prune expired glow/arrival entries so visualOnlyChanged goes false.
@@ -265,12 +274,15 @@ final class MetalSceneManager {
                     registry.updateMergedPositions()
                     let simPositions = registry.mergedPositions
                     // Smooth render positions toward sim positions to prevent jitter
-                    // from async force delivery oscillations. The 0.35 blend gives
-                    // ~3-frame visual smoothing while staying responsive to sim changes.
+                    // from async force delivery. Adaptive blend: when any sim is
+                    // actively converging (high velocity), use aggressive smoothing
+                    // to hide force arrival discontinuities. When nearly settled,
+                    // use responsive blend so the last few pixels snap into place.
                     if positions.isEmpty {
                         positions = simPositions
                     } else {
-                        let blend: Float = 0.35
+                        let maxVelSq = registry.galaxies.values.map { $0.simulation3D.lastMaxSpeedSq }.max() ?? 0
+                        let blend: Float = maxVelSq > 4.0 ? 0.10 : (maxVelSq > 0.5 ? 0.18 : 0.35)
                         for (id, simPos) in simPositions {
                             if let curPos = positions[id] {
                                 positions[id] = curPos + (simPos - curPos) * blend

@@ -659,9 +659,9 @@ extension MetalGraphRenderer: MTKViewDelegate {
             // Always drain accumulator to report observer work between frames
             ObserverAccumulator.shared.drainAndLog()
             if gapMs > 25 { // >25ms = dropped frame
-                os_log(.fault, log: Self.stallLog,
-                       "STALL: frame_gap=%.1fms canary_delay=%.1fms (main thread blocked %.1fms between frames)",
-                       gapMs, canaryMs, canaryMs)
+//                os_log(.fault, log: Self.stallLog,
+//                       "STALL: frame_gap=%.1fms canary_delay=%.1fms (main thread blocked %.1fms between frames)",
+//                       gapMs, canaryMs, canaryMs)
             }
         }
         lastFrameTime = now
@@ -679,7 +679,7 @@ extension MetalGraphRenderer: MTKViewDelegate {
         onFrameCallback?(dtSec)
         let cbMs = (CFAbsoluteTimeGetCurrent() - cbStart) * 1000.0
         if cbMs > 10 {
-            os_log(.fault, log: Self.stallLog, "HOTPATH: onFrameCallback %.1fms", cbMs)
+//            os_log(.fault, log: Self.stallLog, "HOTPATH: onFrameCallback %.1fms", cbMs)
         }
 
         #if ENGRAM_INSTRUMENTATION

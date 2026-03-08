@@ -21,7 +21,15 @@ final class Galaxy: Identifiable {
 
     // World-space center (set by GalaxyRegistry.computeWorldLayout)
     var worldCenter: SIMD3<Float> = .zero {
-        didSet { simulation3D.center = worldCenter }
+        didSet {
+            simulation3D.center = worldCenter
+            // Wake the sim when center changes so nodes re-converge toward
+            // the new center. Without this, a settled galaxy ignores center
+            // shifts (e.g. when a second galaxy is added and layout recomputes).
+            if oldValue != worldCenter && isLoaded {
+                simulation3D.wake()
+            }
+        }
     }
 
     // Per-galaxy node filter (for data partitioning — prevents duplication across galaxies)
