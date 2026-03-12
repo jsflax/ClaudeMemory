@@ -3,11 +3,11 @@ import simd
 
 /// Programmatic audio buffer synthesis — no asset files needed.
 /// All buffers are mono, 44100 Hz, Float32.
-@MainActor
-enum AudioSynthesis {
+enum AudioSynthesis: Sendable {
 
     static let sampleRate: Double = 44100
     static let monoFormat = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 1)!
+    static let stereoFormat = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 2)!
 
     // MARK: - Pentatonic Scale (all combinations consonant)
 

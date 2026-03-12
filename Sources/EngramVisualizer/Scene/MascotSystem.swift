@@ -120,6 +120,19 @@ final class MascotSystem {
         }
     }
 
+    /// Whether the arcane circle should be active (hovering OR conjuring).
+    private var wantsArcaneCircle: Bool {
+        switch currentState {
+        case .hover, .chatting, .conjure: return true
+        default: return false
+        }
+    }
+
+    /// Whether the mascot is in conjure state (for eye glow boost).
+    private var isConjuring: Bool {
+        if case .conjure = currentState { return true } else { return false }
+    }
+
     // Fixed render-space scale — mascot is about 3x node size (nodes are radius 0.04)
     private let mascotScale: Float = 0.06
 
@@ -153,6 +166,21 @@ final class MascotSystem {
     private(set) var thrusterIndexBuffer: MTLBuffer?
     private(set) var thrusterVertexCapacity: Int = 0
     private(set) var actualThrusterParticleCount: Int = 0
+
+    // Conjure scan rings (horizontal rings sweeping up/down mascot during conjure)
+    private var scanRingUniformBuffers: [MTLBuffer] = []  // 3 buffers
+    private var scanRingIndexBuffer: MTLBuffer?
+    private(set) var scanRingsVisible: Bool = false
+    private var scanRingIntensity: Float = 0
+
+    // Conjure orb (energy sphere forming between hands)
+    private var conjureOrbUniformBuffer: MTLBuffer?
+    private var conjureOrbIndexBuffer: MTLBuffer?
+    private(set) var conjureOrbVisible: Bool = false
+    private var conjureOrbIntensity: Float = 0
+    private var conjureOrbPosition: SIMD3<Float> = .zero
+    private var conjureOrbScale: Float = 0
+    private var conjureNodeTarget: SIMD3<Float> = .zero  // final node position for orb flight
 
     // Node awareness — which node the mascot is currently visiting
     private(set) var currentTargetId: UUID?
@@ -263,6 +291,7 @@ final class MascotSystem {
         setupArcaneBuffers()
         setupRingBuffers()
         setupHoloBuffers()
+        setupConjureBuffers()
     }
 
     /// Init from shared resources — used by MascotFleet to avoid per-instance mesh duplication.
@@ -281,6 +310,7 @@ final class MascotSystem {
         setupArcaneBuffers()
         setupRingBuffers()
         setupHoloBuffers()
+        setupConjureBuffers()
     }
 
     /// Extract shared resources from this instance (call on the "template" mascot).
@@ -333,6 +363,35 @@ final class MascotSystem {
         // 6 indices for 1 quad (4 vertices expanded in vertex shader)
         var indices: [UInt32] = [0, 2, 1, 1, 2, 3]
         holoIndexBuffer = device.makeBuffer(
+            bytes: &indices,
+            length: indices.count * MemoryLayout<UInt32>.stride,
+            options: .storageModeShared
+        )
+    }
+
+    private func setupConjureBuffers() {
+        // 3 scan ring uniform buffers (reuse ArcaneCircleUniforms layout)
+        for _ in 0..<3 {
+            if let buf = device.makeBuffer(
+                length: MemoryLayout<ArcaneCircleUniforms>.stride,
+                options: .storageModeShared
+            ) {
+                scanRingUniformBuffers.append(buf)
+            }
+        }
+        var indices: [UInt32] = [0, 2, 1, 1, 2, 3]
+        scanRingIndexBuffer = device.makeBuffer(
+            bytes: &indices,
+            length: indices.count * MemoryLayout<UInt32>.stride,
+            options: .storageModeShared
+        )
+
+        // Conjure orb uniform buffer
+        conjureOrbUniformBuffer = device.makeBuffer(
+            length: MemoryLayout<ConjureOrbUniforms>.stride,
+            options: .storageModeShared
+        )
+        conjureOrbIndexBuffer = device.makeBuffer(
             bytes: &indices,
             length: indices.count * MemoryLayout<UInt32>.stride,
             options: .storageModeShared
@@ -564,30 +623,40 @@ final class MascotSystem {
         }
     }
 
-    /// Conjure animation: fly to position, arms raise, node materializes.
-    /// Phase 0→0.2: flyTo, 0.2→1.0: perform (node scales 0→1)
+    /// Conjure animation: dramatic memory creation sequence.
+    /// Phase 0→0.15: fast approach to target position
+    /// Phase 0.15→0.30: arms raise to 100°, scan rings activate, arcane circle lights up
+    /// Phase 0.30→0.65: orb forms between hands, scanning rings sweep, eye glow intensifies
+    /// Phase 0.65→0.80: orb detaches and flies to node position
+    /// Phase 0.80→1.0: effects fade, arms lower
     private func updateConjure(dt: Float, nodeId: UUID, phase: Float, positions: [UUID: SIMD3<Float>], sf: Float) {
-        let totalDuration: Float = 3.0
+        let totalDuration: Float = 4.5
         let newPhase = phase + dt / totalDuration
 
         if newPhase >= 1.0 {
             // Complete — restore normal state
             conjureArmAngle = 0
+            scanRingsVisible = false
+            scanRingIntensity = 0
+            conjureOrbVisible = false
+            conjureOrbIntensity = 0
+            conjureOrbScale = 0
             transitionToNextTask(positions: positions, scaleFactor: sf)
             return
         }
 
-        // Update spawn position from simulation if available
+        // Track the node's simulation position for orb flight target
         if let pos = positions[nodeId] {
             patrolTarget = pos * sf + SIMD3<Float>(0, mascotScale * 2.0, 0)
+            conjureNodeTarget = pos * sf
         }
 
-        if newPhase < 0.2 {
-            // FlyTo phase: move toward target
+        if newPhase < 0.15 {
+            // Phase 1: Fast approach
             let distToTarget = simd_length(patrolTarget - currentPosition)
             if distToTarget > mascotScale * 0.3 {
                 let dir = simd_normalize(patrolTarget - currentPosition)
-                let speed = patrolSpeed * 1.5  // faster than normal patrol
+                let speed = patrolSpeed * 2.0
                 let step = dir * speed * dt
                 if simd_length(step) < distToTarget {
                     currentPosition += step
@@ -596,15 +665,67 @@ final class MascotSystem {
                 }
             }
             // Arms begin raising
-            conjureArmAngle = (newPhase / 0.2) * 1.05  // 0→60 degrees
+            conjureArmAngle = (newPhase / 0.15) * 0.5  // 0→~29 degrees
+        } else if newPhase < 0.30 {
+            // Phase 2: Arms raise to 100°, scan rings activate
+            let t = (newPhase - 0.15) / 0.15  // 0→1
+            conjureArmAngle = 0.5 + t * 1.25  // ~29°→100°
+            scanRingIntensity = t
+            scanRingsVisible = true
+        } else if newPhase < 0.65 {
+            // Phase 3: Orb forms between hands, scan rings sweep
+            let t = (newPhase - 0.30) / 0.35  // 0→1
+            conjureArmAngle = 1.75  // hold at 100°
+            scanRingIntensity = 1.0
+            scanRingsVisible = true
+            conjureOrbScale = t
+            conjureOrbIntensity = 0.5 + t * 0.5
+            conjureOrbVisible = true
+            // Orb stays between hands
+            conjureOrbPosition = computeOrbHandPosition()
+        } else if newPhase < 0.80 {
+            // Phase 4: Orb detaches and flies to node
+            let t = (newPhase - 0.65) / 0.15  // 0→1
+            let eased = t * t * (3.0 - 2.0 * t)  // smoothstep easing
+            conjureArmAngle = 1.75 * (1.0 - t * 0.3)  // arms begin lowering
+            scanRingIntensity = 1.0 - t
+            scanRingsVisible = scanRingIntensity > 0.01
+            conjureOrbScale = 1.0
+            conjureOrbIntensity = 1.0 - t * 0.3
+            conjureOrbVisible = true
+            // Lerp orb from hands to node position
+            let handPos = computeOrbHandPosition()
+            conjureOrbPosition = simd_mix(handPos, conjureNodeTarget, SIMD3<Float>(repeating: eased))
         } else {
-            // Perform phase: arms at +60 degrees, arcane circle brightens
-            conjureArmAngle = 1.05  // 60 degrees
-            // Node materialization is tracked via birthingNodes in GraphRenderStore
-            // (triggered by MascotFleet.onNodeCreated → enqueueTask)
+            // Phase 5: Fade out
+            let t = (newPhase - 0.80) / 0.20  // 0→1
+            conjureArmAngle = 1.75 * 0.7 * (1.0 - t)  // finish lowering
+            scanRingsVisible = false
+            scanRingIntensity = 0
+            conjureOrbVisible = false
+            conjureOrbIntensity = 0
+            conjureOrbScale = 0
         }
 
         currentState = .conjure(nodeId: nodeId, phase: newPhase)
+    }
+
+    /// Compute the world-space midpoint between the mascot's raised hands.
+    private func computeOrbHandPosition() -> SIMD3<Float> {
+        guard parts.count == 5 else { return currentPosition }
+        // Hand tips are at the far end of each arm — approximate offset from pivot
+        let leftPivot = SIMD3<Float>(-0.68, -0.21, 0.10)
+        let rightPivot = SIMD3<Float>(0.67, -0.21, 0.10)
+        // When arms are raised, hands move upward. Approximate hand position
+        // as pivot + rotated offset along the arm (arm length ~0.5 in model space)
+        let armLength: Float = 0.5
+        let leftHandLocal = leftPivot + SIMD3<Float>(0, -armLength * cos(conjureArmAngle), armLength * sin(conjureArmAngle))
+        let rightHandLocal = rightPivot + SIMD3<Float>(0, -armLength * cos(conjureArmAngle), armLength * sin(conjureArmAngle))
+        let midpoint = (leftHandLocal + rightHandLocal) * 0.5
+
+        // Transform to world space via body matrix
+        let world4 = lastBodyMatrix * SIMD4<Float>(midpoint.x, midpoint.y, midpoint.z, 1.0)
+        return SIMD3<Float>(world4.x, world4.y, world4.z)
     }
 
     /// Absorb animation: fly to condemned node, node shrinks, mascot absorbs.
@@ -894,6 +1015,7 @@ final class MascotSystem {
 
         // Eye: cyan emissive pulse (dims in drowsy/sleeping idle states)
         let eyeMax: Float = {
+            if isConjuring { return 1.8 }  // intense glow during conjure
             if isBusy { return 1.2 }  // brighter during maintenance
             switch idleSubState {
             case .drowsy: return 0.5   // 50% brightness
@@ -901,7 +1023,7 @@ final class MascotSystem {
             default: return 1.0
             }
         }()
-        let eyeFreq: Float = isBusy ? 6.0 : 3.0
+        let eyeFreq: Float = isConjuring ? 8.0 : (isBusy ? 6.0 : 3.0)
         let eyePulse: Float = eyeMax * (0.6 + 0.4 * sin(time * eyeFreq))
         ptr.pointee.parts.3 = MascotPartUniforms(
             modelMatrix: bodyMatrix, parentMatrix: bodyMatrix,
@@ -923,6 +1045,12 @@ final class MascotSystem {
 
         // ── Node inspection rings ──
         updateNodeRings(dt: dt, nodePositions: nodePositions, scaleFactor: sf, dynamicScale: dynamicScale)
+
+        // ── Conjure scan rings ──
+        updateScanRings(dt: dt, bodyMatrix: bodyMatrix, dynamicScale: dynamicScale)
+
+        // ── Conjure orb ──
+        updateConjureOrb(dt: dt, camera: camera, dynamicScale: dynamicScale)
 
         // ── Holo info screen ──
         updateHoloScreen(dt: dt, bodyMatrix: bodyMatrix, bodyRot: bodyRot, dynamicScale: dynamicScale, nodeInfo: nodeInfo)
@@ -1079,6 +1207,7 @@ final class MascotSystem {
         }
 
         let eyeMax: Float = {
+            if isConjuring { return 1.8 }
             if isBusy { return 1.2 }
             switch idleSubState {
             case .drowsy: return 0.5
@@ -1086,7 +1215,7 @@ final class MascotSystem {
             default: return 1.0
             }
         }()
-        let eyeFreq: Float = isBusy ? 6.0 : 3.0
+        let eyeFreq: Float = isConjuring ? 8.0 : (isBusy ? 6.0 : 3.0)
 
         return MascotAnimState(
             currentPosition: currentPosition,
@@ -1148,8 +1277,8 @@ final class MascotSystem {
     // MARK: - Arcane Circle
 
     private func updateArcaneCircle(dt: Float, bodyMatrix: simd_float4x4, bodyRot: simd_float4x4, dynamicScale: Float) {
-        // Fade in when hovering, fade out when flying
-        let target: Float = isHovering ? 1.0 : 0.0
+        // Fade in when hovering or conjuring, fade out when flying
+        let target: Float = wantsArcaneCircle ? 1.0 : 0.0
         arcaneIntensity += (target - arcaneIntensity) * min(dt * 4.0, 1.0)
         arcaneVisible = arcaneIntensity > 0.01
 
@@ -1242,6 +1371,76 @@ final class MascotSystem {
                 _pad1: 0
             )
         }
+    }
+
+    // MARK: - Conjure Scan Rings
+
+    private func updateScanRings(dt: Float, bodyMatrix: simd_float4x4, dynamicScale: Float) {
+        guard scanRingsVisible, scanRingUniformBuffers.count == 3 else {
+            scanRingsVisible = false
+            return
+        }
+
+        let bodyPos = SIMD3<Float>(bodyMatrix.columns.3.x, bodyMatrix.columns.3.y, bodyMatrix.columns.3.z)
+        let ringSize = dynamicScale * 1.2  // slightly wider than mascot body
+
+        // 3 horizontal rings at different Y offsets, sweeping up and down
+        let sweepSpeed: Float = 3.0
+        let sweepRange = dynamicScale * 1.5  // vertical sweep range
+        let offsets: [Float] = [0.0, 0.33, 0.66]  // phase offsets for stagger
+
+        for (i, offset) in offsets.enumerated() {
+            // Ping-pong sweep: triangle wave from -1 to +1
+            let phase = time * sweepSpeed / sweepRange + offset
+            let rawT = phase - floor(phase)  // fract equivalent
+            let sweep: Float = rawT < 0.5 ? rawT * 4.0 - 1.0 : 3.0 - rawT * 4.0
+            let yOffset = sweep * sweepRange * 0.5
+
+            let center = bodyPos + SIMD3<Float>(0, yOffset, 0)
+
+            // Horizontal ring: right = world X, up = world Z (ring lies flat)
+            let yaw = atan2(bodyMatrix.columns.2.x, bodyMatrix.columns.2.z)
+            let right = SIMD3<Float>(cos(yaw), 0, sin(yaw))
+            let up = SIMD3<Float>(-sin(yaw), 0, cos(yaw))
+
+            let ptr = scanRingUniformBuffers[i].contents().bindMemory(to: ArcaneCircleUniforms.self, capacity: 1)
+            ptr.pointee = ArcaneCircleUniforms(
+                center: center,
+                size: ringSize,
+                right: right,
+                opacity: scanRingIntensity * (0.7 + 0.3 * (1.0 - abs(sweep))),  // brighter near center
+                up: up,
+                _pad0: 0,
+                tintColor: projectTint,
+                _pad1: 0
+            )
+        }
+    }
+
+    // MARK: - Conjure Orb
+
+    private func updateConjureOrb(dt: Float, camera: CameraController, dynamicScale: Float) {
+        guard conjureOrbVisible, let buf = conjureOrbUniformBuffer else {
+            conjureOrbVisible = false
+            return
+        }
+
+        // Camera-facing billboard (orb always faces viewer)
+        let vm = camera.viewMatrix()
+        let right = SIMD3<Float>(vm.columns.0.x, vm.columns.1.x, vm.columns.2.x)
+        let up = SIMD3<Float>(vm.columns.0.y, vm.columns.1.y, vm.columns.2.y)
+
+        let ptr = buf.contents().bindMemory(to: ConjureOrbUniforms.self, capacity: 1)
+        ptr.pointee = ConjureOrbUniforms(
+            center: conjureOrbPosition,
+            size: dynamicScale * 1.0,
+            right: right,
+            opacity: conjureOrbIntensity,
+            up: up,
+            orbScale: conjureOrbScale,
+            tintColor: projectTint,
+            glowIntensity: conjureOrbIntensity
+        )
     }
 
     // MARK: - Holo Info Screen
@@ -1543,6 +1742,55 @@ final class MascotSystem {
                 indexBufferOffset: 0
             )
         }
+    }
+
+    /// Draw the 3 conjure scan rings (transparent pass, additive blending).
+    func drawScanRings(
+        encoder: MTLRenderCommandEncoder,
+        frameUniformBuf: MTLBuffer,
+        pipeline: MTLRenderPipelineState
+    ) {
+        guard scanRingsVisible,
+              scanRingUniformBuffers.count == 3,
+              let idxBuf = scanRingIndexBuffer else { return }
+
+        encoder.setRenderPipelineState(pipeline)
+        encoder.setFragmentBuffer(frameUniformBuf, offset: 0, index: 0)
+
+        for i in 0..<3 {
+            encoder.setVertexBuffer(scanRingUniformBuffers[i], offset: 0, index: 0)
+            encoder.setVertexBuffer(frameUniformBuf, offset: 0, index: 1)
+            encoder.drawIndexedPrimitives(
+                type: .triangle,
+                indexCount: 6,
+                indexType: .uint32,
+                indexBuffer: idxBuf,
+                indexBufferOffset: 0
+            )
+        }
+    }
+
+    /// Draw the conjure orb (transparent pass, additive blending).
+    func drawConjureOrb(
+        encoder: MTLRenderCommandEncoder,
+        frameUniformBuf: MTLBuffer,
+        pipeline: MTLRenderPipelineState
+    ) {
+        guard conjureOrbVisible,
+              let uniformBuf = conjureOrbUniformBuffer,
+              let idxBuf = conjureOrbIndexBuffer else { return }
+
+        encoder.setRenderPipelineState(pipeline)
+        encoder.setVertexBuffer(uniformBuf, offset: 0, index: 0)
+        encoder.setVertexBuffer(frameUniformBuf, offset: 0, index: 1)
+        encoder.setFragmentBuffer(frameUniformBuf, offset: 0, index: 0)
+        encoder.drawIndexedPrimitives(
+            type: .triangle,
+            indexCount: 6,
+            indexType: .uint32,
+            indexBuffer: idxBuf,
+            indexBufferOffset: 0
+        )
     }
 
     /// Draw the holographic info screen (transparent pass, alpha blended).

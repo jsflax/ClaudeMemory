@@ -53,10 +53,13 @@ struct EngramApp: App {
             startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil
         )
 
-        #if LATTICE_DEBUG
+        #if ENGRAM_INSTRUMENTATION
+        // Redirect stderr to a file so Lattice C++ debug logs are captured during UI tests
+        // (the app runs in a separate process whose stderr isn't in xcodebuild output)
+        freopen("/tmp/lattice-debug.log", "w", stderr)
         Lattice.setLogLevel(.debug)
         #endif
-        
+
         let dbPath = ProcessInfo.processInfo.environment["CLAUDE_MEMORY_DB"]
             ?? NSHomeDirectory() + "/.claude/memory.sqlite"
         self.dbPath = dbPath
@@ -80,6 +83,11 @@ struct EngramApp: App {
         }()
         // DIAG: force 3D mode for performance testing
         config.dimensionMode = .threeD
+
+        // Allow tests to force sound on via environment
+        if ProcessInfo.processInfo.environment["ENGRAM_FORCE_SOUND"] == "1" {
+            config.soundEnabled = true
+        }
 
         // Configure Google Sign-In if client ID is available
         if let googleClientID = ProcessInfo.processInfo.environment["GOOGLE_CLIENT_ID"]

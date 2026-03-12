@@ -552,7 +552,13 @@ final class MetalSceneManager {
         }
 
         // Spatial audio tick — reads all state computed above
+        #if ENGRAM_INSTRUMENTATION
+        let audioStart = CFAbsoluteTimeGetCurrent()
+        #endif
         spatialAudio?.tick(dt: dt, scene: self)
+        #if ENGRAM_INSTRUMENTATION
+        let audioMs = (CFAbsoluteTimeGetCurrent() - audioStart) * 1000.0
+        #endif
 
         let totalMs = (CFAbsoluteTimeGetCurrent() - frameStart) * 1000.0
         let nodeCount = positions.count
@@ -576,11 +582,11 @@ final class MetalSceneManager {
         if metalTimingFile == nil {
             metalTimingFile = fopen("/tmp/metal-frame-timing.csv", "w")
             if let f = metalTimingFile {
-                fputs("frame,dt_ms,wall_dt_ms,total_ms,sim_ms,mascot_ms,nodes_ms,edges_ms,neb_ms,labels_ms,flow_ms,node_count,edge_count,reason\n", f)
+                fputs("frame,dt_ms,wall_dt_ms,total_ms,sim_ms,mascot_ms,nodes_ms,edges_ms,neb_ms,labels_ms,flow_ms,node_count,edge_count,reason,audio_ms\n", f)
             }
         }
         if let f = metalTimingFile, (isActive || renderFrameCount % 30 == 0) {
-            let line = "\(renderFrameCount),\(String(format: "%.2f", dt * 1000)),\(String(format: "%.2f", wallDt)),\(String(format: "%.2f", totalMs)),\(String(format: "%.2f", simMs)),\(String(format: "%.2f", mascotMs)),\(String(format: "%.2f", nodesMs)),\(String(format: "%.2f", edgesMs)),\(String(format: "%.2f", nebMs)),\(String(format: "%.2f", labelsMs)),\(String(format: "%.2f", flowMs)),\(nodeCount),\(edgeCount),\(reason)\n"
+            let line = "\(renderFrameCount),\(String(format: "%.2f", dt * 1000)),\(String(format: "%.2f", wallDt)),\(String(format: "%.2f", totalMs)),\(String(format: "%.2f", simMs)),\(String(format: "%.2f", mascotMs)),\(String(format: "%.2f", nodesMs)),\(String(format: "%.2f", edgesMs)),\(String(format: "%.2f", nebMs)),\(String(format: "%.2f", labelsMs)),\(String(format: "%.2f", flowMs)),\(nodeCount),\(edgeCount),\(reason),\(String(format: "%.2f", audioMs))\n"
             fputs(line, f)
             fflush(f)
         }

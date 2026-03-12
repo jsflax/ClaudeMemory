@@ -23,10 +23,7 @@ struct SidebarView: View {
     // Visualizer tab
     let projects: [String]
     let colorMap: [String: Color]
-    let allRelationCounts: [(key: String, value: Int)]
-    let visibleMemoryCount: Int
-    let visibleEdgeCount: Int
-    let totalMemories: Int
+    var galaxyRegistry: GalaxyRegistry
     let projectionState: ProjectionState
     let toggleProject: (String) -> Void
     let toggleRelation: (String) -> Void
@@ -65,7 +62,7 @@ struct SidebarView: View {
                 }
             }
         }
-        .frame(width: 260)
+        .frame(width: 310)
         .frame(maxHeight: .infinity)
         .background(Color(red: 0.055, green: 0.07, blue: 0.095).opacity(0.98))
         .background(.ultraThinMaterial)
@@ -140,13 +137,15 @@ struct SidebarView: View {
     private var visualizerContent: some View {
         VStack(alignment: .leading, spacing: 24) {
             section("Stats") {
+                let visibleCount = galaxyRegistry.mergedVisibleNodeIds.count
+                let totalCount = galaxyRegistry.mergedAllNodes.count
                 VStack(alignment: .leading, spacing: 6) {
-                    if visibleMemoryCount < totalMemories {
-                        statRow("Memories", value: "\(visibleMemoryCount)/\(totalMemories)")
+                    if visibleCount < totalCount {
+                        statRow("Memories", value: "\(visibleCount)/\(totalCount)")
                     } else {
-                        statRow("Memories", value: "\(totalMemories)")
+                        statRow("Memories", value: "\(totalCount)")
                     }
-                    statRow("Edges", value: "\(visibleEdgeCount)")
+                    statRow("Edges", value: "\(galaxyRegistry.mergedEdges.count)")
                     statRow("Database", value: dbFileSize)
                 }
             }
@@ -172,10 +171,11 @@ struct SidebarView: View {
                 }
             }
 
-            if !allRelationCounts.isEmpty {
+            let relationCounts = galaxyRegistry.mergedRelationCounts
+            if !relationCounts.isEmpty {
                 section("Relations") {
                     VStack(alignment: .leading, spacing: 2) {
-                        ForEach(allRelationCounts, id: \.key) { relation, count in
+                        ForEach(relationCounts, id: \.key) { relation, count in
                             relationRow(relation, count: count)
                         }
                     }

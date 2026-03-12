@@ -108,16 +108,13 @@ final class Galaxy: Identifiable {
                 case .insert(let pk):
                     guard let memory = bg.object(Memory.self, primaryKey: pk),
                           let gid = memory.__globalId else { return }
-                    // Apply per-galaxy filter
                     let node = NodeData(
                         id: gid, project: memory.project, topic: memory.topic,
                         label: extractLabel(content: memory.content, topic: memory.topic),
                         content: memory.content,
                         createdAt: memory.createdAt, lastAccessedAt: memory.lastAccessedAt,
                         importance: memory.importance)
-                    Task { @MainActor [memoryRef = memory.sendableReference] in
-                        if let memory = memoryRef.resolve(on: self.galaxy.lattice),
-                           let filter = self.galaxy.nodeFilter, !filter(memory) { return }
+                    Task { @MainActor in
                         GalaxyDataLoader.handleNodeInsert(pk: pk, node: node, galaxy: self.galaxy,
                                          is3D: is3D, hiddenProjects: hiddenProjects,
                                          hiddenRelations: hiddenRelations, timeFilter: timeFilter,
@@ -126,17 +123,13 @@ final class Galaxy: Identifiable {
                 case .update(let pk):
                     guard let memory = bg.object(Memory.self, primaryKey: pk),
                           let gid = memory.__globalId else { return }
-                    // Apply per-galaxy filter — prevents synced-project nodes from leaking
-                    // into the personal galaxy via updates (matching the .insert filter)
                     let node = NodeData(
                         id: gid, project: memory.project, topic: memory.topic,
                         label: extractLabel(content: memory.content, topic: memory.topic),
                         content: memory.content,
                         createdAt: memory.createdAt, lastAccessedAt: memory.lastAccessedAt,
                         importance: memory.importance)
-                    Task { @MainActor [memoryRef = memory.sendableReference] in
-                        if let memory = memoryRef.resolve(on: self.galaxy.lattice),
-                           let filter = self.galaxy.nodeFilter, !filter(memory) { return }
+                    Task { @MainActor in
                         GalaxyDataLoader.handleNodeUpdate(node: node, galaxy: self.galaxy)
                     }
                 case .delete(let pk):

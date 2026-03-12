@@ -209,10 +209,7 @@ struct GraphView: View {
                 SidebarView(
                     projects: uniqueProjects(),
                     colorMap: galaxyRegistry.mergedColorMap,
-                    allRelationCounts: galaxyRegistry.mergedRelationCounts,
-                    visibleMemoryCount: galaxyRegistry.mergedVisibleNodeIds.count,
-                    visibleEdgeCount: galaxyRegistry.mergedEdges.count,
-                    totalMemories: galaxyRegistry.mergedAllNodes.count,
+                    galaxyRegistry: galaxyRegistry,
                     projectionState: embeddingProjection.state,
                     toggleProject: toggleProject,
                     toggleRelation: toggleRelation,

@@ -3,8 +3,11 @@ import simd
 
 /// Pool of spatialized voices dynamically assigned to the closest nodes.
 /// Creates a pointillist texture as you fly through — stars singing as you pass.
-@MainActor
-final class ProximityTonePool {
+///
+/// Two-tier update:
+/// - Rescan (6Hz): iterate all positions with simd_length_squared, bounded insertion — O(n)
+/// - Voice update (60Hz): 8 dict lookups, 8 sqrts for volume — ~0.01ms
+final class ProximityTonePool: @unchecked Sendable {
 
     private let environment: AVAudioEnvironmentNode
     private let poolSize: Int
@@ -12,14 +15,26 @@ final class ProximityTonePool {
     private struct Voice {
         let player: AVAudioPlayerNode
         var assignedNode: UUID?
-        var isPlaying: Bool = false
+        var targetVolume: Float = 0
     }
 
     private var voices: [Voice] = []
     /// Buffers keyed by frequency, pre-generated for each pentatonic note × 3 octaves.
     private var bufferCache: [Int: AVAudioPCMBuffer] = [:]
-    /// Hysteresis: a new node must be this much closer than the current assignment to steal a voice.
-    private let hysteresisMargin: Float = 30.0
+
+    private let maxDistance: Float = 300
+    private let maxDistanceSq: Float = 300 * 300
+
+    // --- Rescan throttle ---
+    private var frameCounter: Int = 0
+    private let rescanInterval: Int = 10 // every 10 frames at 60fps ≈ 6Hz
+
+    // --- Cached results ---
+    private struct NodeResult {
+        let id: UUID
+        let distanceSq: Float
+    }
+    private var cachedResults: [NodeResult] = []
 
     init(environment: AVAudioEnvironmentNode, poolSize: Int) {
         self.environment = environment
@@ -53,6 +68,8 @@ final class ProximityTonePool {
         }
     }
 
+    // MARK: - Per-Frame Entry Point
+
     func update(
         positions: [UUID: SIMD3<Float>],
         cameraPosition: SIMD3<Float>,
@@ -63,72 +80,127 @@ final class ProximityTonePool {
     ) {
         guard !positions.isEmpty else { return }
 
-        // Find N closest nodes (excluding selected — that gets its own event sound)
-        let camPos = cameraPosition
-        let maxDistance: Float = 300 // world units — beyond this, no proximity tone
-
-        struct NodeDist: Comparable {
-            let id: UUID
-            let distance: Float
-            static func < (lhs: NodeDist, rhs: NodeDist) -> Bool { lhs.distance < rhs.distance }
+        // Throttled rescan at ~6Hz
+        frameCounter += 1
+        if frameCounter >= rescanInterval {
+            frameCounter = 0
+            rescan(positions: positions, cameraPosition: cameraPosition, selectedNode: selectedNode)
         }
 
-        var candidates: [NodeDist] = []
-        candidates.reserveCapacity(min(positions.count, poolSize * 4))
+        // Every frame: update assigned voice positions from live data
+        updateVoicePositions(
+            positions: positions,
+            cameraPosition: cameraPosition,
+            glowingNodes: glowingNodes,
+            newNodes: newNodes,
+            scaleFactor: scaleFactor
+        )
+    }
+
+    func stopAll() {
+        for i in voices.indices {
+            voices[i].player.stop()
+            voices[i].assignedNode = nil
+            voices[i].targetVolume = 0
+        }
+        cachedResults.removeAll()
+    }
+
+    // MARK: - Rescan (~6Hz)
+
+    func rescan(
+        positions: [UUID: SIMD3<Float>],
+        cameraPosition: SIMD3<Float>,
+        selectedNode: UUID?
+    ) {
+        cachedResults.removeAll(keepingCapacity: true)
+        var worstDistSq: Float = 0
+        var worstIdx: Int = 0
 
         for (id, pos) in positions {
             if id == selectedNode { continue }
-            let dist = simd_length(pos - camPos)
-            if dist < maxDistance {
-                candidates.append(NodeDist(id: id, distance: dist))
+            let distSq = simd_length_squared(pos - cameraPosition)
+            guard distSq < maxDistanceSq else { continue }
+
+            if cachedResults.count < poolSize {
+                cachedResults.append(NodeResult(id: id, distanceSq: distSq))
+                if distSq > worstDistSq {
+                    worstDistSq = distSq
+                    worstIdx = cachedResults.count - 1
+                }
+            } else if distSq < worstDistSq {
+                // Swap-remove the worst, insert this one
+                cachedResults[worstIdx] = NodeResult(id: id, distanceSq: distSq)
+                // Recompute worst
+                worstDistSq = 0
+                for j in cachedResults.indices {
+                    if cachedResults[j].distanceSq > worstDistSq {
+                        worstDistSq = cachedResults[j].distanceSq
+                        worstIdx = j
+                    }
+                }
             }
         }
 
-        candidates.sort()
-        let closest = Array(candidates.prefix(poolSize))
+        assignVoices()
+    }
 
-        // Assign voices to closest nodes
-        let closestIds = Set(closest.map(\.id))
-        let currentAssignments = Set(voices.compactMap(\.assignedNode))
+    // MARK: - Voice Assignment
 
-        // First pass: free voices whose nodes are no longer in closest set
+    func assignVoices() {
+        let resultIds = Set(cachedResults.map(\.id))
+
+        // Free voices whose nodes left the closest set
         for i in voices.indices {
-            if let assigned = voices[i].assignedNode, !closestIds.contains(assigned) {
+            guard let assigned = voices[i].assignedNode else { continue }
+            if !resultIds.contains(assigned) {
                 voices[i].assignedNode = nil
-                voices[i].player.volume = 0
+                voices[i].targetVolume = 0
             }
         }
 
-        // Second pass: assign unassigned closest nodes to free voices
-        for nd in closest {
-            // Already assigned?
-            if voices.contains(where: { $0.assignedNode == nd.id }) { continue }
-
-            // Find a free voice
+        // Assign unvoiced nodes to free voices
+        for result in cachedResults {
+            if voices.contains(where: { $0.assignedNode == result.id }) { continue }
             guard let freeIdx = voices.firstIndex(where: { $0.assignedNode == nil }) else { break }
 
-            voices[freeIdx].assignedNode = nd.id
+            voices[freeIdx].assignedNode = result.id
 
             // Choose buffer based on node characteristics
-            let bufferKey = (nd.id.hashValue & Int.max) % bufferCache.count
+            let bufferKey = (result.id.hashValue & Int.max) % bufferCache.count
             if let buffer = bufferCache[bufferKey] {
+                // Stop before reschedule (player may be paused with old buffer)
                 voices[freeIdx].player.stop()
                 voices[freeIdx].player.scheduleBuffer(buffer, at: nil, options: .loops)
                 voices[freeIdx].player.play()
-                voices[freeIdx].isPlaying = true
             }
         }
+    }
 
-        // Update positions and volume for all assigned voices
+    // MARK: - Per-Frame Voice Update (60Hz, O(poolSize))
+
+    func updateVoicePositions(
+        positions: [UUID: SIMD3<Float>],
+        cameraPosition: SIMD3<Float>,
+        glowingNodes: [UUID: Date],
+        newNodes: [UUID: Date],
+        scaleFactor: Float
+    ) {
         for i in voices.indices {
             guard let nodeId = voices[i].assignedNode,
-                  let pos = positions[nodeId] else { continue }
+                  let pos = positions[nodeId] else {
+                // Fade unassigned voices to silence, then pause to free HRTF processing
+                let vol = voices[i].player.volume * 0.85
+                voices[i].player.volume = vol
+                if vol < 0.001 { voices[i].player.pause() }
+                continue
+            }
 
             let audioPos = pos * scaleFactor
             voices[i].player.position = AVAudio3DPoint(x: audioPos.x, y: audioPos.y, z: audioPos.z)
 
-            // Volume based on distance
-            let dist = simd_length(pos - camPos)
+            // Volume based on distance (sqrt only for 8 assigned voices)
+            let dist = simd_length(pos - cameraPosition)
             let normalizedDist = min(dist / maxDistance, 1.0)
             let distVolume = (1.0 - normalizedDist * normalizedDist) // inverse square falloff
 
@@ -136,15 +208,11 @@ final class ProximityTonePool {
             let glowBoost: Float = glowingNodes[nodeId] != nil ? 1.5 : 1.0
             let arrivalBoost: Float = newNodes[nodeId] != nil ? 1.3 : 1.0
 
-            voices[i].player.volume = min(0.6, distVolume * 0.35 * glowBoost * arrivalBoost)
-        }
-    }
+            voices[i].targetVolume = min(0.6, distVolume * 0.35 * glowBoost * arrivalBoost)
 
-    func stopAll() {
-        for i in voices.indices {
-            voices[i].player.stop()
-            voices[i].isPlaying = false
-            voices[i].assignedNode = nil
+            // Smooth volume transition
+            let current = voices[i].player.volume
+            voices[i].player.volume = current + (voices[i].targetVolume - current) * 0.15
         }
     }
 }

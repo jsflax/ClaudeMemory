@@ -1,4 +1,6 @@
 import XCTest
+import EngramKit
+import Lattice
 
 /// Performance test against the REAL database — no injected test data.
 /// Launches the app with its actual memory.sqlite and captures frame timing
@@ -118,6 +120,97 @@ final class RealDBPerfTests: XCTestCase {
             XCTAssertLessThan(p95, 33.0,
                 "p95 wall_dt \(String(format: "%.1f", p95))ms exceeds 30fps budget (33ms)")
         }
+    }
+
+    // MARK: - Insert Burst Test
+
+    /// Tests insert performance against the real database at full scale.
+    /// Inserts into non-synced projects so the personal galaxy's nodeFilter accepts them.
+    /// All test-inserted memories are cleaned up at the end via globalId.
+    func testRealDBInsertBurst() throws {
+        Lattice.setLogLevel(.debug)
+        app.launch()
+
+        let window = app.windows.firstMatch
+        XCTAssertTrue(window.waitForExistence(timeout: 15), "App window not found")
+        sleep(20) // let full data load + simulation settle
+
+        // Defocus search bar
+        app.typeKey(.escape, modifierFlags: [])
+        usleep(200_000)
+
+        // Real DB path — the app launched without CLAUDE_MEMORY_DB override
+        let dbPath = ("/Users/" + NSUserName() as NSString).appendingPathComponent(".claude/memory.sqlite")
+
+        let baselineFrames = frameCountFromCSV()
+
+        // ── Teleport into a cluster ──
+        window.typeKey("t", modifierFlags: [])
+        sleep(2)
+
+        // ── Idle baseline (3s) ──
+        sleep(3)
+        let preInsertFrames = frameCountFromCSV()
+        takeScreenshot(name: "realdb-insert-00-pre")
+
+        // Track all inserted IDs for cleanup
+        var allInserted: [UUID] = []
+
+        // ── Burst 1: Insert 10 memories ──
+        allInserted.append(contentsOf: insertMemories(at: dbPath, project: "sidescroller", count: 10))
+        sleep(3)
+        let postBurst1Frames = frameCountFromCSV()
+        takeScreenshot(name: "realdb-insert-01-burst10")
+
+        // ── Burst 2: Insert 25 memories ──
+        allInserted.append(contentsOf: insertMemories(at: dbPath, project: "global", count: 25))
+        sleep(4)
+        let postBurst2Frames = frameCountFromCSV()
+        takeScreenshot(name: "realdb-insert-02-burst25")
+
+        // ── Burst 3: Insert 50 memories ──
+        allInserted.append(contentsOf: insertMemories(at: dbPath, project: "sidescroller", count: 50))
+        sleep(5)
+        let postBurst3Frames = frameCountFromCSV()
+        takeScreenshot(name: "realdb-insert-03-burst50")
+
+        // ── Burst 4: Rapid small inserts (simulates real MCP usage) ──
+        for _ in 0..<10 {
+            allInserted.append(contentsOf: insertMemories(at: dbPath, project: "global", count: 3))
+            usleep(300_000)
+        }
+        sleep(3)
+        let postBurst4Frames = frameCountFromCSV()
+        takeScreenshot(name: "realdb-insert-04-rapid")
+
+        // ── Cleanup: delete ONLY the test-inserted memories by globalId ──
+        deleteMemories(at: dbPath, globalIds: allInserted)
+        sleep(2)
+
+        // ═══════════════════════════════════════
+        //   ANALYSIS
+        // ═══════════════════════════════════════
+
+        print("\n" + String(repeating: "═", count: 80))
+        print("  REAL DB INSERT STRESS TEST RESULTS")
+        print(String(repeating: "═", count: 80))
+
+        print("\nFrame counts:")
+        print("  Baseline→PreInsert: \(preInsertFrames - baselineFrames) frames in ~5s")
+        print("  Burst 1 (10 nodes):  \(postBurst1Frames - preInsertFrames) frames in ~3s")
+        print("  Burst 2 (25 nodes):  \(postBurst2Frames - postBurst1Frames) frames in ~4s")
+        print("  Burst 3 (50 nodes):  \(postBurst3Frames - postBurst2Frames) frames in ~5s")
+        print("  Burst 4 (30 rapid):  \(postBurst4Frames - postBurst3Frames) frames in ~6s")
+
+        let report = buildReport()
+        report.printSummary()
+    }
+
+    private func frameCountFromCSV() -> Int {
+        let path = "/tmp/metal-frame-timing.csv"
+        guard let data = FileManager.default.contents(atPath: path),
+              let csv = String(data: data, encoding: .utf8) else { return 0 }
+        return csv.components(separatedBy: "\n").count - 2
     }
 
     // MARK: - Report
@@ -311,6 +404,7 @@ final class RealDBPerfTests: XCTestCase {
         guard !lines.isEmpty else { section.addLine("[Empty]"); return section }
 
         var totals: [Double] = [], callbacks: [Double] = [], waits: [Double] = [], encodes: [Double] = []
+        var interFrames: [Double] = [], canaryDelays: [Double] = []
         for line in lines {
             let c = line.components(separatedBy: ",")
             guard c.count >= 5 else { continue }
@@ -318,6 +412,10 @@ final class RealDBPerfTests: XCTestCase {
             callbacks.append(Double(c[2]) ?? 0)
             waits.append(Double(c[3]) ?? 0)
             encodes.append(Double(c[4]) ?? 0)
+            if c.count >= 7 {
+                interFrames.append(Double(c[5]) ?? 0)
+                canaryDelays.append(Double(c[6]) ?? 0)
+            }
         }
 
         let st = totals.sorted(), sc = callbacks.sorted(), sw = waits.sorted(), se = encodes.sorted()
@@ -326,6 +424,20 @@ final class RealDBPerfTests: XCTestCase {
         section.addLine("callback: p50=\(fmt(percentile(sc, 0.5)))  p95=\(fmt(percentile(sc, 0.95)))  worst=\(fmt(sc.last ?? 0))")
         section.addLine("wait:     p50=\(fmt(percentile(sw, 0.5)))  p95=\(fmt(percentile(sw, 0.95)))  worst=\(fmt(sw.last ?? 0))")
         section.addLine("encode:   p50=\(fmt(percentile(se, 0.5)))  p95=\(fmt(percentile(se, 0.95)))  worst=\(fmt(se.last ?? 0))")
+
+        if !interFrames.isEmpty {
+            let si = interFrames.sorted(), sd = canaryDelays.sorted()
+            section.addLine("inter_frame: p50=\(fmt(percentile(si, 0.5)))  p95=\(fmt(percentile(si, 0.95)))  worst=\(fmt(si.last ?? 0))")
+            section.addLine("canary_delay: p50=\(fmt(percentile(sd, 0.5)))  p95=\(fmt(percentile(sd, 0.95)))  worst=\(fmt(sd.last ?? 0))")
+            let bigStalls = zip(interFrames, canaryDelays).enumerated().filter { $0.element.1 > 1000 }
+            if !bigStalls.isEmpty {
+                section.addLine("")
+                section.addLine("Main thread stalls >1s (canary_delay_ms):")
+                for (i, (inter, canary)) in bigStalls.prefix(20) {
+                    section.addLine("  draw \(i): inter_frame=\(fmt(inter))ms  canary=\(fmt(canary))ms")
+                }
+            }
+        }
 
         let badWaits = waits.filter { $0 > 5 }.count
         if badWaits > 0 { section.addLine("⚠️ GPU wait >5ms: \(badWaits) frames") }

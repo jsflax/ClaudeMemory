@@ -437,6 +437,34 @@ final class MascotFleet: MascotNotifier {
         }
     }
 
+    func drawAllScanRings(
+        encoder: MTLRenderCommandEncoder,
+        frameUniformBuf: MTLBuffer,
+        pipeline: MTLRenderPipelineState
+    ) {
+        for mascot in mascots.values where mascot.scanRingsVisible {
+            mascot.drawScanRings(
+                encoder: encoder,
+                frameUniformBuf: frameUniformBuf,
+                pipeline: pipeline
+            )
+        }
+    }
+
+    func drawAllConjureOrbs(
+        encoder: MTLRenderCommandEncoder,
+        frameUniformBuf: MTLBuffer,
+        pipeline: MTLRenderPipelineState
+    ) {
+        for mascot in mascots.values where mascot.conjureOrbVisible {
+            mascot.drawConjureOrb(
+                encoder: encoder,
+                frameUniformBuf: frameUniformBuf,
+                pipeline: pipeline
+            )
+        }
+    }
+
     func drawAllNodeRings(
         encoder: MTLRenderCommandEncoder,
         frameUniformBuf: MTLBuffer,

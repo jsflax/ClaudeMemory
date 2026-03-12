@@ -40,6 +40,16 @@
                ReferencedContainer = "container:Engram.xcodeproj">
             </BuildableReference>
          </TestableReference>
+         <TestableReference
+            skipped = "NO">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "UNTEST00000000000000040"
+               BuildableName = "EngramUnitTests.xctest"
+               BlueprintName = "EngramUnitTests"
+               ReferencedContainer = "container:Engram.xcodeproj">
+            </BuildableReference>
+         </TestableReference>
       </Testables>
    </TestAction>
    <LaunchAction

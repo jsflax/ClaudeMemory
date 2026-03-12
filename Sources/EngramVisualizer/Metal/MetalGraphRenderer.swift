@@ -26,6 +26,8 @@ final class MetalGraphRenderer: NSObject {
     var arcaneCirclePipeline: MTLRenderPipelineState!
     var nodeRingPipeline: MTLRenderPipelineState!
     var holoScreenPipeline: MTLRenderPipelineState!
+    var conjureScanPipeline: MTLRenderPipelineState!
+    var conjureOrbPipeline: MTLRenderPipelineState!
 
     // Depth stencil states
     var opaqueDepthState: MTLDepthStencilState!
@@ -167,6 +169,8 @@ final class MetalGraphRenderer: NSObject {
             arcaneCirclePipeline = try MetalPipelineBuilder.buildArcaneCirclePipeline(device: device, library: library)
             nodeRingPipeline = try MetalPipelineBuilder.buildNodeRingPipeline(device: device, library: library)
             holoScreenPipeline = try MetalPipelineBuilder.buildHoloScreenPipeline(device: device, library: library)
+            conjureScanPipeline = try MetalPipelineBuilder.buildConjureScanPipeline(device: device, library: library)
+            conjureOrbPipeline = try MetalPipelineBuilder.buildConjureOrbPipeline(device: device, library: library)
         } catch {
             renderLog.error("[MetalGraphRenderer] Pipeline build failed: \(error)")
         }
@@ -895,6 +899,24 @@ extension MetalGraphRenderer: MTKViewDelegate {
             for galaxy in registry.galaxies.values {
                 galaxy.mascotFleet?.drawAllArcaneCircles(
                     encoder: encoder, frameUniformBuf: frameUniformBuf, pipeline: arcanePSO
+                )
+            }
+        }
+
+        // Conjure scan rings (additive glow, sweeps during memory creation)
+        if let scanPSO = conjureScanPipeline, let registry = galaxyRegistryRef {
+            for galaxy in registry.galaxies.values {
+                galaxy.mascotFleet?.drawAllScanRings(
+                    encoder: encoder, frameUniformBuf: frameUniformBuf, pipeline: scanPSO
+                )
+            }
+        }
+
+        // Conjure orbs (additive glow, energy sphere during memory creation)
+        if let orbPSO = conjureOrbPipeline, let registry = galaxyRegistryRef {
+            for galaxy in registry.galaxies.values {
+                galaxy.mascotFleet?.drawAllConjureOrbs(
+                    encoder: encoder, frameUniformBuf: frameUniformBuf, pipeline: orbPSO
                 )
             }
         }

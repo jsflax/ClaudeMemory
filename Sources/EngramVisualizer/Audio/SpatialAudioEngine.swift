@@ -4,26 +4,49 @@ import os
 
 private let audioLog = Logger(subsystem: "io.engram.app", category: "SpatialAudio")
 
+/// Snapshot of scene state captured on main thread, consumed on audio queue.
+struct AudioSceneSnapshot: Sendable {
+    let positions: [UUID: SIMD3<Float>]
+    let cameraPosition: SIMD3<Float>
+    let cameraForward: SIMD3<Float>
+    let selectedNode: UUID?
+    let glowingNodes: [UUID: Date]
+    let newNodes: [UUID: Date]
+    let expandedHubs: Set<UUID>
+    let teleportCounter: Int
+    let topologyVersion: UInt64
+    let renderEdges: [EdgeData]
+    let mascots: [MascotAudioSnapshot]
+    let scaleFactor: Float
+}
+
+struct MascotAudioSnapshot: Sendable {
+    let projectId: String
+    let position: SIMD3<Float>
+    let volume: Float
+}
+
 /// Core spatial audio engine for the 3D memory graph.
 /// Uses AVAudioEngine + AVAudioEnvironmentNode for HRTF-based 3D spatialization.
-/// Listener position/orientation follows the camera each frame.
-@MainActor
-final class SpatialAudioEngine {
+///
+/// Architecture: tick() snapshots scene data on the main thread (~0.01ms),
+/// then dispatches all audio processing to a dedicated serial queue.
+/// This keeps audio work off the render frame entirely.
+final class SpatialAudioEngine: @unchecked Sendable {
 
     let engine = AVAudioEngine()
     let environment = AVAudioEnvironmentNode()
 
-    let ambientBed: AmbientBedController
-    let clusterDrones: ClusterDroneManager
+    let edgeHumPool: EdgeHumPool
     let proximityPool: ProximityTonePool
     let eventPlayer: EventSoundPlayer
 
-    // State tracking for change detection
-    private var lastCameraPosition: SIMD3<Float> = .zero
+    // State tracking for change detection (accessed only from audioQueue)
     private var lastSelectedNode: UUID?
     private var lastExpandedHubs: Set<UUID> = []
     private var lastTeleportCounter: Int = 0
-    private var smoothedVelocity: Float = 0
+    private var lastEdgeTopologyVersion: UInt64 = 0
+
     private var isRunning = false
 
     // Coordinate scale: world units → audio meters
@@ -32,9 +55,12 @@ final class SpatialAudioEngine {
     // which puts the graph in a ~0.5-5m radius sphere. Good for HRTF.
     private let scaleFactor: Float = 1.0 / 200.0
 
+    // Background audio processing — serial queue, at most one tick in flight
+    private let audioQueue = DispatchQueue(label: "io.engram.audio", qos: .userInteractive)
+    private var tickInFlight = false // only read/written on main thread
+
     init() {
-        ambientBed = AmbientBedController(engine: engine)
-        clusterDrones = ClusterDroneManager(environment: environment)
+        edgeHumPool = EdgeHumPool(environment: environment, poolSize: 10)
         proximityPool = ProximityTonePool(environment: environment, poolSize: 8)
         eventPlayer = EventSoundPlayer(environment: environment)
 
@@ -43,7 +69,7 @@ final class SpatialAudioEngine {
 
     private func setupAudioGraph() {
         engine.attach(environment)
-        engine.connect(environment, to: engine.mainMixerNode, format: AudioSynthesis.monoFormat)
+        engine.connect(environment, to: engine.mainMixerNode, format: AudioSynthesis.stereoFormat)
 
         // Environment settings
         environment.distanceAttenuationParameters.distanceAttenuationModel = .inverse
@@ -57,8 +83,7 @@ final class SpatialAudioEngine {
         environment.reverbParameters.level = -20 // subtle
 
         // Let subsystems attach their nodes
-        ambientBed.setup()
-        clusterDrones.setup()
+        edgeHumPool.setup()
         proximityPool.setup()
         eventPlayer.setup()
     }
@@ -70,7 +95,6 @@ final class SpatialAudioEngine {
         do {
             try engine.start()
             isRunning = true
-            ambientBed.start()
             audioLog.info("Spatial audio engine started")
         } catch {
             audioLog.error("Failed to start audio engine: \(error)")
@@ -79,120 +103,206 @@ final class SpatialAudioEngine {
 
     func stop() {
         guard isRunning else { return }
-        ambientBed.stop()
-        clusterDrones.stopAll()
-        proximityPool.stopAll()
+        // Synchronous stop — wait for in-flight audio tick to finish
+        audioQueue.sync {
+            edgeHumPool.stopAll()
+            proximityPool.stopAll()
+        }
         engine.stop()
         isRunning = false
         audioLog.info("Spatial audio engine stopped")
     }
 
-    // MARK: - Per-Frame Tick
+    // MARK: - Per-Frame Tick (called from main thread)
 
+    #if ENGRAM_INSTRUMENTATION
+    nonisolated(unsafe) private var audioTimingFile: UnsafeMutablePointer<FILE>?
+    nonisolated(unsafe) private var audioFrameCounter: Int = 0
+    #endif
+
+    @MainActor
     func tick(dt: Float, scene: MetalSceneManager) {
-        guard isRunning else { return }
+        guard isRunning, !tickInFlight else { return }
 
-        // Update listener from camera
-        updateListener(camera: scene.camera)
+        // Snapshot scene data on main thread (~0.01ms — value-type copies)
+        let snapshot = captureSnapshot(scene: scene)
 
-        // Compute camera velocity
-        let camPos = scene.camera.cameraPosition * scaleFactor
-        let velocity = simd_length(camPos - lastCameraPosition) / max(dt, 0.001)
-        smoothedVelocity = smoothedVelocity * 0.9 + velocity * 0.1
-        lastCameraPosition = camPos
+        tickInFlight = true
+        audioQueue.async { [self] in
+            processAudio(snapshot: snapshot)
+            DispatchQueue.main.async { self.tickInFlight = false }
+        }
+    }
 
-        // Ambient bed: velocity + simulation alpha (tension/resolution)
-        let simAlpha = scene.simulation3D?.alpha ?? 0.0
-        ambientBed.update(velocity: smoothedVelocity, simAlpha: simAlpha)
+    // MARK: - Snapshot (main thread)
 
-        // Cluster drones: update positions from nebula system
-        let nebulaGroups = scene.nebulaFog.nebulaGroupsForCurrentMode(
-            layoutMode: scene.layoutMode,
-            positions: scene.positions,
-            nodes: scene.renderNodes,
-            semanticClusters3D: scene.semanticClusters3D
-        )
-        clusterDrones.update(groups: nebulaGroups, colorMap: scene.renderColorMap, scaleFactor: scaleFactor)
+    @MainActor
+    private func captureSnapshot(scene: MetalSceneManager) -> AudioSceneSnapshot {
+        var mascots: [MascotAudioSnapshot] = []
+        if let registry = scene.galaxyRegistry {
+            for galaxy in registry.galaxies.values {
+                guard let fleet = galaxy.mascotFleet else { continue }
+                for (_, mascot) in fleet.mascots {
+                    mascots.append(MascotAudioSnapshot(
+                        projectId: mascot.projectId,
+                        position: mascot.currentPosition * scaleFactor,
+                        volume: Self.thrusterVolume(for: mascot.currentState)
+                    ))
+                }
+            }
+        }
 
-        // Proximity tones: nearest nodes
-        proximityPool.update(
+        return AudioSceneSnapshot(
             positions: scene.positions,
             cameraPosition: scene.camera.cameraPosition,
+            cameraForward: scene.camera.forward,
             selectedNode: scene.selectedNode,
             glowingNodes: scene.glowingNodes,
             newNodes: scene.newNodes,
+            expandedHubs: scene.expandedHubs,
+            teleportCounter: scene.teleportCounter,
+            topologyVersion: scene.galaxyRegistry?.mergedTopologyVersion ?? 0,
+            renderEdges: scene.renderEdges,
+            mascots: mascots,
             scaleFactor: scaleFactor
         )
-
-        // Event detection
-        detectEvents(scene: scene)
-
-        // Mascot audio
-        updateMascotAudio(scene: scene)
     }
 
-    // MARK: - Listener
+    @MainActor
+    private static func thrusterVolume(for state: MascotSystem.MascotState) -> Float {
+        switch state {
+        case .patrol: return 0.25
+        case .hover: return 0.08
+        case .conjure, .absorb: return 0.15
+        case .chatting: return 0.05
+        case .idle(.sleeping): return 0.02
+        case .idle(.drowsy): return 0.05
+        case .idle(.awake): return 0.1
+        case .react: return 0.12
+        }
+    }
 
-    private func updateListener(camera: CameraController) {
-        let pos = camera.cameraPosition * scaleFactor
+    // MARK: - Audio Processing (runs on audioQueue)
+
+    private func processAudio(snapshot: AudioSceneSnapshot) {
+        #if ENGRAM_INSTRUMENTATION
+        let t0 = CFAbsoluteTimeGetCurrent()
+        #endif
+
+        // Update listener position/orientation
+        let pos = snapshot.cameraPosition * snapshot.scaleFactor
         environment.listenerPosition = AVAudio3DPoint(x: pos.x, y: pos.y, z: pos.z)
-
-        // Convert forward/up to angular orientation
-        let fwd = camera.forward
+        let fwd = snapshot.cameraForward
         let yaw = atan2(fwd.x, fwd.z) * 180.0 / Float.pi
         let pitch = asin(-fwd.y) * 180.0 / Float.pi
         environment.listenerAngularOrientation = AVAudio3DAngularOrientation(yaw: yaw, pitch: pitch, roll: 0)
+
+        #if ENGRAM_INSTRUMENTATION
+        let t1 = CFAbsoluteTimeGetCurrent()
+        #endif
+
+        // Edge hum: rebuild topology on edge add/remove, then per-frame update
+        if snapshot.topologyVersion != lastEdgeTopologyVersion {
+            edgeHumPool.rebuildTopology(
+                edges: snapshot.renderEdges,
+                positions: snapshot.positions,
+                version: snapshot.topologyVersion
+            )
+            lastEdgeTopologyVersion = snapshot.topologyVersion
+        }
+
+        edgeHumPool.update(
+            positions: snapshot.positions,
+            cameraPosition: snapshot.cameraPosition,
+            scaleFactor: snapshot.scaleFactor
+        )
+
+        #if ENGRAM_INSTRUMENTATION
+        let t2 = CFAbsoluteTimeGetCurrent()
+        #endif
+
+        // Proximity tones: nearest nodes
+        proximityPool.update(
+            positions: snapshot.positions,
+            cameraPosition: snapshot.cameraPosition,
+            selectedNode: snapshot.selectedNode,
+            glowingNodes: snapshot.glowingNodes,
+            newNodes: snapshot.newNodes,
+            scaleFactor: snapshot.scaleFactor
+        )
+
+        #if ENGRAM_INSTRUMENTATION
+        let t3 = CFAbsoluteTimeGetCurrent()
+        #endif
+
+        // Event detection
+        detectEvents(snapshot: snapshot)
+
+        #if ENGRAM_INSTRUMENTATION
+        let t4 = CFAbsoluteTimeGetCurrent()
+        #endif
+
+        // Mascot thruster audio
+        for mascot in snapshot.mascots {
+            eventPlayer.updateMascotThruster(
+                projectId: mascot.projectId,
+                position: mascot.position,
+                volume: mascot.volume
+            )
+        }
+
+        #if ENGRAM_INSTRUMENTATION
+        let t5 = CFAbsoluteTimeGetCurrent()
+
+        if audioTimingFile == nil {
+            audioTimingFile = fopen("/tmp/audio-timing.csv", "w")
+            if let f = audioTimingFile {
+                fputs("frame,listener_ms,edge_ms,proximity_ms,events_ms,mascot_ms,total_ms\n", f)
+            }
+        }
+        audioFrameCounter += 1
+        if let f = audioTimingFile {
+            let line = "\(audioFrameCounter),\(String(format: "%.3f", (t1 - t0) * 1000)),\(String(format: "%.3f", (t2 - t1) * 1000)),\(String(format: "%.3f", (t3 - t2) * 1000)),\(String(format: "%.3f", (t4 - t3) * 1000)),\(String(format: "%.3f", (t5 - t4) * 1000)),\(String(format: "%.3f", (t5 - t0) * 1000))\n"
+            fputs(line, f)
+            fflush(f)
+        }
+        #endif
     }
 
-    // MARK: - Event Detection
+    // MARK: - Event Detection (runs on audioQueue)
 
-    private func detectEvents(scene: MetalSceneManager) {
+    private func detectEvents(snapshot: AudioSceneSnapshot) {
         // Selection change
-        if scene.selectedNode != lastSelectedNode {
-            if let nodeId = scene.selectedNode, let pos = scene.positions[nodeId] {
-                let audioPos = pos * scaleFactor
+        if snapshot.selectedNode != lastSelectedNode {
+            if let nodeId = snapshot.selectedNode, let pos = snapshot.positions[nodeId] {
+                let audioPos = pos * snapshot.scaleFactor
                 eventPlayer.playSelection(at: audioPos)
             } else if lastSelectedNode != nil {
                 eventPlayer.playDeselection()
             }
-            lastSelectedNode = scene.selectedNode
+            lastSelectedNode = snapshot.selectedNode
         }
 
         // Hub expansion
-        let currentExpanded = scene.expandedHubs
+        let currentExpanded = snapshot.expandedHubs
         let newlyExpanded = currentExpanded.subtracting(lastExpandedHubs)
         let newlyCollapsed = lastExpandedHubs.subtracting(currentExpanded)
         for hubId in newlyExpanded {
-            if let pos = scene.positions[hubId] {
-                eventPlayer.playExpansion(at: pos * scaleFactor)
+            if let pos = snapshot.positions[hubId] {
+                eventPlayer.playExpansion(at: pos * snapshot.scaleFactor)
             }
         }
         for hubId in newlyCollapsed {
-            if let pos = scene.positions[hubId] {
-                eventPlayer.playCollapse(at: pos * scaleFactor)
+            if let pos = snapshot.positions[hubId] {
+                eventPlayer.playCollapse(at: pos * snapshot.scaleFactor)
             }
         }
         lastExpandedHubs = currentExpanded
 
         // Teleport
-        if scene.teleportCounter != lastTeleportCounter {
+        if snapshot.teleportCounter != lastTeleportCounter {
             eventPlayer.playTeleport()
-            lastTeleportCounter = scene.teleportCounter
-        }
-    }
-
-    // MARK: - Mascot Audio
-
-    private func updateMascotAudio(scene: MetalSceneManager) {
-        guard let registry = scene.galaxyRegistry else { return }
-        for galaxy in registry.galaxies.values {
-            guard let fleet = galaxy.mascotFleet else { continue }
-            for (_, mascot) in fleet.mascots {
-                eventPlayer.updateMascotThruster(
-                    mascot: mascot,
-                    scaleFactor: scaleFactor
-                )
-            }
+            lastTeleportCounter = snapshot.teleportCounter
         }
     }
 }

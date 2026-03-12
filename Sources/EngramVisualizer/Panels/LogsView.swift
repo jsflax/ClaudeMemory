@@ -18,16 +18,16 @@ struct LogEntry: Identifiable {
     let raw: String
 }
 
-/// Content view for the Logs sidebar tab.
-struct LogsContentView: View {
-    @State private var entries: [LogEntry] = []
-    @State private var selectedSource: String? = nil
-    @State private var searchText = ""
-    @State private var autoScroll = true
-    @State private var isLoading = false
-    @State private var fileWatcher: DispatchSourceFileSystemObject?
+@MainActor @Observable
+final class LogsStore {
+    var entries: [LogEntry] = []
+    var selectedSource: String? = nil
+    var searchText = ""
+    var autoScroll = true
 
-    private static let sources: [LogSource] = [
+    private var fileWatcher: DispatchSourceFileSystemObject?
+
+    static let sources: [LogSource] = [
         LogSource(
             id: "memory",
             label: "MCP",
@@ -58,9 +58,131 @@ struct LogsContentView: View {
         ),
     ]
 
+    var filteredEntries: [LogEntry] {
+        var result = entries
+        if let source = selectedSource {
+            result = result.filter { $0.source == source }
+        }
+        if !searchText.isEmpty {
+            let query = searchText.lowercased()
+            result = result.filter { $0.raw.lowercased().contains(query) }
+        }
+        return result
+    }
+
+    func loadLogs() {
+        var all: [LogEntry] = []
+        var counter = 0
+
+        for source in Self.sources {
+            guard let data = FileManager.default.contents(atPath: source.path),
+                  let content = String(data: data, encoding: .utf8) else { continue }
+
+            let lines = content.components(separatedBy: .newlines)
+            let recent = lines.suffix(500)
+            for line in recent {
+                let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else { continue }
+                let parsed = Self.parseLine(trimmed, source: source.id)
+                all.append(LogEntry(id: counter, timestamp: parsed.timestamp, source: source.id, message: parsed.message, raw: trimmed))
+                counter += 1
+            }
+        }
+
+        all.sort { a, b in
+            guard let ta = a.timestamp else { return false }
+            guard let tb = b.timestamp else { return true }
+            return ta < tb
+        }
+
+        entries = all.enumerated().map { i, e in
+            LogEntry(id: i, timestamp: e.timestamp, source: e.source, message: e.message, raw: e.raw)
+        }
+    }
+
+    func startWatching() {
+        guard fileWatcher == nil else { return }
+        fileWatcher = Self.makeWatcher { [weak self] in
+            self?.loadLogs()
+        }
+    }
+
+    /// Creates the DispatchSource outside of @MainActor context so that
+    /// the event/cancel handler closures don't inherit MainActor isolation.
+    /// GCD runs these on the utility queue — an inherited @MainActor assertion
+    /// would crash at runtime (swift_task_isCurrentExecutor).
+    nonisolated private static func makeWatcher(
+        onChange: @escaping @MainActor @Sendable () -> Void
+    ) -> DispatchSourceFileSystemObject? {
+        let dirPath = NSHomeDirectory() + "/.claude"
+        let fd = open(dirPath, O_EVTONLY)
+        guard fd >= 0 else { return nil }
+
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd,
+            eventMask: .write,
+            queue: .global(qos: .utility)
+        )
+        source.setEventHandler {
+            Task { @MainActor in
+                onChange()
+            }
+        }
+        source.setCancelHandler {
+            close(fd)
+        }
+        source.resume()
+        return source
+    }
+
+    func stopWatching() {
+        fileWatcher?.cancel()
+        fileWatcher = nil
+    }
+
+    // MARK: - Parsing
+
+    private static func parseLine(_ line: String, source: String) -> (timestamp: Date?, message: String) {
+        let isoFormatter = ISO8601DateFormatter()
+
+        if source == "memory" {
+            let mcpPattern = /^\[claude-memory\]\s+(\d{4}-\d{2}-\d{2}T[\d:]+Z)\s+(.*)/
+            if let match = line.wholeMatch(of: mcpPattern) {
+                let ts = isoFormatter.date(from: String(match.1))
+                return (ts, String(match.2))
+            }
+        }
+
+        if source == "hooks" {
+            let isoPattern = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)\s+\[memory-hooks\]\s*(.*)/
+            if let match = line.wholeMatch(of: isoPattern) {
+                let ts = isoFormatter.date(from: String(match.1))
+                return (ts, String(match.2))
+            }
+        }
+
+        let startPattern = /^=+\s*started at '([^']+)'\s*=+$/
+        if let match = line.wholeMatch(of: startPattern) {
+            let ts = isoFormatter.date(from: String(match.1))
+            return (ts, "--- Session started ---")
+        }
+
+        let genericPattern = /^(\d{4}-\d{2}-\d{2}T[\d:]+Z?)\s+(.*)/
+        if let match = line.wholeMatch(of: genericPattern) {
+            let ts = isoFormatter.date(from: String(match.1))
+            return (ts, String(match.2))
+        }
+
+        return (nil, line)
+    }
+}
+
+/// Content view for the Logs sidebar tab.
+struct LogsContentView: View {
+    @State private var store = LogsStore()
+
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            // Source filter chips
             sourceFilter
 
             // Search
@@ -68,12 +190,12 @@ struct LogsContentView: View {
                 Image(systemName: "magnifyingglass")
                     .font(.system(size: 10))
                     .foregroundStyle(.white.opacity(0.3))
-                TextField("Filter logs…", text: $searchText)
+                TextField("Filter logs…", text: $store.searchText)
                     .textFieldStyle(.plain)
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(.white.opacity(0.8))
-                if !searchText.isEmpty {
-                    Button { searchText = "" } label: {
+                if !store.searchText.isEmpty {
+                    Button { store.searchText = "" } label: {
                         Image(systemName: "xmark.circle.fill")
                             .font(.system(size: 10))
                             .foregroundStyle(.white.opacity(0.3))
@@ -96,7 +218,7 @@ struct LogsContentView: View {
             ScrollViewReader { proxy in
                 ScrollView(.vertical, showsIndicators: true) {
                     LazyVStack(alignment: .leading, spacing: 1) {
-                        let filtered = filteredEntries
+                        let filtered = store.filteredEntries
                         if filtered.isEmpty {
                             emptyState
                         } else {
@@ -108,8 +230,8 @@ struct LogsContentView: View {
                     }
                     .padding(.vertical, 4)
                 }
-                .onChange(of: entries.count) { _, _ in
-                    if autoScroll, let last = filteredEntries.last {
+                .onChange(of: store.entries.count) { _, _ in
+                    if store.autoScroll, let last = store.filteredEntries.last {
                         withAnimation(.easeOut(duration: 0.2)) {
                             proxy.scrollTo(last.id, anchor: .bottom)
                         }
@@ -120,26 +242,26 @@ struct LogsContentView: View {
             // Bottom toolbar
             HStack(spacing: 8) {
                 Button {
-                    autoScroll.toggle()
+                    store.autoScroll.toggle()
                 } label: {
                     HStack(spacing: 4) {
-                        Image(systemName: autoScroll ? "arrow.down.to.line" : "arrow.down.to.line.compact")
+                        Image(systemName: store.autoScroll ? "arrow.down.to.line" : "arrow.down.to.line.compact")
                             .font(.system(size: 9))
-                        Text(autoScroll ? "Auto-scroll" : "Paused")
+                        Text(store.autoScroll ? "Auto-scroll" : "Paused")
                             .font(.system(size: 9, design: .monospaced))
                     }
-                    .foregroundStyle(autoScroll ? .cyan.opacity(0.8) : .white.opacity(0.4))
+                    .foregroundStyle(store.autoScroll ? .cyan.opacity(0.8) : .white.opacity(0.4))
                 }
                 .buttonStyle(.plain)
 
                 Spacer()
 
-                Text("\(filteredEntries.count) lines")
+                Text("\(store.filteredEntries.count) lines")
                     .font(.system(size: 9, design: .monospaced))
                     .foregroundStyle(.white.opacity(0.3))
 
                 Button {
-                    loadLogs()
+                    store.loadLogs()
                 } label: {
                     Image(systemName: "arrow.clockwise")
                         .font(.system(size: 10))
@@ -150,11 +272,11 @@ struct LogsContentView: View {
             }
         }
         .onAppear {
-            loadLogs()
-            startWatching()
+            store.loadLogs()
+            store.startWatching()
         }
         .onDisappear {
-            stopWatching()
+            store.stopWatching()
         }
     }
 
@@ -163,7 +285,7 @@ struct LogsContentView: View {
     private var sourceFilter: some View {
         HStack(spacing: 4) {
             filterChip(label: "All", id: nil)
-            ForEach(Self.sources) { source in
+            ForEach(LogsStore.sources) { source in
                 filterChip(label: source.label, id: source.id, icon: source.icon, color: source.color)
             }
         }
@@ -171,9 +293,9 @@ struct LogsContentView: View {
     }
 
     private func filterChip(label: String, id: String?, icon: String? = nil, color: Color = .white) -> some View {
-        let selected = selectedSource == id
+        let selected = store.selectedSource == id
         return Button {
-            selectedSource = id
+            store.selectedSource = id
         } label: {
             HStack(spacing: 3) {
                 if let icon {
@@ -197,7 +319,7 @@ struct LogsContentView: View {
     // MARK: - Log Row
 
     private func logRow(_ entry: LogEntry) -> some View {
-        let source = Self.sources.first { $0.id == entry.source }
+        let source = LogsStore.sources.first { $0.id == entry.source }
         let color = source?.color ?? .white
         return HStack(alignment: .top, spacing: 6) {
             if let ts = entry.timestamp {
@@ -235,125 +357,6 @@ struct LogsContentView: View {
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 40)
-    }
-
-    // MARK: - Filtering
-
-    private var filteredEntries: [LogEntry] {
-        var result = entries
-        if let source = selectedSource {
-            result = result.filter { $0.source == source }
-        }
-        if !searchText.isEmpty {
-            let query = searchText.lowercased()
-            result = result.filter { $0.raw.lowercased().contains(query) }
-        }
-        return result
-    }
-
-    // MARK: - Loading
-
-    private func loadLogs() {
-        isLoading = true
-        var all: [LogEntry] = []
-        var counter = 0
-
-        for source in Self.sources {
-            guard let data = FileManager.default.contents(atPath: source.path),
-                  let content = String(data: data, encoding: .utf8) else { continue }
-
-            let lines = content.components(separatedBy: .newlines)
-            // Take last 500 lines per file to avoid memory issues
-            let recent = lines.suffix(500)
-            for line in recent {
-                let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !trimmed.isEmpty else { continue }
-                let parsed = parseLine(trimmed, source: source.id)
-                all.append(LogEntry(id: counter, timestamp: parsed.timestamp, source: source.id, message: parsed.message, raw: trimmed))
-                counter += 1
-            }
-        }
-
-        // Sort by timestamp (entries without timestamps go at the end of their file group)
-        all.sort { a, b in
-            guard let ta = a.timestamp else { return false }
-            guard let tb = b.timestamp else { return true }
-            return ta < tb
-        }
-
-        // Re-assign sequential IDs after sorting
-        entries = all.enumerated().map { i, e in
-            LogEntry(id: i, timestamp: e.timestamp, source: e.source, message: e.message, raw: e.raw)
-        }
-        isLoading = false
-    }
-
-    // MARK: - Parsing
-
-    private func parseLine(_ line: String, source: String) -> (timestamp: Date?, message: String) {
-        // memory.log format: "[claude-memory] 2026-03-07T16:24:52Z message"
-        if source == "memory" {
-            let mcpPattern = /^\[claude-memory\]\s+(\d{4}-\d{2}-\d{2}T[\d:]+Z)\s+(.*)/
-            if let match = line.wholeMatch(of: mcpPattern) {
-                let ts = ISO8601DateFormatter().date(from: String(match.1))
-                return (ts, String(match.2))
-            }
-        }
-
-        // hooks.log format: "2026-03-07T16:24:52Z [memory-hooks] message"
-        if source == "hooks" {
-            let isoPattern = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)\s+\[memory-hooks\]\s*(.*)/
-            if let match = line.wholeMatch(of: isoPattern) {
-                let ts = ISO8601DateFormatter().date(from: String(match.1))
-                return (ts, String(match.2))
-            }
-        }
-
-        // session-learner / maintenance: "===== started at '2026-03-07...' ====="
-        let startPattern = /^=+\s*started at '([^']+)'\s*=+$/
-        if let match = line.wholeMatch(of: startPattern) {
-            let ts = ISO8601DateFormatter().date(from: String(match.1))
-            return (ts, "--- Session started ---")
-        }
-
-        // Try to extract a leading ISO timestamp from any line
-        let genericPattern = /^(\d{4}-\d{2}-\d{2}T[\d:]+Z?)\s+(.*)/
-        if let match = line.wholeMatch(of: genericPattern) {
-            let ts = ISO8601DateFormatter().date(from: String(match.1))
-            return (ts, String(match.2))
-        }
-
-        return (nil, line)
-    }
-
-    // MARK: - File Watching
-
-    private func startWatching() {
-        // Watch the directory for changes to any log file
-        let dirPath = NSHomeDirectory() + "/.claude"
-        let fd = open(dirPath, O_EVTONLY)
-        guard fd >= 0 else { return }
-
-        let source = DispatchSource.makeFileSystemObjectSource(
-            fileDescriptor: fd,
-            eventMask: .write,
-            queue: .global(qos: .utility)
-        )
-        source.setEventHandler { [self] in
-            DispatchQueue.main.async {
-                self.loadLogs()
-            }
-        }
-        source.setCancelHandler {
-            close(fd)
-        }
-        source.resume()
-        fileWatcher = source
-    }
-
-    private func stopWatching() {
-        fileWatcher?.cancel()
-        fileWatcher = nil
     }
 
     // MARK: - Formatters

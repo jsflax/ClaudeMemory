@@ -5,14 +5,16 @@ import SwiftUI
 import simd
 
 /// Manages N galaxies and produces merged data for the single Metal renderer.
-/// All properties are plain (not @Observable) — read directly by renderTick each frame.
+/// @Observable so SidebarView can react to topology changes. renderTick reads
+/// outside SwiftUI observation tracking, so no spurious view updates.
+/// Per-frame properties (positions) are @ObservationIgnored.
 @MainActor
 final class GalaxyRegistry {
     private(set) var galaxies: [String: Galaxy] = [:]  // id -> Galaxy
 
     // SyncConfig observation — drives node migration between personal ↔ synced galaxies
-    private var syncConfigObserver: AnyCancellable?
-    weak var syncManager: SyncManager?
+    @ObservationIgnored private var syncConfigObserver: AnyCancellable?
+    @ObservationIgnored weak var syncManager: SyncManager?
 
     // Hierarchy spacing
     let levelSpacing: Float = 3000    // Y between hierarchy levels
@@ -33,7 +35,7 @@ final class GalaxyRegistry {
     var hiddenRelations: Set<String> = []
 
     // Topology tracking — each galaxy's topologyVersion is summed to detect changes
-    private var lastMergedTopologySum: UInt64 = 0
+    @ObservationIgnored private var lastMergedTopologySum: UInt64 = 0
 
     // MARK: - Galaxy Management
 
@@ -126,31 +128,47 @@ final class GalaxyRegistry {
         let mergeStart = CFAbsoluteTimeGetCurrent()
         #endif
 
-        // Rebuild merged arrays
-        var nodes: [NodeData] = []
-        var hubs: Set<UUID> = []
-        var colorMap: [String: Color] = [:]
-        var nodeById: [UUID: NodeData] = [:]
-        var nodeToGalaxy: [UUID: String] = [:]
+        let nodeCount: Int
+        let edgeCount: Int
 
-        for galaxy in galaxies.values {
-            let store = galaxy.renderStore
-            nodes.append(contentsOf: store.nodes)
-            hubs.formUnion(store.hubs)
-            colorMap.merge(store.colorMap) { existing, _ in existing }
-            nodeById.merge(store.nodeById) { existing, _ in existing }
-            for node in store.nodes {
-                nodeToGalaxy[node.id] = galaxy.id
-            }
-        }
-
-        // Cross-galaxy edge merge
-        let edges: [EdgeData]
         if galaxies.count <= 1, let only = galaxies.values.first {
-            // Single galaxy fast path — use per-galaxy filtered edges directly
-            edges = only.renderStore.edges
+            // Single-galaxy fast path: CoW references, no allocation or iteration.
+            // With 1 galaxy there are no cross-galaxy edges to discover.
+            let store = only.renderStore
+            mergedNodes = store.nodes
+            mergedEdges = store.edges
+            mergedHubs = store.hubs
+            mergedColorMap = store.colorMap
+            mergedNodeById = store.nodeById
+
+            // nodeToGalaxy: only rebuild when node count diverges
+            if nodeToGalaxy.count != store.nodes.count || lastSingleGalaxyId != only.id {
+                nodeToGalaxy.removeAll(keepingCapacity: true)
+                for node in store.nodes { nodeToGalaxy[node.id] = only.id }
+                lastSingleGalaxyId = only.id
+            }
+            nodeCount = store.nodes.count
+            edgeCount = store.edges.count
         } else {
-            // Multi-galaxy: iterate ALL galaxies' allEdges, dedup by globalId,
+            // Multi-galaxy: full rebuild
+            var nodes: [NodeData] = []
+            var hubs: Set<UUID> = []
+            var colorMap: [String: Color] = [:]
+            var nodeById: [UUID: NodeData] = [:]
+            var newNodeToGalaxy: [UUID: String] = [:]
+
+            for galaxy in galaxies.values {
+                let store = galaxy.renderStore
+                nodes.append(contentsOf: store.nodes)
+                hubs.formUnion(store.hubs)
+                colorMap.merge(store.colorMap) { existing, _ in existing }
+                nodeById.merge(store.nodeById) { existing, _ in existing }
+                for node in store.nodes {
+                    newNodeToGalaxy[node.id] = galaxy.id
+                }
+            }
+
+            // Cross-galaxy edge merge: iterate ALL galaxies' allEdges, dedup by globalId,
             // filter against merged visible node set + hiddenRelations.
             let mergedVisibleIds = Set(nodes.map(\.id))
             var seen = Set<UUID>()
@@ -164,15 +182,17 @@ final class GalaxyRegistry {
                     crossEdges.append(edge)
                 }
             }
-            edges = crossEdges
-        }
 
-        mergedNodes = nodes
-        mergedEdges = edges
-        mergedHubs = hubs
-        mergedColorMap = colorMap
-        mergedNodeById = nodeById
-        self.nodeToGalaxy = nodeToGalaxy
+            mergedNodes = nodes
+            mergedEdges = crossEdges
+            mergedHubs = hubs
+            mergedColorMap = colorMap
+            mergedNodeById = nodeById
+            self.nodeToGalaxy = newNodeToGalaxy
+            lastSingleGalaxyId = nil
+            nodeCount = nodes.count
+            edgeCount = crossEdges.count
+        }
 
         #if ENGRAM_INSTRUMENTATION
         let mergeMs = (CFAbsoluteTimeGetCurrent() - mergeStart) * 1000.0
@@ -185,7 +205,7 @@ final class GalaxyRegistry {
             }
             if let f = mergeTimingFile {
                 let ts = String(format: "%.3f", CFAbsoluteTimeGetCurrent())
-                let line = "\(ts),\(galaxies.count),\(nodes.count),\(edges.count),\(String(format: "%.2f", mergeMs))\n"
+                let line = "\(ts),\(galaxies.count),\(nodeCount),\(edgeCount),\(String(format: "%.2f", mergeMs))\n"
                 fputs(line, f)
                 fflush(f)
             }
@@ -193,11 +213,14 @@ final class GalaxyRegistry {
         #endif
     }
 
+    @ObservationIgnored private var lastSingleGalaxyId: String?
+
     // MARK: - Merged Accessors (convenience for renderer)
 
     /// Cached merged positions — rebuilt each frame via updateMergedPositions().
     /// Stored var avoids per-frame dictionary allocation (reuses capacity via removeAll).
-    private(set) var cachedMergedPositions: [UUID: SIMD3<Float>] = [:]
+    /// @ObservationIgnored because this changes every frame from renderTick.
+    @ObservationIgnored private(set) var cachedMergedPositions: [UUID: SIMD3<Float>] = [:]
 
     /// Rebuild merged positions from all galaxy simulations. Called each frame by renderTick.
     func updateMergedPositions() {

@@ -2,8 +2,7 @@ import AVFoundation
 import simd
 
 /// Oneshot event sounds and mascot thruster hum management.
-@MainActor
-final class EventSoundPlayer {
+final class EventSoundPlayer: @unchecked Sendable {
 
     private let environment: AVAudioEnvironmentNode
 
@@ -93,34 +92,12 @@ final class EventSoundPlayer {
 
     // MARK: - Mascot Thruster
 
-    func updateMascotThruster(mascot: MascotSystem, scaleFactor: Float) {
-        let project = mascot.projectId
-        let pos = mascot.currentPosition * scaleFactor
+    func updateMascotThruster(projectId: String, position: SIMD3<Float>, volume: Float) {
+        let project = projectId
+        let pos = position
 
         if let player = thrusterPlayers[project] {
-            // Update position
             player.position = AVAudio3DPoint(x: pos.x, y: pos.y, z: pos.z)
-
-            // Volume based on state
-            let volume: Float
-            switch mascot.currentState {
-            case .patrol:
-                volume = 0.25
-            case .hover:
-                volume = 0.08
-            case .conjure, .absorb:
-                volume = 0.15
-            case .chatting:
-                volume = 0.05
-            case .idle(.sleeping):
-                volume = 0.02
-            case .idle(.drowsy):
-                volume = 0.05
-            case .idle(.awake):
-                volume = 0.1
-            case .react:
-                volume = 0.12
-            }
             player.volume = volume
         } else {
             // Create new thruster voice

@@ -31,6 +31,7 @@ final class PerfBottleneckTests: XCTestCase {
         "/tmp/label-diag.csv",
         "/tmp/swiftui-jitter.csv",
         "/tmp/swiftui-body-eval.csv",
+        "/tmp/audio-timing.csv",
     ]
 
     override func setUpWithError() throws {
@@ -96,6 +97,7 @@ final class PerfBottleneckTests: XCTestCase {
         )
 
         app.launchEnvironment["CLAUDE_MEMORY_DB"] = localDbPath
+        app.launchEnvironment["ENGRAM_FORCE_SOUND"] = "1"
         app.launchEnvironment["ENGRAM_TEST_NO_NOTIFY"] = "1"
         app.launchEnvironment["ENGRAM_TEST_INSERT_DELAY"] = "45"
         app.launchEnvironment["TEST_AUTH_TOKEN"] = "mock-\(testUUID)"
@@ -158,6 +160,23 @@ final class PerfBottleneckTests: XCTestCase {
             sleep(2)
             if p == 0 || p == 3 { takeScreenshot(name: "perf-04-teleport-\(p)") }
         }
+
+        // ── Phase 4b: Sustained in-cluster movement (stress: proximity tones + edge hums) ──
+        // Teleport lands inside a cluster. Dolly in close, then orbit around.
+        // This puts many nodes within maxDistance=300, stressing ProximityTonePool rescan.
+        window.typeKey("t", modifierFlags: [])
+        sleep(2)
+        holdKey(VK.w, duration: 2.0)   // dolly deep into cluster
+        holdKey(VK.j, duration: 1.5)   // orbit left
+        holdKey(VK.l, duration: 1.5)   // orbit right
+        holdKey(VK.w, duration: 1.0)   // push deeper
+        holdKey(VK.i, duration: 0.8)   // look up through nodes
+        holdKey(VK.k, duration: 0.8)   // look down
+        holdKey(VK.a, duration: 1.0)   // strafe left through cluster
+        holdKey(VK.d, duration: 1.0)   // strafe right
+        holdKey(VK.s, duration: 1.5)   // pull back out
+        sleep(1)
+        takeScreenshot(name: "perf-04b-in-cluster")
 
         // ── Phase 5: Node selection ──
         let center = window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
@@ -296,6 +315,7 @@ final class PerfBottleneckTests: XCTestCase {
         report.addSection(analyzeCenterLog())
         report.addSection(analyzeMigrationTiming())
         report.addSection(analyzeLabelDiag())
+        report.addSection(analyzeAudioTiming())
         report.addSection(analyzeSwiftUIJitter())
 
         report.printSummary()
@@ -327,7 +347,7 @@ final class PerfBottleneckTests: XCTestCase {
             return section
         }
 
-        // CSV: frame,dt_ms,wall_dt_ms,total_ms,sim_ms,mascot_ms,nodes_ms,edges_ms,neb_ms,labels_ms,flow_ms,node_count,edge_count,reason
+        // CSV: frame,dt_ms,wall_dt_ms,total_ms,sim_ms,mascot_ms,nodes_ms,edges_ms,neb_ms,labels_ms,flow_ms,node_count,edge_count,reason,audio_ms
         let lines = csv.components(separatedBy: "\n").dropFirst().filter { !$0.isEmpty }
         guard !lines.isEmpty else { section.addLine("[Empty]"); return section }
 
@@ -336,6 +356,7 @@ final class PerfBottleneckTests: XCTestCase {
             let sim: Double, mascot: Double, nodes: Double, edges: Double
             let neb: Double, labels: Double, flow: Double
             let nodeCount: Int, edgeCount: Int, reason: String
+            let audio: Double
         }
         var frames: [Frame] = []
         for (i, line) in lines.enumerated() {
@@ -347,7 +368,8 @@ final class PerfBottleneckTests: XCTestCase {
                 nodes: Double(c[6]) ?? 0, edges: Double(c[7]) ?? 0, neb: Double(c[8]) ?? 0,
                 labels: Double(c[9]) ?? 0, flow: Double(c[10]) ?? 0,
                 nodeCount: Int(c[11]) ?? 0, edgeCount: Int(c[12]) ?? 0,
-                reason: c[13].trimmingCharacters(in: .whitespacesAndNewlines)))
+                reason: c[13].trimmingCharacters(in: .whitespacesAndNewlines),
+                audio: c.count > 14 ? (Double(c[14].trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0) : 0))
         }
 
         let totals = frames.map(\.total).sorted()
@@ -387,7 +409,8 @@ final class PerfBottleneckTests: XCTestCase {
             section.addLine("Sub-phase averages (sim frames only):")
             let phases: [(String, KeyPath<Frame, Double>)] = [
                 ("sim", \.sim), ("mascot", \.mascot), ("nodes", \.nodes),
-                ("edges", \.edges), ("nebulae", \.neb), ("labels", \.labels), ("flow", \.flow)
+                ("edges", \.edges), ("nebulae", \.neb), ("labels", \.labels), ("flow", \.flow),
+                ("audio", \.audio)
             ]
             var bottlenecks: [(String, Double)] = []
             for (name, kp) in phases {
@@ -413,10 +436,10 @@ final class PerfBottleneckTests: XCTestCase {
         let worst = frames.sorted { $0.total > $1.total }.prefix(10)
         section.addLine("")
         section.addLine("Worst 10 frames:")
-        section.addLine("  frame  wall_dt  total   sim   nodes edges labels  neb  reason")
+        section.addLine("  frame  wall_dt  total   sim   nodes edges labels  neb  audio  reason")
         for fr in worst {
-            section.addLine(String(format: "  %5d %7.1f %6.1f %5.1f %6.1f %5.1f %6.1f %5.1f  %@",
-                fr.idx, fr.wallDt, fr.total, fr.sim, fr.nodes, fr.edges, fr.labels, fr.neb, fr.reason))
+            section.addLine(String(format: "  %5d %7.1f %6.1f %5.1f %6.1f %5.1f %6.1f %5.1f %5.1f  %@",
+                fr.idx, fr.wallDt, fr.total, fr.sim, fr.nodes, fr.edges, fr.labels, fr.neb, fr.audio, fr.reason))
         }
 
         return section
@@ -926,6 +949,76 @@ final class PerfBottleneckTests: XCTestCase {
                     fr.frame, fr.wallDt, fr.totalMs, evalDelta,
                     fr.selectionCb ? 1 : 0, fr.reticleCb ? 1 : 0, fr.teleportCb ? 1 : 0, fr.reason))
             }
+        }
+
+        return section
+    }
+
+    // MARK: - Audio Timing
+
+    private func analyzeAudioTiming() -> BottleneckSection {
+        var section = BottleneckSection(title: "AUDIO SUBSYSTEM BREAKDOWN")
+        let path = "/tmp/audio-timing.csv"
+        guard let data = FileManager.default.contents(atPath: path),
+              let csv = String(data: data, encoding: .utf8) else {
+            section.addLine("[No data — audio not active or instrumentation not enabled]")
+            return section
+        }
+
+        // CSV: frame,listener_ms,edge_ms,proximity_ms,events_ms,mascot_ms,total_ms
+        let lines = csv.components(separatedBy: "\n").dropFirst().filter { !$0.isEmpty }
+        guard !lines.isEmpty else { section.addLine("[Empty]"); return section }
+
+        var listeners: [Double] = [], edges: [Double] = [], proximities: [Double] = []
+        var events: [Double] = [], mascots: [Double] = [], totals: [Double] = []
+
+        for line in lines {
+            let c = line.components(separatedBy: ",")
+            guard c.count >= 7 else { continue }
+            listeners.append(Double(c[1]) ?? 0)
+            edges.append(Double(c[2]) ?? 0)
+            proximities.append(Double(c[3]) ?? 0)
+            events.append(Double(c[4]) ?? 0)
+            mascots.append(Double(c[5]) ?? 0)
+            totals.append(Double(c[6]) ?? 0)
+        }
+
+        let st = totals.sorted()
+        section.addLine("Audio ticks: \(lines.count)")
+        section.addLine("total:     p50=\(f(pct(st, 0.5)))  p95=\(f(pct(st, 0.95)))  p99=\(f(pct(st, 0.99)))  worst=\(f(st.last ?? 0))")
+
+        let phases: [(String, [Double])] = [
+            ("listener", listeners), ("edge", edges), ("proximity", proximities),
+            ("events", events), ("mascot", mascots)
+        ]
+
+        section.addLine("")
+        var bottlenecks: [(String, Double)] = []
+        for (name, vals) in phases {
+            let sorted = vals.sorted()
+            let avg = vals.reduce(0, +) / Double(max(vals.count, 1))
+            let sp95 = pct(sorted, 0.95)
+            let worst = sorted.last ?? 0
+            section.addLine("  \(name.padding(toLength: 12, withPad: " ", startingAt: 0)) avg=\(f(avg))  p95=\(f(sp95))  worst=\(f(worst))")
+            bottlenecks.append((name, sp95))
+        }
+
+        let ranked = bottlenecks.sorted { $0.1 > $1.1 }
+        section.addLine("")
+        section.addLine("AUDIO BOTTLENECK RANKING (by p95):")
+        for (i, (name, val)) in ranked.enumerated() {
+            let bar = String(repeating: "█", count: min(Int(val / 0.05), 40))
+            section.addLine("  #\(i+1) \(name.padding(toLength: 12, withPad: " ", startingAt: 0)) \(f(val))ms \(bar)")
+        }
+
+        // Worst 10 audio frames
+        let indexed = totals.enumerated().sorted { $0.element > $1.element }.prefix(10)
+        section.addLine("")
+        section.addLine("Worst 10 audio frames:")
+        section.addLine("  frame  total   listener  edge    prox    events  mascot")
+        for (i, _) in indexed {
+            section.addLine(String(format: "  %5d %7.2f %7.2f %7.2f %7.2f %7.2f %7.2f",
+                i, totals[i], listeners[i], edges[i], proximities[i], events[i], mascots[i]))
         }
 
         return section

@@ -208,6 +208,18 @@ struct ArcaneCircleUniforms {
     float       _pad1;
 };
 
+// Conjure orb billboard (camera-facing energy sphere between mascot's hands).
+struct ConjureOrbUniforms {
+    simd_float3 center;          // current orb world position (hands → node lerp)
+    float       size;            // billboard half-extent
+    simd_float3 right;           // camera right (orb faces camera)
+    float       opacity;         // overall fade (0..1)
+    simd_float3 up;              // camera up
+    float       orbScale;        // grow factor (0→1 during charge, 1 during flight)
+    simd_float3 tintColor;       // per-project tint
+    float       glowIntensity;   // inner glow brightness (ramps during charge)
+};
+
 // Holographic info screen billboard (oriented to mascot's facing direction).
 struct HoloScreenUniforms {
     simd_float3 center;          // world-space billboard center

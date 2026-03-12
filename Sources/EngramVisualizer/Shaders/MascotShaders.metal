@@ -361,6 +361,160 @@ fragment float4 node_ring_fragment(
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// MARK: - Conjure Scan Rings (horizontal rings sweeping up/down mascot body)
+// ──────────────────────────────────────────────────────────────────────────────
+
+// Reuses arcane_vertex for billboard expansion, different fragment for scan effect.
+fragment float4 conjure_scan_fragment(
+    ArcaneVertexOut          in    [[stage_in]],
+    constant FrameUniforms&  frame [[buffer(0)]])
+{
+    float2 uv = in.uv * 2.0 - 1.0;
+    float r = length(uv);
+    float time = frame.time;
+
+    float totalAlpha = 0.0;
+
+    // Thin sharp ring at fixed radius
+    {
+        float ringR = 0.55;
+        float ring = smoothstep(0.014, 0.003, abs(r - ringR));
+        totalAlpha += ring * 0.9;
+    }
+
+    // Second thinner outer ring
+    {
+        float ringR = 0.75;
+        float ring = smoothstep(0.010, 0.002, abs(r - ringR));
+        totalAlpha += ring * 0.6;
+    }
+
+    // Pulsing energy band between rings
+    {
+        float bandCenter = 0.65;
+        float band = exp(-(r - bandCenter) * (r - bandCenter) * 30.0);
+        float pulse = 0.5 + 0.5 * sin(time * 5.0);
+        totalAlpha += band * 0.15 * pulse;
+    }
+
+    // Rotating glyph markers on outer ring (tech/magic feel)
+    {
+        float theta = atan2(uv.y, uv.x);
+        float rot = theta + time * 2.0;
+        constexpr float TAU = 6.28318530;
+        float segAngle = TAU / 8.0;
+        float segFrac = fract((rot + 3.14159265) / segAngle);
+        float tick = smoothstep(0.45, 0.48, segFrac) * smoothstep(0.55, 0.52, segFrac);
+        tick *= smoothstep(0.80, 0.74, r) * step(0.70, r);
+        totalAlpha += tick * 0.7;
+    }
+
+    // Circular edge fade
+    totalAlpha *= smoothstep(1.0, 0.82, r);
+
+    // Apply vertex-level opacity
+    totalAlpha *= in.color.a;
+
+    if (totalAlpha < 0.004) discard_fragment();
+
+    float3 tint = in.color.rgb;
+    if (length(tint) < 0.01) tint = float3(0.0, 0.9, 1.0);
+    float3 color = mix(tint, float3(1.0), r * 0.15);  // slight white at edges
+
+    return float4(color, totalAlpha);
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// MARK: - Conjure Orb (camera-facing energy sphere forming between hands)
+// ──────────────────────────────────────────────────────────────────────────────
+
+struct ConjureOrbVertexOut {
+    float4 position [[position]];
+    float2 uv;
+    float  opacity;
+    float  orbScale;
+    float  glowIntensity;
+    float3 tint;
+};
+
+vertex ConjureOrbVertexOut conjure_orb_vertex(
+    constant ConjureOrbUniforms& orb   [[buffer(0)]],
+    constant FrameUniforms&      frame [[buffer(1)]],
+    uint vid [[vertex_id]])
+{
+    uint cornerIdx = vid % 4;
+    float2 corners[4] = { float2(-1, 1), float2(1, 1), float2(-1, -1), float2(1, -1) };
+    float2 uvs[4]     = { float2(0, 0), float2(1, 0), float2(0, 1), float2(1, 1) };
+    float2 c = corners[cornerIdx];
+
+    // Camera-facing billboard
+    float3 worldPos = orb.center
+                    + orb.right * c.x * orb.size
+                    + orb.up    * c.y * orb.size;
+
+    ConjureOrbVertexOut out;
+    out.position = frame.viewProjectionMatrix * float4(worldPos, 1.0);
+    out.uv = uvs[cornerIdx];
+    out.opacity = orb.opacity;
+    out.orbScale = orb.orbScale;
+    out.glowIntensity = orb.glowIntensity;
+    float3 tint = orb.tintColor;
+    out.tint = length(tint) < 0.01 ? float3(0.0, 0.9, 1.0) : tint;
+    return out;
+}
+
+fragment float4 conjure_orb_fragment(
+    ConjureOrbVertexOut      in    [[stage_in]],
+    constant FrameUniforms&  frame [[buffer(0)]])
+{
+    float2 uv = in.uv * 2.0 - 1.0;
+    float r = length(uv);
+    float time = frame.time;
+
+    // Visible radius grows with orbScale
+    float visR = max(in.orbScale, 0.01);
+
+    // Dense glowing core — gaussian falloff
+    float core = exp(-r * r / (visR * visR * 0.15));
+
+    // Animated energy ripples — concentric rings pulsing outward
+    float ripple1 = smoothstep(0.015, 0.004, abs(r - fract(time * 0.8) * visR));
+    float ripple2 = smoothstep(0.012, 0.003, abs(r - fract(time * 0.8 + 0.5) * visR));
+    float ripples = (ripple1 + ripple2) * 0.4;
+
+    // Outer halo
+    float halo = exp(-r * r / (visR * visR * 0.6)) * 0.3;
+
+    // Edge crackle — angular noise
+    float theta = atan2(uv.y, uv.x);
+    float edgeNoise = 0.0;
+    {
+        float n = sin(theta * 8.0 + time * 4.0) * 0.5 + 0.5;
+        n *= sin(theta * 13.0 - time * 3.0) * 0.5 + 0.5;
+        float edgeR = visR * (0.35 + n * 0.15);
+        float edgeBand = smoothstep(0.04, 0.0, abs(r - edgeR));
+        edgeNoise = edgeBand * 0.5;
+    }
+
+    float totalAlpha = (core + ripples + halo + edgeNoise);
+    totalAlpha *= in.opacity;
+
+    // Color: project tint at core, shifts whiter at peak intensity
+    float whiteMix = in.glowIntensity * core * 0.6;
+    float3 color = mix(in.tint, float3(1.0), whiteMix);
+
+    // Boost brightness with glow intensity
+    totalAlpha *= (0.6 + in.glowIntensity * 0.8);
+
+    // Clip outside visible radius (with soft fade)
+    totalAlpha *= smoothstep(visR * 1.2, visR * 0.8, r);
+
+    if (totalAlpha < 0.004) discard_fragment();
+
+    return float4(color, totalAlpha);
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // MARK: - Mascot Mesh Shaders
 // ──────────────────────────────────────────────────────────────────────────────
 

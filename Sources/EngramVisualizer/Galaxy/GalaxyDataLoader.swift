@@ -340,10 +340,11 @@ struct GalaxyDataLoader {
             old!.importance != node.importance ||
             old!.label != node.label
         if !structuralChange {
+            // Access-only change: update dicts (O(1)), skip O(n) array scan.
+            // nodes[] array gets stale lastAccessedAt but that field doesn't affect
+            // rendering — it's only used by activity log which reads from nodeById.
             store.allNodes[gid]?.lastAccessedAt = node.lastAccessedAt
-            if let idx = store.nodes.firstIndex(where: { $0.id == gid }) {
-                store.nodes[idx].lastAccessedAt = node.lastAccessedAt
-            }
+            store.nodeById[gid]?.lastAccessedAt = node.lastAccessedAt
             return
         }
         store.allNodes[gid] = node
@@ -408,9 +409,18 @@ struct GalaxyDataLoader {
         let t0 = CFAbsoluteTimeGetCurrent()
         defer { ObserverAccumulator.shared.record("edgeUpdate", ms: (CFAbsoluteTimeGetCurrent() - t0) * 1000.0) }
         let store = galaxy.renderStore
+        let old = store.allEdges[data.id]
         store.allEdges[data.id] = data
-        if let idx = store.edges.firstIndex(where: { $0.id == data.id }) {
-            store.edges[idx] = data
+        // Only scan the edges array when structural fields changed (relation, endpoints).
+        // Edge updates that don't change routing (rare) skip the O(edges) linear scan.
+        let structuralChange = old == nil ||
+            old!.relation != data.relation ||
+            old!.sourceId != data.sourceId ||
+            old!.targetId != data.targetId
+        if structuralChange {
+            if let idx = store.edges.firstIndex(where: { $0.id == data.id }) {
+                store.edges[idx] = data
+            }
         }
     }
 
@@ -549,7 +559,7 @@ struct GalaxyDataLoader {
         let edgeFlushStart = CFAbsoluteTimeGetCurrent()
         #endif
 
-        var bumpedTopology = false
+        var addedVisibleEdge = false
 
         for (_, data) in entries {
             store.allEdges[data.id] = data
@@ -565,13 +575,15 @@ struct GalaxyDataLoader {
                 if is3D {
                     galaxy.simulation3D.addEdge(from: data.sourceId, to: data.targetId)
                 }
+                addedVisibleEdge = true
             }
             if data.relation == "part_of" {
                 store.hubs.insert(data.targetId)
-                bumpedTopology = true
             }
         }
-        if bumpedTopology {
+        // Bump topology whenever visible edges were added — ensures mergeRenderData
+        // picks up new edges (not just part_of hub changes).
+        if addedVisibleEdge {
             store.bumpTopology()
         }
 
@@ -585,7 +597,7 @@ struct GalaxyDataLoader {
         }
         if let f = flushTimingFile {
             let ts = String(format: "%.3f", CFAbsoluteTimeGetCurrent())
-            let line = "\(ts),\(galaxy.id),\(entries.count),\(String(format: "%.2f", edgeFlushMs)),\(store.edges.count),\(bumpedTopology)\n"
+            let line = "\(ts),\(galaxy.id),\(entries.count),\(String(format: "%.2f", edgeFlushMs)),\(store.edges.count),\(addedVisibleEdge)\n"
             fputs(line, f)
             fflush(f)
         }

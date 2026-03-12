@@ -229,6 +229,56 @@ struct MetalPipelineBuilder {
         return try device.makeRenderPipelineState(descriptor: desc)
     }
 
+    // MARK: - Conjure Scan Ring Pipeline (additive transparent, depth-write OFF)
+
+    static func buildConjureScanPipeline(device: MTLDevice, library: MTLLibrary) throws -> MTLRenderPipelineState {
+        guard let vertexFn = library.makeFunction(name: "arcane_vertex"),
+              let fragmentFn = library.makeFunction(name: "conjure_scan_fragment") else {
+            throw MetalPipelineError.functionNotFound("arcane_vertex or conjure_scan_fragment")
+        }
+
+        let desc = MTLRenderPipelineDescriptor()
+        desc.label = "Conjure Scan Ring Pipeline"
+        desc.vertexFunction = vertexFn
+        desc.fragmentFunction = fragmentFn
+        desc.colorAttachments[0].pixelFormat = .bgra8Unorm
+        desc.colorAttachments[0].isBlendingEnabled = true
+        desc.colorAttachments[0].rgbBlendOperation = .add
+        desc.colorAttachments[0].alphaBlendOperation = .add
+        desc.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+        desc.colorAttachments[0].destinationRGBBlendFactor = .one
+        desc.colorAttachments[0].sourceAlphaBlendFactor = .one
+        desc.colorAttachments[0].destinationAlphaBlendFactor = .one
+        desc.depthAttachmentPixelFormat = .depth32Float
+
+        return try device.makeRenderPipelineState(descriptor: desc)
+    }
+
+    // MARK: - Conjure Orb Pipeline (additive transparent, depth-write OFF)
+
+    static func buildConjureOrbPipeline(device: MTLDevice, library: MTLLibrary) throws -> MTLRenderPipelineState {
+        guard let vertexFn = library.makeFunction(name: "conjure_orb_vertex"),
+              let fragmentFn = library.makeFunction(name: "conjure_orb_fragment") else {
+            throw MetalPipelineError.functionNotFound("conjure_orb_vertex or conjure_orb_fragment")
+        }
+
+        let desc = MTLRenderPipelineDescriptor()
+        desc.label = "Conjure Orb Pipeline"
+        desc.vertexFunction = vertexFn
+        desc.fragmentFunction = fragmentFn
+        desc.colorAttachments[0].pixelFormat = .bgra8Unorm
+        desc.colorAttachments[0].isBlendingEnabled = true
+        desc.colorAttachments[0].rgbBlendOperation = .add
+        desc.colorAttachments[0].alphaBlendOperation = .add
+        desc.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+        desc.colorAttachments[0].destinationRGBBlendFactor = .one
+        desc.colorAttachments[0].sourceAlphaBlendFactor = .one
+        desc.colorAttachments[0].destinationAlphaBlendFactor = .one
+        desc.depthAttachmentPixelFormat = .depth32Float
+
+        return try device.makeRenderPipelineState(descriptor: desc)
+    }
+
     // MARK: - Holo Screen Pipeline (transparent, alpha blended, depth-write OFF)
 
     static func buildHoloScreenPipeline(device: MTLDevice, library: MTLLibrary) throws -> MTLRenderPipelineState {
