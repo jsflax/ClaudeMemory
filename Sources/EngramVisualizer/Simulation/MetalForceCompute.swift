@@ -37,6 +37,40 @@ final class MetalForceCompute: @unchecked Sendable {
         var nodeCount: UInt32
     }
 
+    /// Initialize with an external device and library (shares GPU with renderer).
+    init?(device: MTLDevice, library: MTLLibrary) {
+        guard let queue = device.makeCommandQueue(),
+              let function = library.makeFunction(name: "compute_charge_forces"),
+              let pipeline = try? device.makeComputePipelineState(function: function)
+        else { return nil }
+
+        self.device = device
+        self.commandQueue = queue
+        self.pipelineState = pipeline
+
+        // Build full simulation pipelines
+        if let fn = library.makeFunction(name: "compute_spring_forces") {
+            springPipeline = try? device.makeComputePipelineState(function: fn)
+        }
+        if let fn = library.makeFunction(name: "compute_group_centroids") {
+            centroidPipeline = try? device.makeComputePipelineState(function: fn)
+        }
+        if let fn = library.makeFunction(name: "compute_centroid_repulsion") {
+            centroidRepulsionPipeline = try? device.makeComputePipelineState(function: fn)
+        }
+        if let fn = library.makeFunction(name: "apply_cohesion_forces") {
+            cohesionPipeline = try? device.makeComputePipelineState(function: fn)
+        }
+        fullSimReady = springPipeline != nil && centroidPipeline != nil
+            && centroidRepulsionPipeline != nil && cohesionPipeline != nil
+
+        simParamBuffer = device.makeBuffer(length: MemoryLayout<ForceSimParams>.stride, options: .storageModeShared)
+        groupTypeBuffer = device.makeBuffer(length: MemoryLayout<UInt32>.stride, options: .storageModeShared)
+        nodeCountBuffer = device.makeBuffer(length: MemoryLayout<UInt32>.stride, options: .storageModeShared)
+        repulsionBuffer = device.makeBuffer(length: MemoryLayout<Float>.stride, options: .storageModeShared)
+        groupCountBuffer = device.makeBuffer(length: MemoryLayout<UInt32>.stride, options: .storageModeShared)
+    }
+
     init?() {
         guard let device = MTLCreateSystemDefaultDevice(),
               let queue = device.makeCommandQueue(),
@@ -75,6 +109,224 @@ final class MetalForceCompute: @unchecked Sendable {
 
     /// Whether the full GPU simulation pipeline is available.
     var isFullSimAvailable: Bool { fullSimReady }
+
+    /// Node count from last encodeForces call (for readback sizing).
+    private var lastEncodedNodeCount: Int = 0
+
+    /// Encode all force compute passes into an external compute encoder.
+    /// Called from MetalGraphRenderer.drawFrame() BEFORE render passes.
+    /// Forces accumulate in fullForceBuffer; read back via readBackForces() after GPU completes.
+    func encodeForces(
+        encoder: MTLComputeCommandEncoder,
+        x: [Float], y: [Float], z: [Float],
+        projectGroups: [Int], topicGroups: [Int],
+        chargeStrength: Float, crossChargeMultiplier: Float,
+        sameTopicChargeScale: Float, sameProjectChargeScale: Float,
+        springLength: Float, crossProjectSpringLength: Float, springStrength: Float,
+        cohesionStrength: Float, centroidRepulsion: Float,
+        topicCohesionStrength: Float, topicCentroidRepulsion: Float,
+        centerStrength: Float, center: SIMD3<Float>,
+        alpha: Float, damping: Float, maxSpeed: Float
+    ) {
+        let n = x.count
+        guard n > 1, fullSimReady else { return }
+
+        let projectCount = UInt32(max((projectGroups.max() ?? 0) + 1, 1))
+        let topicCount = UInt32(max((topicGroups.max() ?? 0) + 1, 1))
+        let maxGroups = max(Int(projectCount), Int(topicCount))
+
+        // Ensure buffer capacity
+        if n > fullNodeCapacity {
+            let cap = max(n * 2, 512)
+            fullNodeBuffer = device.makeBuffer(length: cap * MemoryLayout<ForceNodeFull>.stride, options: .storageModeShared)
+            fullForceBuffer = device.makeBuffer(length: cap * MemoryLayout<SIMD3<Float>>.stride, options: .storageModeShared)
+            fullNodeCapacity = cap
+        }
+        if maxGroups > fullGroupCapacity {
+            let cap = max(maxGroups * 2, 64)
+            projCentroidBuffer = device.makeBuffer(length: cap * MemoryLayout<GroupCentroid>.stride, options: .storageModeShared)
+            topicCentroidBuffer = device.makeBuffer(length: cap * MemoryLayout<GroupCentroid>.stride, options: .storageModeShared)
+            projForceBuffer = device.makeBuffer(length: cap * MemoryLayout<SIMD3<Float>>.stride, options: .storageModeShared)
+            topicForceBuffer = device.makeBuffer(length: cap * MemoryLayout<SIMD3<Float>>.stride, options: .storageModeShared)
+            fullGroupCapacity = cap
+        }
+
+        guard let nodeBuf = fullNodeBuffer, let forceBuf = fullForceBuffer,
+              let projCBuf = projCentroidBuffer, let topicCBuf = topicCentroidBuffer,
+              let projFBuf = projForceBuffer, let topicFBuf = topicForceBuffer,
+              let simPBuf = simParamBuffer, let gtBuf = groupTypeBuffer,
+              let repBuf = repulsionBuffer, let gcBuf = groupCountBuffer
+        else { return }
+
+        lastEncodedNodeCount = n
+
+        // Pack node data
+        let nodePtr = nodeBuf.contents().bindMemory(to: ForceNodeFull.self, capacity: n)
+        for i in 0..<n {
+            nodePtr[i] = ForceNodeFull(
+                px: x[i], py: y[i], pz: z[i], vx: 0, vy: 0, vz: 0,
+                projectGroup: Int32(projectGroups[i]),
+                topicGroup: Int32(i < topicGroups.count ? topicGroups[i] : -1))
+        }
+
+        // Zero buffers
+        memset(forceBuf.contents(), 0, MemoryLayout<SIMD3<Float>>.stride * n)
+        memset(projCBuf.contents(), 0, MemoryLayout<GroupCentroid>.stride * Int(projectCount))
+        memset(topicCBuf.contents(), 0, MemoryLayout<GroupCentroid>.stride * Int(topicCount))
+        memset(projFBuf.contents(), 0, MemoryLayout<SIMD3<Float>>.stride * Int(projectCount))
+        memset(topicFBuf.contents(), 0, MemoryLayout<SIMD3<Float>>.stride * Int(topicCount))
+
+        // Set params
+        if paramBuffer == nil {
+            paramBuffer = device.makeBuffer(length: MemoryLayout<GPUForceParams>.stride, options: .storageModeShared)
+        }
+        if let chargePBuf = paramBuffer {
+            chargePBuf.contents().bindMemory(to: GPUForceParams.self, capacity: 1).pointee = GPUForceParams(
+                chargeStrength: chargeStrength, crossChargeMultiplier: crossChargeMultiplier,
+                sameTopicChargeScale: sameTopicChargeScale, sameProjectChargeScale: sameProjectChargeScale,
+                cutoffSq: 500 * 500, nodeCount: UInt32(n))
+        }
+        simPBuf.contents().bindMemory(to: ForceSimParams.self, capacity: 1).pointee = ForceSimParams(
+            springLength: springLength, crossProjectSpringLength: crossProjectSpringLength,
+            springStrength: springStrength, cohesionStrength: cohesionStrength,
+            centroidRepulsion: centroidRepulsion, topicCohesionStrength: topicCohesionStrength,
+            topicCentroidRepulsion: topicCentroidRepulsion, centerStrength: centerStrength,
+            center: center, alpha: alpha, damping: damping, maxSpeed: maxSpeed,
+            nodeCount: UInt32(n), edgeCount: UInt32(csrEdgeCount),
+            projectGroupCount: projectCount, topicGroupCount: topicCount, _pad0: 0, _pad1: 0)
+
+        let tgSize = 256
+
+        // 1. Charge (O(n²))
+        encoder.setComputePipelineState(pipelineState)
+        encoder.setBuffer(nodeBuf, offset: 0, index: 0)
+        encoder.setBuffer(forceBuf, offset: 0, index: 1)
+        if let chargePBuf = paramBuffer { encoder.setBuffer(chargePBuf, offset: 0, index: 2) }
+        let chargeTg = min(Int(pipelineState.maxTotalThreadsPerThreadgroup), tgSize)
+        encoder.dispatchThreads(MTLSize(width: n, height: 1, depth: 1),
+                               threadsPerThreadgroup: MTLSize(width: chargeTg, height: 1, depth: 1))
+        encoder.memoryBarrier(scope: .buffers)
+
+        // 2. Springs
+        if csrEdgeCount > 0, let springPL = springPipeline,
+           let adjOffBuf = adjOffsetsBuffer, let adjNbrBuf = adjNeighborsBuffer {
+            encoder.setComputePipelineState(springPL)
+            encoder.setBuffer(adjOffBuf, offset: 0, index: 0)
+            encoder.setBuffer(adjNbrBuf, offset: 0, index: 1)
+            encoder.setBuffer(nodeBuf, offset: 0, index: 2)
+            encoder.setBuffer(forceBuf, offset: 0, index: 3)
+            encoder.setBuffer(simPBuf, offset: 0, index: 4)
+            let springTg = min(Int(springPL.maxTotalThreadsPerThreadgroup), tgSize)
+            encoder.dispatchThreads(MTLSize(width: n, height: 1, depth: 1),
+                                   threadsPerThreadgroup: MTLSize(width: springTg, height: 1, depth: 1))
+            encoder.memoryBarrier(scope: .buffers)
+        }
+
+        // 3-6. Project centroids, repulsion, cohesion
+        if let centPL = centroidPipeline, projectCount > 1,
+           let projOffBuf = projMemberOffsetsBuffer, let projMemBuf = projMembersBuffer {
+            encoder.setComputePipelineState(centPL)
+            encoder.setBuffer(projOffBuf, offset: 0, index: 0)
+            encoder.setBuffer(projMemBuf, offset: 0, index: 1)
+            encoder.setBuffer(nodeBuf, offset: 0, index: 2)
+            encoder.setBuffer(projCBuf, offset: 0, index: 3)
+            let centTg = min(Int(centPL.maxTotalThreadsPerThreadgroup), tgSize)
+            encoder.dispatchThreads(MTLSize(width: Int(projectCount), height: 1, depth: 1),
+                                   threadsPerThreadgroup: MTLSize(width: min(centTg, Int(projectCount)), height: 1, depth: 1))
+            encoder.memoryBarrier(scope: .buffers)
+
+            if let repPL = centroidRepulsionPipeline {
+                encoder.setComputePipelineState(repPL)
+                encoder.setBuffer(projCBuf, offset: 0, index: 0)
+                encoder.setBuffer(projFBuf, offset: 0, index: 1)
+                encoder.setBuffer(simPBuf, offset: 0, index: 2)
+                gcBuf.contents().bindMemory(to: UInt32.self, capacity: 1).pointee = projectCount
+                encoder.setBuffer(gcBuf, offset: 0, index: 3)
+                gtBuf.contents().bindMemory(to: UInt32.self, capacity: 1).pointee = 0
+                encoder.setBuffer(gtBuf, offset: 0, index: 4)
+                repBuf.contents().bindMemory(to: Float.self, capacity: 1).pointee = centroidRepulsion
+                encoder.setBuffer(repBuf, offset: 0, index: 5)
+                let repTg = min(Int(repPL.maxTotalThreadsPerThreadgroup), tgSize)
+                encoder.dispatchThreads(MTLSize(width: Int(projectCount), height: 1, depth: 1),
+                                        threadsPerThreadgroup: MTLSize(width: min(repTg, Int(projectCount)), height: 1, depth: 1))
+                encoder.memoryBarrier(scope: .buffers)
+            }
+
+            if let cohPL = cohesionPipeline {
+                encoder.setComputePipelineState(cohPL)
+                encoder.setBuffer(projOffBuf, offset: 0, index: 0)
+                encoder.setBuffer(projMemBuf, offset: 0, index: 1)
+                encoder.setBuffer(nodeBuf, offset: 0, index: 2)
+                encoder.setBuffer(projCBuf, offset: 0, index: 3)
+                encoder.setBuffer(projFBuf, offset: 0, index: 4)
+                encoder.setBuffer(forceBuf, offset: 0, index: 5)
+                encoder.setBuffer(simPBuf, offset: 0, index: 6)
+                let cohTg = min(Int(cohPL.maxTotalThreadsPerThreadgroup), tgSize)
+                encoder.dispatchThreads(MTLSize(width: n, height: 1, depth: 1),
+                                       threadsPerThreadgroup: MTLSize(width: cohTg, height: 1, depth: 1))
+                encoder.memoryBarrier(scope: .buffers)
+            }
+        }
+
+        // Topic centroids, repulsion, cohesion
+        if let centPL = centroidPipeline, topicCount > 1,
+           let topicOffBuf = topicMemberOffsetsBuffer, let topicMemBuf = topicMembersBuffer {
+            encoder.setComputePipelineState(centPL)
+            encoder.setBuffer(topicOffBuf, offset: 0, index: 0)
+            encoder.setBuffer(topicMemBuf, offset: 0, index: 1)
+            encoder.setBuffer(nodeBuf, offset: 0, index: 2)
+            encoder.setBuffer(topicCBuf, offset: 0, index: 3)
+            let centTg = min(Int(centPL.maxTotalThreadsPerThreadgroup), tgSize)
+            encoder.dispatchThreads(MTLSize(width: Int(topicCount), height: 1, depth: 1),
+                                   threadsPerThreadgroup: MTLSize(width: min(centTg, Int(topicCount)), height: 1, depth: 1))
+            encoder.memoryBarrier(scope: .buffers)
+
+            if let repPL = centroidRepulsionPipeline {
+                encoder.setComputePipelineState(repPL)
+                encoder.setBuffer(topicCBuf, offset: 0, index: 0)
+                encoder.setBuffer(topicFBuf, offset: 0, index: 1)
+                encoder.setBuffer(simPBuf, offset: 0, index: 2)
+                gcBuf.contents().bindMemory(to: UInt32.self, capacity: 1).pointee = topicCount
+                encoder.setBuffer(gcBuf, offset: 0, index: 3)
+                gtBuf.contents().bindMemory(to: UInt32.self, capacity: 1).pointee = 1
+                encoder.setBuffer(gtBuf, offset: 0, index: 4)
+                repBuf.contents().bindMemory(to: Float.self, capacity: 1).pointee = topicCentroidRepulsion
+                encoder.setBuffer(repBuf, offset: 0, index: 5)
+                let repTg = min(Int(repPL.maxTotalThreadsPerThreadgroup), tgSize)
+                encoder.dispatchThreads(MTLSize(width: Int(topicCount), height: 1, depth: 1),
+                                        threadsPerThreadgroup: MTLSize(width: min(repTg, Int(topicCount)), height: 1, depth: 1))
+                encoder.memoryBarrier(scope: .buffers)
+            }
+
+            if let cohPL = cohesionPipeline {
+                encoder.setComputePipelineState(cohPL)
+                encoder.setBuffer(topicOffBuf, offset: 0, index: 0)
+                encoder.setBuffer(topicMemBuf, offset: 0, index: 1)
+                encoder.setBuffer(nodeBuf, offset: 0, index: 2)
+                encoder.setBuffer(topicCBuf, offset: 0, index: 3)
+                encoder.setBuffer(topicFBuf, offset: 0, index: 4)
+                encoder.setBuffer(forceBuf, offset: 0, index: 5)
+                encoder.setBuffer(simPBuf, offset: 0, index: 6)
+                let cohTg = min(Int(cohPL.maxTotalThreadsPerThreadgroup), tgSize)
+                encoder.dispatchThreads(MTLSize(width: n, height: 1, depth: 1),
+                                       threadsPerThreadgroup: MTLSize(width: cohTg, height: 1, depth: 1))
+                encoder.memoryBarrier(scope: .buffers)
+            }
+        }
+    }
+
+    /// Read back force results from GPU shared buffer after command buffer completion.
+    /// Call this from the command buffer's completion handler or after waitUntilCompleted.
+    func readBackForces() -> (fx: [Float], fy: [Float], fz: [Float])? {
+        let n = lastEncodedNodeCount
+        guard n > 0, let forceBuf = fullForceBuffer else { return nil }
+        let forcePtr = forceBuf.contents().bindMemory(to: SIMD3<Float>.self, capacity: n)
+        var fx = [Float](repeating: 0, count: n)
+        var fy = [Float](repeating: 0, count: n)
+        var fz = [Float](repeating: 0, count: n)
+        for i in 0..<n { fx[i] = forcePtr[i].x; fy[i] = forcePtr[i].y; fz[i] = forcePtr[i].z }
+        return (fx, fy, fz)
+    }
 
     // Full GPU force simulation pipelines
     private var springPipeline: MTLComputePipelineState?

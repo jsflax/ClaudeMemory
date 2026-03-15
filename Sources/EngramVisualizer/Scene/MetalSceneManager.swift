@@ -249,6 +249,12 @@ final class MetalSceneManager {
                 // in batches of 50 and the sim would waste GPU on partial graphs while
                 // alpha decays uselessly. wake() fires after all batches complete.
                 if !galaxy.isInitialLoad {
+                    // GPU forces encoded by renderer — skip CPU dispatch in tick()
+                    let gpuAvailable = renderer.forceCompute?.isFullSimAvailable ?? false
+                    galaxy.simulation3D.useGPUForces = gpuAvailable
+                    if !gpuAvailable && renderFrameCount == 1 {
+                        print("[engram:sim] GPU force compute unavailable for galaxy \(galaxy.id) — falling back to CPU")
+                    }
                     galaxy.simulation3D.tick()
                 }
                 galaxy.embeddingProjection.tickAnimation3D()

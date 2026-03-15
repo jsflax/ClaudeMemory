@@ -287,26 +287,34 @@ final class ForceSimulation3D {
     private var storedFy: [Float] = []
     private var storedFz: [Float] = []
 
-    /// Pending force result from async computation — written off-MainActor, read by tick().
-    /// Using OSAllocatedUnfairLock for safe cross-isolation handoff without MainActor hop.
-    private let pendingForces = OSAllocatedUnfairLock<ForceResult?>(initialState: nil)
+    /// Pending force result — written by GPU completion handler, read by tick().
+    /// Public for renderer's completion handler to write into.
+    let pendingForces = OSAllocatedUnfairLock<ForceResult?>(initialState: nil)
 
-    private(set) var positions: [UUID: SIMD3<Float>] = [:]
+    /// Public accessors for renderer's force encoding (read-only snapshots of sim state)
+    var posX: [Float] { x }
+    var posY: [Float] { y }
+    var posZ: [Float] { z }
+    var projectGroupPublic: [Int] { projectGroup }
+    var topicGroupPublic: [Int] { topicGroup }
+    var edgeIndicesPublic: [(Int, Int)] { edgeIndices }
     var nodeCount: Int { ids.count }
 
-    // Force parameters (tuned for 3D — slightly stronger since space is larger)
-    private let springLength: Float = 240
-    private let crossProjectSpringLength: Float = 400
-    private let springStrength: Float = 0.0004
-    private let chargeStrength: Float = 500
-    private let crossChargeMultiplier: Float = 3.0
-    private let sameProjectChargeScale: Float = 1.0   // pre-GPU: no reduction for same-project different-topic
-    private let sameTopicChargeScale: Float = 0.35     // pre-GPU value (was 0.25 post-GPU)
-    private let centerStrength: Float = 0.006
-    private let cohesionStrength: Float = 0.0015       // pre-GPU value (was 0.004 post-GPU)
-    private let centroidRepulsion: Float = 2500         // pre-GPU value (was 4000 post-GPU)
-    private let topicCohesionStrength: Float = 0.009    // pre-GPU value (was 0.005 post-GPU)
-    private let topicCentroidRepulsion: Float = 3500    // pre-GPU value (was 6000 post-GPU)
+    private(set) var positions: [UUID: SIMD3<Float>] = [:]
+
+    // Force parameters (tuned for 3D — matches JS version exactly)
+    let springLength: Float = 240
+    let crossProjectSpringLength: Float = 400
+    let springStrength: Float = 0.0004
+    let chargeStrength: Float = 500
+    let crossChargeMultiplier: Float = 3.0
+    let sameProjectChargeScale: Float = 1.0
+    let sameTopicChargeScale: Float = 0.35
+    let centerStrength: Float = 0.006
+    let cohesionStrength: Float = 0.0015
+    let centroidRepulsion: Float = 2500
+    let topicCohesionStrength: Float = 0.009
+    let topicCentroidRepulsion: Float = 3500
     private let damping: Float = 0.78
     private let maxSpeed: Float = 12.0
 
@@ -327,7 +335,9 @@ final class ForceSimulation3D {
 
     /// Set by topology changes, cleared after CSR rebuild in dispatchForceComputation.
     /// CSR (Compressed Sparse Row) structures are pre-built for GPU gather kernels.
-    private var topologyDirtyForGPU = true
+    var topologyDirtyForGPU = true
+    /// When true, the renderer handles GPU force encoding — tick() skips CPU dispatch.
+    var useGPUForces = false
 
     // MARK: - Local wake state
     // When a node is inserted into a settled sim, we run a lightweight CPU-only
@@ -755,9 +765,9 @@ final class ForceSimulation3D {
 
         syncPositions()
 
-        // Dispatch CPU force computation on background thread.
-        // GPU is reserved for rendering — no GPU force compute to avoid contention.
-        if !tickInFlight {
+        // CPU fallback: only dispatch if GPU force encoding isn't active.
+        // When useGPUForces is true, the renderer encodes forces into its command buffer.
+        if !tickInFlight && !useGPUForces {
             tickInFlight = true
             dispatchedToGPU = false
             let input = ForceComputationInput(
@@ -803,7 +813,7 @@ final class ForceSimulation3D {
         let topicCohesionStrength: Float, topicCentroidRepulsion: Float
     }
 
-    private struct ForceResult: Sendable {
+    struct ForceResult: Sendable {
         let fx: [Float], fy: [Float], fz: [Float]
     }
 

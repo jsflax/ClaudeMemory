@@ -142,6 +142,9 @@ final class MetalGraphRenderer: NSObject {
     // Lighting setup (matches Graph3DScene's 3 directional lights)
     var lightingUniforms = LightingUniforms()
 
+    // Force compute (shares device + command queue with renderer)
+    private(set) var forceCompute: MetalForceCompute?
+
     // Callback for bridging render events to the scene manager
     var onFrameCallback: ((Float) -> Void)?
 
@@ -165,6 +168,8 @@ final class MetalGraphRenderer: NSObject {
         self.bufferPool = MetalBufferPool(device: device)
 
         super.init()
+
+        self.forceCompute = MetalForceCompute(device: device, library: library)
 
         setupPipelines()
         setupSphereTemplate()
@@ -880,8 +885,36 @@ extension MetalGraphRenderer: MTKViewDelegate {
         bufferPool.updateFrameUniforms(frameUniforms)
         bufferPool.updateLightingUniforms(lightingUniforms)
 
-        // GPU compute: pack + stamp node spheres, edge cylinders, label quads + thruster particles (single shared encoder)
+        // GPU compute: force sim + pack + stamp (all in one encoder, one command buffer)
         if let computeEncoder = commandBuffer.makeComputeCommandEncoder() {
+            // Force compute for each galaxy's simulation (before render packing).
+            // Encoded into the same command buffer as rendering — no GPU contention.
+            // Forces are read back in the completion handler (1-frame delay, like JS).
+            if let fc = forceCompute, fc.isFullSimAvailable, let registry = galaxyRegistryRef {
+                for galaxy in registry.galaxies.values {
+                    let sim = galaxy.simulation3D
+                    guard !sim.isSettled, sim.nodeCount > 1 else { continue }
+                    if sim.topologyDirtyForGPU {
+                        fc.rebuildTopologyBuffers(
+                            nodeCount: sim.nodeCount, edges: sim.edgeIndicesPublic,
+                            projectGroups: sim.projectGroupPublic, topicGroups: sim.topicGroupPublic)
+                        sim.topologyDirtyForGPU = false
+                    }
+                    fc.encodeForces(
+                        encoder: computeEncoder,
+                        x: sim.posX, y: sim.posY, z: sim.posZ,
+                        projectGroups: sim.projectGroupPublic, topicGroups: sim.topicGroupPublic,
+                        chargeStrength: sim.chargeStrength, crossChargeMultiplier: sim.crossChargeMultiplier,
+                        sameTopicChargeScale: sim.sameTopicChargeScale, sameProjectChargeScale: sim.sameProjectChargeScale,
+                        springLength: sim.springLength, crossProjectSpringLength: sim.crossProjectSpringLength,
+                        springStrength: sim.springStrength,
+                        cohesionStrength: sim.cohesionStrength, centroidRepulsion: sim.centroidRepulsion,
+                        topicCohesionStrength: sim.topicCohesionStrength, topicCentroidRepulsion: sim.topicCentroidRepulsion,
+                        centerStrength: sim.centerStrength, center: sim.center,
+                        alpha: sim.alpha, damping: 0.78, maxSpeed: 12.0)
+                    computeEncoder.memoryBarrier(scope: .buffers)
+                }
+            }
             // Pack nodes (GPU): NodePackInput[] → NodeInstance[] + point lights
             packNodesGPU(encoder: computeEncoder)
             // Barrier: stampNodes reads nodeInstanceBuffer that packNodesGPU just wrote
@@ -1105,8 +1138,19 @@ extension MetalGraphRenderer: MTKViewDelegate {
 
         commandBuffer.present(drawable)
         let pool = bufferPool
-        commandBuffer.addCompletedHandler { _ in
+        let fc = forceCompute
+        let registry = galaxyRegistryRef
+        commandBuffer.addCompletedHandler { @Sendable _ in
             pool.signalFrameComplete()
+            // Read back GPU force results and deliver to simulations (1-frame delay)
+            if let fc, let forces = fc.readBackForces(), let registry {
+                // Store in each galaxy's sim via lock-free handoff
+                for galaxy in registry.galaxies.values {
+                    let sim = galaxy.simulation3D
+                    guard !sim.isSettled, sim.nodeCount == forces.fx.count else { continue }
+                    sim.pendingForces.withLock { $0 = ForceSimulation3D.ForceResult(fx: forces.fx, fy: forces.fy, fz: forces.fz) }
+                }
+            }
         }
         commandBuffer.commit()
 
