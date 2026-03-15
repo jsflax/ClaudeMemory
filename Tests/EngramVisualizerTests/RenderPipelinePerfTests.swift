@@ -2,7 +2,7 @@ import Foundation
 import Testing
 import simd
 import CEngramSceneTypes
-@testable import EngramSceneKit
+import EngramSceneKit
 
 /// Perf tests for every component of the render pipeline.
 /// Budget: 16.67ms total for 60fps. Each component gets a slice.

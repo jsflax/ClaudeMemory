@@ -2,6 +2,7 @@ import Foundation
 import Accelerate
 import simd
 import os
+import EngramSceneKit
 
 private let forceSimLog = Logger(subsystem: "com.claudememory.visualizer", category: "ForceSimulation3D")
 
@@ -694,11 +695,10 @@ final class ForceSimulation3D {
         // Fast path: when settled, skip all work (no integration, no sync, no force dispatch)
         if isSettled { return }
 
-        // Async force computation — dispatch to GPU, apply results next frame.
-        // No blending, no attenuation smoothing — just apply directly when they arrive.
-        // 1-frame delay at 60fps (16ms) is imperceptible.
+        // Async force computation — CPU Barnes-Hut on background thread.
+        // GPU reserved for rendering to avoid contention/hangs.
         let forceStart = CFAbsoluteTimeGetCurrent()
-        var forceMethod = "gpu"
+        let forceMethod = "cpu"
 
         // Drain pending force results from async dispatch
         if let result = pendingForces.withLock({ value -> ForceResult? in
@@ -755,82 +755,29 @@ final class ForceSimulation3D {
 
         syncPositions()
 
-        // Dispatch next force computation (async, non-blocking).
-        // No node count cap — GPU handles any scale.
+        // Dispatch CPU force computation on background thread.
+        // GPU is reserved for rendering — no GPU force compute to avoid contention.
         if !tickInFlight {
-            if let metal = metalForceCompute, n >= 16, metal.isFullSimAvailable {
-                tickInFlight = true
-                dispatchedToGPU = true
-                if topologyDirtyForGPU {
-                    metal.rebuildTopologyBuffers(
-                        nodeCount: n, edges: edgeIndices,
-                        projectGroups: projectGroup, topicGroups: topicGroup
-                    )
-                    topologyDirtyForGPU = false
-                }
-                let capturedX = x, capturedY = y, capturedZ = z
-                let capturedPG = projectGroup, capturedTG = topicGroup
-                let params = (chargeStrength: chargeStrength, crossChargeMultiplier: crossChargeMultiplier,
-                              sameTopicChargeScale: sameTopicChargeScale, sameProjectChargeScale: sameProjectChargeScale,
-                              springLength: springLength, crossProjectSpringLength: crossProjectSpringLength,
-                              springStrength: springStrength,
-                              cohesionStrength: cohesionStrength, centroidRepulsion: centroidRepulsion,
-                              topicCohesionStrength: topicCohesionStrength, topicCentroidRepulsion: topicCentroidRepulsion,
-                              centerStrength: centerStrength, center: center, alpha: alpha)
-                Task.detached(priority: .userInitiated) { [pendingForces] in
-                    let result = await metal.dispatchFullSimulation(
-                        positions: (x: capturedX, y: capturedY, z: capturedZ),
-                        projectGroups: capturedPG, topicGroups: capturedTG,
-                        chargeStrength: params.chargeStrength,
-                        crossChargeMultiplier: params.crossChargeMultiplier,
-                        sameTopicChargeScale: params.sameTopicChargeScale,
-                        sameProjectChargeScale: params.sameProjectChargeScale,
-                        springLength: params.springLength,
-                        crossProjectSpringLength: params.crossProjectSpringLength,
-                        springStrength: params.springStrength,
-                        cohesionStrength: params.cohesionStrength,
-                        centroidRepulsion: params.centroidRepulsion,
-                        topicCohesionStrength: params.topicCohesionStrength,
-                        topicCentroidRepulsion: params.topicCentroidRepulsion,
-                        centerStrength: params.centerStrength,
-                        center: params.center,
-                        alpha: params.alpha,
-                        damping: 0.78, maxSpeed: 12.0
-                    )
-                    pendingForces.withLock {
-                        $0 = ForceResult(fx: result.fx, fy: result.fy, fz: result.fz)
-                    }
-                }
-            } else {
-                forceMethod = "cpu"
-                tickInFlight = true
-                dispatchedToGPU = false
-                let state = SimState(
-                    n: n, x: x, y: y, z: z,
-                    projectGroup: projectGroup, topicGroup: topicGroup,
-                    edgeIndices: edgeIndices, topicProjectGroup: topicProjectGroup,
-                    alpha: alpha, center: center,
-                    chargeStrength: chargeStrength, crossChargeMultiplier: crossChargeMultiplier,
-                    sameProjectChargeScale: sameProjectChargeScale, sameTopicChargeScale: sameTopicChargeScale,
-                    centerStrength: centerStrength,
-                    springLength: springLength, crossProjectSpringLength: crossProjectSpringLength,
-                    springStrength: springStrength,
-                    cohesionStrength: cohesionStrength, centroidRepulsion: centroidRepulsion,
-                    topicCohesionStrength: topicCohesionStrength, topicCentroidRepulsion: topicCentroidRepulsion
-                )
-                Task.detached(priority: .userInitiated) { [pendingForces] in
-                    let result = Self.computeForces(state)
-                    pendingForces.withLock { $0 = result }
-                }
+            tickInFlight = true
+            dispatchedToGPU = false
+            let input = ForceComputationInput(
+                n: n, x: x, y: y, z: z,
+                projectGroup: projectGroup, topicGroup: topicGroup,
+                edgeIndices: edgeIndices, topicProjectGroup: topicProjectGroup,
+                alpha: alpha, center: center,
+                chargeStrength: chargeStrength, crossChargeMultiplier: crossChargeMultiplier,
+                sameProjectChargeScale: sameProjectChargeScale, sameTopicChargeScale: sameTopicChargeScale,
+                centerStrength: centerStrength,
+                springLength: springLength, crossProjectSpringLength: crossProjectSpringLength,
+                springStrength: springStrength,
+                cohesionStrength: cohesionStrength, centroidRepulsion: centroidRepulsion,
+                topicCohesionStrength: topicCohesionStrength, topicCentroidRepulsion: topicCentroidRepulsion
+            )
+            Task.detached(priority: .userInitiated) { [pendingForces] in
+                let result = computeAllForces(input)
+                pendingForces.withLock { $0 = ForceResult(fx: result.fx, fy: result.fy, fz: result.fz) }
             }
         }
-        // Safety: GPU timeout — if command buffer hangs, reset after 12 frames
-        if tickInFlight && dispatchedToGPU && forceAge > 12 {
-            forceSimLog.warning("GPU force computation timed out after \(self.forceAge) frames (n=\(n)) — resetting")
-            tickInFlight = false
-            forceAge = 2
-        }
-        forceAge += 1
 
         let integrateMs = (CFAbsoluteTimeGetCurrent() - integrateStart) * 1000.0
         let totalTickMs = (CFAbsoluteTimeGetCurrent() - forceStart) * 1000.0

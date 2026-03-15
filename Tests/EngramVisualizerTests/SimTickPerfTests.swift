@@ -1,6 +1,6 @@
 import Foundation
 import Testing
-@testable import EngramSceneKit
+import EngramSceneKit
 
 /// Verifies that tick() never blocks the calling thread for more than 2ms.
 /// The GPU force dispatch must be async — synchronous waitUntilCompleted()

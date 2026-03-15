@@ -2,7 +2,7 @@ import Foundation
 import Testing
 import simd
 import CEngramSceneTypes
-@testable import EngramSceneKit
+import EngramSceneKit
 
 @Suite("SceneEdgeFrame Builder")
 struct EdgeFrameBuilderTests {

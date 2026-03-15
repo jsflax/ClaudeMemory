@@ -1,7 +1,7 @@
 import Foundation
 import Testing
 import simd
-@testable import EngramSceneKit
+import EngramSceneKit
 
 // MARK: - Phase 1: Visual State Tests (TDD — written before implementation)
 

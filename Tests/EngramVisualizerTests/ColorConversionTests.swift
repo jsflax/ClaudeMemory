@@ -2,7 +2,7 @@ import Foundation
 import Testing
 import SwiftUI
 import simd
-@testable import EngramSceneKit
+import EngramSceneKit
 
 @Suite("Color Conversion")
 struct ColorConversionTests {
