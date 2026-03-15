@@ -1,4 +1,5 @@
 import Metal
+import CEngramSceneTypes
 import simd
 import SwiftUI
 
@@ -199,23 +200,36 @@ final class MascotFleet: MascotNotifier {
             mascot.update(dt: dt, camera: camera, nodePositions: projectPositions, nodeInfo: info)
         }
 
-        // Pack instance buffer from CPU-computed matrices
-        packInstanceBuffer()
+        // Collect anim states and upload to GPU buffer for compute kernel dispatch.
+        // CPU state machine updates are done above; GPU computes the 5-part matrix math.
+        // bodyMatrix is still available on each mascot for effect subsystems (arcane, rings, holo).
+        prepareGPUAnimStates()
     }
 
-    // MARK: - Instance Buffer Packing
+    // MARK: - GPU Animation State Preparation
 
-    /// Pack instance data from per-mascot uniformBuffers (CPU-computed matrices).
-    /// GPU matrix compute kernel (mascot_compute_matrices) is available but not yet wired in
-    /// because arcane circle, node rings, and holo screen effects still depend on CPU-side bodyMatrix.
-    private func packInstanceBuffer() {
+    /// Collect MascotAnimState from each mascot and upload to GPU buffer.
+    /// Called once per frame after CPU state machine updates.
+    private func prepareGPUAnimStates() {
         let count = mascots.count
         guard count > 0 else {
             orderedMascots = []
             return
         }
 
-        // Ensure buffer capacity
+        orderedMascots = Array(mascots.values)
+
+        // Ensure anim state buffer capacity
+        if animStateCapacity < count {
+            let cap = max(count, 10)
+            animStateBuffer = device.makeBuffer(
+                length: cap * MemoryLayout<MascotAnimState>.stride,
+                options: .storageModeShared
+            )
+            animStateCapacity = cap
+        }
+
+        // Ensure instance buffer capacity (GPU kernel writes into this)
         if instanceBufferCapacity < count {
             let cap = max(count, 10)
             instanceBuffer = device.makeBuffer(
@@ -225,25 +239,35 @@ final class MascotFleet: MascotNotifier {
             instanceBufferCapacity = cap
         }
 
-        guard let buf = instanceBuffer else { return }
-        let ptr = buf.contents().bindMemory(to: MascotInstanceData.self, capacity: count)
-
-        orderedMascots = Array(mascots.values)
+        // Upload anim states from each mascot's CPU-computed scalar params
+        guard let animBuf = animStateBuffer else { return }
+        let animPtr = animBuf.contents().bindMemory(to: MascotAnimState.self, capacity: count)
         for (i, mascot) in orderedMascots.enumerated() {
-            guard let uniformBuf = mascot.uniformBuffer else { continue }
-            let uniforms = uniformBuf.contents().bindMemory(to: MascotUniforms.self, capacity: 1).pointee
-            ptr[i].parts = uniforms.parts
-            ptr[i].projectTint = mascot.projectTint
-            ptr[i]._instancePad = 0
+            animPtr[i] = mascot.packAnimState()
         }
     }
 
     /// Dispatch GPU matrix compute kernel to fill instance buffer from anim states.
-    /// Reserved for future use when arcane/holo/ring effects are also GPU-ified.
+    /// The kernel computes all 5-part 4x4 matrices per mascot on the GPU.
+    /// bodyMatrix is still available on each MascotSystem for effect subsystems
+    /// (arcane circle, rings, holo screen) — those only need 1 matrix per mascot.
     func dispatchMatrixCompute(encoder: MTLComputeCommandEncoder) {
-        // Currently a no-op — instance buffer is packed from CPU-computed matrices.
-        // The GPU kernel (mascot_compute_matrices) and anim state packing infrastructure
-        // are ready to be activated when effect subsystems no longer depend on CPU bodyMatrix.
+        let count = orderedMascots.count
+        guard count > 0,
+              let pipeline = matrixComputePipeline,
+              let animBuf = animStateBuffer,
+              let instBuf = instanceBuffer else { return }
+
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(animBuf, offset: 0, index: 0)
+        encoder.setBuffer(instBuf, offset: 0, index: 1)
+
+        let tgSize = min(pipeline.maxTotalThreadsPerThreadgroup, 256)
+        let tgCount = (count + tgSize - 1) / tgSize
+        encoder.dispatchThreadgroups(
+            MTLSize(width: tgCount, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: tgSize, height: 1, depth: 1)
+        )
     }
 
     // MARK: - Drawing (opaque pass — instanced)

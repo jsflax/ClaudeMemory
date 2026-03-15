@@ -1,4 +1,5 @@
 import Metal
+import CEngramSceneTypes
 import simd
 
 /// Triple-buffered frame management for the Metal render loop.
@@ -34,9 +35,17 @@ final class MetalBufferPool {
     }
 
     /// Call at the start of each frame. Blocks if GPU is 3 frames behind.
-    func waitForNextFrame() {
-        frameSemaphore.wait()
+    /// Returns false if the wait timed out (GPU hang) — caller should skip the frame.
+    func waitForNextFrame() -> Bool {
+        let result = frameSemaphore.wait(timeout: .now() + .milliseconds(200))
+        if result == .timedOut {
+            // GPU overloaded — skip frame instead of blocking main thread for seconds.
+            // Long blocks here starve WindowServer compositing → system watchdog crash.
+            frameSemaphore.signal()
+            return false
+        }
         frameIndex = (frameIndex + 1) % maxInflightFrames
+        return true
     }
 
     /// Signal that the GPU has finished a frame (call from command buffer completion handler).

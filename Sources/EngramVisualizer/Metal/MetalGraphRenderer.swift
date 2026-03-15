@@ -1,4 +1,5 @@
 import MetalKit
+import CEngramSceneTypes
 import simd
 import os
 import SwiftUI
@@ -38,6 +39,9 @@ final class MetalGraphRenderer: NSObject {
     var stampLabelPipeline: MTLComputePipelineState!
     var stampEdgePipeline: MTLComputePipelineState!
     var packEdgePipeline: MTLComputePipelineState!
+    var packNodePipeline: MTLComputePipelineState?
+    var packNebulaPipeline: MTLComputePipelineState?
+    var packLabelPipeline: MTLComputePipelineState?
 
     // Depth texture
     var depthTexture: MTLTexture?
@@ -107,6 +111,25 @@ final class MetalGraphRenderer: NSObject {
     var flowVertexCapacity: Int = 0
     var actualFlowParticleCount: Int = 0
 
+    // GPU node packing buffers
+    var nodePackInputBuffer: MTLBuffer?
+    var nodePackInputCapacity: Int = 0
+    var pointLightOutputBuffer: MTLBuffer?
+    var pointLightCountBuffer: MTLBuffer?
+    var nodePackParamsBuffer: MTLBuffer?
+    var nodeProjectIdxBuffer: MTLBuffer?
+    var nodeProjectIdxCapacity: Int = 0
+
+    // GPU nebula packing buffers
+    var nebulaGroupInputBuffer: MTLBuffer?
+    var nebulaGroupInputCapacity: Int = 0
+    var nebulaPackParamsBuffer: MTLBuffer?
+
+    // GPU label packing buffers
+    var labelMetadataBuffer: MTLBuffer?
+    var labelMetadataCapacity: Int = 0
+    var labelPackParamsBuffer: MTLBuffer?
+
     // Galaxy registry — used to draw fleet mascots
     weak var galaxyRegistryRef: GalaxyRegistry?
 
@@ -152,6 +175,11 @@ final class MetalGraphRenderer: NSObject {
         labelStampParamsBuffer = device.makeBuffer(length: MemoryLayout<LabelStampParams>.stride, options: .storageModeShared)
         edgeStampParamsBuffer = device.makeBuffer(length: MemoryLayout<EdgeStampParams>.stride, options: .storageModeShared)
         packEdgeParamsBuffer = device.makeBuffer(length: MemoryLayout<PackEdgeParams>.stride, options: .storageModeShared)
+        nodePackParamsBuffer = device.makeBuffer(length: MemoryLayout<NodePackParams>.stride, options: .storageModeShared)
+        nebulaPackParamsBuffer = device.makeBuffer(length: MemoryLayout<NebulaPackParams>.stride, options: .storageModeShared)
+        labelPackParamsBuffer = device.makeBuffer(length: MemoryLayout<LabelPackParams>.stride, options: .storageModeShared)
+        pointLightOutputBuffer = device.makeBuffer(length: 16 * MemoryLayout<PointLightEntry>.stride, options: .storageModeShared)
+        pointLightCountBuffer = device.makeBuffer(length: MemoryLayout<UInt32>.stride, options: .storageModeShared)
 
         renderLog.info("[MetalGraphRenderer] Initialized with device: \(device.name)")
     }
@@ -190,6 +218,15 @@ final class MetalGraphRenderer: NSObject {
         }
         if let fn = library.makeFunction(name: "pack_edge_instances") {
             packEdgePipeline = try? device.makeComputePipelineState(function: fn)
+        }
+        if let fn = library.makeFunction(name: "pack_node_instances") {
+            packNodePipeline = try? device.makeComputePipelineState(function: fn)
+        }
+        if let fn = library.makeFunction(name: "pack_nebula_vertices") {
+            packNebulaPipeline = try? device.makeComputePipelineState(function: fn)
+        }
+        if let fn = library.makeFunction(name: "pack_label_instances") {
+            packLabelPipeline = try? device.makeComputePipelineState(function: fn)
         }
     }
 
@@ -449,6 +486,97 @@ final class MetalGraphRenderer: NSObject {
         nodePositionCapacity = needed
     }
 
+    // MARK: - GPU Node Packing Buffers
+
+    func ensureNodePackBuffers(count: Int) {
+        guard count > nodePackInputCapacity else { return }
+        let needed = max(count * 2, 512)
+        nodePackInputBuffer = device.makeBuffer(
+            length: needed * MemoryLayout<NodePackInput>.stride,
+            options: .storageModeShared
+        )
+        nodeProjectIdxBuffer = device.makeBuffer(
+            length: needed * MemoryLayout<UInt32>.stride,
+            options: .storageModeShared
+        )
+        nodePackInputCapacity = needed
+        nodeProjectIdxCapacity = needed
+    }
+
+    // MARK: - Pack Nodes (GPU Compute)
+
+    /// GPU dispatch: NodePackInput[] → NodeInstance[] + point lights.
+    /// Called from the compute encoder before stampNodes.
+    /// MetalSceneManager prepares nodePackInputBuffer; this dispatches the kernel.
+    func packNodesGPU(encoder: MTLComputeCommandEncoder) {
+        guard actualNodeCount > 0,
+              let pipeline = packNodePipeline,
+              let inputBuf = nodePackInputBuffer,
+              let instanceBuf = nodeInstanceBuffer,
+              let lightBuf = pointLightOutputBuffer,
+              let lightCountBuf = pointLightCountBuffer,
+              let paramsBuf = nodePackParamsBuffer,
+              let projIdxBuf = nodeProjectIdxBuffer else { return }
+
+        // Reset point light counter
+        lightCountBuf.contents().bindMemory(to: UInt32.self, capacity: 1).pointee = 0
+
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(inputBuf, offset: 0, index: 0)
+        encoder.setBuffer(instanceBuf, offset: 0, index: 1)
+        // Centroids buffer (index 2) — not used yet, pass a dummy
+        encoder.setBuffer(lightBuf, offset: 0, index: 2)
+        encoder.setBuffer(lightBuf, offset: 0, index: 3)
+        encoder.setBuffer(lightCountBuf, offset: 0, index: 4)
+        encoder.setBuffer(paramsBuf, offset: 0, index: 5)
+        encoder.setBuffer(projIdxBuf, offset: 0, index: 6)
+
+        let threadgroupSize = min(pipeline.maxTotalThreadsPerThreadgroup, 256)
+        let threadgroups = (actualNodeCount + threadgroupSize - 1) / threadgroupSize
+        encoder.dispatchThreadgroups(
+            MTLSize(width: threadgroups, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: threadgroupSize, height: 1, depth: 1)
+        )
+    }
+
+    // MARK: - GPU Nebula Packing Buffers
+
+    func ensureNebulaGroupInputBuffer(count: Int) {
+        guard count > nebulaGroupInputCapacity else { return }
+        let needed = max(count * 2, 32)
+        nebulaGroupInputBuffer = device.makeBuffer(
+            length: needed * MemoryLayout<NebulaGroupInput>.stride,
+            options: .storageModeShared
+        )
+        nebulaGroupInputCapacity = needed
+    }
+
+    // MARK: - Pack Nebula (GPU Compute)
+
+    /// GPU dispatch: NebulaGroupInput[] → NebulaQuadVertex[].
+    /// MetalSceneManager prepares nebulaGroupInputBuffer; this dispatches the kernel.
+    var nebulaGroupCount: Int = 0
+
+    func packNebulaGPU(encoder: MTLComputeCommandEncoder) {
+        guard nebulaGroupCount > 0,
+              let pipeline = packNebulaPipeline,
+              let inputBuf = nebulaGroupInputBuffer,
+              let outputBuf = nebulaVertexBuffer,
+              let paramsBuf = nebulaPackParamsBuffer else { return }
+
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(inputBuf, offset: 0, index: 0)
+        encoder.setBuffer(outputBuf, offset: 0, index: 1)
+        encoder.setBuffer(paramsBuf, offset: 0, index: 2)
+
+        let threadgroupSize = min(pipeline.maxTotalThreadsPerThreadgroup, 256)
+        let threadgroups = (nebulaGroupCount + threadgroupSize - 1) / threadgroupSize
+        encoder.dispatchThreadgroups(
+            MTLSize(width: threadgroups, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: threadgroupSize, height: 1, depth: 1)
+        )
+    }
+
     // MARK: - Pack Edges (GPU Compute)
 
     func packEdgesGPU(encoder: MTLComputeCommandEncoder) {
@@ -692,7 +820,10 @@ extension MetalGraphRenderer: MTKViewDelegate {
 
         // Wait for a free frame slot
         let waitStart = CFAbsoluteTimeGetCurrent()
-        bufferPool.waitForNextFrame()
+        guard bufferPool.waitForNextFrame() else {
+            os_log(.fault, log: Self.stallLog, "GPU HANG: frameSemaphore timed out — skipping frame")
+            return
+        }
         let waitMs = (CFAbsoluteTimeGetCurrent() - waitStart) * 1000.0
         if waitMs > 10 {
             os_log(.fault, log: Self.stallLog, "HOTPATH: bufferPool.wait %.1fms", waitMs)
@@ -749,8 +880,14 @@ extension MetalGraphRenderer: MTKViewDelegate {
         bufferPool.updateFrameUniforms(frameUniforms)
         bufferPool.updateLightingUniforms(lightingUniforms)
 
-        // GPU compute: stamp node spheres, edge cylinders, label quads + thruster particles (single shared encoder)
+        // GPU compute: pack + stamp node spheres, edge cylinders, label quads + thruster particles (single shared encoder)
         if let computeEncoder = commandBuffer.makeComputeCommandEncoder() {
+            // Pack nodes (GPU): NodePackInput[] → NodeInstance[] + point lights
+            packNodesGPU(encoder: computeEncoder)
+            // Barrier: stampNodes reads nodeInstanceBuffer that packNodesGPU just wrote
+            if let buf = nodeInstanceBuffer, actualNodeCount > 0, nodePackInputBuffer != nil {
+                computeEncoder.memoryBarrier(resources: [buf])
+            }
             stampNodes(encoder: computeEncoder)
             if edgeDataDirty {
                 packEdgesGPU(encoder: computeEncoder)
@@ -761,6 +898,14 @@ extension MetalGraphRenderer: MTKViewDelegate {
                 stampEdges(encoder: computeEncoder)
                 edgeDataDirty = false
             }
+
+            // Pack nebula (GPU): NebulaGroupInput[] → NebulaQuadVertex[]
+            packNebulaGPU(encoder: computeEncoder)
+            // Barrier: render reads nebulaVertexBuffer that packNebulaGPU just wrote
+            if let buf = nebulaVertexBuffer, nebulaGroupCount > 0 {
+                computeEncoder.memoryBarrier(resources: [buf])
+            }
+
             stampLabels(encoder: computeEncoder)
 
             // Dispatch GPU mascot matrix compute + thruster particle compute for each galaxy's fleet

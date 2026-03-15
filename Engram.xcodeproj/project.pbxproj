@@ -20,6 +20,8 @@
 		A1B2C3D400000000000006 /* GoogleSignInSwift in Frameworks */ = {isa = PBXBuildFile; productRef = D4E5F60000000000000005 /* GoogleSignInSwift */; };
 		UITEST00000000000000101 /* EngramKit in Frameworks */ = {isa = PBXBuildFile; productRef = UITEST00000000000000201 /* EngramKit */; };
 		UITEST00000000000000102 /* Lattice in Frameworks */ = {isa = PBXBuildFile; productRef = UITEST00000000000000202 /* Lattice */; };
+		E5F60000000000000000007 /* EngramSceneKit in Frameworks */ = {isa = PBXBuildFile; productRef = E5F60000000000000000107 /* EngramSceneKit */; };
+		E5F60000000000000000008 /* CEngramSceneTypes in Frameworks */ = {isa = PBXBuildFile; productRef = E5F60000000000000000108 /* CEngramSceneTypes */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -81,6 +83,8 @@
 				A1B2C3D400000000000004 /* Sparkle in Frameworks */,
 				A1B2C3D400000000000005 /* GoogleSignIn in Frameworks */,
 				A1B2C3D400000000000006 /* GoogleSignInSwift in Frameworks */,
+				E5F60000000000000000007 /* EngramSceneKit in Frameworks */,
+				E5F60000000000000000008 /* CEngramSceneTypes in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -163,6 +167,8 @@
 				53DCFB6E2F55D76C0021613A /* EngramFoundationModels */,
 				53DCFB702F55D76C0021613A /* EngramKit */,
 				53DCFB722F55D76C0021613A /* EngramModels */,
+				E5F60000000000000000107 /* EngramSceneKit */,
+				E5F60000000000000000108 /* CEngramSceneTypes */,
 			);
 			productName = Engram;
 			productReference = B2C3D4E500000000000002 /* Engram.app */;
@@ -677,6 +683,14 @@
 		UITEST00000000000000202 /* Lattice */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = Lattice;
+		};
+		E5F60000000000000000107 /* EngramSceneKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = EngramSceneKit;
+		};
+		E5F60000000000000000108 /* CEngramSceneTypes */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = CEngramSceneTypes;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

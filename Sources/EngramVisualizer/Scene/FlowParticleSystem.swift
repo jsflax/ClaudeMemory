@@ -1,4 +1,5 @@
 import Metal
+import CEngramSceneTypes
 import simd
 import SwiftUI
 

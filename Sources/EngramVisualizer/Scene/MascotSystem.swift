@@ -1,4 +1,5 @@
 import Metal
+import CEngramSceneTypes
 import MetalKit
 import simd
 import AppKit

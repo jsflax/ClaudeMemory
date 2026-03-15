@@ -1,8 +1,10 @@
 import Metal
+import CEngramSceneTypes
 import simd
 import SwiftUI
 import os
 import GameController
+import EngramSceneKit
 
 private let frameLog = Logger(subsystem: "io.engram.app", category: "MetalScene")
 
@@ -23,6 +25,9 @@ final class MetalSceneManager {
 
     // External references (set by Graph3DView)
     weak var camera3DState: Camera3DState?
+    // Pushed from SwiftUI onChange handlers — never read from @Model in renderTick
+    var soundEnabled: Bool = false
+    var notificationsEnabled: Bool = false
 
     /// Galaxy registry — ticks all galaxy simulations and provides merged render data.
     var galaxyRegistry: GalaxyRegistry? {
@@ -114,6 +119,7 @@ final class MetalSceneManager {
 
     // GPU edge packing state
     private var nodeIndexMap: [UUID: UInt32] = [:]
+    private var cachedResolvedEdges: [ResolvedEdge] = []
     private var lastEdgeDescriptorTopologyCount: Int = 0
     private var lastEdgeDescriptorSelection: UUID? = nil
     private var lastEdgeDescriptorSearchActive: Bool = false
@@ -126,7 +132,7 @@ final class MetalSceneManager {
     var projectLabelAtlasRects: [String: (u0: Float, v0: Float, u1: Float, v1: Float)] = [:]
     var galaxyLabelAtlasRects: [String: (u0: Float, v0: Float, u1: Float, v1: Float)] = [:]
     var topicLabelAtlasRects: [String: (u0: Float, v0: Float, u1: Float, v1: Float)] = [:]
-    var projectCentroids: [String: (centroid: SIMD3<Float>, radius: Float, maxY: Float)] = [:]
+    var projectCentroids: [String: (centroid: SIMD3<Float>, radius: Float, maxY: Float, count: Int)] = [:]
     // Cached by packNodeInstances for packLabelInstances — avoids redundant position passes
     private var cachedMinDepth: Float = .greatestFiniteMagnitude
     private var cachedMaxDepth: Float = 0
@@ -210,7 +216,33 @@ final class MetalSceneManager {
         // Tick ALL galaxy simulations + compute merged positions
         let simStart = CFAbsoluteTimeGetCurrent()
         var didUpdatePositions = false
+        #if ENGRAM_INSTRUMENTATION
+        var drainMs: Double = 0
+        #endif
         if let registry = galaxyRegistry {
+            // Build DrainConfig from VisualizerConfig + layout mode each frame.
+            let drainConfig = DrainConfig(
+                hiddenProjects: registry.hiddenProjects,
+                hiddenRelations: registry.hiddenRelations,
+                timeFilter: nil,
+                is3D: layoutMode == .forceDirected,
+                soundEnabled: soundEnabled,
+                notificationsEnabled: notificationsEnabled
+            )
+            registry.currentDrainConfig = drainConfig
+
+            // Drain pending updates from Galaxy actors — atomic, before sim tick.
+            // All store + simulation mutations happen here, ensuring consistency.
+            #if ENGRAM_INSTRUMENTATION
+            let drainStart = CFAbsoluteTimeGetCurrent()
+            #endif
+            for galaxy in registry.galaxies.values {
+                galaxy.drainPendingUpdate(config: drainConfig)
+            }
+            #if ENGRAM_INSTRUMENTATION
+            drainMs = (CFAbsoluteTimeGetCurrent() - drainStart) * 1000.0
+            #endif
+
             var anyActive = false
             for galaxy in registry.galaxies.values {
                 // Skip simulation during initial batch loading — nodes are still arriving
@@ -220,11 +252,12 @@ final class MetalSceneManager {
                     galaxy.simulation3D.tick()
                 }
                 galaxy.embeddingProjection.tickAnimation3D()
-                if !galaxy.simulation3D.isSettled || !galaxy.embeddingProjection.is3DAnimationSettled {
+                if !galaxy.simulation3D.isSettled || galaxy.simulation3D.isLocalWake || !galaxy.embeddingProjection.is3DAnimationSettled {
                     anyActive = true
                 }
             }
 
+            #if ENGRAM_INSTRUMENTATION
             // Diagnostic: log per-galaxy sim state once per second
             if renderFrameCount % 60 == 0 && registry.galaxies.count > 1 {
                 for galaxy in registry.galaxies.values {
@@ -232,7 +265,8 @@ final class MetalSceneManager {
                     print("SIM[\(galaxy.id)] frame=\(renderFrameCount) initLoad=\(galaxy.isInitialLoad) settled=\(sim.isSettled) nodes=\(sim.nodeCount) positions=\(sim.positions.count) alpha=\(String(format: "%.4f", sim.alpha)) maxSpeedSq=\(String(format: "%.4f", sim.lastMaxSpeedSq)) atten=\(String(format: "%.4f", sim.smoothedAttenuation)) forceAge=\(sim.forceAge) tickInFlight=\(sim.tickInFlight) framesSinceWake=\(sim.framesSinceWake) center=(\(String(format: "%.0f", sim.center.x)),\(String(format: "%.0f", sim.center.y)),\(String(format: "%.0f", sim.center.z)))")
                 }
             }
-
+            #endif
+            
             registry.mergeRenderData()
 
             // Prune expired glow/arrival entries so visualOnlyChanged goes false.
@@ -543,6 +577,11 @@ final class MetalSceneManager {
             labelsMs = (CFAbsoluteTimeGetCurrent() - t4) * 1000.0
         }
 
+        let frameTotalMs = (CFAbsoluteTimeGetCurrent() - frameStart) * 1000.0
+        if renderFrameCount % 60 == 1 || frameTotalMs > 20 {
+            print("[engram:frame] #\(renderFrameCount) total=\(String(format: "%.1f", frameTotalMs))ms sim=\(String(format: "%.1f", simMs))ms mascot=\(String(format: "%.1f", mascotMs))ms nodes=\(String(format: "%.1f", nodesMs))ms edges=\(String(format: "%.1f", edgesMs))ms labels=\(String(format: "%.1f", labelsMs))ms neb=\(String(format: "%.1f", nebMs))ms nodeCount=\(positions.count) edgeCount=\(renderEdges.count)")
+        }
+
         // Report camera state
         if let camState = camera3DState {
             if camera.azimuth != camState.azimuth { camState.azimuth = camera.azimuth }
@@ -582,11 +621,11 @@ final class MetalSceneManager {
         if metalTimingFile == nil {
             metalTimingFile = fopen("/tmp/metal-frame-timing.csv", "w")
             if let f = metalTimingFile {
-                fputs("frame,dt_ms,wall_dt_ms,total_ms,sim_ms,mascot_ms,nodes_ms,edges_ms,neb_ms,labels_ms,flow_ms,node_count,edge_count,reason,audio_ms\n", f)
+                fputs("frame,dt_ms,wall_dt_ms,total_ms,drain_ms,sim_ms,mascot_ms,nodes_ms,edges_ms,neb_ms,labels_ms,flow_ms,node_count,edge_count,reason,audio_ms\n", f)
             }
         }
         if let f = metalTimingFile, (isActive || renderFrameCount % 30 == 0) {
-            let line = "\(renderFrameCount),\(String(format: "%.2f", dt * 1000)),\(String(format: "%.2f", wallDt)),\(String(format: "%.2f", totalMs)),\(String(format: "%.2f", simMs)),\(String(format: "%.2f", mascotMs)),\(String(format: "%.2f", nodesMs)),\(String(format: "%.2f", edgesMs)),\(String(format: "%.2f", nebMs)),\(String(format: "%.2f", labelsMs)),\(String(format: "%.2f", flowMs)),\(nodeCount),\(edgeCount),\(reason),\(String(format: "%.2f", audioMs))\n"
+            let line = "\(renderFrameCount),\(String(format: "%.2f", dt * 1000)),\(String(format: "%.2f", wallDt)),\(String(format: "%.2f", totalMs)),\(String(format: "%.2f", drainMs)),\(String(format: "%.2f", simMs)),\(String(format: "%.2f", mascotMs)),\(String(format: "%.2f", nodesMs)),\(String(format: "%.2f", edgesMs)),\(String(format: "%.2f", nebMs)),\(String(format: "%.2f", labelsMs)),\(String(format: "%.2f", flowMs)),\(nodeCount),\(edgeCount),\(reason),\(String(format: "%.2f", audioMs))\n"
             fputs(line, f)
             fflush(f)
         }
@@ -636,11 +675,11 @@ final class MetalSceneManager {
     }
     #endif
 
-    // MARK: - Node Instance Packing
+    // MARK: - Node Instance Packing (GPU-accelerated)
 
     private func packNodeInstances() {
-        let nodeCount = positions.count
-        guard nodeCount > 0 else {
+        let nodes = renderNodes
+        guard !nodes.isEmpty else {
             renderer.actualNodeCount = 0
             return
         }
@@ -649,19 +688,13 @@ final class MetalSceneManager {
         let packStart = CFAbsoluteTimeGetCurrent()
         #endif
 
-        let hubs = renderHubs
         let colorMap = renderColorMap
-        let nodeById = galaxyRegistry?.mergedNodeById ?? [:]
         let now = Date()
 
-        if instanceArray.count < nodeCount {
-            instanceArray = [NodeInstance](repeating: NodeInstance(position: .zero, scale: 0, color: .zero), count: max(nodeCount * 2, 512))
-        }
-
-        // Pre-compute inspecting nodes and birthing nodes across all galaxies
-        // to avoid O(N×M) galaxy scans inside the per-node loop.
+        // Pre-compute inspecting nodes and birthing elapsed times across all galaxies
         var inspectingIntensity: [UUID: Float] = [:]
-        var birthingNodeStarts: [UUID: (date: Date, galaxyId: String)] = [:]
+        var birthingElapsed: [UUID: Float] = [:]
+        var birthingGalaxyMap: [UUID: String] = [:]
         if let registry = galaxyRegistry {
             for galaxy in registry.galaxies.values {
                 if let fleet = galaxy.mascotFleet {
@@ -672,9 +705,22 @@ final class MetalSceneManager {
                     }
                 }
                 for (nodeId, start) in galaxy.renderStore.birthingNodes {
-                    birthingNodeStarts[nodeId] = (start, galaxy.id)
+                    birthingElapsed[nodeId] = Float(now.timeIntervalSince(start))
+                    birthingGalaxyMap[nodeId] = galaxy.id
                 }
             }
+        }
+
+        // Convert glow/arrival Dates → elapsed Floats for the pure builder
+        var glowElapsed: [UUID: Float] = [:]
+        for (id, date) in glowingNodes { glowElapsed[id] = Float(now.timeIntervalSince(date)) }
+        var arrivalElapsed: [UUID: Float] = [:]
+        for (id, date) in newNodes { arrivalElapsed[id] = Float(now.timeIntervalSince(date)) }
+
+        // Pre-convert project colors to SIMD3<Float>
+        var projectColors: [String: SIMD3<Float>] = [:]
+        for (project, _) in colorMap {
+            projectColors[project] = nodeColorFloat3(for: project, colorMap: colorMap)
         }
 
         #if ENGRAM_INSTRUMENTATION
@@ -682,200 +728,131 @@ final class MetalSceneManager {
         let packLoopStart = CFAbsoluteTimeGetCurrent()
         #endif
 
-        // Point lights
-        var pointLightCount: Int = 0
-
-        // Prepare GPU position buffer for edge packing (piggyback on this iteration)
-        let posCount = nodeIndexMap.count > 0 ? nodeIndexMap.count : nodeCount
-        renderer.ensureNodePositionBuffer(count: posCount)
-        let gpuPosPtr: UnsafeMutablePointer<SIMD3<Float>>?
-        if let posBuf = renderer.nodePositionBuffer {
-            gpuPosPtr = posBuf.contents().bindMemory(to: SIMD3<Float>.self, capacity: posCount)
-        } else {
-            gpuPosPtr = nil
+        // Build the NodeFrame using the pure builder (testable, no GPU dependency)
+        let t_input = CFAbsoluteTimeGetCurrent()
+        // Rebuild nodeIndexMap and cached node data only when topology changes
+        if nodes.count != lastTopologyNodeCount {
+            nodeIndexMap.removeAll(keepingCapacity: true)
+            cachedNodeProject.removeAll(keepingCapacity: true)
+            cachedNodeRadii.removeAll(keepingCapacity: true)
+            for (i, node) in nodes.enumerated() {
+                nodeIndexMap[node.id] = UInt32(i)
+                cachedNodeProject[node.id] = node.project
+                let isHub = renderHubs.contains(node.id)
+                let importance = max(1, node.importance)
+                let baseR: Float = isHub ? nodeRadius * 1.6 : nodeRadius
+                cachedNodeRadii[node.id] = baseR * (1.0 + Float(importance - 1) * 0.08)
+            }
+            lastTopologyNodeCount = nodes.count
         }
 
-        // Accumulate per-project centroid data in the same pass (avoids redundant iteration in packLabelInstances)
-        var centroidSums: [String: (sum: SIMD3<Float>, count: Int, maxY: Float)] = [:]
-        let camPos = camera.cameraPosition
-        var depthMin: Float = .greatestFiniteMagnitude
-        var depthMax: Float = 0
+        let frameInput = SceneNodeFrameInput(
+            nodes: nodes.map { (id: $0.id, project: $0.project, importance: $0.importance) },
+            positions: positions,
+            hubs: renderHubs,
+            projectColors: projectColors,
+            selectedNode: selectedNode,
+            glowingNodes: glowElapsed,
+            newNodes: arrivalElapsed,
+            isSearchActive: isSearchActive,
+            searchMatchIds: searchMatchIds,
+            inspectingIntensity: inspectingIntensity,
+            birthingElapsed: birthingElapsed,
+            nodeRadius: nodeRadius,
+            cameraPosition: camera.cameraPosition,
+            nodeIndexMap: nodeIndexMap,
+            nodeRadii: cachedNodeRadii
+        )
+        let t_build = CFAbsoluteTimeGetCurrent()
+        let nodeFrame = buildSceneNodeFrame(frameInput)
+        let t_built = CFAbsoluteTimeGetCurrent()
+        let actualCount = nodeFrame.packInputs.count
 
-        var idx = 0
-        for (id, pos) in positions {
-            // Write raw sim-space position to GPU buffer for edge packing
-            if let gpuPos = gpuPosPtr, let posIdx = nodeIndexMap[id] {
-                gpuPos[Int(posIdx)] = pos
-            }
-
-            // Depth range for labels (piggybacked — saves a full pass later)
-            let d = simd_length(pos - camPos)
-            depthMin = min(depthMin, d)
-            depthMax = max(depthMax, d)
-
-            guard let nodeData = nodeById[id] else { continue }
-
-            // Centroid accumulation (piggybacked — saves two full passes later)
-            var entry = centroidSums[nodeData.project, default: (.zero, 0, -.greatestFiniteMagnitude)]
-            entry.sum += pos
-            entry.count += 1
-            entry.maxY = max(entry.maxY, pos.y)
-            centroidSums[nodeData.project] = entry
-
-            let worldPos = pos * scaleFactor
-            let isHub = hubs.contains(id)
-            let importance = max(1, nodeData.importance)
-            let baseRadius: Float = isHub ? nodeRadius * 1.6 : nodeRadius
-            let r = baseRadius * (1.0 + Float(importance - 1) * 0.08)
-
-            // Recall glow
-            let ri: Float = {
-                guard let glowStart = glowingNodes[id], id != selectedNode else { return 0 }
-                let elapsed = Float(now.timeIntervalSince(glowStart))
-                let fadeIn: Float = 1.0, hold: Float = 1.5, fadeOut: Float = 2.0
-                if elapsed < fadeIn { let t = elapsed / fadeIn; return t * t * t }
-                else if elapsed < fadeIn + hold { return 1.0 }
-                else if elapsed < fadeIn + hold + fadeOut {
-                    let t = 1.0 - (elapsed - fadeIn - hold) / fadeOut; return t * t
-                }
-                return 0
-            }()
-
-            // Arrival intensity
-            let ai: Float = {
-                guard let arrivalTime = newNodes[id] else { return 0 }
-                let elapsed = Float(now.timeIntervalSince(arrivalTime))
-                let fadeIn: Float = 0.8, hold: Float = 2.0, fadeOut: Float = 3.0
-                if elapsed < fadeIn { let t = elapsed / fadeIn; return t * t * t }
-                else if elapsed < fadeIn + hold { return 1.0 }
-                else if elapsed < fadeIn + hold + fadeOut {
-                    let t = 1.0 - (elapsed - fadeIn - hold) / fadeOut; return t * t
-                }
-                return 0
-            }()
-
-            let searchDimmed = isSearchActive && !searchMatchIds.contains(id)
-            let searchMatched = isSearchActive && searchMatchIds.contains(id) && id != selectedNode
-            let isInspecting = inspectingIntensity[id] != nil
-
-            // Check birth/death states from pre-computed map
-            let birthEntry = birthingNodeStarts[id]
-            let isBirthing = birthEntry != nil
-            let birthIntensity: Float = {
-                guard let entry = birthEntry else { return 0 }
-                return min(Float(now.timeIntervalSince(entry.date)) / 1.5, 1.0)  // 0→1 over 1.5s
-            }()
-            // Clean up completed births
-            if birthIntensity >= 1.0, let entry = birthEntry {
-                galaxyRegistry?.galaxies[entry.galaxyId]?.renderStore.birthingNodes.removeValue(forKey: id)
-            }
-
-            let curState: Float
-            let curIntensity: Float
-            if isBirthing {
-                curState = 6; curIntensity = birthIntensity  // birth: scale 0→1
-            } else if id == selectedNode {
-                curState = 1; curIntensity = 0
-            } else if searchMatched {
-                curState = 4; curIntensity = 0
-            } else if searchDimmed {
-                // When search is active, suppress recall/arrival glow on non-matched nodes
-                curState = 0; curIntensity = 0
-            } else if isInspecting {
-                curState = 5; curIntensity = inspectingIntensity[id] ?? 0.5
-            } else if ri > 0 {
-                curState = 2; curIntensity = ri
-            } else if ai > 0 {
-                curState = 3; curIntensity = ai
-            } else {
-                curState = 0; curIntensity = 0
-            }
-
-            let packedState: Float = curState + (searchDimmed ? 10.0 : 0.0) + curIntensity * 0.01
-
-            let color: SIMD3<Float> = id == selectedNode
-                ? SIMD3<Float>(1, 1, 1)
-                : nodeColorFloat3(for: nodeData.project, colorMap: colorMap)
-
-            instanceArray[idx] = NodeInstance(
-                position: worldPos,
-                scale: r,
-                color: SIMD4<Float>(color.x, color.y, color.z, packedState)
-            )
-            idx += 1
-
-            // Pack point lights into uniform buffer
-            if (curState >= 1 && curState <= 5) && pointLightCount < 16 {
-                let lightColor: SIMD3<Float>
-                let intensity: Float
-                let atten: Float
-                if curState == 2 {
-                    let pulse = 1.0 + sin(renderer.animationTime * 3.0) * 0.4
-                    lightColor = SIMD3(0.7, 0.9, 1.0)
-                    intensity = 3.0 * curIntensity * pulse
-                    atten = 0.5
-                } else if curState == 3 {
-                    let pulse = 1.0 + sin(renderer.animationTime * 2.5) * 0.4
-                    lightColor = SIMD3(1.0, 0.8, 0.3)
-                    intensity = 3.0 * curIntensity * pulse
-                    atten = 0.5
-                } else if curState == 4 {
-                    let pulse = 1.0 + sin(renderer.animationTime * 4.0) * 0.3
-                    lightColor = SIMD3(0.0, 0.9, 1.0)
-                    intensity = 4.0 * pulse
-                    atten = 0.4
-                } else if curState == 5 {
-                    let pulse = 1.0 + sin(renderer.animationTime * 2.0) * 0.2
-                    lightColor = SIMD3(0.2, 0.6, 0.9)
-                    intensity = 2.0 * curIntensity * pulse
-                    atten = 0.4
-                } else {
-                    lightColor = SIMD3(1, 1, 1)
-                    intensity = 2.0
-                    atten = 0.3
-                }
-                setPointLight(index: pointLightCount, position: worldPos, color: lightColor, intensity: intensity, attenuation: atten)
-                pointLightCount += 1
+        // Apply side effect: remove completed births from render stores
+        for nodeId in nodeFrame.completedBirths {
+            if let galaxyId = birthingGalaxyMap[nodeId] {
+                galaxyRegistry?.galaxies[galaxyId]?.renderStore.birthingNodes.removeValue(forKey: nodeId)
             }
         }
 
-        let actualNodeCount = idx
-        renderer.lightingUniforms.pointLightCount = UInt32(pointLightCount)
+        // Upload NodeFrame to GPU buffers
+        let t_upload = CFAbsoluteTimeGetCurrent()
+        let nodeCount = nodes.count
+        renderer.ensureNodeBuffers(nodeCount: nodeCount)
+        renderer.ensureNodePackBuffers(count: nodeCount)
+        renderer.ensureNodePositionBuffer(count: nodeCount)
+
+        guard let packBuf = renderer.nodePackInputBuffer,
+              let posBuf = renderer.nodePositionBuffer else {
+            renderer.actualNodeCount = 0
+            return
+        }
+
+        let packPtr = packBuf.contents().bindMemory(to: NodePackInput.self, capacity: nodeCount)
+        let posPtr = posBuf.contents().bindMemory(to: SIMD3<Float>.self, capacity: nodeCount)
+
+        nodeFrame.packInputs.withUnsafeBufferPointer { ptr in
+            guard let base = ptr.baseAddress else { return }
+            packPtr.update(from: base, count: actualCount)
+        }
+        nodeFrame.nodePositions.withUnsafeBufferPointer { ptr in
+            guard let base = ptr.baseAddress else { return }
+            posPtr.update(from: base, count: actualCount)
+        }
 
         // Finalize centroid + depth caches (consumed by packLabelInstances)
         projectCentroids.removeAll(keepingCapacity: true)
-        for (project, data) in centroidSums where data.count >= 2 {
-            let centroid = data.sum / Float(data.count)
-            projectCentroids[project] = (centroid: centroid, radius: 0, maxY: data.maxY)
+        for (project, data) in nodeFrame.projectCentroids {
+            projectCentroids[project] = (centroid: data.centroid, radius: 0, maxY: data.maxY, count: data.count)
         }
-        cachedMinDepth = depthMin
-        cachedMaxDepth = depthMax
+        cachedMinDepth = nodeFrame.minDepth
+        cachedMaxDepth = nodeFrame.maxDepth
 
-        // Upload instance data to renderer
-        renderer.ensureNodeBuffers(nodeCount: actualNodeCount)
-        if let instanceBuf = renderer.nodeInstanceBuffer {
-            instanceArray.withUnsafeBufferPointer { ptr in
-                guard let base = ptr.baseAddress else { return }
-                instanceBuf.contents().copyMemory(
-                    from: base,
-                    byteCount: actualNodeCount * MemoryLayout<NodeInstance>.stride
-                )
-            }
+        // Set GPU pack params — the pack_node_instances kernel runs in the compute pass
+        if let paramsBuf = renderer.nodePackParamsBuffer {
+            let paramsPtr = paramsBuf.contents().bindMemory(to: NodePackParams.self, capacity: 1)
+            paramsPtr.pointee = NodePackParams(
+                nodeCount: UInt32(actualCount),
+                scaleFactor: scaleFactor,
+                nodeRadius: nodeRadius,
+                animationTime: renderer.animationTime,
+                projectCount: UInt32(projectCentroids.count),
+                _pad0: 0, _pad1: 0, _pad2: 0
+            )
         }
 
-        // Set stamp params
+        // Set stamp params for stamp_node_spheres kernel
         if let paramsBuf = renderer.nodeStampParamsBuffer {
             let paramsPtr = paramsBuf.contents().bindMemory(to: StampParams.self, capacity: 1)
             paramsPtr.pointee = StampParams(
                 vertsPerNode: UInt32(renderer.vertsPerSphere),
-                nodeCount: UInt32(actualNodeCount)
+                nodeCount: UInt32(actualCount)
             )
         }
 
-        renderer.actualNodeCount = actualNodeCount
+        renderer.actualNodeCount = actualCount
+
+        // Read back point lights from GPU after the compute pass completes (1-frame latency).
+        if let lightCountBuf = renderer.pointLightCountBuffer,
+           let lightBuf = renderer.pointLightOutputBuffer {
+            let count = min(Int(lightCountBuf.contents().bindMemory(to: UInt32.self, capacity: 1).pointee), 16)
+            let lights = lightBuf.contents().bindMemory(to: PointLightEntry.self, capacity: count)
+            for i in 0..<count {
+                setPointLight(index: i, position: lights[i].position, color: lights[i].color,
+                              intensity: lights[i].intensity, attenuation: lights[i].attenuation)
+            }
+            renderer.lightingUniforms.pointLightCount = UInt32(count)
+        }
+
         if !nodeIndexMap.isEmpty {
-            nodePositionsDirty = false  // positions uploaded in this loop
-            renderer.edgeDataDirty = true  // GPU needs to re-pack edges with new positions
+            nodePositionsDirty = false
+            renderer.edgeDataDirty = true
+        }
+
+        let t_done = CFAbsoluteTimeGetCurrent()
+        let packTotalCheck = (t_done - t_input) * 1000.0
+        if packTotalCheck > 10 {
+            print("[engram:pack] n=\(actualCount) input=\(String(format: "%.1f", (t_build - t_input) * 1000))ms build=\(String(format: "%.1f", (t_built - t_build) * 1000))ms upload=\(String(format: "%.1f", (t_done - t_upload) * 1000))ms total=\(String(format: "%.1f", packTotalCheck))ms")
         }
 
         #if ENGRAM_INSTRUMENTATION
@@ -887,7 +864,6 @@ final class MetalSceneManager {
                 fputs("frame,dt_ms,wall_dt_ms,total_ms,sim_ms,mascot_ms,nodes_ms,edges_ms,neb_ms,labels_ms,flow_ms,node_count,edge_count,reason\n", f)
             }
         }
-        // Append pack timing to a separate CSV for detailed analysis
         do {
             struct PackTiming { nonisolated(unsafe) static var file: UnsafeMutablePointer<FILE>? = nil }
             if PackTiming.file == nil {
@@ -897,7 +873,7 @@ final class MetalSceneManager {
                 }
             }
             if let f = PackTiming.file {
-                let line = "\(renderFrameCount),\(String(format: "%.2f", packPrecomputeMs)),\(String(format: "%.2f", packLoopMs)),\(String(format: "%.2f", packTotalMs)),\(actualNodeCount)\n"
+                let line = "\(renderFrameCount),\(String(format: "%.2f", packPrecomputeMs)),\(String(format: "%.2f", packLoopMs)),\(String(format: "%.2f", packTotalMs)),\(actualCount)\n"
                 fputs(line, f)
                 fflush(f)
             }
@@ -940,132 +916,73 @@ final class MetalSceneManager {
     }
 
     /// Rebuilds edge descriptors when topology, selection, or search state changes.
-    /// Uses nodeIndexMap for O(1) lookups instead of UUID dictionary per edge.
+    /// Rebuilds edge descriptors using pre-resolved edges + per-frame state.
     private func rebuildEdgeDescriptors() {
-        let edges = renderEdges
         let interGalaxyConns = galaxyRegistry?.interGalaxyConnections ?? []
-        let totalEdgeCapacity = edges.count + interGalaxyConns.count
+        let totalEdgeCapacity = cachedResolvedEdges.count + interGalaxyConns.count
         guard totalEdgeCapacity > 0 else {
             renderer.actualEdgeCount = 0
             renderer.actualEdgeVertexCount = 0
             return
         }
 
-        let nodes = renderNodes
-        let hubs = renderHubs
-        let colorMap = renderColorMap
-        let isSemanticMode = layoutMode == .embedding
-
-        // Rebuild nodeIndexMap and cached node data when topology changes
-        if nodes.count != lastTopologyNodeCount {
-            nodeIndexMap.removeAll(keepingCapacity: true)
-            cachedNodeProject.removeAll(keepingCapacity: true)
-            cachedNodeRadii.removeAll(keepingCapacity: true)
-            for (i, node) in nodes.enumerated() {
-                nodeIndexMap[node.id] = UInt32(i)
-                cachedNodeProject[node.id] = node.project
-                let isHub = hubs.contains(node.id)
-                let importance = max(1, node.importance)
-                let baseR: Float = isHub ? nodeRadius * 1.6 : nodeRadius
-                cachedNodeRadii[node.id] = baseR * (1.0 + Float(importance - 1) * 0.08)
+        // Build per-frame input (lightweight — no UUID lookups)
+        let selectedIdx = selectedNode.flatMap { nodeIndexMap[$0] }
+        var dimmedIndices = Set<UInt32>()
+        if isSearchActive {
+            for (id, idx) in nodeIndexMap where !searchMatchIds.contains(id) {
+                dimmedIndices.insert(idx)
             }
-            lastTopologyNodeCount = nodes.count
         }
+
+        let edgeInput = SceneEdgeFrameInput(
+            resolvedEdges: cachedResolvedEdges,
+            selectedIdx: selectedIdx,
+            isSearchActive: isSearchActive,
+            searchDimmedSourceIdx: dimmedIndices,
+            isSemanticMode: layoutMode == .embedding,
+            edgeRadius: edgeRadius,
+            nodeCount: nodeIndexMap.count,
+            interGalaxyConnections: interGalaxyConns.map { (from: $0.from, to: $0.to) }
+        )
+        let edgeFrame = buildSceneEdgeFrame(edgeInput)
 
         renderer.ensureEdgeBuffers(edgeCount: totalEdgeCapacity)
         renderer.ensureEdgeDescriptorBuffer(count: totalEdgeCapacity)
         guard let descBuf = renderer.edgeDescriptorBuffer else { return }
 
         let descriptors = descBuf.contents().bindMemory(to: EdgeDescriptor.self, capacity: totalEdgeCapacity)
-
-        let nodeProject = cachedNodeProject
-        let nodeRadii = cachedNodeRadii
-        var ei = 0
-
-        for edge in edges {
-            guard let srcIdx = nodeIndexMap[edge.sourceId],
-                  let tgtIdx = nodeIndexMap[edge.targetId] else { continue }
-
-            let connected = edge.sourceId == selectedNode || edge.targetId == selectedNode
-            let radius = connected ? edgeRadius * 2.5 : edgeRadius * 1.3
-
-            let searchDimmed = isSearchActive
-                && !searchMatchIds.contains(edge.sourceId)
-                && !searchMatchIds.contains(edge.targetId)
-            let state: Float
-            if connected { state = 1 }
-            else if searchDimmed { state = 2 }
-            else if isSemanticMode { state = 3 }
-            else { state = 0 }
-
-            let color: SIMD3<Float>
-            if connected {
-                color = SIMD3<Float>(1, 1, 1)
-            } else {
-                color = edgeColorFloat3(for: nodeProject[edge.sourceId], colorMap: colorMap)
-            }
-
-            let r1 = nodeRadii[edge.sourceId] ?? nodeRadius
-            let r2 = nodeRadii[edge.targetId] ?? nodeRadius
-
-            descriptors[ei] = EdgeDescriptor(
-                sourceIdx: srcIdx,
-                targetIdx: tgtIdx,
-                sourceRadius: r1,
-                targetRadius: r2,
-                color: SIMD4<Float>(color.x, color.y, color.z, 1),
-                baseRadius: radius,
-                state: state,
-                _pad0: 0, _pad1: 0
-            )
-            ei += 1
+        edgeFrame.descriptors.withUnsafeBufferPointer { ptr in
+            guard let base = ptr.baseAddress else { return }
+            descriptors.update(from: base, count: edgeFrame.count)
         }
 
-        // Append inter-galaxy connections as direct EdgeInstances
-        // These use world-space positions directly, not node indices.
-        // We handle them by adding virtual position entries.
-        let interGalaxyBase = UInt32(nodeIndexMap.count)
-        if !interGalaxyConns.isEmpty {
-            let totalPositions = Int(interGalaxyBase) + interGalaxyConns.count * 2
+        // Upload inter-galaxy virtual positions
+        if !edgeFrame.interGalaxyPositions.isEmpty {
+            let interGalaxyBase = Int(nodeIndexMap.count)
+            let totalPositions = interGalaxyBase + edgeFrame.interGalaxyPositions.count
             renderer.ensureNodePositionBuffer(count: totalPositions)
             if let posBuf = renderer.nodePositionBuffer {
                 let posPtr = posBuf.contents().bindMemory(to: SIMD3<Float>.self, capacity: totalPositions)
-                for (i, conn) in interGalaxyConns.enumerated() {
-                    // Positions are in sim-space; GPU kernel multiplies by scaleFactor
-                    posPtr[Int(interGalaxyBase) + i * 2] = conn.from
-                    posPtr[Int(interGalaxyBase) + i * 2 + 1] = conn.to
+                for (i, pos) in edgeFrame.interGalaxyPositions.enumerated() {
+                    posPtr[interGalaxyBase + i] = pos
                 }
-            }
-
-            for (i, _) in interGalaxyConns.enumerated() {
-                descriptors[ei] = EdgeDescriptor(
-                    sourceIdx: interGalaxyBase + UInt32(i * 2),
-                    targetIdx: interGalaxyBase + UInt32(i * 2 + 1),
-                    sourceRadius: 0,  // no inset for inter-galaxy lines
-                    targetRadius: 0,
-                    color: SIMD4<Float>(0.5, 0.5, 0.6, 0.4),
-                    baseRadius: edgeRadius * 4.0,
-                    state: 2,  // dimmed state
-                    _pad0: 0, _pad1: 0
-                )
-                ei += 1
             }
         }
 
-        renderer.actualEdgeCount = ei
+        renderer.actualEdgeCount = edgeFrame.count
 
-        // Set pack params
         if let paramsBuf = renderer.packEdgeParamsBuffer {
             let paramsPtr = paramsBuf.contents().bindMemory(to: PackEdgeParams.self, capacity: 1)
             paramsPtr.pointee = PackEdgeParams(
-                edgeCount: UInt32(ei),
+                edgeCount: UInt32(edgeFrame.count),
                 scaleFactor: scaleFactor,
                 _pad0: 0, _pad1: 0
             )
         }
 
         edgeDescriptorsDirty = false
-        renderer.edgeDataDirty = true  // new descriptors → GPU needs to repack
+        renderer.edgeDataDirty = true
         lastEdgeDescriptorSelection = selectedNode
         lastEdgeDescriptorSearchActive = isSearchActive
         lastEdgeDescriptorSearchMatchIds = searchMatchIds
@@ -1074,15 +991,33 @@ final class MetalSceneManager {
 
     /// Updates edge GPU data: uploads positions every frame, rebuilds descriptors only when needed.
     private func packEdgeVertices() {
-        let edges = renderEdges
         let interGalaxyConns = galaxyRegistry?.interGalaxyConnections ?? []
-        guard edges.count + interGalaxyConns.count > 0 else {
+        guard renderEdges.count + interGalaxyConns.count > 0 else {
             renderer.actualEdgeCount = 0
             renderer.actualEdgeVertexCount = 0
             return
         }
 
-        // Check if descriptors need rebuilding
+        // Re-resolve edges on topology change (one-time UUID work)
+        if renderNodes.count != lastEdgeDescriptorTopologyCount || edgeDescriptorsDirty {
+            let colorMap = renderColorMap
+            var projectColors: [String: SIMD3<Float>] = [:]
+            for project in cachedNodeProject.values {
+                if projectColors[project] == nil {
+                    projectColors[project] = nodeColorFloat3(for: project, colorMap: colorMap)
+                }
+            }
+            cachedResolvedEdges = resolveEdges(
+                edges: renderEdges.map { (sourceId: $0.sourceId, targetId: $0.targetId, relation: $0.relation) },
+                nodeIndexMap: nodeIndexMap,
+                nodeRadii: cachedNodeRadii,
+                nodeProjects: cachedNodeProject,
+                projectColors: projectColors,
+                defaultEdgeRadius: edgeRadius
+            )
+        }
+
+        // Check if descriptors need rebuilding (per-frame state changes)
         let descriptorsNeedRebuild = edgeDescriptorsDirty
             || renderNodes.count != lastEdgeDescriptorTopologyCount
             || selectedNode != lastEdgeDescriptorSelection
@@ -1164,6 +1099,9 @@ final class MetalSceneManager {
         }
         guard renderer.labelAtlasTexture != nil else { return }
 
+        // Build label frame using pure builder
+        let sf = scaleFactor
+
         // projectCentroids already computed by packNodeInstances — just build color lookup
         var projectColors: [String: SIMD3<Float>] = [:]
         for project in projectCentroids.keys {
@@ -1171,11 +1109,8 @@ final class MetalSceneManager {
         }
 
         let nodeById = galaxyRegistry?.mergedNodeById ?? [:]
-        let sf = scaleFactor
-        let aspectCorr = labelAtlasAspectCorrection
 
         let hasExpansions = !expandedChildPositions.isEmpty
-        // Avoid O(N) dict copy when no hubs are expanded (the common case)
         let allPositions: [UUID: SIMD3<Float>]
         if hasExpansions {
             var merged = positions
@@ -1193,140 +1128,88 @@ final class MetalSceneManager {
             }
         }
 
-        // Depth range computed by packNodeInstances — reuse cached values.
-        // Expanded child positions are close to their parent, so they don't significantly
-        // change the depth range.
-        let depthRange = max(50.0, cachedMaxDepth - cachedMinDepth)
-
-        let projectLabelCount = projectCentroids.count
-        let maxNodeLabels = max(0, 2048 - projectLabelCount - topicGroups.count)
-        var instances = [LabelInstance]()
-        let topicLabelCount = topicGroups.count
-        instances.reserveCapacity(min(allPositions.count + projectLabelCount + topicLabelCount, 2048))
-
+        // Build node label entries from allPositions
+        var nodeLabels: [(id: UUID, position: SIMD3<Float>, isHub: Bool,
+                          importance: Int, isSelected: Bool,
+                          isSearchMatch: Bool, searchDimmed: Bool,
+                          isExpandedChild: Bool)] = []
+        nodeLabels.reserveCapacity(allPositions.count)
+        #if ENGRAM_INSTRUMENTATION
+        var diagMissingRects = 0
+        #endif
         for (id, pos3D) in allPositions {
-            guard instances.count < maxNodeLabels,
-                  let nodeData = nodeById[id],
-                  let rect = labelAtlasRects[id] else {
-                #if ENGRAM_INSTRUMENTATION
-                if nodeById[id] != nil && labelAtlasRects[id] == nil {
-                    diagMissingRects += 1
-                }
-                #endif
-                continue
-            }
-
-            let isSelected = id == selectedNode
-            let isHub = hubs.contains(id)
-            let importance = Float(max(1, nodeData.importance))
-            let isSearchMatch = isSearchActive && searchMatchIds.contains(id)
-            let searchDimmed = isSearchActive && !searchMatchIds.contains(id)
-
-            let maxVisible: Float = (isSelected || expandedChildren.contains(id) || isSearchMatch)
-                ? .greatestFiniteMagnitude
-                : (isHub ? 1200 : (200 + importance * 80))
-
-            let baseOpacity: Float = isSelected ? 0.95 : (isHub ? 0.8 : 0.6)
-            let halfH: Float = isSelected ? 0.025 : (isHub ? 0.022 : 0.018)
-            let textAspect = (rect.u1 - rect.u0) / max(0.001, rect.v1 - rect.v0) * aspectCorr
-
-            let anchor = pos3D * sf + SIMD3<Float>(0, nodeRadius * 1.8, 0)
-
-            var flags: UInt32 = 0
-            if isSelected { flags |= 1 }
-            if isSearchMatch { flags |= 2 }
-            if searchDimmed { flags |= 4 }
-
-            instances.append(LabelInstance(
-                anchor: anchor,
-                halfH: halfH,
-                uvRect: SIMD4<Float>(rect.u0, rect.v0, rect.u1, rect.v1),
-                color: SIMD4<Float>(1, 1, 1, baseOpacity),
-                textAspect: textAspect,
-                maxVisible: maxVisible,
-                forwardBias: 0,
-                flags: flags
+            guard let nodeData = nodeById[id] else { continue }
+            #if ENGRAM_INSTRUMENTATION
+            if labelAtlasRects[id] == nil { diagMissingRects += 1 }
+            #endif
+            nodeLabels.append((
+                id: id, position: pos3D,
+                isHub: hubs.contains(id),
+                importance: nodeData.importance,
+                isSelected: id == selectedNode,
+                isSearchMatch: isSearchActive && searchMatchIds.contains(id),
+                searchDimmed: isSearchActive && !searchMatchIds.contains(id),
+                isExpandedChild: expandedChildren.contains(id)
             ))
         }
 
-        // Project labels
-        for (project, centroidData) in projectCentroids {
-            guard let rect = projectLabelAtlasRects[project] else { continue }
-
-            let labelY = centroidData.maxY * sf + 0.15
-            let anchor = SIMD3<Float>(centroidData.centroid.x * sf, labelY, centroidData.centroid.z * sf)
-            let color = projectColors[project] ?? SIMD3<Float>(1, 1, 1)
-            let textAspect = (rect.u1 - rect.u0) / max(0.001, rect.v1 - rect.v0) * aspectCorr
-
-            instances.append(LabelInstance(
-                anchor: anchor,
-                halfH: 0.20,
-                uvRect: SIMD4<Float>(rect.u0, rect.v0, rect.u1, rect.v1),
-                color: SIMD4<Float>(color.x, color.y, color.z, 0.9),
-                textAspect: textAspect,
-                maxVisible: 12000,
-                forwardBias: 0.25,
-                flags: 0
-            ))
+        // Convert atlas rects
+        var atlasRects: [UUID: AtlasRect] = [:]
+        for (id, rect) in labelAtlasRects {
+            atlasRects[id] = AtlasRect(u0: rect.u0, v0: rect.v0, u1: rect.u1, v1: rect.v1)
+        }
+        var projLabelRects: [String: AtlasRect] = [:]
+        for (k, rect) in projectLabelAtlasRects {
+            projLabelRects[k] = AtlasRect(u0: rect.u0, v0: rect.v0, u1: rect.u1, v1: rect.v1)
+        }
+        var galLabelRects: [String: AtlasRect] = [:]
+        for (k, rect) in galaxyLabelAtlasRects {
+            galLabelRects[k] = AtlasRect(u0: rect.u0, v0: rect.v0, u1: rect.u1, v1: rect.v1)
+        }
+        var topLabelRects: [String: AtlasRect] = [:]
+        for (k, rect) in topicLabelAtlasRects {
+            topLabelRects[k] = AtlasRect(u0: rect.u0, v0: rect.v0, u1: rect.u1, v1: rect.v1)
         }
 
-        // Galaxy labels — always visible, positioned above each galaxy's world center
+        // Build galaxy labels
+        var galaxyLabels: [(name: String, center: SIMD3<Float>)] = []
         if let registry = galaxyRegistry, registry.galaxies.count > 1 {
             for galaxy in registry.galaxies.values {
-                guard let rect = galaxyLabelAtlasRects[galaxy.displayName] else { continue }
-
-                let center = galaxy.worldCenter * sf
-                let anchor = SIMD3<Float>(center.x, center.y + 0.6, center.z)
-                let textAspect = (rect.u1 - rect.u0) / max(0.001, rect.v1 - rect.v0) * aspectCorr
-
-                instances.append(LabelInstance(
-                    anchor: anchor,
-                    halfH: 0.25,
-                    uvRect: SIMD4<Float>(rect.u0, rect.v0, rect.u1, rect.v1),
-                    color: SIMD4<Float>(0.8, 0.85, 1.0, 0.85),
-                    textAspect: textAspect,
-                    maxVisible: .greatestFiniteMagnitude,
-                    forwardBias: 0.3,
-                    flags: 0
-                ))
+                galaxyLabels.append((name: galaxy.displayName, center: galaxy.worldCenter))
             }
         }
 
-        // Topic group labels — positioned above each topic cluster's centroid
+        // Build topic groups with member positions
+        var topicGroupsInput: [(topic: String, project: String, memberPositions: [SIMD3<Float>])] = []
         for group in topicGroups {
-            guard group.ids.count >= 3,
-                  let rect = topicLabelAtlasRects[group.topic] else { continue }
-
-            // Compute centroid and max Y from member positions
-            var sum = SIMD3<Float>.zero
-            var maxY: Float = -.greatestFiniteMagnitude
-            var memberCount = 0
-            for id in group.ids {
-                guard let pos = allPositions[id] else { continue }
-                sum += pos
-                maxY = max(maxY, pos.y)
-                memberCount += 1
-            }
-            guard memberCount >= 3 else { continue }
-            let centroid = sum / Float(memberCount)
-
-            let labelY = maxY * sf + 0.06
-            let anchor = SIMD3<Float>(centroid.x * sf, labelY, centroid.z * sf)
-            let textAspect = (rect.u1 - rect.u0) / max(0.001, rect.v1 - rect.v0) * aspectCorr
-            let color = projectColors[group.project] ?? SIMD3<Float>(0.75, 0.82, 0.95)
-
-            instances.append(LabelInstance(
-                anchor: anchor,
-                halfH: 0.06,
-                uvRect: SIMD4<Float>(rect.u0, rect.v0, rect.u1, rect.v1),
-                color: SIMD4<Float>(color.x, color.y, color.z, 0.6),
-                textAspect: textAspect,
-                maxVisible: 1500,
-                forwardBias: 0.15,
-                flags: 0
-            ))
+            guard group.ids.count >= 3 else { continue }
+            let memberPositions = group.ids.compactMap { allPositions[$0] }
+            guard memberPositions.count >= 3 else { continue }
+            topicGroupsInput.append((topic: group.topic, project: group.project, memberPositions: memberPositions))
         }
 
+        // Build centroids in the format the label builder expects
+        var labelCentroids: [String: (centroid: SIMD3<Float>, maxY: Float, count: Int)] = [:]
+        for (project, data) in projectCentroids {
+            labelCentroids[project] = (centroid: data.centroid, maxY: data.maxY, count: data.count)
+        }
+
+        let labelInput = SceneLabelFrameInput(
+            nodeLabels: nodeLabels,
+            atlasRects: atlasRects,
+            projectCentroids: labelCentroids,
+            projectLabelRects: projLabelRects,
+            projectColors: projectColors,
+            galaxyLabels: galaxyLabels,
+            galaxyLabelRects: galLabelRects,
+            topicGroups: topicGroupsInput,
+            topicLabelRects: topLabelRects,
+            scaleFactor: sf,
+            nodeRadius: nodeRadius,
+            aspectCorrection: labelAtlasAspectCorrection
+        )
+        let labelFrame = buildSceneLabelFrame(labelInput)
+        let instances = labelFrame.instances
         let actualLabelCount = instances.count
 
         renderer.ensureLabelBuffers(labelCount: actualLabelCount)
@@ -1341,6 +1224,7 @@ final class MetalSceneManager {
         }
 
         // Set stamp params
+        let depthRange = max(50.0, cachedMaxDepth - cachedMinDepth)
         let scaledCamPos = camera.cameraPosition * sf
         if let paramsBuf = renderer.labelStampParamsBuffer {
             let paramsPtr = paramsBuf.contents().bindMemory(to: LabelStampParams.self, capacity: 1)
@@ -1749,14 +1633,113 @@ final class MetalSceneManager {
 
     // MARK: - Nebulae
 
+    // Cached nebula color conversion — only rebuild when color map changes
+    private var cachedNebulaColors: [String: SIMD4<Float>] = [:]
+    private var lastNebulaColorMapVersion: UInt64 = 0
+
     private func updateNebulae() {
-        let groups = nebulaFog.nebulaGroupsForCurrentMode(
-            layoutMode: layoutMode,
-            positions: positions,
-            nodes: renderNodes,
-            semanticClusters3D: semanticClusters3D
+        // Rebuild nebula color cache when color map changes (avoids per-frame NSColor conversion)
+        let colorVersion = galaxyRegistry?.mergedColorMapVersion ?? 0
+        if colorVersion != lastNebulaColorMapVersion {
+            cachedNebulaColors.removeAll(keepingCapacity: true)
+            for (project, color) in renderColorMap {
+                let nsColor = NSColor(color).usingColorSpace(.sRGB) ?? NSColor(color)
+                var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+                nsColor.getRed(&r, green: &g, blue: &b, alpha: &a)
+                cachedNebulaColors[project] = SIMD4<Float>(
+                    Float(min(1.0, r * 1.3 + 0.1)),
+                    Float(min(1.0, g * 1.3 + 0.1)),
+                    Float(min(1.0, b * 1.3 + 0.1)),
+                    0.25
+                )
+            }
+            lastNebulaColorMapVersion = colorVersion
+        }
+
+        if layoutMode == .embedding {
+            // Embedding mode: use semantic clusters (fall back to original CPU path)
+            let groups = nebulaFog.nebulaGroupsForCurrentMode(
+                layoutMode: layoutMode, positions: positions,
+                nodes: renderNodes, semanticClusters3D: semanticClusters3D
+            )
+            nebulaFog.updateRenderer(renderer: renderer, groups: groups, colorMap: renderColorMap)
+            renderer.nebulaGroupCount = 0  // disable GPU nebula path
+            return
+        }
+
+        // Force-directed mode: use projectCentroids from packNodeInstances (saves O(N) recomputation).
+        // Build NebulaGroupInput[] using the pure builder.
+        var nebulaCentroids: [String: (centroid: SIMD3<Float>, maxY: Float, count: Int)] = [:]
+        for (project, data) in projectCentroids {
+            nebulaCentroids[project] = (centroid: data.centroid, maxY: data.maxY, count: data.count)
+        }
+        let groupInputs = buildNebulaGroups(
+            projectCentroids: nebulaCentroids,
+            projectColors: cachedNebulaColors,
+            scaleFactor: scaleFactor
         )
-        nebulaFog.updateRenderer(renderer: renderer, groups: groups, colorMap: renderColorMap)
+
+        let groupCount = groupInputs.count
+        guard groupCount > 0 else {
+            renderer.actualNebulaVertexCount = 0
+            renderer.nebulaGroupCount = 0
+            return
+        }
+
+        // Ensure GPU buffers
+        renderer.ensureNebulaGroupInputBuffer(count: groupCount)
+        let quadCount = groupCount * 3  // 3 quads per group
+        if renderer.nebulaVertexCapacity < quadCount {
+            let cap = max(quadCount * 2, 64)
+            renderer.nebulaVertexBuffer = renderer.device.makeBuffer(
+                length: cap * 4 * MemoryLayout<NebulaQuadVertex>.stride,
+                options: .storageModeShared
+            )
+            // Index buffer for quads
+            let indexCount = cap * 6
+            renderer.nebulaIndexBuffer = renderer.device.makeBuffer(
+                length: indexCount * MemoryLayout<UInt32>.stride,
+                options: .storageModeShared
+            )
+            if let buf = renderer.nebulaIndexBuffer {
+                let indices = buf.contents().bindMemory(to: UInt32.self, capacity: indexCount)
+                for i in 0..<cap {
+                    let vBase = UInt32(i * 4)
+                    let iBase = i * 6
+                    indices[iBase]     = vBase
+                    indices[iBase + 1] = vBase + 2
+                    indices[iBase + 2] = vBase + 1
+                    indices[iBase + 3] = vBase + 1
+                    indices[iBase + 4] = vBase + 2
+                    indices[iBase + 5] = vBase + 3
+                }
+            }
+            renderer.nebulaVertexCapacity = cap
+        }
+
+        // Upload group inputs to GPU buffer
+        if let inputBuf = renderer.nebulaGroupInputBuffer {
+            groupInputs.withUnsafeBufferPointer { ptr in
+                guard let base = ptr.baseAddress else { return }
+                inputBuf.contents().copyMemory(
+                    from: base,
+                    byteCount: groupCount * MemoryLayout<NebulaGroupInput>.stride
+                )
+            }
+        }
+
+        // Set pack params
+        if let paramsBuf = renderer.nebulaPackParamsBuffer {
+            let paramsPtr = paramsBuf.contents().bindMemory(to: NebulaPackParams.self, capacity: 1)
+            paramsPtr.pointee = NebulaPackParams(
+                groupCount: UInt32(groupCount),
+                quadsPerGroup: 3,
+                _pad0: 0, _pad1: 0
+            )
+        }
+
+        renderer.nebulaGroupCount = groupCount
+        renderer.actualNebulaVertexCount = groupCount * 3 * 4  // 3 quads × 4 vertices each
     }
 
     // MARK: - Hub Expansion

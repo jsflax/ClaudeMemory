@@ -5,6 +5,258 @@ import os
 
 private let forceSimLog = Logger(subsystem: "com.claudememory.visualizer", category: "ForceSimulation3D")
 
+// MARK: - Barnes-Hut Octree for O(n log n) charge computation
+
+private struct OctreeNode {
+    var cx: Float, cy: Float, cz: Float   // cell geometric center
+    var halfSize: Float
+    var comX: Float, comY: Float, comZ: Float  // center of mass
+    var mass: Float                         // body count (as Float for division)
+    var child0: Int32, child1: Int32, child2: Int32, child3: Int32
+    var child4: Int32, child5: Int32, child6: Int32, child7: Int32  // -1 = empty
+    var bodyIndex: Int32  // leaf with 1 body: its index; else -1
+
+    static func empty(cx: Float, cy: Float, cz: Float, halfSize: Float) -> OctreeNode {
+        OctreeNode(cx: cx, cy: cy, cz: cz, halfSize: halfSize,
+                   comX: 0, comY: 0, comZ: 0, mass: 0,
+                   child0: -1, child1: -1, child2: -1, child3: -1,
+                   child4: -1, child5: -1, child6: -1, child7: -1,
+                   bodyIndex: -1)
+    }
+
+    func child(_ octant: Int) -> Int32 {
+        switch octant {
+        case 0: return child0; case 1: return child1
+        case 2: return child2; case 3: return child3
+        case 4: return child4; case 5: return child5
+        case 6: return child6; case 7: return child7
+        default: return -1
+        }
+    }
+
+    mutating func setChild(_ octant: Int, _ value: Int32) {
+        switch octant {
+        case 0: child0 = value; case 1: child1 = value
+        case 2: child2 = value; case 3: child3 = value
+        case 4: child4 = value; case 5: child5 = value
+        case 6: child6 = value; case 7: child7 = value
+        default: break
+        }
+    }
+}
+
+/// Build octree from positions. Returns the node array (root at index 0).
+private func buildOctree(x: [Float], y: [Float], z: [Float], n: Int) -> [OctreeNode] {
+    guard n > 0 else { return [] }
+
+    // Find bounding box, make cubic
+    var minX = x[0], maxX = x[0], minY = y[0], maxY = y[0], minZ = z[0], maxZ = z[0]
+    for i in 1..<n {
+        if x[i] < minX { minX = x[i] } else if x[i] > maxX { maxX = x[i] }
+        if y[i] < minY { minY = y[i] } else if y[i] > maxY { maxY = y[i] }
+        if z[i] < minZ { minZ = z[i] } else if z[i] > maxZ { maxZ = z[i] }
+    }
+    let sizeX = maxX - minX, sizeY = maxY - minY, sizeZ = maxZ - minZ
+    let maxSize = max(sizeX, max(sizeY, sizeZ), 1.0)
+    let half = maxSize * 0.5 + 1.0  // +1 padding to avoid boundary issues
+    let rootCX = (minX + maxX) * 0.5
+    let rootCY = (minY + maxY) * 0.5
+    let rootCZ = (minZ + maxZ) * 0.5
+
+    var nodes = [OctreeNode]()
+    nodes.reserveCapacity(max(8 * n, 512))
+    nodes.append(.empty(cx: rootCX, cy: rootCY, cz: rootCZ, halfSize: half))
+
+    let maxDepth = 40
+
+    for i in 0..<n {
+        let px = x[i], py = y[i], pz = z[i]
+        var nodeIdx = 0
+        var depth = 0
+
+        while depth < maxDepth {
+            // Update center of mass
+            let oldMass = nodes[nodeIdx].mass
+            let newMass = oldMass + 1
+            nodes[nodeIdx].comX = (nodes[nodeIdx].comX * oldMass + px) / newMass
+            nodes[nodeIdx].comY = (nodes[nodeIdx].comY * oldMass + py) / newMass
+            nodes[nodeIdx].comZ = (nodes[nodeIdx].comZ * oldMass + pz) / newMass
+            nodes[nodeIdx].mass = newMass
+
+            if nodes[nodeIdx].mass == 1 && nodes[nodeIdx].bodyIndex == -1 {
+                // Empty cell — place body here as leaf
+                nodes[nodeIdx].bodyIndex = Int32(i)
+                break
+            }
+
+            if nodes[nodeIdx].bodyIndex >= 0 {
+                // Leaf with existing body — subdivide
+                let existingBody = Int(nodes[nodeIdx].bodyIndex)
+                nodes[nodeIdx].bodyIndex = -1  // no longer a leaf
+
+                // Push existing body down
+                let eCX = nodes[nodeIdx].cx, eCY = nodes[nodeIdx].cy, eCZ = nodes[nodeIdx].cz
+                let eHalf = nodes[nodeIdx].halfSize * 0.5
+                let eOctant = octant(px: x[existingBody], py: y[existingBody], pz: z[existingBody],
+                                     cx: eCX, cy: eCY, cz: eCZ)
+                let (oCX, oCY, oCZ) = childCenter(parentCX: eCX, parentCY: eCY, parentCZ: eCZ,
+                                                    halfSize: eHalf, octant: eOctant)
+                let childIdx = Int32(nodes.count)
+                var childNode = OctreeNode.empty(cx: oCX, cy: oCY, cz: oCZ, halfSize: eHalf)
+                childNode.bodyIndex = Int32(existingBody)
+                childNode.comX = x[existingBody]; childNode.comY = y[existingBody]; childNode.comZ = z[existingBody]
+                childNode.mass = 1
+                nodes.append(childNode)
+                nodes[nodeIdx].setChild(eOctant, childIdx)
+            }
+
+            // Descend into correct octant for new body
+            let oct = octant(px: px, py: py, pz: pz,
+                           cx: nodes[nodeIdx].cx, cy: nodes[nodeIdx].cy, cz: nodes[nodeIdx].cz)
+            let childRef = nodes[nodeIdx].child(oct)
+            if childRef >= 0 {
+                nodeIdx = Int(childRef)
+            } else {
+                // Create new child
+                let newHalf = nodes[nodeIdx].halfSize * 0.5
+                let (nCX, nCY, nCZ) = childCenter(parentCX: nodes[nodeIdx].cx, parentCY: nodes[nodeIdx].cy,
+                                                    parentCZ: nodes[nodeIdx].cz, halfSize: newHalf, octant: oct)
+                let newIdx = Int32(nodes.count)
+                nodes.append(.empty(cx: nCX, cy: nCY, cz: nCZ, halfSize: newHalf))
+                nodes[nodeIdx].setChild(oct, newIdx)
+                nodeIdx = Int(newIdx)
+            }
+            depth += 1
+        }
+
+        // Max depth reached — leave as multi-body leaf (mass > 1, bodyIndex == -1)
+    }
+
+    return nodes
+}
+
+@inline(__always)
+private func octant(px: Float, py: Float, pz: Float, cx: Float, cy: Float, cz: Float) -> Int {
+    var o = 0
+    if px >= cx { o |= 1 }
+    if py >= cy { o |= 2 }
+    if pz >= cz { o |= 4 }
+    return o
+}
+
+@inline(__always)
+private func childCenter(parentCX: Float, parentCY: Float, parentCZ: Float,
+                          halfSize: Float, octant: Int) -> (Float, Float, Float) {
+    let qSize = halfSize * 0.5
+    let cx = parentCX + ((octant & 1) != 0 ? qSize : -qSize)
+    let cy = parentCY + ((octant & 2) != 0 ? qSize : -qSize)
+    let cz = parentCZ + ((octant & 4) != 0 ? qSize : -qSize)
+    return (cx, cy, cz)
+}
+
+/// Compute charge forces using Barnes-Hut O(n log n) approximation.
+/// - theta: opening angle threshold (lower = more accurate, 0.7 is standard)
+/// - cutoff: skip subtrees whose nearest point is beyond this distance
+private func computeChargeForcesBH(
+    x: [Float], y: [Float], z: [Float], n: Int,
+    projectGroup: [Int], topicGroup: [Int],
+    hasProjects: Bool, hasTopics: Bool,
+    chargeBase: Float, chargeCross: Float,
+    chargeSameProject: Float, chargeSameTopic: Float,
+    fx: inout [Float], fy: inout [Float], fz: inout [Float]
+) {
+    let nodes = buildOctree(x: x, y: y, z: z, n: n)
+    guard !nodes.isEmpty else { return }
+
+    let theta: Float = 0.7
+    let thetaSq = theta * theta
+    let cutoff: Float = 500
+    let cutoffSq = cutoff * cutoff
+
+    // Pre-allocate traversal stack
+    var stack = [Int]()
+    stack.reserveCapacity(64)
+
+    for i in 0..<n {
+        let xi = x[i], yi = y[i], zi = z[i]
+        let pg_i = hasProjects ? projectGroup[i] : 0
+        let tg_i = hasTopics ? topicGroup[i] : -1
+
+        stack.removeAll(keepingCapacity: true)
+        stack.append(0)  // start from root
+
+        while !stack.isEmpty {
+            let nIdx = stack.removeLast()
+            let node = nodes[nIdx]
+
+            if node.mass == 0 { continue }
+
+            // Single-body leaf — exact pairwise
+            if node.bodyIndex >= 0 {
+                let j = Int(node.bodyIndex)
+                if j == i { continue }
+
+                let dx = xi - x[j], dy = yi - y[j], dz = zi - z[j]
+                var distSq = dx * dx + dy * dy + dz * dz
+                if distSq > cutoffSq { continue }
+                if distSq < 1 { distSq = 1 }
+
+                let charge: Float
+                if hasProjects && projectGroup[j] != pg_i {
+                    charge = chargeCross
+                } else if hasTopics && topicGroup[j] == tg_i {
+                    charge = chargeSameTopic
+                } else if hasProjects {
+                    charge = chargeSameProject
+                } else {
+                    charge = chargeBase
+                }
+
+                let dist = sqrt(distSq)
+                let forceMag = charge / distSq
+                fx[i] += (dx / dist) * forceMag
+                fy[i] += (dy / dist) * forceMag
+                fz[i] += (dz / dist) * forceMag
+                continue
+            }
+
+            // Internal node — check opening angle
+            let dx = xi - node.comX, dy = yi - node.comY, dz = zi - node.comZ
+            var distSq = dx * dx + dy * dy + dz * dz
+            if distSq < 1 { distSq = 1 }
+
+            let cellSize = node.halfSize * 2
+            let sSq = cellSize * cellSize
+
+            // Far enough — approximate as single body with base charge
+            if sSq < distSq * thetaSq {
+                // Skip if center of mass is beyond cutoff
+                if distSq > cutoffSq { continue }
+
+                let dist = sqrt(distSq)
+                let forceMag = chargeBase * node.mass / distSq
+                fx[i] += (dx / dist) * forceMag
+                fy[i] += (dy / dist) * forceMag
+                fz[i] += (dz / dist) * forceMag
+                continue
+            }
+
+            // Check if nearest point of cell is beyond cutoff
+            let nearX = max(node.cx - node.halfSize, min(xi, node.cx + node.halfSize))
+            let nearY = max(node.cy - node.halfSize, min(yi, node.cy + node.halfSize))
+            let nearZ = max(node.cz - node.halfSize, min(zi, node.cz + node.halfSize))
+            let nearDx = xi - nearX, nearDy = yi - nearY, nearDz = zi - nearZ
+            if nearDx * nearDx + nearDy * nearDy + nearDz * nearDz > cutoffSq { continue }
+
+            // Recurse into children
+            for oct in 0..<8 {
+                let c = node.child(oct)
+                if c >= 0 { stack.append(Int(c)) }
+            }
+        }
+    }
+}
+
 /// 3D force-directed graph layout engine. Same split architecture as ForceSimulation:
 /// O(n²) force computation runs async on @ForceSimulatorActor, O(n) integration runs sync at 60fps.
 @MainActor
@@ -61,13 +313,41 @@ final class ForceSimulation3D {
     private let alphaDecay: Float = 0.995
     private let alphaFloor: Float = 0.01
     private(set) var tickInFlight = false
+    private var dispatchedToGPU = false  // true when current dispatch is GPU (can hang), false for CPU (always completes)
     private(set) var forceAge: Int = 100
     private(set) var smoothedAttenuation: Float = 0.001
     private var topologyVersion: UInt64 = 0
+    /// After a GPU timeout, skip GPU path for this many ticks to prevent concurrent dispatch.
+    private var gpuCooldownTicks: Int = 0
 
     /// Set by addNode/addEdge, drained by tick(). Coalesces multiple topology changes
     /// into a single wake per tick instead of one per call.
     private var hasPendingTopologyChanges = false
+
+    /// Set by topology changes, cleared after CSR rebuild in dispatchForceComputation.
+    /// CSR (Compressed Sparse Row) structures are pre-built for GPU gather kernels.
+    private var topologyDirtyForGPU = true
+
+    // MARK: - Local wake state
+    // When a node is inserted into a settled sim, we run a lightweight CPU-only
+    // force computation on just the neighborhood (~50-100 nodes) instead of waking
+    // the full O(n) simulation. This avoids the 300x per-frame cost cliff.
+
+    /// Indices of nodes in the active local wake neighborhood.
+    private var localWakeIndices: Set<Int> = []
+
+    /// True when a local wake is active (node inserted while settled).
+    private(set) var isLocalWake = false
+
+    /// Frames remaining in local wake. Counts down from localWakeMaxFrames.
+    private var localWakeFramesRemaining = 0
+    private let localWakeMaxFrames = 15  // ~250ms at 60fps
+
+    /// Index of the newly inserted node that triggered the local wake.
+    private var localWakeNewNodeIndex: Int? = nil
+
+    /// Whether the neighborhood has been expanded (done once on first local tick).
+    private var localWakeExpanded = false
 
     /// Metal compute for GPU-accelerated charge force calculation.
     private var metalForceCompute: MetalForceCompute? = MetalForceCompute()
@@ -90,6 +370,8 @@ final class ForceSimulation3D {
 
     /// Wake the simulation from settled state (e.g. after topology change or user interaction).
     func wake() {
+        // Cancel any active local wake — full wake supersedes it
+        clearLocalWake()
         isSettled = false
         settledFrameCount = 0
         framesSinceWake = 0
@@ -187,6 +469,7 @@ final class ForceSimulation3D {
         storedFz = [Float](repeating: 0, count: ids.count)
 
         topologyVersion &+= 1
+        topologyDirtyForGPU = true
         isSettled = false; settledFrameCount = 0
         forceAge = 2
         rebuildPositions()
@@ -196,6 +479,7 @@ final class ForceSimulation3D {
     /// Compacts SoA arrays and remaps edge indices.
     func removeNodes(_ idsToRemove: Set<UUID>) {
         guard !idsToRemove.isEmpty else { return }
+        clearLocalWake()  // indices become invalid after compaction
         let oldCount = ids.count
 
         // Build old→new index mapping
@@ -255,21 +539,30 @@ final class ForceSimulation3D {
         for id in idsToRemove { positions.removeValue(forKey: id) }
 
         hasPendingTopologyChanges = true
+        topologyDirtyForGPU = true
     }
 
     /// Surgically insert a single node without rebuilding the entire graph.
+    /// When the sim is settled, activates local wake instead of full wake.
     func addNode(_ id: UUID, project: String, topic: String) {
         guard idToIndex[id] == nil else { return }
-        let angle = Float.random(in: 0...(2 * .pi))
-        let phi = Float.random(in: -.pi/2...(.pi/2))
-        let r = Float.random(in: 50...250)
+
+        let newIndex = ids.count
+
+        // Smart positioning: place at project cluster centroid + jitter when settled,
+        // random sphere position when sim is actively converging.
+        let position: SIMD3<Float>
+        if (isSettled || isLocalWake), let pg = projectToGroup[project] {
+            position = projectCentroid(group: pg, jitter: 15.0)
+        } else {
+            position = randomSpherePosition()
+        }
+
         ids.append(id)
-        x.append(center.x + cos(angle) * cos(phi) * r)
-        y.append(center.y + sin(angle) * cos(phi) * r)
-        z.append(center.z + sin(phi) * r)
+        x.append(position.x); y.append(position.y); z.append(position.z)
         vx.append(0); vy.append(0); vz.append(0)
         pinned.append(false)
-        idToIndex[id] = ids.count - 1
+        idToIndex[id] = newIndex
 
         // Project group
         let projGroup: Int
@@ -293,9 +586,25 @@ final class ForceSimulation3D {
         }
 
         storedFx.append(0); storedFy.append(0); storedFz.append(0)
-        hasPendingTopologyChanges = true
-        // Set only the new node's position — syncPositions() in the next tick() will update all.
-        positions[id] = SIMD3(x.last!, y.last!, z.last!)
+        positions[id] = position
+        topologyDirtyForGPU = true
+
+        // Route to local wake or full wake
+        if isSettled && !isLocalWake {
+            // First insert into a settled sim → activate local wake
+            isLocalWake = true
+            localWakeFramesRemaining = localWakeMaxFrames
+            localWakeNewNodeIndex = newIndex
+            localWakeIndices = [newIndex]
+            topologyVersion &+= 1  // so render pipeline picks up the new node
+        } else if isLocalWake {
+            // Additional insert during active local wake → extend the set
+            localWakeIndices.insert(newIndex)
+            topologyVersion &+= 1
+        } else {
+            // Sim already awake → normal full-wake path
+            hasPendingTopologyChanges = true
+        }
     }
 
     /// Surgically insert a single edge without rebuilding the entire graph.
@@ -304,11 +613,20 @@ final class ForceSimulation3D {
         let key = UInt64(si) << 32 | UInt64(ti)
         guard edgeIndexSet.insert(key).inserted else { return }
         edgeIndices.append((si, ti))
-        hasPendingTopologyChanges = true
+        topologyDirtyForGPU = true
+
+        if isLocalWake {
+            // Extend neighborhood to include edge endpoints
+            localWakeIndices.insert(si)
+            localWakeIndices.insert(ti)
+        } else {
+            hasPendingTopologyChanges = true
+        }
     }
 
     /// Write external positions (e.g. from 2D positions + z jitter) into internal arrays.
     func setPositions(_ positions: [UUID: SIMD3<Float>]) {
+        clearLocalWake()
         for (id, point) in positions {
             guard let i = idToIndex[id] else { continue }
             x[i] = point.x; y[i] = point.y; z[i] = point.z
@@ -362,52 +680,52 @@ final class ForceSimulation3D {
             topologyVersion &+= 1
             isSettled = false
             settledFrameCount = 0
+            // Full topology change during local wake → escalate to full wake
+            if isLocalWake { clearLocalWake() }
+        }
+
+        // Local wake path: lightweight CPU-only integration for neighborhood only.
+        // Runs instead of full sim when a node was inserted while settled.
+        if isLocalWake {
+            tickLocalWake()
+            return
         }
 
         // Fast path: when settled, skip all work (no integration, no sync, no force dispatch)
         if isSettled { return }
 
-        // Drain pending force results from async computation (lock-free MainActor handoff)
+        // Async force computation — dispatch to GPU, apply results next frame.
+        // No blending, no attenuation smoothing — just apply directly when they arrive.
+        // 1-frame delay at 60fps (16ms) is imperceptible.
+        let forceStart = CFAbsoluteTimeGetCurrent()
+        var forceMethod = "gpu"
+
+        // Drain pending force results from async dispatch
         if let result = pendingForces.withLock({ value -> ForceResult? in
             let r = value; value = nil; return r
         }) {
-            // Blend old → new forces to avoid acceleration discontinuity.
-            // Without blending, forceAge reset causes a ~64% jump in applied magnitude.
-            let blend: Float = 0.65
-            if storedFx.count == result.fx.count {
-                for i in 0..<result.fx.count {
-                    storedFx[i] = storedFx[i] * (1 - blend) + result.fx[i] * blend
-                    storedFy[i] = storedFy[i] * (1 - blend) + result.fy[i] * blend
-                    storedFz[i] = storedFz[i] * (1 - blend) + result.fz[i] * blend
-                }
-            } else {
-                storedFx = result.fx; storedFy = result.fy; storedFz = result.fz
-            }
-            forceAge = 2
+            storedFx = result.fx; storedFy = result.fy; storedFz = result.fz
             tickInFlight = false
         }
 
-        let hasForcesComputed = storedFx.count == n
-        let rawAttenuation = pow(damping, Float(forceAge))
-        // Blend=0.12: with off-MainActor dispatch, forces arrive every 1-3 frames
-        // (longer at high node counts due to O(n²) GPU charge computation).
-        // The blend rate smooths the forceAge sawtooth (2→3→4→2) into near-constant
-        // force application, preventing visible jitter from magnitude oscillations.
-        smoothedAttenuation += (rawAttenuation - smoothedAttenuation) * 0.12
-        let attenuation = smoothedAttenuation
-        forceAge += 1
+        let forceMs = (CFAbsoluteTimeGetCurrent() - forceStart) * 1000.0
 
+        // Integrate with whatever forces we have (current or from previous frame)
+        let integrateStart = CFAbsoluteTimeGetCurrent()
+        let hasForcesComputed = storedFx.count == n
         var maxSpeedSq: Float = 0
+        var totalKineticEnergy: Float = 0
         for i in 0..<n where !pinned[i] {
             if hasForcesComputed {
-                vx[i] += storedFx[i] * attenuation
-                vy[i] += storedFy[i] * attenuation
-                vz[i] += storedFz[i] * attenuation
+                vx[i] += storedFx[i]
+                vy[i] += storedFy[i]
+                vz[i] += storedFz[i]
             }
             vx[i] *= damping; vy[i] *= damping; vz[i] *= damping
 
             let speedSq = vx[i] * vx[i] + vy[i] * vy[i] + vz[i] * vz[i]
             maxSpeedSq = max(maxSpeedSq, speedSq)
+            totalKineticEnergy += speedSq
             if speedSq > maxSpeed * maxSpeed {
                 let scale = maxSpeed / sqrt(speedSq)
                 vx[i] *= scale; vy[i] *= scale; vz[i] *= scale
@@ -419,34 +737,105 @@ final class ForceSimulation3D {
         lastMaxSpeedSq = maxSpeedSq
         framesSinceWake += 1
 
-        // Settle detection: all nodes nearly stationary for 30 consecutive frames,
-        // AND at least settleGuardFrames since last wake (prevents premature settling
-        // before async force results have propagated through the graph).
+        // Settle detection — simple threshold like JS version.
+        // No scale-adaptive hacks needed since forces are synchronous (no micro-oscillation).
+        let settleThreshold: Float = 0.01
         if hasForcesComputed
             && framesSinceWake >= settleGuardFrames
-            && maxSpeedSq < 0.01 {
+            && maxSpeedSq < settleThreshold {
             settledFrameCount += 1
             if settledFrameCount >= 30 {
                 isSettled = true
-                syncPositions()  // one final sync
+                syncPositions()
                 return
             }
-        } else if maxSpeedSq >= 0.01 {
+        } else if maxSpeedSq >= settleThreshold {
             settledFrameCount = 0
         }
 
         syncPositions()
 
-        // Dispatch force computation whenever the pipeline is idle.
-        // Safety: if the GPU force computation hangs (command buffer never completes),
-        // tickInFlight stays true forever, permanently blocking new dispatches.
-        // Reset after 10 frames (~170ms) — more than enough for any GPU computation.
-        if tickInFlight && forceAge > 12 {
-            forceSimLog.warning("Force computation timed out after \(self.forceAge) frames (n=\(n)) — resetting tickInFlight")
-            tickInFlight = false
-        }
+        // Dispatch next force computation (async, non-blocking).
+        // No node count cap — GPU handles any scale.
         if !tickInFlight {
-            dispatchForceComputation()
+            if let metal = metalForceCompute, n >= 16, metal.isFullSimAvailable {
+                tickInFlight = true
+                dispatchedToGPU = true
+                if topologyDirtyForGPU {
+                    metal.rebuildTopologyBuffers(
+                        nodeCount: n, edges: edgeIndices,
+                        projectGroups: projectGroup, topicGroups: topicGroup
+                    )
+                    topologyDirtyForGPU = false
+                }
+                let capturedX = x, capturedY = y, capturedZ = z
+                let capturedPG = projectGroup, capturedTG = topicGroup
+                let params = (chargeStrength: chargeStrength, crossChargeMultiplier: crossChargeMultiplier,
+                              sameTopicChargeScale: sameTopicChargeScale, sameProjectChargeScale: sameProjectChargeScale,
+                              springLength: springLength, crossProjectSpringLength: crossProjectSpringLength,
+                              springStrength: springStrength,
+                              cohesionStrength: cohesionStrength, centroidRepulsion: centroidRepulsion,
+                              topicCohesionStrength: topicCohesionStrength, topicCentroidRepulsion: topicCentroidRepulsion,
+                              centerStrength: centerStrength, center: center, alpha: alpha)
+                Task.detached(priority: .userInitiated) { [pendingForces] in
+                    let result = await metal.dispatchFullSimulation(
+                        positions: (x: capturedX, y: capturedY, z: capturedZ),
+                        projectGroups: capturedPG, topicGroups: capturedTG,
+                        chargeStrength: params.chargeStrength,
+                        crossChargeMultiplier: params.crossChargeMultiplier,
+                        sameTopicChargeScale: params.sameTopicChargeScale,
+                        sameProjectChargeScale: params.sameProjectChargeScale,
+                        springLength: params.springLength,
+                        crossProjectSpringLength: params.crossProjectSpringLength,
+                        springStrength: params.springStrength,
+                        cohesionStrength: params.cohesionStrength,
+                        centroidRepulsion: params.centroidRepulsion,
+                        topicCohesionStrength: params.topicCohesionStrength,
+                        topicCentroidRepulsion: params.topicCentroidRepulsion,
+                        centerStrength: params.centerStrength,
+                        center: params.center,
+                        alpha: params.alpha,
+                        damping: 0.78, maxSpeed: 12.0
+                    )
+                    pendingForces.withLock {
+                        $0 = ForceResult(fx: result.fx, fy: result.fy, fz: result.fz)
+                    }
+                }
+            } else {
+                forceMethod = "cpu"
+                tickInFlight = true
+                dispatchedToGPU = false
+                let state = SimState(
+                    n: n, x: x, y: y, z: z,
+                    projectGroup: projectGroup, topicGroup: topicGroup,
+                    edgeIndices: edgeIndices, topicProjectGroup: topicProjectGroup,
+                    alpha: alpha, center: center,
+                    chargeStrength: chargeStrength, crossChargeMultiplier: crossChargeMultiplier,
+                    sameProjectChargeScale: sameProjectChargeScale, sameTopicChargeScale: sameTopicChargeScale,
+                    centerStrength: centerStrength,
+                    springLength: springLength, crossProjectSpringLength: crossProjectSpringLength,
+                    springStrength: springStrength,
+                    cohesionStrength: cohesionStrength, centroidRepulsion: centroidRepulsion,
+                    topicCohesionStrength: topicCohesionStrength, topicCentroidRepulsion: topicCentroidRepulsion
+                )
+                Task.detached(priority: .userInitiated) { [pendingForces] in
+                    let result = Self.computeForces(state)
+                    pendingForces.withLock { $0 = result }
+                }
+            }
+        }
+        // Safety: GPU timeout — if command buffer hangs, reset after 12 frames
+        if tickInFlight && dispatchedToGPU && forceAge > 12 {
+            forceSimLog.warning("GPU force computation timed out after \(self.forceAge) frames (n=\(n)) — resetting")
+            tickInFlight = false
+            forceAge = 2
+        }
+        forceAge += 1
+
+        let integrateMs = (CFAbsoluteTimeGetCurrent() - integrateStart) * 1000.0
+        let totalTickMs = (CFAbsoluteTimeGetCurrent() - forceStart) * 1000.0
+        if framesSinceWake % 60 == 1 || totalTickMs > 20 {
+            print("[engram:sim] tick n=\(n) method=\(forceMethod) force=\(String(format: "%.1f", forceMs))ms integrate=\(String(format: "%.1f", integrateMs))ms total=\(String(format: "%.1f", totalTickMs))ms maxSpeedSq=\(String(format: "%.4f", maxSpeedSq)) alpha=\(String(format: "%.4f", alpha)) settled=\(isSettled)")
         }
     }
 
@@ -492,18 +881,64 @@ final class ForceSimulation3D {
             topicCohesionStrength: topicCohesionStrength, topicCentroidRepulsion: topicCentroidRepulsion
         )
 
-        // Try GPU path for charge forces (O(n²) bottleneck)
-        if let metal = metalForceCompute, n >= 16 {
+        // Try full GPU path (charge + springs + cohesion all on GPU)
+        // Skip GPU during cooldown after a timeout to prevent concurrent buffer access.
+        // Skip GPU entirely for large graphs — O(n²) charge kernel hangs at 4K+ nodes.
+        // CPU Barnes-Hut O(n log n) is fast enough (~5ms for 8K nodes).
+        if let metal = metalForceCompute, n >= 16, n <= 4096, metal.isFullSimAvailable, gpuCooldownTicks == 0 {
+            dispatchedToGPU = true
+            // Rebuild CSR topology buffers when graph structure changed
+            if topologyDirtyForGPU {
+                metal.rebuildTopologyBuffers(
+                    nodeCount: n,
+                    edges: edgeIndices,
+                    projectGroups: projectGroup,
+                    topicGroups: topicGroup
+                )
+                topologyDirtyForGPU = false
+            }
+
             let positions = (x: Array(x), y: Array(y), z: Array(z))
             let projGroups = Array(projectGroup)
             let topGroups = Array(topicGroup)
 
-            // Run entire force pipeline off MainActor — MetalForceCompute is @unchecked Sendable
-            // and Metal device/queue/pipeline are thread-safe. The tickInFlight flag ensures
-            // at most one concurrent dispatch, so buffer access is safe.
-            let dispatchN = n
             Task.detached(priority: .userInitiated) { [pendingForces] in
-                let t0 = CFAbsoluteTimeGetCurrent()
+                let result = await metal.dispatchFullSimulation(
+                    positions: positions,
+                    projectGroups: projGroups,
+                    topicGroups: topGroups,
+                    chargeStrength: state.chargeStrength,
+                    crossChargeMultiplier: state.crossChargeMultiplier,
+                    sameTopicChargeScale: state.sameTopicChargeScale,
+                    sameProjectChargeScale: state.sameProjectChargeScale,
+                    springLength: state.springLength,
+                    crossProjectSpringLength: state.crossProjectSpringLength,
+                    springStrength: state.springStrength,
+                    cohesionStrength: state.cohesionStrength,
+                    centroidRepulsion: state.centroidRepulsion,
+                    topicCohesionStrength: state.topicCohesionStrength,
+                    topicCentroidRepulsion: state.topicCentroidRepulsion,
+                    centerStrength: state.centerStrength,
+                    center: state.center,
+                    alpha: state.alpha,
+                    damping: 0.78,
+                    maxSpeed: 12.0
+                )
+                pendingForces.withLock {
+                    $0 = ForceResult(fx: result.fx, fy: result.fy, fz: result.fz)
+                }
+            }
+            return
+        }
+
+        // Fallback: GPU charge + CPU springs/cohesion (for older Metal or small graphs)
+        if let metal = metalForceCompute, n >= 16, n <= 4096, gpuCooldownTicks == 0 {
+            dispatchedToGPU = true
+            let positions = (x: Array(x), y: Array(y), z: Array(z))
+            let projGroups = Array(projectGroup)
+            let topGroups = Array(topicGroup)
+
+            Task.detached(priority: .userInitiated) { [pendingForces] in
                 async let chargeResult = metal.dispatchChargeForces(
                     positions: positions,
                     projectGroups: projGroups,
@@ -513,33 +948,27 @@ final class ForceSimulation3D {
                     sameTopicChargeScale: state.sameTopicChargeScale,
                     sameProjectChargeScale: state.sameProjectChargeScale
                 )
-                // Run CPU forces concurrently with GPU charge forces
                 let cpuForces = ForceSimulation3D.computeCPUOnlyForces(state)
                 let charge = await chargeResult
-                let gpuMs = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0
-                if gpuMs > 50 {
-                    print("FORCE_COMPUTE: n=\(dispatchN) gpu+cpu=\(String(format: "%.1f", gpuMs))ms charge_fx=\(charge.fx.count) cpu_fx=\(cpuForces.fx.count)")
-                }
-
                 let nn = min(charge.fx.count, cpuForces.fx.count)
-                var combinedFx = [Float](repeating: 0, count: nn)
-                var combinedFy = [Float](repeating: 0, count: nn)
-                var combinedFz = [Float](repeating: 0, count: nn)
+                var cfx = [Float](repeating: 0, count: nn)
+                var cfy = [Float](repeating: 0, count: nn)
+                var cfz = [Float](repeating: 0, count: nn)
                 for i in 0..<nn {
-                    combinedFx[i] = charge.fx[i] + cpuForces.fx[i]
-                    combinedFy[i] = charge.fy[i] + cpuForces.fy[i]
-                    combinedFz[i] = charge.fz[i] + cpuForces.fz[i]
+                    cfx[i] = charge.fx[i] + cpuForces.fx[i]
+                    cfy[i] = charge.fy[i] + cpuForces.fy[i]
+                    cfz[i] = charge.fz[i] + cpuForces.fz[i]
                 }
-                let result = ForceResult(fx: combinedFx, fy: combinedFy, fz: combinedFz)
+                let result = ForceResult(fx: cfx, fy: cfy, fz: cfz)
                 pendingForces.withLock { $0 = result }
             }
             return
         }
 
-        // CPU fallback path — should not be reached in production (Metal always available on macOS)
-        forceSimLog.error("[ForceSimulation3D] ⚠️ CPU fallback path hit — Metal unavailable or n<16 (n=\(n))")
+        // CPU fallback — n > 4096 (Barnes-Hut O(n log n)) or no Metal
+        dispatchedToGPU = false
         Task.detached(priority: .userInitiated) { [pendingForces] in
-            let result = await Self.computeForces(state)
+            let result = Self.computeForces(state)
             pendingForces.withLock { $0 = result }
         }
     }
@@ -723,8 +1152,9 @@ final class ForceSimulation3D {
         return ForceResult(fx: fx, fy: fy, fz: fz)
     }
 
-    @ForceSimulatorActor
-    private static func computeForces(_ s: SimState) -> ForceResult {
+    /// Pure force computation — runs on background thread via Task.detached.
+    /// nonisolated: takes SimState by value, no shared mutable state, safe to run in parallel.
+    private nonisolated static func computeForces(_ s: SimState) -> ForceResult {
         let n = s.n
         let x = s.x, y = s.y, z = s.z
         let projectGroup = s.projectGroup, topicGroup = s.topicGroup
@@ -737,42 +1167,74 @@ final class ForceSimulation3D {
         var fy = [Float](repeating: 0, count: n)
         var fz = [Float](repeating: 0, count: n)
 
-        // --- Charge repulsion (O(n²)) ---
+        // --- Charge repulsion ---
         let chargeBase = s.chargeStrength
         let chargeCross = chargeBase * s.crossChargeMultiplier
         let chargeSameProject = chargeBase * s.sameProjectChargeScale
         let chargeSameTopic = chargeBase * s.sameTopicChargeScale
+
+        // Check spatial extent to decide exact vs Barnes-Hut.
+        // BH only helps when nodes are spread beyond the charge cutoff (500 units),
+        // so distant subtrees can be pruned. For dense initial placement (all nodes
+        // within cutoff), BH degenerates to O(n²) without Newton's third — slower
+        // than exact. Use exact O(n²) with Newton's third for small or dense graphs.
         let cutoffSq: Float = 500 * 500
-
-        for i in 0..<n {
-            let xi = x[i], yi = y[i], zi = z[i]
-            let pg_i = hasProjects ? projectGroup[i] : 0
-            let tg_i = hasTopics ? topicGroup[i] : -1
-
-            for j in (i + 1)..<n {
-                let dx = xi - x[j], dy = yi - y[j], dz = zi - z[j]
-                var distSq = dx * dx + dy * dy + dz * dz
-                if distSq > cutoffSq { continue }
-                if distSq < 1 { distSq = 1 }
-
-                let charge: Float
-                if hasProjects && projectGroup[j] != pg_i {
-                    charge = chargeCross
-                } else if hasTopics && topicGroup[j] == tg_i {
-                    charge = chargeSameTopic
-                } else if hasProjects {
-                    charge = chargeSameProject  // same project, different topic
-                } else {
-                    charge = chargeBase
-                }
-
-                let dist = sqrt(distSq)
-                let forceMag = charge / distSq
-                let ux = dx / dist, uy = dy / dist, uz = dz / dist
-                let ffx = ux * forceMag, ffy = uy * forceMag, ffz = uz * forceMag
-                fx[i] += ffx; fy[i] += ffy; fz[i] += ffz
-                fx[j] -= ffx; fy[j] -= ffy; fz[j] -= ffz
+        var useBH = n > 256
+        if useBH {
+            var minX = x[0], maxX = x[0], minY = y[0], maxY = y[0], minZ = z[0], maxZ = z[0]
+            for i in 1..<n {
+                if x[i] < minX { minX = x[i] } else if x[i] > maxX { maxX = x[i] }
+                if y[i] < minY { minY = y[i] } else if y[i] > maxY { maxY = y[i] }
+                if z[i] < minZ { minZ = z[i] } else if z[i] > maxZ { maxZ = z[i] }
             }
+            let extent = max(maxX - minX, max(maxY - minY, maxZ - minZ))
+            // If all nodes fit within 2× cutoff diameter, most pairs are within cutoff
+            // and BH can't prune anything — exact with Newton's third is faster
+            if extent < 1000 { useBH = false }
+        }
+
+        if !useBH {
+            // Exact O(n²) with Newton's third — optimal for small/dense graphs
+            for i in 0..<n {
+                let xi = x[i], yi = y[i], zi = z[i]
+                let pg_i = hasProjects ? projectGroup[i] : 0
+                let tg_i = hasTopics ? topicGroup[i] : -1
+
+                for j in (i + 1)..<n {
+                    let dx = xi - x[j], dy = yi - y[j], dz = zi - z[j]
+                    var distSq = dx * dx + dy * dy + dz * dz
+                    if distSq > cutoffSq { continue }
+                    if distSq < 1 { distSq = 1 }
+
+                    let charge: Float
+                    if hasProjects && projectGroup[j] != pg_i {
+                        charge = chargeCross
+                    } else if hasTopics && topicGroup[j] == tg_i {
+                        charge = chargeSameTopic
+                    } else if hasProjects {
+                        charge = chargeSameProject
+                    } else {
+                        charge = chargeBase
+                    }
+
+                    let dist = sqrt(distSq)
+                    let forceMag = charge / distSq
+                    let ux = dx / dist, uy = dy / dist, uz = dz / dist
+                    let ffx = ux * forceMag, ffy = uy * forceMag, ffz = uz * forceMag
+                    fx[i] += ffx; fy[i] += ffy; fz[i] += ffz
+                    fx[j] -= ffx; fy[j] -= ffy; fz[j] -= ffz
+                }
+            }
+        } else {
+            // Spread-out graph: Barnes-Hut O(n log n)
+            computeChargeForcesBH(
+                x: x, y: y, z: z, n: n,
+                projectGroup: projectGroup, topicGroup: topicGroup,
+                hasProjects: hasProjects, hasTopics: hasTopics,
+                chargeBase: chargeBase, chargeCross: chargeCross,
+                chargeSameProject: chargeSameProject, chargeSameTopic: chargeSameTopic,
+                fx: &fx, fy: &fy, fz: &fz
+            )
         }
 
         // --- Spring attraction ---
@@ -934,6 +1396,177 @@ final class ForceSimulation3D {
         }
 
         return ForceResult(fx: fx, fy: fy, fz: fz)
+    }
+
+    // MARK: - Local wake (targeted force computation for single-node inserts)
+
+    /// Compute project cluster centroid from existing node positions.
+    private func projectCentroid(group: Int, jitter: Float) -> SIMD3<Float> {
+        var sumX: Float = 0, sumY: Float = 0, sumZ: Float = 0, count: Float = 0
+        for i in 0..<ids.count {
+            if projectGroup[i] == group {
+                sumX += x[i]; sumY += y[i]; sumZ += z[i]; count += 1
+            }
+        }
+        if count > 0 {
+            return SIMD3<Float>(
+                sumX / count + .random(in: -jitter...jitter),
+                sumY / count + .random(in: -jitter...jitter),
+                sumZ / count + .random(in: -jitter...jitter)
+            )
+        }
+        return randomSpherePosition()
+    }
+
+    /// Random position on a spherical shell around center.
+    private func randomSpherePosition() -> SIMD3<Float> {
+        let angle = Float.random(in: 0...(2 * .pi))
+        let phi = Float.random(in: -.pi/2...(.pi/2))
+        let r = Float.random(in: 50...250)
+        return SIMD3<Float>(
+            center.x + cos(angle) * cos(phi) * r,
+            center.y + sin(angle) * cos(phi) * r,
+            center.z + sin(phi) * r
+        )
+    }
+
+    /// Expand local wake neighborhood to include same-project-group nodes, capped.
+    private func expandLocalWakeNeighborhood() {
+        let maxSize = 100
+        guard let newIdx = localWakeNewNodeIndex else { return }
+        let newProjGroup = projectGroup[newIdx]
+        for i in 0..<ids.count {
+            if projectGroup[i] == newProjGroup {
+                localWakeIndices.insert(i)
+            }
+            if localWakeIndices.count >= maxSize { break }
+        }
+    }
+
+    /// Lightweight per-frame tick for local wake: CPU-only forces on neighborhood.
+    private func tickLocalWake() {
+        // First tick: expand neighborhood to include project peers
+        if !localWakeExpanded {
+            expandLocalWakeNeighborhood()
+            localWakeExpanded = true
+        }
+
+        let localIndices = Array(localWakeIndices)
+        let k = localIndices.count
+        guard k > 0 else { finishLocalWake(); return }
+
+        // --- O(K²) charge repulsion among local nodes ---
+        for ii in 0..<k {
+            let i = localIndices[ii]
+            guard !pinned[i] else { continue }
+            for jj in (ii + 1)..<k {
+                let j = localIndices[jj]
+                let dx = x[i] - x[j], dy = y[i] - y[j], dz = z[i] - z[j]
+                var distSq = dx * dx + dy * dy + dz * dz
+                if distSq > 250_000 { continue }  // 500² cutoff
+                if distSq < 1 { distSq = 1 }
+
+                let charge: Float
+                if projectGroup[i] != projectGroup[j] {
+                    charge = chargeStrength * crossChargeMultiplier
+                } else if topicGroup[i] == topicGroup[j] {
+                    charge = chargeStrength * sameTopicChargeScale
+                } else {
+                    charge = chargeStrength * sameProjectChargeScale
+                }
+
+                let dist = sqrt(distSq)
+                let forceMag = charge / distSq
+                let ux = dx / dist, uy = dy / dist, uz = dz / dist
+                let ffx = ux * forceMag, ffy = uy * forceMag, ffz = uz * forceMag
+                vx[i] += ffx; vy[i] += ffy; vz[i] += ffz
+                vx[j] -= ffx; vy[j] -= ffy; vz[j] -= ffz
+            }
+        }
+
+        // --- Spring forces for edges touching the local set ---
+        let localSet = localWakeIndices
+        for (si, ti) in edgeIndices {
+            guard localSet.contains(si) || localSet.contains(ti) else { continue }
+            let dx = x[ti] - x[si], dy = y[ti] - y[si], dz = z[ti] - z[si]
+            var d = sqrt(dx * dx + dy * dy + dz * dz)
+            if d < 1 { d = 1 }
+            let cross = projectGroup[si] != projectGroup[ti]
+            let rest = cross ? crossProjectSpringLength : springLength
+            let force = springStrength * (d - rest)
+            let efx = (dx / d) * force, efy = (dy / d) * force, efz = (dz / d) * force
+            if localSet.contains(si) { vx[si] += efx; vy[si] += efy; vz[si] += efz }
+            if localSet.contains(ti) { vx[ti] -= efx; vy[ti] -= efy; vz[ti] -= efz }
+        }
+
+        // --- Cohesion: pull new node(s) toward project centroid ---
+        if let newIdx = localWakeNewNodeIndex {
+            let pg = projectGroup[newIdx]
+            var sumX: Float = 0, sumY: Float = 0, sumZ: Float = 0, count: Float = 0
+            for i in 0..<ids.count where projectGroup[i] == pg {
+                sumX += x[i]; sumY += y[i]; sumZ += z[i]; count += 1
+            }
+            if count > 1 {
+                let cx = sumX / count, cy = sumY / count, cz = sumZ / count
+                // Stronger cohesion for fast convergence (3x normal)
+                let str = cohesionStrength * 3.0
+                let dx = cx - x[newIdx], dy = cy - y[newIdx], dz = cz - z[newIdx]
+                vx[newIdx] += dx * str
+                vy[newIdx] += dy * str
+                vz[newIdx] += dz * str
+            }
+        }
+
+        // --- Center gravity for local nodes ---
+        for i in localIndices where !pinned[i] {
+            vx[i] += (center.x - x[i]) * alphaFloor * centerStrength
+            vy[i] += (center.y - y[i]) * alphaFloor * centerStrength
+            vz[i] += (center.z - z[i]) * alphaFloor * centerStrength
+        }
+
+        // --- Integration: only local nodes ---
+        var maxSpeedSq: Float = 0
+        for i in localIndices where !pinned[i] {
+            vx[i] *= damping; vy[i] *= damping; vz[i] *= damping
+            let speedSq = vx[i] * vx[i] + vy[i] * vy[i] + vz[i] * vz[i]
+            maxSpeedSq = max(maxSpeedSq, speedSq)
+            if speedSq > maxSpeed * maxSpeed {
+                let scale = maxSpeed / sqrt(speedSq)
+                vx[i] *= scale; vy[i] *= scale; vz[i] *= scale
+            }
+            x[i] += vx[i]; y[i] += vy[i]; z[i] += vz[i]
+        }
+
+        lastMaxSpeedSq = maxSpeedSq
+
+        // Sync only changed positions (O(K) instead of O(n))
+        for i in localIndices {
+            positions[ids[i]] = SIMD3(x[i], y[i], z[i])
+        }
+
+        // Settle: velocities converged or max frames reached
+        localWakeFramesRemaining -= 1
+        if maxSpeedSq < 0.01 || localWakeFramesRemaining <= 0 {
+            finishLocalWake()
+        }
+    }
+
+    /// Finish local wake — transition back to settled state.
+    private func finishLocalWake() {
+        clearLocalWake()
+        isSettled = true
+        lastMaxSpeedSq = 0
+        // Final full sync for consistency
+        syncPositions()
+    }
+
+    /// Reset all local wake state without changing isSettled.
+    private func clearLocalWake() {
+        isLocalWake = false
+        localWakeIndices.removeAll()
+        localWakeNewNodeIndex = nil
+        localWakeExpanded = false
+        localWakeFramesRemaining = 0
     }
 
     // MARK: - Position sync

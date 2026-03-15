@@ -1,4 +1,5 @@
 import Metal
+import CEngramSceneTypes
 
 /// Factory for MTLRenderPipelineState objects.
 /// Creates pipelines for nodes, edges, labels, nebulae, and flow particles.

@@ -1,4 +1,5 @@
 import SwiftUI
+import CEngramSceneTypes
 import RealityKit
 import GameController
 import Metal

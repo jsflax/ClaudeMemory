@@ -15,6 +15,8 @@ let package = Package(
         .library(name: "EngramKit", targets: ["EngramKit"]),
         .library(name: "EngramModels", targets: ["EngramModels"]),
         .library(name: "EngramFoundationModels", targets: ["EngramFoundationModels"]),
+        .library(name: "EngramSceneKit", targets: ["EngramSceneKit"]),
+        .library(name: "CEngramSceneTypes", targets: ["CEngramSceneTypes"]),
     ],
     dependencies: [
         .package(url: "https://github.com/modelcontextprotocol/swift-sdk.git", from: "0.10.0"),
@@ -25,6 +27,19 @@ let package = Package(
         .package(url: "https://github.com/google/GoogleSignIn-iOS.git", from: "7.0.0"),
     ],
     targets: [
+        // C target exposing SharedTypes.h (GPU struct definitions) to Swift modules.
+        // Keep this header in sync with Sources/EngramVisualizer/Metal/SharedTypes.h.
+        .target(
+            name: "CEngramSceneTypes"
+        ),
+        // Pure-logic library for scene frame building — no Metal, no @MainActor.
+        .target(
+            name: "EngramSceneKit",
+            dependencies: ["CEngramSceneTypes"],
+            swiftSettings: [
+                .interoperabilityMode(.Cxx),
+            ]
+        ),
         .target(
             name: "EngramModels",
             dependencies: [
@@ -74,6 +89,8 @@ let package = Package(
             dependencies: [
                 "EngramKit",
                 "EngramFoundationModels",
+                "EngramSceneKit",
+                "CEngramSceneTypes",
                 .product(name: "Lattice", package: "Lattice"),
                 .product(name: "Sparkle", package: "Sparkle"),
                 .product(name: "GoogleSignIn", package: "GoogleSignIn-iOS"),
@@ -139,6 +156,13 @@ let package = Package(
                 "EngramKit",
                 .product(name: "Lattice", package: "Lattice"),
             ],
+            swiftSettings: [
+                .interoperabilityMode(.Cxx),
+            ]
+        ),
+        .testTarget(
+            name: "EngramVisualizerTests",
+            dependencies: ["EngramSceneKit"],
             swiftSettings: [
                 .interoperabilityMode(.Cxx),
             ]
