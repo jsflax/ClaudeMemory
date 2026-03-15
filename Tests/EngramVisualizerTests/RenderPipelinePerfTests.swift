@@ -22,40 +22,67 @@ struct RenderPipelinePerfTests {
                            "sidescroller", "global", "LatticeCore", "SwiftLM"]
 
     struct TestGraph {
-        let nodes: [(id: UUID, project: String, importance: Int)]
-        let positions: [UUID: SIMD3<Float>]
-        let hubs: Set<UUID>
-        let nodeIndexMap: [UUID: UInt32]
-        let nodeRadii: [UUID: Float]
-        let nodeProjects: [UUID: String]
+        // Parallel arrays for SceneNodeFrameInput
+        let nodeIds: [UUID]
+        let nodeProjects: [String]
+        let nodeImportances: [Int]
+        let nodePositions: [SIMD3<Float>]
+        let hasPosition: [Bool]
+        let nodeRadii: [Float]
+        let nodeIsHub: [Bool]
         let projectColors: [String: SIMD3<Float>]
+
+        // Dictionary forms kept for edge-related APIs (resolveEdges)
+        let nodeIndexMap: [UUID: UInt32]
+        let nodeRadiiDict: [UUID: Float]
+        let nodeProjectsDict: [UUID: String]
         let edges: [(sourceId: UUID, targetId: UUID, relation: String)]
     }
 
     static func makeGraph(nodeCount: Int, edgesPerNode: Int = 15) -> TestGraph {
-        var nodes: [(id: UUID, project: String, importance: Int)] = []
-        var positions: [UUID: SIMD3<Float>] = [:]
-        var hubs: Set<UUID> = []
-        var nodeIndexMap: [UUID: UInt32] = [:]
-        var nodeRadii: [UUID: Float] = [:]
-        var nodeProjects: [UUID: String] = [:]
+        var nodeIds: [UUID] = []
+        var nodeProjectsArr: [String] = []
+        var nodeImportances: [Int] = []
+        var nodePositionsArr: [SIMD3<Float>] = []
+        var hasPosition: [Bool] = []
+        var nodeRadiiArr: [Float] = []
+        var nodeIsHub: [Bool] = []
 
-        nodes.reserveCapacity(nodeCount)
+        var nodeIndexMap: [UUID: UInt32] = [:]
+        var nodeRadiiDict: [UUID: Float] = [:]
+        var nodeProjectsDict: [UUID: String] = [:]
+
+        nodeIds.reserveCapacity(nodeCount)
+        nodeProjectsArr.reserveCapacity(nodeCount)
+        nodeImportances.reserveCapacity(nodeCount)
+        nodePositionsArr.reserveCapacity(nodeCount)
+        hasPosition.reserveCapacity(nodeCount)
+        nodeRadiiArr.reserveCapacity(nodeCount)
+        nodeIsHub.reserveCapacity(nodeCount)
+
         for i in 0..<nodeCount {
             let id = UUID()
             let project = projects[i % projects.count]
             let importance = (i % 5) + 1
-            nodes.append((id: id, project: project, importance: importance))
-            positions[id] = SIMD3<Float>(
+            let isHub = i % 50 == 0
+            let pos = SIMD3<Float>(
                 Float.random(in: -500...500),
                 Float.random(in: -500...500),
                 Float.random(in: -500...500))
-            nodeIndexMap[id] = UInt32(i)
-            nodeProjects[id] = project
-            let isHub = i % 50 == 0
-            if isHub { hubs.insert(id) }
             let baseR: Float = isHub ? 0.04 * 1.6 : 0.04
-            nodeRadii[id] = baseR * (1.0 + Float(importance - 1) * 0.08)
+            let radius = baseR * (1.0 + Float(importance - 1) * 0.08)
+
+            nodeIds.append(id)
+            nodeProjectsArr.append(project)
+            nodeImportances.append(importance)
+            nodePositionsArr.append(pos)
+            hasPosition.append(true)
+            nodeRadiiArr.append(radius)
+            nodeIsHub.append(isHub)
+
+            nodeIndexMap[id] = UInt32(i)
+            nodeRadiiDict[id] = radius
+            nodeProjectsDict[id] = project
         }
 
         var projectColors: [String: SIMD3<Float>] = [:]
@@ -73,14 +100,44 @@ struct RenderPipelinePerfTests {
             let src = i % nodeCount
             let tgt = (i / nodeCount + i + 1) % nodeCount
             if src != tgt {
-                edges.append((sourceId: nodes[src].id, targetId: nodes[tgt].id, relation: "relates_to"))
+                edges.append((sourceId: nodeIds[src], targetId: nodeIds[tgt], relation: "relates_to"))
             }
         }
 
-        return TestGraph(nodes: nodes, positions: positions, hubs: hubs,
-                         nodeIndexMap: nodeIndexMap, nodeRadii: nodeRadii,
-                         nodeProjects: nodeProjects, projectColors: projectColors,
-                         edges: edges)
+        return TestGraph(
+            nodeIds: nodeIds,
+            nodeProjects: nodeProjectsArr,
+            nodeImportances: nodeImportances,
+            nodePositions: nodePositionsArr,
+            hasPosition: hasPosition,
+            nodeRadii: nodeRadiiArr,
+            nodeIsHub: nodeIsHub,
+            projectColors: projectColors,
+            nodeIndexMap: nodeIndexMap,
+            nodeRadiiDict: nodeRadiiDict,
+            nodeProjectsDict: nodeProjectsDict,
+            edges: edges)
+    }
+
+    private func makeNodeInput(from g: TestGraph) -> SceneNodeFrameInput {
+        SceneNodeFrameInput(
+            nodeIds: g.nodeIds,
+            nodeProjects: g.nodeProjects,
+            nodeImportances: g.nodeImportances,
+            nodePositions: g.nodePositions,
+            hasPosition: g.hasPosition,
+            nodeRadii: g.nodeRadii,
+            nodeIsHub: g.nodeIsHub,
+            projectColors: g.projectColors,
+            selectedNodeIndex: nil,
+            glowingNodes: [:],
+            newNodes: [:],
+            isSearchActive: false,
+            searchMatchIndices: [],
+            inspectingIntensity: [:],
+            birthingElapsed: [:],
+            nodeRadius: 0.04,
+            cameraPosition: SIMD3<Float>(0, 0, 800))
     }
 
     private func measure(_ label: String, iterations: Int = 10, block: () -> Void) -> Double {
@@ -98,14 +155,7 @@ struct RenderPipelinePerfTests {
     @Test("Node packing 10K: under 3ms")
     func testNodePacking10K() {
         let g = Self.makeGraph(nodeCount: 10000)
-        let input = SceneNodeFrameInput(
-            nodes: g.nodes, positions: g.positions, hubs: g.hubs,
-            projectColors: g.projectColors, selectedNode: nil,
-            glowingNodes: [:], newNodes: [:],
-            isSearchActive: false, searchMatchIds: [],
-            inspectingIntensity: [:], birthingElapsed: [:],
-            nodeRadius: 0.04, cameraPosition: SIMD3<Float>(0, 0, 800),
-            nodeIndexMap: g.nodeIndexMap, nodeRadii: g.nodeRadii)
+        let input = makeNodeInput(from: g)
         let ms = measure("node-pack-10K") { _ = buildSceneNodeFrame(input) }
         #expect(ms < 3.0, "node packing took \(String(format: "%.1f", ms))ms, budget 3ms")
     }
@@ -113,14 +163,7 @@ struct RenderPipelinePerfTests {
     @Test("Node packing 20K: under 6ms")
     func testNodePacking20K() {
         let g = Self.makeGraph(nodeCount: 20000)
-        let input = SceneNodeFrameInput(
-            nodes: g.nodes, positions: g.positions, hubs: g.hubs,
-            projectColors: g.projectColors, selectedNode: nil,
-            glowingNodes: [:], newNodes: [:],
-            isSearchActive: false, searchMatchIds: [],
-            inspectingIntensity: [:], birthingElapsed: [:],
-            nodeRadius: 0.04, cameraPosition: SIMD3<Float>(0, 0, 800),
-            nodeIndexMap: g.nodeIndexMap, nodeRadii: g.nodeRadii)
+        let input = makeNodeInput(from: g)
         let ms = measure("node-pack-20K") { _ = buildSceneNodeFrame(input) }
         #expect(ms < 6.0, "node packing took \(String(format: "%.1f", ms))ms, budget 6ms")
     }
@@ -132,7 +175,7 @@ struct RenderPipelinePerfTests {
         let g = Self.makeGraph(nodeCount: 10000, edgesPerNode: 15)
         let ms = measure("edge-resolve-10K/150K", iterations: 5) {
             _ = resolveEdges(edges: g.edges, nodeIndexMap: g.nodeIndexMap,
-                             nodeRadii: g.nodeRadii, nodeProjects: g.nodeProjects,
+                             nodeRadii: g.nodeRadiiDict, nodeProjects: g.nodeProjectsDict,
                              projectColors: g.projectColors, defaultEdgeRadius: 0.004)
         }
         #expect(ms < 50.0, "edge resolve took \(String(format: "%.1f", ms))ms, budget 50ms (one-time)")
@@ -142,7 +185,7 @@ struct RenderPipelinePerfTests {
     func testEdgePacking10K() {
         let g = Self.makeGraph(nodeCount: 10000, edgesPerNode: 15)
         let resolved = resolveEdges(edges: g.edges, nodeIndexMap: g.nodeIndexMap,
-                                     nodeRadii: g.nodeRadii, nodeProjects: g.nodeProjects,
+                                     nodeRadii: g.nodeRadiiDict, nodeProjects: g.nodeProjectsDict,
                                      projectColors: g.projectColors, defaultEdgeRadius: 0.004)
         let input = SceneEdgeFrameInput(resolvedEdges: resolved, edgeRadius: 0.004,
                                          nodeCount: g.nodeIndexMap.count)
@@ -154,7 +197,7 @@ struct RenderPipelinePerfTests {
     func testEdgePacking20K() {
         let g = Self.makeGraph(nodeCount: 20000, edgesPerNode: 15)
         let resolved = resolveEdges(edges: g.edges, nodeIndexMap: g.nodeIndexMap,
-                                     nodeRadii: g.nodeRadii, nodeProjects: g.nodeProjects,
+                                     nodeRadii: g.nodeRadiiDict, nodeProjects: g.nodeProjectsDict,
                                      projectColors: g.projectColors, defaultEdgeRadius: 0.004)
         let input = SceneEdgeFrameInput(resolvedEdges: resolved, edgeRadius: 0.004,
                                          nodeCount: g.nodeIndexMap.count)
@@ -173,11 +216,11 @@ struct RenderPipelinePerfTests {
                           importance: Int, isSelected: Bool,
                           isSearchMatch: Bool, searchDimmed: Bool,
                           isExpandedChild: Bool)] = []
-        for node in g.nodes {
-            atlasRects[node.id] = rect
-            nodeLabels.append((id: node.id, position: g.positions[node.id]!,
-                               isHub: g.hubs.contains(node.id),
-                               importance: node.importance, isSelected: false,
+        for (i, id) in g.nodeIds.enumerated() {
+            atlasRects[id] = rect
+            nodeLabels.append((id: id, position: g.nodePositions[i],
+                               isHub: g.nodeIsHub[i],
+                               importance: g.nodeImportances[i], isSelected: false,
                                isSearchMatch: false, searchDimmed: false,
                                isExpandedChild: false))
         }
@@ -254,17 +297,10 @@ struct RenderPipelinePerfTests {
     func testFullPipeline10K() {
         let g = Self.makeGraph(nodeCount: 10000, edgesPerNode: 15)
 
-        let nodeInput = SceneNodeFrameInput(
-            nodes: g.nodes, positions: g.positions, hubs: g.hubs,
-            projectColors: g.projectColors, selectedNode: nil,
-            glowingNodes: [:], newNodes: [:],
-            isSearchActive: false, searchMatchIds: [],
-            inspectingIntensity: [:], birthingElapsed: [:],
-            nodeRadius: 0.04, cameraPosition: SIMD3<Float>(0, 0, 800),
-            nodeIndexMap: g.nodeIndexMap, nodeRadii: g.nodeRadii)
+        let nodeInput = makeNodeInput(from: g)
 
         let resolved = resolveEdges(edges: g.edges, nodeIndexMap: g.nodeIndexMap,
-                                     nodeRadii: g.nodeRadii, nodeProjects: g.nodeProjects,
+                                     nodeRadii: g.nodeRadiiDict, nodeProjects: g.nodeProjectsDict,
                                      projectColors: g.projectColors, defaultEdgeRadius: 0.004)
         let edgeInput = SceneEdgeFrameInput(resolvedEdges: resolved, edgeRadius: 0.004,
                                              nodeCount: g.nodeIndexMap.count)

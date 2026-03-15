@@ -730,38 +730,68 @@ final class MetalSceneManager {
 
         // Build the NodeFrame using the pure builder (testable, no GPU dependency)
         let t_input = CFAbsoluteTimeGetCurrent()
-        // Rebuild nodeIndexMap and cached node data only when topology changes
-        if nodes.count != lastTopologyNodeCount {
+        let hubs = renderHubs
+        let nodeCount = nodes.count
+
+        // Rebuild cached data only on topology change
+        if nodeCount != lastTopologyNodeCount {
             nodeIndexMap.removeAll(keepingCapacity: true)
             cachedNodeProject.removeAll(keepingCapacity: true)
             cachedNodeRadii.removeAll(keepingCapacity: true)
             for (i, node) in nodes.enumerated() {
                 nodeIndexMap[node.id] = UInt32(i)
                 cachedNodeProject[node.id] = node.project
-                let isHub = renderHubs.contains(node.id)
+                let isHub = hubs.contains(node.id)
                 let importance = max(1, node.importance)
                 let baseR: Float = isHub ? nodeRadius * 1.6 : nodeRadius
                 cachedNodeRadii[node.id] = baseR * (1.0 + Float(importance - 1) * 0.08)
             }
-            lastTopologyNodeCount = nodes.count
+            lastTopologyNodeCount = nodeCount
+        }
+
+        // Build parallel arrays for the builder (no UUID dict lookups in hot loop)
+        var nodeIds = [UUID](repeating: UUID(), count: nodeCount)
+        var nodeProj = [String](repeating: "", count: nodeCount)
+        var nodeImp = [Int](repeating: 1, count: nodeCount)
+        var nodePos = [SIMD3<Float>](repeating: .zero, count: nodeCount)
+        var hasPos = [Bool](repeating: false, count: nodeCount)
+        var nodeRad = [Float](repeating: nodeRadius, count: nodeCount)
+        var nodeHub = [Bool](repeating: false, count: nodeCount)
+        var selectedIdx: Int? = nil
+        var searchMatchIdx = Set<Int>()
+
+        for (i, node) in nodes.enumerated() {
+            nodeIds[i] = node.id
+            nodeProj[i] = node.project
+            nodeImp[i] = node.importance
+            if let pos = positions[node.id] {
+                nodePos[i] = pos
+                hasPos[i] = true
+            }
+            nodeRad[i] = cachedNodeRadii[node.id] ?? nodeRadius
+            nodeHub[i] = hubs.contains(node.id)
+            if node.id == selectedNode { selectedIdx = i }
+            if isSearchActive && searchMatchIds.contains(node.id) { searchMatchIdx.insert(i) }
         }
 
         let frameInput = SceneNodeFrameInput(
-            nodes: nodes.map { (id: $0.id, project: $0.project, importance: $0.importance) },
-            positions: positions,
-            hubs: renderHubs,
+            nodeIds: nodeIds,
+            nodeProjects: nodeProj,
+            nodeImportances: nodeImp,
+            nodePositions: nodePos,
+            hasPosition: hasPos,
+            nodeRadii: nodeRad,
+            nodeIsHub: nodeHub,
             projectColors: projectColors,
-            selectedNode: selectedNode,
+            selectedNodeIndex: selectedIdx,
             glowingNodes: glowElapsed,
             newNodes: arrivalElapsed,
             isSearchActive: isSearchActive,
-            searchMatchIds: searchMatchIds,
+            searchMatchIndices: searchMatchIdx,
             inspectingIntensity: inspectingIntensity,
             birthingElapsed: birthingElapsed,
             nodeRadius: nodeRadius,
-            cameraPosition: camera.cameraPosition,
-            nodeIndexMap: nodeIndexMap,
-            nodeRadii: cachedNodeRadii
+            cameraPosition: camera.cameraPosition
         )
         let t_build = CFAbsoluteTimeGetCurrent()
         let nodeFrame = buildSceneNodeFrame(frameInput)
@@ -777,7 +807,6 @@ final class MetalSceneManager {
 
         // Upload NodeFrame to GPU buffers
         let t_upload = CFAbsoluteTimeGetCurrent()
-        let nodeCount = nodes.count
         renderer.ensureNodeBuffers(nodeCount: nodeCount)
         renderer.ensureNodePackBuffers(count: nodeCount)
         renderer.ensureNodePositionBuffer(count: nodeCount)

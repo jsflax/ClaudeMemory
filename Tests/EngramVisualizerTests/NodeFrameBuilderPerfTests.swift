@@ -7,32 +7,44 @@ import EngramSceneKit
 @Suite("NodeFrame Builder Performance")
 struct NodeFrameBuilderPerfTests {
 
-    /// Helper to build test data at a given scale.
+    /// Helper to build test data at a given scale using the parallel-array API.
     private func makeScaleInput(nodeCount: Int) -> SceneNodeFrameInput {
         let projects = ["Engram", "Lattice", "ClaudeMemory", "engram-server",
                         "sidescroller", "global", "LatticeCore", "SwiftLM"]
 
-        var nodes: [(id: UUID, project: String, importance: Int)] = []
-        var positions: [UUID: SIMD3<Float>] = [:]
-        var hubs: Set<UUID> = []
-        var nodeIndexMap: [UUID: UInt32] = [:]
-        var nodeRadii: [UUID: Float] = [:]
+        var nodeIds: [UUID] = []
+        var nodeProjects: [String] = []
+        var nodeImportances: [Int] = []
+        var nodePositions: [SIMD3<Float>] = []
+        var hasPosition: [Bool] = []
+        var nodeRadii: [Float] = []
+        var nodeIsHub: [Bool] = []
 
-        nodes.reserveCapacity(nodeCount)
+        nodeIds.reserveCapacity(nodeCount)
+        nodeProjects.reserveCapacity(nodeCount)
+        nodeImportances.reserveCapacity(nodeCount)
+        nodePositions.reserveCapacity(nodeCount)
+        hasPosition.reserveCapacity(nodeCount)
+        nodeRadii.reserveCapacity(nodeCount)
+        nodeIsHub.reserveCapacity(nodeCount)
+
         for i in 0..<nodeCount {
             let id = UUID()
             let project = projects[i % projects.count]
             let importance = (i % 5) + 1
-            nodes.append((id: id, project: project, importance: importance))
-            positions[id] = SIMD3<Float>(Float.random(in: -500...500),
-                                         Float.random(in: -500...500),
-                                         Float.random(in: -500...500))
-            nodeIndexMap[id] = UInt32(i)
-            if i % 50 == 0 { hubs.insert(id) }
+            let isHub = i % 50 == 0
 
-            let isHub = hubs.contains(id)
+            nodeIds.append(id)
+            nodeProjects.append(project)
+            nodeImportances.append(importance)
+            nodePositions.append(SIMD3<Float>(Float.random(in: -500...500),
+                                              Float.random(in: -500...500),
+                                              Float.random(in: -500...500)))
+            hasPosition.append(true)
+            nodeIsHub.append(isHub)
+
             let baseR: Float = isHub ? 0.04 * 1.6 : 0.04
-            nodeRadii[id] = baseR * (1.0 + Float(importance - 1) * 0.08)
+            nodeRadii.append(baseR * (1.0 + Float(importance - 1) * 0.08))
         }
 
         var projectColors: [String: SIMD3<Float>] = [:]
@@ -43,21 +55,23 @@ struct NodeFrameBuilderPerfTests {
         }
 
         return SceneNodeFrameInput(
-            nodes: nodes,
-            positions: positions,
-            hubs: hubs,
+            nodeIds: nodeIds,
+            nodeProjects: nodeProjects,
+            nodeImportances: nodeImportances,
+            nodePositions: nodePositions,
+            hasPosition: hasPosition,
+            nodeRadii: nodeRadii,
+            nodeIsHub: nodeIsHub,
             projectColors: projectColors,
-            selectedNode: nil,
+            selectedNodeIndex: nil,
             glowingNodes: [:],
             newNodes: [:],
             isSearchActive: false,
-            searchMatchIds: [],
+            searchMatchIndices: [],
             inspectingIntensity: [:],
             birthingElapsed: [:],
             nodeRadius: 0.04,
-            cameraPosition: SIMD3<Float>(0, 0, 800),
-            nodeIndexMap: nodeIndexMap,
-            nodeRadii: nodeRadii
+            cameraPosition: SIMD3<Float>(0, 0, 800)
         )
     }
 
@@ -96,36 +110,34 @@ struct NodeFrameBuilderPerfTests {
         #expect(ms < 1.0, "visual state took \(String(format: "%.2f", ms))ms")
     }
 
-    @Test("8684 nodes — position dict lookup cost")
-    func testPositionLookupCost() {
+    @Test("8684 nodes — position array access cost")
+    func testPositionAccessCost() {
         let input = makeScaleInput(nodeCount: 8684)
-        let ids = input.nodes.map(\.id)
-        let ms = measure("position lookup 8684", iterations: 20) {
+        let ms = measure("position access 8684", iterations: 20) {
             var sum: Float = 0
-            for id in ids {
-                if let pos = input.positions[id] {
-                    sum += pos.x
+            for i in 0..<input.nodePositions.count {
+                if input.hasPosition[i] {
+                    sum += input.nodePositions[i].x
                 }
             }
             _ = sum // prevent optimization
         }
-        #expect(ms < 3.0, "position lookup took \(String(format: "%.2f", ms))ms")
+        #expect(ms < 3.0, "position access took \(String(format: "%.2f", ms))ms")
     }
 
-    @Test("20000 nodes — position dict lookup cost")
-    func testPositionLookup20k() {
+    @Test("20000 nodes — position array access cost")
+    func testPositionAccess20k() {
         let input = makeScaleInput(nodeCount: 20000)
-        let ids = input.nodes.map(\.id)
-        let ms = measure("position lookup 20000", iterations: 20) {
+        let ms = measure("position access 20000", iterations: 20) {
             var sum: Float = 0
-            for id in ids {
-                if let pos = input.positions[id] {
-                    sum += pos.x
+            for i in 0..<input.nodePositions.count {
+                if input.hasPosition[i] {
+                    sum += input.nodePositions[i].x
                 }
             }
             _ = sum
         }
-        #expect(ms < 6.0, "position lookup took \(String(format: "%.2f", ms))ms")
+        #expect(ms < 6.0, "position access took \(String(format: "%.2f", ms))ms")
     }
 
     @Test("packNodeState encoding is trivial")
