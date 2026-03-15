@@ -888,12 +888,17 @@ extension MetalGraphRenderer: MTKViewDelegate {
         // GPU compute: force sim + pack + stamp (all in one encoder, one command buffer)
         if let computeEncoder = commandBuffer.makeComputeCommandEncoder() {
             // Force compute for each galaxy's simulation (before render packing).
-            // Encoded into the same command buffer as rendering — no GPU contention.
-            // Forces are read back in the completion handler (1-frame delay, like JS).
-            if let fc = forceCompute, fc.isFullSimAvailable, let registry = galaxyRegistryRef {
+            // Each galaxy has its own MetalForceCompute with separate buffers.
+            // All encoded into the same command buffer — no GPU contention.
+            if let registry = galaxyRegistryRef {
                 for galaxy in registry.galaxies.values {
                     let sim = galaxy.simulation3D
-                    guard !sim.isSettled, sim.nodeCount > 1 else { continue }
+                    guard sim.useGPUForces, !sim.isSettled, sim.nodeCount > 1 else { continue }
+                    // Lazy-create per-galaxy force compute (shares renderer's device/library)
+                    if galaxy.metalForceCompute == nil {
+                        galaxy.metalForceCompute = MetalForceCompute(device: device, library: library)
+                    }
+                    guard let fc = galaxy.metalForceCompute, fc.isFullSimAvailable else { continue }
                     if sim.topologyDirtyForGPU {
                         fc.rebuildTopologyBuffers(
                             nodeCount: sim.nodeCount, edges: sim.edgeIndicesPublic,
@@ -1138,18 +1143,17 @@ extension MetalGraphRenderer: MTKViewDelegate {
 
         commandBuffer.present(drawable)
         let pool = bufferPool
-        let fc = forceCompute
         let registry = galaxyRegistryRef
         commandBuffer.addCompletedHandler { @Sendable _ in
             pool.signalFrameComplete()
-            // Read back GPU force results and deliver to simulations (1-frame delay)
-            if let fc, let forces = fc.readBackForces(), let registry {
-                // Store in each galaxy's sim via lock-free handoff
-                for galaxy in registry.galaxies.values {
-                    let sim = galaxy.simulation3D
-                    guard !sim.isSettled, sim.nodeCount == forces.fx.count else { continue }
-                    sim.pendingForces.withLock { $0 = ForceSimulation3D.ForceResult(fx: forces.fx, fy: forces.fy, fz: forces.fz) }
-                }
+            // Read back GPU force results per galaxy (each has own buffers)
+            guard let registry else { return }
+            for galaxy in registry.galaxies.values {
+                guard let fc = galaxy.metalForceCompute,
+                      let forces = fc.readBackForces() else { continue }
+                let sim = galaxy.simulation3D
+                guard !sim.isSettled, sim.nodeCount == forces.fx.count else { continue }
+                sim.pendingForces.withLock { $0 = ForceSimulation3D.ForceResult(fx: forces.fx, fy: forces.fy, fz: forces.fz) }
             }
         }
         commandBuffer.commit()
