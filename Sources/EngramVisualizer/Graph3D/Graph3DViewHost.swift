@@ -1,4 +1,6 @@
 import SwiftUI
+import EngramSceneKit
+import EngramMetalShaders
 import RealityKit
 import GameController
 import Metal
@@ -32,7 +34,7 @@ struct Graph3DView: View {
 
     @State private var scene = Graph3DScene()
     @State private var metalScene: MetalSceneManager?
-    @State private var metalRenderer: MetalGraphRenderer?
+    @State private var metalOrchestrator: FrameOrchestrator?
     @State private var scrollMonitor: Any?
     @State private var updateClosureCount: UInt64 = 0
     /// Mirrors metalScene.reticleTarget for SwiftUI (MetalSceneManager is not @Observable).
@@ -205,6 +207,7 @@ struct Graph3DView: View {
         .onDisappear { removeInputMonitor() }
         .onChange(of: soundEnabled) { _, enabled in
             if Self.useMetalRenderer, let ms = metalScene {
+                ms.soundEnabled = enabled
                 if enabled {
                     let audio = SpatialAudioEngine()
                     ms.spatialAudio = audio
@@ -307,8 +310,8 @@ struct Graph3DView: View {
 
     @ViewBuilder
     private var metalViewContent: some View {
-        if let renderer = metalRenderer {
-            MetalViewRepresentable(renderer: renderer)
+        if let orch = metalOrchestrator {
+            MetalViewRepresentable(orchestrator: orch)
                 .onChange(of: layoutMode) { _, _ in pushDataToMetalScene() }
                 .onChange(of: showMascots) { _, _ in pushDataToMetalScene() }
                 .onChange(of: transitionProgress) { _, _ in
@@ -322,18 +325,51 @@ struct Graph3DView: View {
     }
 
     private func setupMetalRenderer() {
-        guard metalRenderer == nil else { return }
-        guard let r = MetalGraphRenderer(create: true) else { return }
-        metalRenderer = r
-        #if ENGRAM_INSTRUMENTATION
-        r.installRunLoopObserver()
-        #endif
-        guard let mgr = MetalSceneManager(renderer: r) else { return }
+        guard metalOrchestrator == nil else { return }
+        guard let device = MTLCreateSystemDefaultDevice(),
+              let library = try? EngramMetalShaders.makeLibrary(device: device),
+              let orch = FrameOrchestrator(device: device, library: library) else { return }
+        metalOrchestrator = orch
+
+        guard let mgr = MetalSceneManager(orchestrator: orch) else { return }
         metalScene = mgr
 
+        // Build mascot pipelines (app-target only — after MetalSceneManager creates the MascotDrawPass)
+        setupMascotPipelines(pass: mgr.mascotDrawPass, orchestrator: orch)
+
+        // Wire force snapshot provider — FrameOrchestrator dispatches forces via ForceEngine
+        orch.forceSnapshotProvider = { [weak mgr] in
+            guard let mgr, let registry = mgr.galaxyRegistry else { return nil }
+            let sim = registry.unifiedSimulation
+            guard !sim.isSettled, sim.nodeCount > 1 else { return nil }
+            sim.useGPUForces = true
+            return ForceEngine.SimulationSnapshot(
+                nodeCount: sim.nodeCount, isSettled: sim.isSettled,
+                posX: sim.posX, posY: sim.posY, posZ: sim.posZ,
+                projectGroups: sim.projectGroupPublic, topicGroups: sim.topicGroupPublic,
+                galaxyGroups: sim.galaxyGroupPublic, galaxyCenters: sim.galaxyCentersPublic,
+                edgeIndices: sim.edgeIndicesPublic, topologyDirty: sim.topologyDirtyForGPU,
+                chargeStrength: sim.chargeStrength, crossChargeMultiplier: sim.crossChargeMultiplier,
+                sameTopicChargeScale: sim.sameTopicChargeScale, sameProjectChargeScale: sim.sameProjectChargeScale,
+                springLength: sim.springLength, crossProjectSpringLength: sim.crossProjectSpringLength,
+                springStrength: sim.springStrength,
+                cohesionStrength: sim.cohesionStrength, centroidRepulsion: sim.centroidRepulsion,
+                topicCohesionStrength: sim.topicCohesionStrength, topicCentroidRepulsion: sim.topicCentroidRepulsion,
+                centerStrength: sim.centerStrength, center: sim.center,
+                alpha: sim.alpha, damping: 0.78, maxSpeed: 12.0
+            )
+        }
+        orch.onForceResult = { [weak mgr] result in
+            guard let mgr, let registry = mgr.galaxyRegistry else { return }
+            let sim = registry.unifiedSimulation
+            sim.topologyDirtyForGPU = false
+            sim.applyGPUForces(result)
+        }
+
         // Galaxy registry provides all simulation/render data for the Metal path.
-        // Singular refs kept for RealityKit fallback (deprecated).
         mgr.galaxyRegistry = galaxyRegistry
+        mgr.soundEnabled = soundEnabled
+        mgr.notificationsEnabled = false
         mgr.camera3DState = camera3DState
         mgr.simulation3D = simulation3D
         mgr.embeddingProjection = embeddingProjection
@@ -363,6 +399,22 @@ struct Graph3DView: View {
             let audio = SpatialAudioEngine()
             mgr.spatialAudio = audio
             audio.start()
+        }
+    }
+
+    private func setupMascotPipelines(pass: MascotDrawPass, orchestrator: FrameOrchestrator) {
+        let device = orchestrator.device
+        let library = orchestrator.library
+        do {
+            pass.mascotPipeline = try MetalPipelineBuilder.buildMascotPipeline(device: device, library: library)
+            pass.arcaneCirclePipeline = try MetalPipelineBuilder.buildArcaneCirclePipeline(device: device, library: library)
+            pass.nodeRingPipeline = try MetalPipelineBuilder.buildNodeRingPipeline(device: device, library: library)
+            pass.holoScreenPipeline = try MetalPipelineBuilder.buildHoloScreenPipeline(device: device, library: library)
+            pass.conjureScanPipeline = try MetalPipelineBuilder.buildConjureScanPipeline(device: device, library: library)
+            pass.conjureOrbPipeline = try MetalPipelineBuilder.buildConjureOrbPipeline(device: device, library: library)
+            pass.flowPipeline = orchestrator.flowPipeline
+        } catch {
+            // Mascot pipelines are non-critical — graph still renders without them
         }
     }
 
@@ -442,12 +494,13 @@ struct Graph3DView: View {
                             metalCollapseAllHubs()
                             selectedNode = nil
                         } else {
-                            let expanding = !ms.expandedHubs.contains(nodeId)
-                            for hubId in ms.expandedHubs where hubId != nodeId {
-                                ms.toggleHubExpansion(hubId: hubId)
+                            let expanding = !ms.hubExpansion.expandedHubs.contains(nodeId)
+                            let edgeTuples = ms.renderEdges.map { (sourceId: $0.sourceId, targetId: $0.targetId, relation: $0.relation) }
+                            for hubId in ms.hubExpansion.expandedHubs where hubId != nodeId {
+                                ms.hubExpansion.toggleHubExpansion(hubId: hubId, positions: ms.positions, edges: edgeTuples)
                                 pinUnpinHubChildren(hubId: hubId, expanding: false)
                             }
-                            ms.toggleHubExpansion(hubId: nodeId)
+                            ms.hubExpansion.toggleHubExpansion(hubId: nodeId, positions: ms.positions, edges: edgeTuples)
                             pinUnpinHubChildren(hubId: nodeId, expanding: expanding)
                             selectedNode = nodeId
                         }
@@ -502,8 +555,9 @@ struct Graph3DView: View {
 
     private func metalCollapseAllHubs() {
         guard let ms = metalScene else { return }
-        for hubId in ms.expandedHubs {
-            ms.toggleHubExpansion(hubId: hubId)
+        let edgeTuples = ms.renderEdges.map { (sourceId: $0.sourceId, targetId: $0.targetId, relation: $0.relation) }
+        for hubId in ms.hubExpansion.expandedHubs {
+            ms.hubExpansion.toggleHubExpansion(hubId: hubId, positions: ms.positions, edges: edgeTuples)
             pinUnpinHubChildren(hubId: hubId, expanding: false)
         }
     }

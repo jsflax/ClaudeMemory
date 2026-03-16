@@ -1,5 +1,6 @@
 import Metal
 import CEngramSceneTypes
+import EngramSceneKit
 import simd
 import SwiftUI
 
@@ -134,9 +135,9 @@ final class NebulaFogSystem {
         return vertices
     }
 
-    /// Upload nebula vertices and update index buffer on the renderer.
+    /// Upload nebula vertices and update index buffer via buffer manager.
     func updateRenderer(
-        renderer: MetalGraphRenderer,
+        bufferManager: InstanceBufferManager,
         groups: [NebulaGroup],
         colorMap: [String: Color]
     ) {
@@ -145,24 +146,24 @@ final class NebulaFogSystem {
         let quadCount = vertexCount / 4
 
         guard quadCount > 0 else {
-            renderer.actualNebulaVertexCount = 0
+            bufferManager.actualNebulaVertexCount = 0
             return
         }
 
         // Ensure buffers
-        if renderer.nebulaVertexCapacity < quadCount {
+        if bufferManager.nebulaVertexCapacity < quadCount {
             let cap = max(quadCount * 2, 64)
-            renderer.nebulaVertexBuffer = device.makeBuffer(
+            bufferManager.nebulaVertexBuffer = device.makeBuffer(
                 length: cap * 4 * MemoryLayout<NebulaQuadVertex>.stride,
                 options: .storageModeShared
             )
             // Index buffer for quads
             let indexCount = cap * 6
-            renderer.nebulaIndexBuffer = device.makeBuffer(
+            bufferManager.nebulaIndexBuffer = device.makeBuffer(
                 length: indexCount * MemoryLayout<UInt32>.stride,
                 options: .storageModeShared
             )
-            if let buf = renderer.nebulaIndexBuffer {
+            if let buf = bufferManager.nebulaIndexBuffer {
                 let indices = buf.contents().bindMemory(to: UInt32.self, capacity: indexCount)
                 for i in 0..<cap {
                     let vBase = UInt32(i * 4)
@@ -175,11 +176,11 @@ final class NebulaFogSystem {
                     indices[iBase + 5] = vBase + 3
                 }
             }
-            renderer.nebulaVertexCapacity = cap
+            bufferManager.nebulaVertexCapacity = cap
         }
 
         // Upload vertices
-        if let buf = renderer.nebulaVertexBuffer {
+        if let buf = bufferManager.nebulaVertexBuffer {
             vertices.withUnsafeBufferPointer { ptr in
                 guard let base = ptr.baseAddress else { return }
                 buf.contents().copyMemory(
@@ -189,6 +190,6 @@ final class NebulaFogSystem {
             }
         }
 
-        renderer.actualNebulaVertexCount = vertexCount
+        bufferManager.actualNebulaVertexCount = vertexCount
     }
 }

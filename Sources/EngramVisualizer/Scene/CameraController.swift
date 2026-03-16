@@ -1,11 +1,13 @@
 import simd
 import GameController
 import os
+import EngramSceneKit
 
 private let cameraLog = Logger(subsystem: "io.engram.app", category: "CameraController")
 
 /// Camera state and math extracted from Graph3DScene.
 /// Shared by both the Metal renderer and the RealityKit renderer.
+/// Input handling, smoothing, and animation live here; pure math delegates to CameraState.
 @Observable
 @MainActor
 final class CameraController {
@@ -27,39 +29,28 @@ final class CameraController {
     let scaleFactor: Float = 1.0 / 200.0
     let fovDegrees: Float = 60
 
-    // MARK: - Computed Properties
+    // MARK: - CameraState snapshot
 
-    var cameraPosition: SIMD3<Float> {
-        let x = orbitRadius * cos(elevation) * sin(azimuth)
-        let y = orbitRadius * sin(elevation)
-        let z = orbitRadius * cos(elevation) * cos(azimuth)
-        return cameraTarget + SIMD3(x, y, z)
+    /// Build a CameraState value from current smoothed state.
+    var state: CameraState {
+        CameraState(
+            azimuth: azimuth, elevation: elevation,
+            cameraTarget: cameraTarget, orbitRadius: orbitRadius,
+            scaleFactor: scaleFactor, fovDegrees: fovDegrees
+        )
     }
 
-    var forward: SIMD3<Float> {
-        normalize(cameraTarget - cameraPosition)
-    }
+    // MARK: - Computed Properties (delegate to CameraState)
 
-    var right: SIMD3<Float> {
-        normalize(cross(forward, SIMD3<Float>(0, 1, 0)))
-    }
-
-    var up: SIMD3<Float> {
-        cross(right, forward)
-    }
+    var cameraPosition: SIMD3<Float> { state.cameraPosition }
+    var forward: SIMD3<Float> { state.forward }
+    var right: SIMD3<Float> { state.right }
+    var up: SIMD3<Float> { state.up }
 
     // MARK: - View / Projection Matrices
 
-    func viewMatrix() -> simd_float4x4 {
-        let pos = cameraPosition * scaleFactor
-        let target = cameraTarget * scaleFactor
-        return lookAt(eye: pos, center: target, up: SIMD3(0, 1, 0))
-    }
-
-    func projectionMatrix(aspect: Float) -> simd_float4x4 {
-        let fovRad = fovDegrees * .pi / 180.0
-        return perspectiveProjection(fovRadians: fovRad, aspect: aspect, near: 0.001, far: 100.0)
-    }
+    func viewMatrix() -> simd_float4x4 { state.viewMatrix() }
+    func projectionMatrix(aspect: Float) -> simd_float4x4 { state.projectionMatrix(aspect: aspect) }
 
     // MARK: - Camera Movement
 
@@ -330,34 +321,4 @@ final class CameraController {
         teleportLabel = label
     }
 
-    // MARK: - Matrix Helpers
-
-    private func lookAt(eye: SIMD3<Float>, center: SIMD3<Float>, up: SIMD3<Float>) -> simd_float4x4 {
-        let f = normalize(center - eye)
-        let s = normalize(cross(f, up))
-        let u = cross(s, f)
-
-        var result = matrix_identity_float4x4
-        result[0][0] = s.x;  result[1][0] = s.y;  result[2][0] = s.z
-        result[0][1] = u.x;  result[1][1] = u.y;  result[2][1] = u.z
-        result[0][2] = -f.x; result[1][2] = -f.y; result[2][2] = -f.z
-        result[3][0] = -dot(s, eye)
-        result[3][1] = -dot(u, eye)
-        result[3][2] = dot(f, eye)
-        return result
-    }
-
-    private func perspectiveProjection(fovRadians: Float, aspect: Float, near: Float, far: Float) -> simd_float4x4 {
-        let yScale = 1 / tan(fovRadians * 0.5)
-        let xScale = yScale / aspect
-        let zRange = far - near
-
-        var result = simd_float4x4(0)
-        result[0][0] = xScale
-        result[1][1] = yScale
-        result[2][2] = -(far + near) / zRange
-        result[2][3] = -1
-        result[3][2] = -2 * far * near / zRange
-        return result
-    }
 }

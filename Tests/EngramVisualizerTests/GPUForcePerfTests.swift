@@ -19,6 +19,8 @@ struct GPUForcePerfTests {
         float vx, vy, vz;
         int projectGroup;
         int topicGroup;
+        int galaxyGroup;
+        int _pad;
     };
 
     struct ForceParams {
@@ -100,7 +102,8 @@ struct GPUForcePerfTests {
                 pz: Float.random(in: -500...500),
                 vx: 0, vy: 0, vz: 0,
                 projectGroup: Int32(i % 8),
-                topicGroup: Int32(i % 30))
+                topicGroup: Int32(i % 30),
+                galaxyGroup: 0, _pad: 0)
         }
 
         struct GPUForceParams {
@@ -158,7 +161,8 @@ struct GPUForcePerfTests {
             nodePtr[i] = ForceNodeFull(
                 px: Float.random(in: -500...500), py: Float.random(in: -500...500),
                 pz: Float.random(in: -500...500), vx: 0, vy: 0, vz: 0,
-                projectGroup: Int32(i % 8), topicGroup: Int32(i % 30))
+                projectGroup: Int32(i % 8), topicGroup: Int32(i % 30),
+                galaxyGroup: 0, _pad: 0)
         }
 
         struct GPUForceParams {

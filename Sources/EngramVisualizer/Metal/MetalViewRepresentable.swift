@@ -1,5 +1,6 @@
 import SwiftUI
 import MetalKit
+import EngramSceneKit
 
 /// MTKView subclass that accepts first responder so clicking it defocuses SwiftUI text fields.
 final class FocusableMTKView: MTKView {
@@ -11,11 +12,10 @@ final class FocusableMTKView: MTKView {
     }
 }
 
-/// NSViewRepresentable wrapping MTKView for the raw Metal renderer.
-/// Hosts the MetalGraphRenderer and bridges to SwiftUI.
+/// NSViewRepresentable wrapping MTKView for the FrameOrchestrator render loop.
 struct MetalViewRepresentable: NSViewRepresentable {
 
-    let renderer: MetalGraphRenderer
+    let orchestrator: FrameOrchestrator
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
@@ -23,12 +23,12 @@ struct MetalViewRepresentable: NSViewRepresentable {
 
     func makeNSView(context: Context) -> MTKView {
         let mtkView = FocusableMTKView()
-        mtkView.device = renderer.device
+        mtkView.device = orchestrator.device
         mtkView.colorPixelFormat = .bgra8Unorm
         mtkView.depthStencilPixelFormat = .depth32Float
         mtkView.clearColor = MTLClearColor(red: 0.051, green: 0.067, blue: 0.09, alpha: 1.0)
         mtkView.preferredFramesPerSecond = 60
-        mtkView.delegate = renderer
+        mtkView.delegate = orchestrator
         mtkView.isPaused = false
         mtkView.enableSetNeedsDisplay = false
         context.coordinator.observeMinimize(for: mtkView)
@@ -36,7 +36,7 @@ struct MetalViewRepresentable: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: MTKView, context: Context) {
-        // Nothing to do — renderer drives the loop via MTKViewDelegate
+        // Nothing to do — orchestrator drives the loop via MTKViewDelegate
     }
 
     final class Coordinator {

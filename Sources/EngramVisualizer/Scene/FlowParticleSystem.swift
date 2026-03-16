@@ -1,5 +1,6 @@
 import Metal
 import CEngramSceneTypes
+import EngramSceneKit
 import simd
 import SwiftUI
 
@@ -47,7 +48,7 @@ final class FlowParticleSystem {
         edges: [EdgeData],
         positions: [UUID: SIMD3<Float>],
         expandedHubs: Set<UUID>,
-        renderer: MetalGraphRenderer
+        bufferManager: InstanceBufferManager
     ) {
         // Selection change → flush all particles
         if selectedNode != lastSelectedNode {
@@ -117,23 +118,23 @@ final class FlowParticleSystem {
         // Pack into FlowParticleVertex buffer
         let particleCount = particles.count
         guard particleCount > 0 else {
-            renderer.actualFlowParticleCount = 0
+            bufferManager.actualFlowParticleCount = 0
             return
         }
 
         // Ensure buffers
-        if renderer.flowVertexCapacity < particleCount {
+        if bufferManager.flowVertexCapacity < particleCount {
             let cap = max(particleCount * 2, 64)
-            renderer.flowVertexBuffer = device.makeBuffer(
+            bufferManager.flowVertexBuffer = device.makeBuffer(
                 length: cap * MemoryLayout<FlowParticleVertex>.stride,
                 options: .storageModeShared
             )
             let indexCount = cap * 6
-            renderer.flowIndexBuffer = device.makeBuffer(
+            bufferManager.flowIndexBuffer = device.makeBuffer(
                 length: indexCount * MemoryLayout<UInt32>.stride,
                 options: .storageModeShared
             )
-            if let buf = renderer.flowIndexBuffer {
+            if let buf = bufferManager.flowIndexBuffer {
                 let indices = buf.contents().bindMemory(to: UInt32.self, capacity: indexCount)
                 for i in 0..<cap {
                     let vBase = UInt32(i * 4)
@@ -146,11 +147,11 @@ final class FlowParticleSystem {
                     indices[iBase + 5] = vBase + 3
                 }
             }
-            renderer.flowVertexCapacity = cap
+            bufferManager.flowVertexCapacity = cap
         }
 
         // Pack one FlowParticleVertex per particle (vertex shader expands to 4 corners)
-        if let buf = renderer.flowVertexBuffer {
+        if let buf = bufferManager.flowVertexBuffer {
             let ptr = buf.contents().bindMemory(to: FlowParticleVertex.self, capacity: particleCount)
             for (i, p) in particles.enumerated() {
                 let pos = p.sourcePos + (p.targetPos - p.sourcePos) * p.t
@@ -170,6 +171,6 @@ final class FlowParticleSystem {
             }
         }
 
-        renderer.actualFlowParticleCount = particleCount
+        bufferManager.actualFlowParticleCount = particleCount
     }
 }

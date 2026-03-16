@@ -20,6 +20,11 @@ public struct ForceComputationInput: Sendable {
     public let cohesionStrength: Float, centroidRepulsion: Float
     public let topicCohesionStrength: Float, topicCentroidRepulsion: Float
 
+    /// Per-node galaxy group index. Empty = single-galaxy backward compat.
+    public let galaxyGroup: [Int]
+    /// Per-galaxy center position. Indexed by galaxyGroup[i]. Empty = use `center`.
+    public let galaxyCenters: [SIMD3<Float>]
+
     public init(
         n: Int, x: [Float], y: [Float], z: [Float],
         projectGroup: [Int], topicGroup: [Int],
@@ -30,7 +35,8 @@ public struct ForceComputationInput: Sendable {
         centerStrength: Float,
         springLength: Float, crossProjectSpringLength: Float, springStrength: Float,
         cohesionStrength: Float, centroidRepulsion: Float,
-        topicCohesionStrength: Float, topicCentroidRepulsion: Float
+        topicCohesionStrength: Float, topicCentroidRepulsion: Float,
+        galaxyGroup: [Int] = [], galaxyCenters: [SIMD3<Float>] = []
     ) {
         self.n = n; self.x = x; self.y = y; self.z = z
         self.projectGroup = projectGroup; self.topicGroup = topicGroup
@@ -43,6 +49,7 @@ public struct ForceComputationInput: Sendable {
         self.springStrength = springStrength
         self.cohesionStrength = cohesionStrength; self.centroidRepulsion = centroidRepulsion
         self.topicCohesionStrength = topicCohesionStrength; self.topicCentroidRepulsion = topicCentroidRepulsion
+        self.galaxyGroup = galaxyGroup; self.galaxyCenters = galaxyCenters
     }
 }
 
@@ -56,16 +63,16 @@ public struct ForceComputationResult: Sendable {
 // MARK: - Barnes-Hut Octree
 
 
-struct OctreeNode {
-    var cx: Float, cy: Float, cz: Float   // cell geometric center
-    var halfSize: Float
-    var comX: Float, comY: Float, comZ: Float  // center of mass
-    var mass: Float                         // body count (as Float for division)
-    var child0: Int32, child1: Int32, child2: Int32, child3: Int32
-    var child4: Int32, child5: Int32, child6: Int32, child7: Int32  // -1 = empty
-    var bodyIndex: Int32  // leaf with 1 body: its index; else -1
+public struct OctreeNode: Sendable {
+    public var cx: Float, cy: Float, cz: Float   // cell geometric center
+    public var halfSize: Float
+    public var comX: Float, comY: Float, comZ: Float  // center of mass
+    public var mass: Float                         // body count (as Float for division)
+    public var child0: Int32, child1: Int32, child2: Int32, child3: Int32
+    public var child4: Int32, child5: Int32, child6: Int32, child7: Int32  // -1 = empty
+    public var bodyIndex: Int32  // leaf with 1 body: its index; else -1
 
-    static func empty(cx: Float, cy: Float, cz: Float, halfSize: Float) -> OctreeNode {
+    public static func empty(cx: Float, cy: Float, cz: Float, halfSize: Float) -> OctreeNode {
         OctreeNode(cx: cx, cy: cy, cz: cz, halfSize: halfSize,
                    comX: 0, comY: 0, comZ: 0, mass: 0,
                    child0: -1, child1: -1, child2: -1, child3: -1,
@@ -73,7 +80,7 @@ struct OctreeNode {
                    bodyIndex: -1)
     }
 
-    func child(_ octant: Int) -> Int32 {
+    public func child(_ octant: Int) -> Int32 {
         switch octant {
         case 0: return child0; case 1: return child1
         case 2: return child2; case 3: return child3
@@ -95,7 +102,7 @@ struct OctreeNode {
 }
 
 /// Build octree from positions. Returns the node array (root at index 0).
-func buildOctree(x: [Float], y: [Float], z: [Float], n: Int) -> [OctreeNode] {
+public func buildOctree(x: [Float], y: [Float], z: [Float], n: Int) -> [OctreeNode] {
     guard n > 0 else { return [] }
 
     // Find bounding box, make cubic
@@ -116,7 +123,7 @@ func buildOctree(x: [Float], y: [Float], z: [Float], n: Int) -> [OctreeNode] {
     nodes.reserveCapacity(max(8 * n, 512))
     nodes.append(.empty(cx: rootCX, cy: rootCY, cz: rootCZ, halfSize: half))
 
-    let maxDepth = 40
+    let maxDepth = 20  // halfSize / 2^20 ≈ 0.001 — sub-pixel, no point going deeper
 
     for i in 0..<n {
         let px = x[i], py = y[i], pz = z[i]
@@ -367,8 +374,12 @@ public func computeAllForces(_ s: ForceComputationInput) -> ForceComputationResu
             fx: &fx, fy: &fy, fz: &fz)
     }
 
-    // --- Springs ---
+    // --- Springs (skip cross-galaxy edges) ---
+    let hasGalaxies = !s.galaxyGroup.isEmpty && !s.galaxyCenters.isEmpty
+    let galaxyGroup_ = s.galaxyGroup
     for (si, ti) in s.edgeIndices {
+        // Cross-galaxy edges produce zero spring force — visual separation between galaxies
+        if hasGalaxies && galaxyGroup_[si] != galaxyGroup_[ti] { continue }
         let dx = x[ti]-x[si], dy = y[ti]-y[si], dz = z[ti]-z[si]
         var d = sqrt(dx*dx + dy*dy + dz*dz); if d < 1 { d = 1 }
         let cross = hasProjects && projectGroup[si] != projectGroup[ti]
@@ -429,9 +440,19 @@ public func computeAllForces(_ s: ForceComputationInput) -> ForceComputationResu
         }
     }
 
-    // --- Center gravity ---
-    let c = s.center
-    for i in 0..<n { fx[i]+=(c.x-x[i])*alpha*s.centerStrength; fy[i]+=(c.y-y[i])*alpha*s.centerStrength; fz[i]+=(c.z-z[i])*alpha*s.centerStrength }
+    // --- Center gravity (per-galaxy or single center) ---
+    let galaxyCenters = s.galaxyCenters
+    if hasGalaxies {
+        for i in 0..<n {
+            let c = galaxyCenters[galaxyGroup_[i]]
+            fx[i]+=(c.x-x[i])*alpha*s.centerStrength
+            fy[i]+=(c.y-y[i])*alpha*s.centerStrength
+            fz[i]+=(c.z-z[i])*alpha*s.centerStrength
+        }
+    } else {
+        let c = s.center
+        for i in 0..<n { fx[i]+=(c.x-x[i])*alpha*s.centerStrength; fy[i]+=(c.y-y[i])*alpha*s.centerStrength; fz[i]+=(c.z-z[i])*alpha*s.centerStrength }
+    }
 
     return ForceComputationResult(fx: fx, fy: fy, fz: fz)
 }

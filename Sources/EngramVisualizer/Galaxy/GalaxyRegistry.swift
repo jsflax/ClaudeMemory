@@ -1,5 +1,7 @@
 import Combine
+import EngramSceneKit
 import EngramKit
+import EngramSceneKit
 import Lattice
 import SwiftUI
 import simd
@@ -11,6 +13,11 @@ import simd
 @MainActor
 final class GalaxyRegistry {
     private(set) var galaxies: [String: Galaxy] = [:]  // id -> Galaxy
+
+    /// Single unified simulation for all galaxies. Galaxy membership is metadata (galaxyGroup),
+    /// not a physics boundary. This eliminates per-galaxy sim contention, O(n) position merges,
+    /// and double force compute cost.
+    let unifiedSimulation = ForceSimulation3D()
 
     // SyncConfig observation — drives node migration between personal ↔ synced galaxies
     @ObservationIgnored private var syncConfigObserver: AnyCancellable?
@@ -31,8 +38,16 @@ final class GalaxyRegistry {
     private(set) var nodeToGalaxy: [UUID: String] = [:]
     var focusedGalaxyId: String?
 
-    // Cross-galaxy edge filtering (pushed from VisualizerConfig)
+    // Render config (pushed from VisualizerConfig, used by drain + edge filtering)
+    var hiddenProjects: Set<String> = []
     var hiddenRelations: Set<String> = []
+
+    /// Per-frame drain config — built by MetalSceneManager from VisualizerConfig + layout mode,
+    /// stored here so migration code and other callers can read it.
+    var currentDrainConfig = DrainConfig(
+        hiddenProjects: [], hiddenRelations: [], timeFilter: nil,
+        is3D: true, soundEnabled: false, notificationsEnabled: false
+    )
 
     // Topology tracking — each galaxy's topologyVersion is summed to detect changes
     @ObservationIgnored private var lastMergedTopologySum: UInt64 = 0
@@ -41,7 +56,9 @@ final class GalaxyRegistry {
 
     func register(_ galaxy: Galaxy) {
         galaxies[galaxy.id] = galaxy
+        galaxy.simulation3D = unifiedSimulation
         computeWorldLayout()
+        unifiedSimulation.setGalaxyCenter(galaxy.id, galaxy.worldCenter)
     }
 
     func remove(_ galaxyId: String) {
@@ -84,12 +101,37 @@ final class GalaxyRegistry {
             let startX = -totalWidth / 2.0
 
             for (i, galaxy) in sorted.enumerated() {
-                galaxy.worldCenter = SIMD3<Float>(
+                let center = SIMD3<Float>(
                     startX + Float(i) * siblingSpacing,
                     Float(level) * levelSpacing,
                     0
                 )
+                print("LAYOUT: galaxy=\(galaxy.id) center=\(center) galaxyCount=\(galaxies.count)")
+                galaxy.worldCenter = center
+                unifiedSimulation.setGalaxyCenter(galaxy.id, center)
             }
+        }
+    }
+
+    // MARK: - Reactive Galaxy Lifecycle
+
+    /// Idempotent entry point for creating and loading a galaxy. Returns early if
+    /// the galaxy already exists. `register()` runs synchronously on MainActor so
+    /// `computeWorldLayout()` fires with the correct galaxy count before any data
+    /// arrives. The actual data load + observer setup happens in a background Task.
+    func onLatticeAvailable(id: String, displayName: String,
+                            latticeRef: LatticeThreadSafeReference,
+                            hierarchyLevel: Int = 0,
+                            nodeFilter: (@Sendable (Memory) -> Bool)? = nil) {
+        guard galaxies[id] == nil else { return }
+        let galaxy = Galaxy(id: id, displayName: displayName,
+                            lattice: latticeRef, hierarchyLevel: hierarchyLevel)
+        register(galaxy)
+
+        Task {
+            if let filter = nodeFilter { await galaxy.setNodeFilter(filter) }
+            await galaxy.loadData()
+            await galaxy.startObservers()
         }
     }
 
@@ -157,15 +199,18 @@ final class GalaxyRegistry {
             var nodeById: [UUID: NodeData] = [:]
             var newNodeToGalaxy: [UUID: String] = [:]
 
+            var seenIds = Set<UUID>()
             for galaxy in galaxies.values {
                 let store = galaxy.renderStore
-                nodes.append(contentsOf: store.nodes)
+                for node in store.nodes {
+                    if seenIds.insert(node.id).inserted {
+                        nodes.append(node)
+                        newNodeToGalaxy[node.id] = galaxy.id
+                    }
+                }
                 hubs.formUnion(store.hubs)
                 colorMap.merge(store.colorMap) { existing, _ in existing }
                 nodeById.merge(store.nodeById) { existing, _ in existing }
-                for node in store.nodes {
-                    newNodeToGalaxy[node.id] = galaxy.id
-                }
             }
 
             // Cross-galaxy edge merge: iterate ALL galaxies' allEdges, dedup by globalId,
@@ -217,48 +262,9 @@ final class GalaxyRegistry {
 
     // MARK: - Merged Accessors (convenience for renderer)
 
-    /// Cached merged positions — rebuilt each frame via updateMergedPositions().
-    /// Stored var avoids per-frame dictionary allocation (reuses capacity via removeAll).
-    /// @ObservationIgnored because this changes every frame from renderTick.
-    @ObservationIgnored private(set) var cachedMergedPositions: [UUID: SIMD3<Float>] = [:]
-
-    /// Rebuild merged positions from all galaxy simulations. Called each frame by renderTick.
-    func updateMergedPositions() {
-        #if ENGRAM_INSTRUMENTATION
-        let posStart = CFAbsoluteTimeGetCurrent()
-        #endif
-
-        if galaxies.count == 1, let only = galaxies.values.first {
-            cachedMergedPositions = only.simulation3D.positions
-        } else {
-            cachedMergedPositions.removeAll(keepingCapacity: true)
-            for galaxy in galaxies.values {
-                cachedMergedPositions.merge(galaxy.simulation3D.positions) { _, new in new }
-            }
-        }
-
-        #if ENGRAM_INSTRUMENTATION
-        let posMergeMs = (CFAbsoluteTimeGetCurrent() - posStart) * 1000.0
-        if posMergeMs > 0.5 {
-            if mergeTimingFile == nil {
-                mergeTimingFile = fopen("/tmp/merge-timing.csv", "w")
-                if let f = mergeTimingFile {
-                    fputs("timestamp,galaxy_count,node_count,edge_count,merge_ms\n", f)
-                }
-            }
-            if let f = mergeTimingFile {
-                let ts = String(format: "%.3f", CFAbsoluteTimeGetCurrent())
-                let line = "\(ts),\(galaxies.count),\(cachedMergedPositions.count),0,\(String(format: "%.2f", posMergeMs))\n"
-                fputs(line, f)
-                fflush(f)
-            }
-        }
-        #endif
-    }
-
-    /// Merged positions from all galaxy simulations — already in world space.
+    /// Positions from the unified simulation — already in world space.
     var mergedPositions: [UUID: SIMD3<Float>] {
-        cachedMergedPositions
+        unifiedSimulation.positions
     }
 
     /// Merged allEdges from all galaxies.
@@ -456,129 +462,91 @@ final class GalaxyRegistry {
 
     /// Observe SyncConfig changes on the personal galaxy's Lattice.
     /// When a project's policy flips, migrate nodes between personal ↔ synced galaxies
-    /// and rebuild the personal galaxy's nodeFilter.
-    func setupSyncConfigObserver(
-        hiddenProjects: Set<String>,
-        hiddenRelations: Set<String>,
-        timeFilter: Date?,
-        is3D: Bool,
-        soundEnabled: Bool,
-        notificationsEnabled: Bool
-    ) {
+    /// and rebuild the personal galaxy's nodeFilter. Uses `currentDrainConfig` for
+    /// filter params — no captured config needed.
+    func setupSyncConfigObserver() {
         guard let personal = galaxies["personal"] else { return }
-        let lattice = personal.lattice
-        self.hiddenRelations = hiddenRelations
+        let latticeRef = personal.latticeRef
 
-        syncConfigObserver = lattice.objects(SyncConfig.self).observe { [weak self] change in
-            switch change {
-            case .insert(let pk), .update(let pk):
-                // Read config inside @MainActor Task — observer fires on bg thread,
-                // and rapid toggles can cause the bg read to see stale values.
-                let capturedPk = pk
-                Task { @MainActor [weak self] in
-                    guard let self,
-                          let personal = self.galaxies["personal"],
-                          let config = personal.lattice.object(SyncConfig.self, primaryKey: capturedPk) else { return }
-                    let project = config.project
-                    let policy = config.policy
+        Task.detached {
+            guard let lattice = latticeRef.resolve() else { preconditionFailure() }
+            let syncConfigObserver = lattice.objects(SyncConfig.self).observe { [weak self] change in
+                switch change {
+                case .insert(let pk), .update(let pk):
+                    let capturedPk = pk
+                    Task { @MainActor [weak self] in
+                        guard let self,
+                              let personal = self.galaxies["personal"],
+                              let syncConfig = personal.latticeRef.resolve()?.object(SyncConfig.self, primaryKey: capturedPk) else { return }
+                        let project = syncConfig.project
+                        let policy = syncConfig.policy
 
-                    #if ENGRAM_INSTRUMENTATION
-                    let migStart = CFAbsoluteTimeGetCurrent()
-                    #endif
+#if ENGRAM_INSTRUMENTATION
+                        let migStart = CFAbsoluteTimeGetCurrent()
+#endif
 
-                    if policy == .sync {
-                        // Idempotent: only migrate if nodes are actually in personal
-                        guard personal.renderStore.allNodes.values.contains(where: { $0.project == project }) else {
-                            #if ENGRAM_INSTRUMENTATION
+                        if policy == .sync {
+                            guard personal.renderStore.allNodes.values.contains(where: { $0.project == project }) else {
+#if ENGRAM_INSTRUMENTATION
+                                let ts = String(format: "%.3f", CFAbsoluteTimeGetCurrent())
+                                self.migrationLog("\(ts),skip_idempotent,\(project),personal→synced,personal,synced,0,0,0,0.00")
+#endif
+                                return
+                            }
+                            self.ensureSyncedGalaxyExists()
+                            let extracted = self.migrateProjectOut(project, from: "personal")
+                            self.migrateRenderStoreIn("synced", nodes: extracted.nodes, intraProjectEdges: extracted.intraEdges)
+                            // Reassign galaxy group in unified sim (no remove+re-add)
+                            let nodeIds = Set(extracted.nodes.map(\.id))
+                            self.unifiedSimulation.changeGalaxyGroup(for: nodeIds, to: "synced")
+                            self.unifiedSimulation.wake()
+
+#if ENGRAM_INSTRUMENTATION
+                            let migMs = (CFAbsoluteTimeGetCurrent() - migStart) * 1000.0
                             let ts = String(format: "%.3f", CFAbsoluteTimeGetCurrent())
-                            self.migrationLog("\(ts),skip_idempotent,\(project),personal→synced,personal,synced,0,0,0,0.00")
-                            #endif
-                            return
-                        }
-                        self.ensureSyncedGalaxyExists(
-                            hiddenProjects: hiddenProjects,
-                            hiddenRelations: hiddenRelations,
-                            timeFilter: timeFilter,
-                            is3D: is3D,
-                            soundEnabled: soundEnabled,
-                            notificationsEnabled: notificationsEnabled
-                        )
-                        let srcPositions = self.captureWorldPositions(project: project, in: "personal")
-                        let extracted = self.migrateProjectOut(project, from: "personal")
-                        self.loadExtractedNodesIntoGalaxy(
-                            "synced", nodes: extracted.nodes,
-                            intraProjectEdges: extracted.intraEdges,
-                            sourcePositions: srcPositions,
-                            hiddenProjects: hiddenProjects,
-                            hiddenRelations: hiddenRelations,
-                            timeFilter: timeFilter, is3D: is3D
-                        )
+                            self.migrationLog("\(ts),migrate,\(project),personal→synced,personal,synced,\(extracted.nodes.count),\(extracted.intraEdges.count),0,\(String(format: "%.2f", migMs))")
+#endif
+                        } else {
+                            guard self.galaxies["synced"]?.renderStore.allNodes.values.contains(where: { $0.project == project }) == true else {
+#if ENGRAM_INSTRUMENTATION
+                                let ts = String(format: "%.3f", CFAbsoluteTimeGetCurrent())
+                                self.migrationLog("\(ts),skip_idempotent,\(project),synced→personal,synced,personal,0,0,0,0.00")
+#endif
+                                return
+                            }
+                            let extracted = self.migrateProjectOut(project, from: "synced")
+                            self.migrateRenderStoreIn("personal", nodes: extracted.nodes, intraProjectEdges: extracted.intraEdges)
+                            // Reassign galaxy group in unified sim (no remove+re-add)
+                            let nodeIds = Set(extracted.nodes.map(\.id))
+                            self.unifiedSimulation.changeGalaxyGroup(for: nodeIds, to: "personal")
+                            self.unifiedSimulation.wake()
 
-                        #if ENGRAM_INSTRUMENTATION
-                        let migMs = (CFAbsoluteTimeGetCurrent() - migStart) * 1000.0
-                        let ts = String(format: "%.3f", CFAbsoluteTimeGetCurrent())
-                        self.migrationLog("\(ts),migrate,\(project),personal→synced,personal,synced,\(extracted.nodes.count),\(extracted.intraEdges.count),\(srcPositions.count),\(String(format: "%.2f", migMs))")
-                        #endif
-                    } else {
-                        // Idempotent: only migrate if nodes are actually in synced
-                        guard self.galaxies["synced"]?.renderStore.allNodes.values.contains(where: { $0.project == project }) == true else {
-                            #if ENGRAM_INSTRUMENTATION
+#if ENGRAM_INSTRUMENTATION
+                            let migMs = (CFAbsoluteTimeGetCurrent() - migStart) * 1000.0
                             let ts = String(format: "%.3f", CFAbsoluteTimeGetCurrent())
-                            self.migrationLog("\(ts),skip_idempotent,\(project),synced→personal,synced,personal,0,0,0,0.00")
-                            #endif
-                            return
+                            self.migrationLog("\(ts),migrate,\(project),synced→personal,synced,personal,\(extracted.nodes.count),\(extracted.intraEdges.count),0,\(String(format: "%.2f", migMs))")
+#endif
                         }
-                        let srcPositions = self.captureWorldPositions(project: project, in: "synced")
-                        let extracted = self.migrateProjectOut(project, from: "synced")
-                        self.loadExtractedNodesIntoGalaxy(
-                            "personal", nodes: extracted.nodes,
-                            intraProjectEdges: extracted.intraEdges,
-                            sourcePositions: srcPositions,
-                            hiddenProjects: hiddenProjects,
-                            hiddenRelations: hiddenRelations,
-                            timeFilter: timeFilter, is3D: is3D
-                        )
-
-                        #if ENGRAM_INSTRUMENTATION
-                        let migMs = (CFAbsoluteTimeGetCurrent() - migStart) * 1000.0
-                        let ts = String(format: "%.3f", CFAbsoluteTimeGetCurrent())
-                        self.migrationLog("\(ts),migrate,\(project),synced→personal,synced,personal,\(extracted.nodes.count),\(extracted.intraEdges.count),\(srcPositions.count),\(String(format: "%.2f", migMs))")
-                        #endif
+                        self.rebuildPersonalNodeFilter()
                     }
-                    self.rebuildPersonalNodeFilter()
+                case .delete:
+                    Task { @MainActor [weak self] in
+                        self?.reconcileSyncState()
+                        self?.rebuildPersonalNodeFilter()
+                    }
                 }
-            case .delete:
-                Task { @MainActor [weak self] in
-                    self?.reconcileSyncState()
-                    self?.rebuildPersonalNodeFilter()
-                }
+            }
+            Task { @MainActor in
+                self.syncConfigObserver = syncConfigObserver
             }
         }
     }
 
     /// Create + load the synced galaxy if it doesn't already exist.
-    private func ensureSyncedGalaxyExists(
-        hiddenProjects: Set<String>,
-        hiddenRelations: Set<String>,
-        timeFilter: Date?,
-        is3D: Bool,
-        soundEnabled: Bool,
-        notificationsEnabled: Bool
-    ) {
-        guard galaxies["synced"] == nil,
-              let syncedLattice = syncManager?.syncedLattice else { return }
-        let synced = Galaxy(id: "synced", displayName: "Synced",
-                            lattice: syncedLattice, hierarchyLevel: 0)
-        register(synced)
-        GalaxyDataLoader.loadData(
-            into: synced,
-            hiddenProjects: hiddenProjects,
-            hiddenRelations: hiddenRelations,
-            timeFilter: timeFilter,
-            is3D: is3D,
-            soundEnabled: soundEnabled,
-            notificationsEnabled: notificationsEnabled
-        )
+    /// Uses `onLatticeAvailable` for idempotent creation.
+    private func ensureSyncedGalaxyExists() {
+        guard let syncedLattice = syncManager?.actor.syncedLatticeRef else { return }
+        onLatticeAvailable(id: "synced", displayName: "Synced", latticeRef: syncedLattice)
     }
 
     /// Extract a project's nodes from a galaxy's render store. Edges STAY in the
@@ -596,7 +564,7 @@ final class GalaxyRegistry {
         #if ENGRAM_INSTRUMENTATION
         let outStart = CFAbsoluteTimeGetCurrent()
         let preNodeCount = store.allNodes.count
-        let preSimCount = galaxy.simulation3D.positions.count
+        let preSimCount = unifiedSimulation.positions.count
         #endif
 
         // Collect nodes BEFORE removing
@@ -636,8 +604,8 @@ final class GalaxyRegistry {
             return filtered.count >= 2 ? filtered : nil
         }
 
-        // Remove from simulation so ghost nodes don't produce stale positions
-        galaxy.simulation3D.removeNodes(removedIds)
+        // Don't remove from unified sim — changeGalaxyGroup will reassign them
+        // after migrateRenderStoreIn moves the render store data.
 
         // Lightweight derived data rebuild — skip full recomputeDerivedData.
         // visibleNodeIds and nodeById are already maintained inline above.
@@ -649,7 +617,7 @@ final class GalaxyRegistry {
         let outMs = (CFAbsoluteTimeGetCurrent() - outStart) * 1000.0
         let ts = String(format: "%.3f", CFAbsoluteTimeGetCurrent())
         migrationLog("\(ts),migrate_out,\(project),from_\(galaxyId),\(galaxyId),,\(removedIds.count),\(intraEdges.count),0,\(String(format: "%.2f", outMs))")
-        migrationLog("\(ts),migrate_out_counts,\(project),from_\(galaxyId),pre_nodes=\(preNodeCount) post_nodes=\(store.allNodes.count) pre_sim=\(preSimCount) post_sim=\(galaxy.simulation3D.positions.count),,,,")
+        migrationLog("\(ts),migrate_out_counts,\(project),from_\(galaxyId),pre_nodes=\(preNodeCount) post_nodes=\(store.allNodes.count) pre_sim=\(preSimCount) post_sim=\(unifiedSimulation.positions.count),,,,")
         #endif
 
         return (Array(removedNodes), Array(intraEdges))
@@ -657,45 +625,15 @@ final class GalaxyRegistry {
 
     /// Capture world-space positions for all nodes of a project in a given galaxy.
     /// Must be called BEFORE migrateProjectOut removes them.
-    private func captureWorldPositions(project: String, in galaxyId: String) -> [UUID: SIMD3<Float>] {
-        guard let galaxy = galaxies[galaxyId] else { return [:] }
-        let positions = galaxy.simulation3D.positions
-        var result: [UUID: SIMD3<Float>] = [:]
-        for node in galaxy.renderStore.allNodes.values where node.project == project {
-            if let pos = positions[node.id] {
-                result[node.id] = pos
-            }
-        }
-        return result
-    }
 
-    /// Insert previously-extracted nodes into a destination galaxy. Edges are NOT
-    /// fully migrated — only intra-project edges (both endpoints migrating) are copied
-    /// into the destination's `allEdges`/`edgesByNode` so `insertNodeBatch` can wire
-    /// them into the force simulation. Cross-galaxy edges are resolved at merge time
-    /// by `mergeRenderData()`.
-    private func loadExtractedNodesIntoGalaxy(
-        _ galaxyId: String,
-        nodes: [NodeData],
-        intraProjectEdges: [EdgeData],
-        sourcePositions: [UUID: SIMD3<Float>] = [:],
-        hiddenProjects: Set<String>,
-        hiddenRelations: Set<String>,
-        timeFilter: Date?,
-        is3D: Bool
-    ) {
+    /// Move render store data into destination galaxy without touching the unified sim.
+    /// Used during migration where `changeGalaxyGroup` handles the sim side.
+    private func migrateRenderStoreIn(_ galaxyId: String, nodes: [NodeData], intraProjectEdges: [EdgeData]) {
         guard let galaxy = galaxies[galaxyId] else { return }
         let store = galaxy.renderStore
-        guard !nodes.isEmpty else { return }
+        let config = currentDrainConfig
 
-        #if ENGRAM_INSTRUMENTATION
-        let loadStart = CFAbsoluteTimeGetCurrent()
-        let preNodeCount = store.allNodes.count
-        let preSimCount = galaxy.simulation3D.positions.count
-        #endif
-
-        // Copy intra-project edges into destination's allEdges/edgesByNode
-        // so insertNodeBatch can wire them into the force simulation
+        // Copy intra-project edges
         for edge in intraProjectEdges {
             guard store.allEdges[edge.id] == nil else { continue }
             store.allEdges[edge.id] = edge
@@ -703,43 +641,49 @@ final class GalaxyRegistry {
             store.edgesByNode[edge.targetId, default: []].append(edge)
         }
 
-        // insertNodeBatch calls addNode which randomizes positions
-        GalaxyDataLoader.insertNodeBatch(
-            nodes, into: galaxy,
-            hiddenProjects: hiddenProjects,
-            hiddenRelations: hiddenRelations,
-            timeFilter: timeFilter,
-            is3D: is3D
-        )
+        // Add nodes to render store
+        for nd in nodes {
+            store.allNodes[nd.id] = nd
+            let visible = !config.hiddenProjects.contains(nd.project) &&
+                (config.timeFilter == nil || nd.createdAt <= config.timeFilter!)
+            guard visible else { continue }
+            store.nodes.append(nd)
+            store.nodeById[nd.id] = nd
+            store.visibleNodeIds.insert(nd.id)
 
-        // Override with source positions so nodes start where they were and
-        // the force simulation pulls them toward the destination galaxy center
-        for (id, pos) in sourcePositions {
-            galaxy.simulation3D.setPosition(id, to: pos)
+            // Wire visible edges
+            for edge in store.edgesByNode[nd.id] ?? [] {
+                let otherId = edge.sourceId == nd.id ? edge.targetId : edge.sourceId
+                guard store.visibleNodeIds.contains(otherId),
+                      !config.hiddenRelations.contains(edge.relation) else { continue }
+                if !store.filteredEdgeIds.contains(edge.id) {
+                    store.filteredEdgeIds.insert(edge.id)
+                    store.edges.append(edge)
+                }
+            }
+
+            // Hub detection
+            if let edges = store.edgesByNode[nd.id] {
+                for edge in edges where edge.relation == "part_of" && edge.targetId == nd.id {
+                    store.hubs.insert(nd.id)
+                    break
+                }
+            }
+
+            // Assign color
+            if store.colorMap[nd.project] == nil {
+                if nd.project == "global" {
+                    store.colorMap["global"] = .gray
+                } else {
+                    let idx = store.colorMap.count - (store.colorMap["global"] != nil ? 1 : 0)
+                    store.colorMap[nd.project] = GraphView.goldenAngleColor(at: idx)
+                }
+            }
         }
 
-        // Always wake the sim after adding nodes — without this, the sim stays
-        // in its default state with decayed alpha and near-zero smoothedAttenuation,
-        // producing negligible force application even though isSettled gets cleared
-        // by hasPendingTopologyChanges on the first tick.
-        galaxy.simulation3D.wake()
-
-        // Mark initial load complete so renderTick ticks this galaxy's sim.
-        // loadData (async) may not have finished yet for newly created galaxies,
-        // but migration has populated the sim — it must tick to animate.
         galaxy.isInitialLoad = false
-
-        // insertNodeBatch already maintains visibleNodeIds, nodeById, colorMap, hubs, edges.
-        // Only rebuild stats (relation counts, topic groups, edge counts).
         recomputeStatsOnly(for: galaxy)
         store.bumpTopology()
-
-        #if ENGRAM_INSTRUMENTATION
-        let loadMs = (CFAbsoluteTimeGetCurrent() - loadStart) * 1000.0
-        let ts = String(format: "%.3f", CFAbsoluteTimeGetCurrent())
-        migrationLog("\(ts),load_into,\(nodes.first?.project ?? "?"),into_\(galaxyId),,\(galaxyId),\(nodes.count),\(intraProjectEdges.count),\(sourcePositions.count),\(String(format: "%.2f", loadMs))")
-        migrationLog("\(ts),load_into_counts,\(nodes.first?.project ?? "?"),into_\(galaxyId),pre_nodes=\(preNodeCount) post_nodes=\(store.allNodes.count) pre_sim=\(preSimCount) post_sim=\(galaxy.simulation3D.positions.count),,,,")
-        #endif
     }
 
     /// Full reconciliation — query Lattice for current synced projects, diff against
@@ -747,7 +691,7 @@ final class GalaxyRegistry {
     /// Single pass over nodes/edges, single topology bump.
     private func reconcileSyncState() {
         guard let personal = galaxies["personal"] else { return }
-        let lattice = personal.lattice
+        guard let lattice = personal.latticeRef.resolve() else { preconditionFailure() }
 
         var syncedProjects = Set<String>()
         for config in lattice.objects(SyncConfig.self).where({ $0.policy == .sync }) {
@@ -796,7 +740,7 @@ final class GalaxyRegistry {
                 store.nodes.append(node)
                 store.nodeById[node.id] = node
                 store.visibleNodeIds.insert(node.id)
-                personal.simulation3D.addNode(node.id, project: node.project, topic: node.topic)
+                unifiedSimulation.addNode(node.id, project: node.project, topic: node.topic, galaxyId: personal.id)
             }
         }
 
@@ -810,7 +754,7 @@ final class GalaxyRegistry {
             store.edges.append(contentsOf: newEdges)
             store.filteredEdgeIds.formUnion(newEdges.map(\.id))
             for edge in newEdges {
-                personal.simulation3D.addEdge(from: edge.sourceId, to: edge.targetId)
+                unifiedSimulation.addEdge(from: edge.sourceId, to: edge.targetId)
             }
 
             var hubs = Set<UUID>()
@@ -821,7 +765,7 @@ final class GalaxyRegistry {
         }
 
         // Single recompute + topology bump
-        GalaxyDataLoader.recomputeDerivedData(for: personal)
+        personal.recomputeDerivedData()
         store.bumpTopology()
     }
 
@@ -864,21 +808,22 @@ final class GalaxyRegistry {
     }
 
     /// Rebuild the personal galaxy's nodeFilter from current SyncConfig state in Lattice.
-    private func rebuildPersonalNodeFilter() {
+    func rebuildPersonalNodeFilter() {
         guard let personal = galaxies["personal"] else { return }
-        let lattice = personal.lattice
+        guard let lattice = personal.latticeRef.resolve() else { preconditionFailure() }
 
         var syncedProjects = Set<String>()
         for config in lattice.objects(SyncConfig.self).where({ $0.policy == .sync }) {
             syncedProjects.insert(config.project)
         }
-
-        if syncedProjects.isEmpty {
-            personal.nodeFilter = nil
-        } else {
-            let captured = syncedProjects
-            personal.nodeFilter = { @Sendable memory in
-                !captured.contains(memory.project) || memory.isPrivate
+        Task {
+            if syncedProjects.isEmpty {
+                await personal.setNodeFilter(nil)
+            } else {
+                let captured = syncedProjects
+                await personal.setNodeFilter { @Sendable memory in
+                    !captured.contains(memory.project) || memory.isPrivate
+                }
             }
         }
     }
