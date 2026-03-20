@@ -74,7 +74,7 @@ func percentile(_ sorted: [Double], _ p: Double) -> Double {
 /// Parsed metal frame timing row.
 struct MetalFrame {
     let idx: Int, dt: Double, wallDt: Double, total: Double
-    let sim: Double, mascot: Double, nodes: Double, edges: Double
+    let drain: Double, sim: Double, mascot: Double, nodes: Double, edges: Double
     let neb: Double, labels: Double, flow: Double
     let nodeCount: Int, edgeCount: Int, reason: String
 }
@@ -86,14 +86,15 @@ func parseMetalFrames(path: String = "/tmp/metal-frame-timing.csv") -> [MetalFra
     let lines = csv.components(separatedBy: "\n").dropFirst().filter { !$0.isEmpty }
     return lines.enumerated().compactMap { (i, line) in
         let c = line.components(separatedBy: ",")
-        guard c.count >= 14 else { return nil }
+        guard c.count >= 15 else { return nil }
         return MetalFrame(
             idx: i, dt: Double(c[1]) ?? 0, wallDt: Double(c[2]) ?? 0,
-            total: Double(c[3]) ?? 0, sim: Double(c[4]) ?? 0, mascot: Double(c[5]) ?? 0,
-            nodes: Double(c[6]) ?? 0, edges: Double(c[7]) ?? 0, neb: Double(c[8]) ?? 0,
-            labels: Double(c[9]) ?? 0, flow: Double(c[10]) ?? 0,
-            nodeCount: Int(c[11]) ?? 0, edgeCount: Int(c[12]) ?? 0,
-            reason: c[13].trimmingCharacters(in: .whitespacesAndNewlines))
+            total: Double(c[3]) ?? 0, drain: Double(c[4]) ?? 0,
+            sim: Double(c[5]) ?? 0, mascot: Double(c[6]) ?? 0,
+            nodes: Double(c[7]) ?? 0, edges: Double(c[8]) ?? 0, neb: Double(c[9]) ?? 0,
+            labels: Double(c[10]) ?? 0, flow: Double(c[11]) ?? 0,
+            nodeCount: Int(c[12]) ?? 0, edgeCount: Int(c[13]) ?? 0,
+            reason: c[14].trimmingCharacters(in: .whitespacesAndNewlines))
     }
 }
 
@@ -401,6 +402,46 @@ func addCrossProjectEdges(at path: String, sourceIds: [UUID], targetIds: [UUID])
     for i in 0..<count {
         lattice.add(Edge(sourceGlobalId: sourceIds[i], targetGlobalId: targetIds[i], relation: .relatesTo))
     }
+}
+
+// MARK: - Preview Instrumentation Parsing
+
+/// Parsed preview frame timing row from per-frame CSV.
+struct PreviewFrame {
+    let frame: Int
+    let wallMs: Double
+    let forceMs: Double
+    let alpha: Double
+    let maxSpeedSq: Double
+    let minProjSep: Double
+    let nodeCount: Int
+    let settled: Bool
+}
+
+/// Parse preview instrumentation frames CSV.
+func parsePreviewFrames(path: String) -> [PreviewFrame] {
+    guard let data = FileManager.default.contents(atPath: path),
+          let csv = String(data: data, encoding: .utf8) else { return [] }
+    return csv.components(separatedBy: "\n").dropFirst().compactMap { line in
+        let cols = line.components(separatedBy: ",")
+        guard cols.count >= 8 else { return nil }
+        return PreviewFrame(
+            frame: Int(cols[0]) ?? 0,
+            wallMs: Double(cols[1]) ?? 0,
+            forceMs: Double(cols[2]) ?? 0,
+            alpha: Double(cols[3]) ?? 0,
+            maxSpeedSq: Double(cols[4]) ?? 0,
+            minProjSep: Double(cols[5]) ?? 0,
+            nodeCount: Int(cols[6]) ?? 0,
+            settled: cols[7].trimmingCharacters(in: .whitespacesAndNewlines) == "true"
+        )
+    }
+}
+
+/// Parse preview cluster report JSON.
+func parseClusterReport(path: String) -> [String: Any]? {
+    guard let data = FileManager.default.contents(atPath: path) else { return nil }
+    return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
 }
 
 // MARK: - Glow Event Parser
