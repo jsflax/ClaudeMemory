@@ -2,7 +2,6 @@ import Foundation
 import Accelerate
 import simd
 import os
-import EngramSceneKit
 
 private let forceSimLog = Logger(subsystem: "com.claudememory.visualizer", category: "ForceSimulation3D")
 
@@ -54,23 +53,26 @@ public final class ForceSimulation3D {
     public var galaxyGroupPublic: [Int] { galaxyGroup }
     public var galaxyCentersPublic: [SIMD3<Float>] { galaxyCenters }
     public var edgeIndicesPublic: [(Int, Int)] { edgeIndices }
+    public var topicProjectGroupPublic: [Int] { topicProjectGroup }
+    public var nodeIds: [UUID] { ids }
     public var nodeCount: Int { ids.count }
 
     public private(set) var positions: [UUID: SIMD3<Float>] = [:]
 
-    // Force parameters (tuned for 3D — matches JS version exactly)
+    // Force parameters (tuned for 3D cluster quality at 200–20K nodes)
     public let springLength: Float = 240
-    public let crossProjectSpringLength: Float = 400
+    public let crossProjectSpringLength: Float = 600
     public let springStrength: Float = 0.0004
+    public let crossProjectSpringScale: Float = 1.0
     public let chargeStrength: Float = 500
-    public let crossChargeMultiplier: Float = 3.0
+    public let crossChargeMultiplier: Float = 5.0
     public let sameProjectChargeScale: Float = 1.0
-    public let sameTopicChargeScale: Float = 0.35
-    public let centerStrength: Float = 0.006
-    public let cohesionStrength: Float = 0.0015
-    public let centroidRepulsion: Float = 2500
-    public let topicCohesionStrength: Float = 0.009
-    public let topicCentroidRepulsion: Float = 3500
+    public let sameTopicChargeScale: Float = 1.0
+    public let centerStrength: Float = 0.003
+    public let cohesionStrength: Float = 0.002
+    public let centroidRepulsion: Float = 2000
+    public let topicCohesionStrength: Float = 0.005
+    public let topicCentroidRepulsion: Float = 1000
     private let damping: Float = 0.78
     private let maxSpeed: Float = 12.0
 
@@ -171,6 +173,7 @@ public final class ForceSimulation3D {
         // Cancel any active local wake — full wake supersedes it
         clearLocalWake()
         isSettled = false
+        tickInFlight = false  // discard any in-flight force result so dispatch resumes
         settledFrameCount = 0
         framesSinceWake = 0
         forceAge = 2
@@ -209,11 +212,27 @@ public final class ForceSimulation3D {
             newPinned.append(pinned[i])
         }
 
-        // Add new nodes
+        // Add new nodes — seed positions by project so same-project nodes start near
+        // each other. Without this, random placement creates local minima that the
+        // force simulation can't escape, causing inconsistent clustering quality.
+        // Pre-build project index for seeded positioning
+        var projGroupForSeed: [String: Int] = [:]
+        for id in nodeIds {
+            let proj = projectForNode[id] ?? ""
+            if projGroupForSeed[proj] == nil { projGroupForSeed[proj] = projGroupForSeed.count }
+        }
+        let numProjects = max(projGroupForSeed.count, 1)
         for id in nodeIds where idToIndex[id] == nil {
-            let angle = Float.random(in: 0...(2 * .pi))
-            let phi = Float.random(in: -.pi/2...(.pi/2))
-            let r = Float.random(in: 50...250)
+            let proj = projectForNode[id] ?? ""
+            let projIdx = projGroupForSeed[proj] ?? 0
+            // Golden-angle spacing in azimuth gives maximally separated project directions
+            let baseAngle = Float(projIdx) * 2.399963  // golden angle in radians
+            let basePhi = Float(projIdx) * 0.8 - Float(numProjects) * 0.4  // spread in elevation
+            let jitterAngle = Float.random(in: -0.4...0.4)
+            let jitterPhi = Float.random(in: -0.3...0.3)
+            let r = Float.random(in: 80...180)
+            let angle = baseAngle + jitterAngle
+            let phi = max(-.pi/2, min(.pi/2, basePhi + jitterPhi))
             newIds.append(id)
             newX.append(center.x + cos(angle) * cos(phi) * r)
             newY.append(center.y + sin(angle) * cos(phi) * r)
@@ -504,53 +523,77 @@ public final class ForceSimulation3D {
         // Fast path: when settled, skip all work (no integration, no sync, no force dispatch)
         if isSettled { return }
 
-        // Force results arrive via applyGPUForces() callback (from GPU or CPU).
-        // tick() just integrates with whatever stored forces are current.
+        // GPU path: GPU handles force computation + integration via ForceIntegrate.metal.
+        // tick() only decays alpha, checks settle, and syncs positions.
+        // CPU path: tick() integrates stored forces locally.
         let forceStart = CFAbsoluteTimeGetCurrent()
         let forceMethod = useGPUForces ? "gpu" : "cpu"
         let forceMs = 0.0  // force computation is async, not measured here
 
-        // Integrate with whatever forces we have (current or from previous frame)
         let integrateStart = CFAbsoluteTimeGetCurrent()
-        let hasForcesComputed = storedFx.count == n
         var maxSpeedSq: Float = 0
-        var totalKineticEnergy: Float = 0
-        for i in 0..<n where !pinned[i] {
-            if hasForcesComputed {
-                vx[i] += storedFx[i]
-                vy[i] += storedFy[i]
-                vz[i] += storedFz[i]
-            }
-            vx[i] *= damping; vy[i] *= damping; vz[i] *= damping
 
-            let speedSq = vx[i] * vx[i] + vy[i] * vy[i] + vz[i] * vz[i]
-            maxSpeedSq = max(maxSpeedSq, speedSq)
-            totalKineticEnergy += speedSq
-            if speedSq > maxSpeed * maxSpeed {
-                let scale = maxSpeed / sqrt(speedSq)
-                vx[i] *= scale; vy[i] *= scale; vz[i] *= scale
+        if useGPUForces {
+            // GPU integration delivered positions via applyGPUForces().
+            // Just measure velocity for settle detection (from last GPU delivery).
+            for i in 0..<n {
+                let speedSq = vx[i] * vx[i] + vy[i] * vy[i] + vz[i] * vz[i]
+                maxSpeedSq = max(maxSpeedSq, speedSq)
             }
+        } else {
+            // CPU path: integrate stored forces locally
+            let hasForcesComputed = storedFx.count == n
+            var totalKineticEnergy: Float = 0
+            for i in 0..<n where !pinned[i] {
+                if hasForcesComputed {
+                    // Scale forces by alpha (matches GPU integration: forces[gid] * params.alpha).
+                    vx[i] += storedFx[i] * alpha
+                    vy[i] += storedFy[i] * alpha
+                    vz[i] += storedFz[i] * alpha
+                }
+                vx[i] *= damping; vy[i] *= damping; vz[i] *= damping
 
-            x[i] += vx[i]; y[i] += vy[i]; z[i] += vz[i]
+                let speedSq = vx[i] * vx[i] + vy[i] * vy[i] + vz[i] * vz[i]
+                maxSpeedSq = max(maxSpeedSq, speedSq)
+                totalKineticEnergy += speedSq
+                if speedSq > maxSpeed * maxSpeed {
+                    let scale = maxSpeed / sqrt(speedSq)
+                    vx[i] *= scale; vy[i] *= scale; vz[i] *= scale
+                }
+
+                x[i] += vx[i]; y[i] += vy[i]; z[i] += vz[i]
+            }
         }
         alpha = max(alpha * alphaDecay, alphaFloor)
         lastMaxSpeedSq = maxSpeedSq
         framesSinceWake += 1
 
-        // Settle detection — simple threshold like JS version.
-        // No scale-adaptive hacks needed since forces are synchronous (no micro-oscillation).
-        let settleThreshold: Float = 0.01
-        if hasForcesComputed
-            && framesSinceWake >= settleGuardFrames
-            && maxSpeedSq < settleThreshold {
-            settledFrameCount += 1
-            if settledFrameCount >= 30 {
-                isSettled = true
-                syncPositions()
-                return
+        // Settle detection — only consider settling after alpha has decayed
+        // substantially (< 0.05 = ~600 frames at 0.995 decay). This ensures
+        // forces have had enough time to separate clusters before checking.
+        let settleThreshold: Float = 0.05
+        let relaxedThreshold: Float = 1.0
+        let hasForceData = useGPUForces || storedFx.count == n
+        if hasForceData && alpha < 0.05 {
+            if maxSpeedSq < settleThreshold {
+                settledFrameCount += 1
+                if settledFrameCount >= 30 {
+                    isSettled = true
+                    syncPositions()
+                    return
+                }
+            } else if maxSpeedSq < relaxedThreshold {
+                // Low energy but not zero — structural force residuals.
+                // Force settle after 120 frames of sub-pixel motion.
+                settledFrameCount += 1
+                if settledFrameCount >= 120 {
+                    isSettled = true
+                    syncPositions()
+                    return
+                }
+            } else {
+                settledFrameCount = 0
             }
-        } else if maxSpeedSq >= settleThreshold {
-            settledFrameCount = 0
         }
 
         syncPositions()
@@ -592,12 +635,43 @@ public final class ForceSimulation3D {
     /// Apply GPU force results delivered via @MainActor callback.
     /// Called from MetalForceCompute's completion handler (dispatched to main actor).
     public func applyGPUForces(_ result: ForceResult) {
-        guard result.fx.count == ids.count else { return }
+        // GPU-integrated positions: forces were already applied with alpha scaling on GPU.
+        // Write positions directly into CPU arrays and zero stored forces.
+        if let gpuPositions = result.positions {
+            guard gpuPositions.count == ids.count else {
+                tickInFlight = false
+                return
+            }
+            // Compute velocity from position delta (for settle detection).
+            // GPU velocities live on GPU; this derives them from the position change.
+            for i in 0..<ids.count {
+                vx[i] = gpuPositions[i].x - x[i]
+                vy[i] = gpuPositions[i].y - y[i]
+                vz[i] = gpuPositions[i].z - z[i]
+                x[i] = gpuPositions[i].x
+                y[i] = gpuPositions[i].y
+                z[i] = gpuPositions[i].z
+            }
+            // Zero stored forces — GPU already integrated them.
+            storedFx = [Float](repeating: 0, count: ids.count)
+            storedFy = [Float](repeating: 0, count: ids.count)
+            storedFz = [Float](repeating: 0, count: ids.count)
+            tickInFlight = false
+            syncPositions()
+            GPULog.log("APPLIED GPU positions n=\(gpuPositions.count)")
+            return
+        }
+
+        // Raw forces: store for CPU integration in next tick().
+        guard result.fx.count == ids.count else {
+            tickInFlight = false
+            return
+        }
         storedFx = result.fx
         storedFy = result.fy
         storedFz = result.fz
         tickInFlight = false
-        GPULog.log("APPLIED n=\(result.fx.count)")
+        GPULog.log("APPLIED forces n=\(result.fx.count)")
     }
 
     // Force computation now handled by:
