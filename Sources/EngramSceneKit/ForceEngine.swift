@@ -63,7 +63,6 @@ public final class ForceEngine {
         public let centerStrength: Float
         public let center: SIMD3<Float>
         public let alpha: Float
-        public let forceAge: Int
         public let damping: Float
         public let maxSpeed: Float
 
@@ -82,7 +81,7 @@ public final class ForceEngine {
             topicCohesionStrength: Float, topicCentroidRepulsion: Float,
             topicLeashStrength: Float = 0.01,
             centerStrength: Float, center: SIMD3<Float>,
-            alpha: Float, forceAge: Int = 2, damping: Float, maxSpeed: Float
+            alpha: Float, damping: Float, maxSpeed: Float
         ) {
             self.nodeCount = nodeCount; self.isSettled = isSettled
             self.posX = posX; self.posY = posY; self.posZ = posZ
@@ -104,7 +103,7 @@ public final class ForceEngine {
             self.topicCentroidRepulsion = topicCentroidRepulsion
             self.topicLeashStrength = topicLeashStrength
             self.centerStrength = centerStrength; self.center = center
-            self.alpha = alpha; self.forceAge = forceAge
+            self.alpha = alpha
             self.damping = damping; self.maxSpeed = maxSpeed
         }
     }

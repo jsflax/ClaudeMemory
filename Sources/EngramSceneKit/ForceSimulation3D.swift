@@ -5,7 +5,7 @@ import os
 
 private let forceSimLog = Logger(subsystem: "com.claudememory.visualizer", category: "ForceSimulation3D")
 
-// Barnes-Hut octree code is in EngramSceneKit/ForceComputation.swift (public).
+// GPU force computation via MetalForceCompute + ForceIntegrate.metal.
 
 /// 3D force-directed graph layout engine. Same split architecture as ForceSimulation:
 /// O(n²) force computation runs async on @ForceSimulatorActor, O(n) integration runs sync at 60fps.
@@ -35,11 +35,6 @@ public final class ForceSimulation3D {
     // Reverse mappings for surgical insert (addNode)
     private var projectToGroup: [String: Int] = [:]
     private var topicKeyToGroup: [String: Int] = [:]
-
-    // Stored per-node forces from last async computation
-    private var storedFx: [Float] = []
-    private var storedFy: [Float] = []
-    private var storedFz: [Float] = []
 
     // Force results now delivered via @MainActor callback (applyGPUForces).
     // No cross-thread lock needed.
@@ -80,9 +75,6 @@ public final class ForceSimulation3D {
     public private(set) var alpha: Float = 1.0
     private let alphaDecay: Float = 0.995
     private let alphaFloor: Float = 0.01
-    public private(set) var tickInFlight = false
-    public private(set) var forceAge: Int = 100
-    public private(set) var smoothedAttenuation: Float = 0.001
     private var topologyVersion: UInt64 = 0
 
     /// Set by addNode/addEdge, drained by tick(). Coalesces multiple topology changes
@@ -92,29 +84,6 @@ public final class ForceSimulation3D {
     /// Set by topology changes, cleared after CSR rebuild in dispatchForceComputation.
     /// CSR (Compressed Sparse Row) structures are pre-built for GPU gather kernels.
     public var topologyDirtyForGPU = true
-    /// When true, the renderer handles GPU force encoding — tick() skips CPU dispatch.
-    public var useGPUForces = false
-
-    // MARK: - Local wake state
-    // When a node is inserted into a settled sim, we run a lightweight CPU-only
-    // force computation on just the neighborhood (~50-100 nodes) instead of waking
-    // the full O(n) simulation. This avoids the 300x per-frame cost cliff.
-
-    /// Indices of nodes in the active local wake neighborhood.
-    private var localWakeIndices: Set<Int> = []
-
-    /// True when a local wake is active (node inserted while settled).
-    public private(set) var isLocalWake = false
-
-    /// Frames remaining in local wake. Counts down from localWakeMaxFrames.
-    private var localWakeFramesRemaining = 0
-    private let localWakeMaxFrames = 15  // ~250ms at 60fps
-
-    /// Index of the newly inserted node that triggered the local wake.
-    private var localWakeNewNodeIndex: Int? = nil
-
-    /// Whether the neighborhood has been expanded (done once on first local tick).
-    private var localWakeExpanded = false
 
     public init() {}
 
@@ -181,22 +150,14 @@ public final class ForceSimulation3D {
 
     /// Wake the simulation from settled state (e.g. after topology change or user interaction).
     public func wake() {
-        // Cancel any active local wake — full wake supersedes it
-        clearLocalWake()
         isSettled = false
-        tickInFlight = false  // discard any in-flight force result so dispatch resumes
         settledFrameCount = 0
         framesSinceWake = 0
         framesAtAlphaFloor = 0
-        forceAge = 2
         // Reset alpha so center gravity and other alpha-scaled forces are meaningful.
         // Without this, alpha decays to 0.01 after ~15s and never recovers — making
         // migration animations crawl because center force is 100x weaker.
         alpha = 1.0
-        // Reset smoothedAttenuation so forces apply at meaningful strength immediately.
-        // Without this, smoothedAttenuation ramps from near-zero at 4%/frame — taking
-        // ~30 frames to reach useful values — causing newly added nodes to appear stuck.
-        smoothedAttenuation = pow(damping, Float(forceAge))
     }
 
     // MARK: - Graph Management
@@ -293,14 +254,9 @@ public final class ForceSimulation3D {
         }
         edgeIndexSet = Set(edgeIndices.map { UInt64($0.0) << 32 | UInt64($0.1) })
 
-        storedFx = [Float](repeating: 0, count: ids.count)
-        storedFy = [Float](repeating: 0, count: ids.count)
-        storedFz = [Float](repeating: 0, count: ids.count)
-
         topologyVersion &+= 1
         topologyDirtyForGPU = true
         isSettled = false; settledFrameCount = 0
-        forceAge = 2
         rebuildPositions()
     }
 
@@ -308,7 +264,6 @@ public final class ForceSimulation3D {
     /// Compacts SoA arrays and remaps edge indices.
     public func removeNodes(_ idsToRemove: Set<UUID>) {
         guard !idsToRemove.isEmpty else { return }
-        clearLocalWake()  // indices become invalid after compaction
         let oldCount = ids.count
 
         // Build old→new index mapping
@@ -362,11 +317,6 @@ public final class ForceSimulation3D {
         }
         edgeIndexSet = Set(edgeIndices.map { UInt64($0.0) << 32 | UInt64($0.1) })
 
-        // Compact stored forces
-        storedFx = [Float](repeating: 0, count: cap)
-        storedFy = [Float](repeating: 0, count: cap)
-        storedFz = [Float](repeating: 0, count: cap)
-
         // Remove from positions dict
         for id in idsToRemove { positions.removeValue(forKey: id) }
 
@@ -391,7 +341,7 @@ public final class ForceSimulation3D {
             galaxyCenter = nil
         }
         let position: SIMD3<Float>
-        if (isSettled || isLocalWake), let pg = projectToGroup[project] {
+        if isSettled, let pg = projectToGroup[project] {
             position = projectCentroid(group: pg, jitter: 15.0)
         } else {
             position = randomSpherePosition(around: galaxyCenter)
@@ -433,26 +383,9 @@ public final class ForceSimulation3D {
             topicProjectGroup.append(projGroup)
         }
 
-        storedFx.append(0); storedFy.append(0); storedFz.append(0)
         positions[id] = position
         topologyDirtyForGPU = true
-
-        // Route to local wake or full wake
-        if isSettled && !isLocalWake {
-            // First insert into a settled sim → activate local wake
-            isLocalWake = true
-            localWakeFramesRemaining = localWakeMaxFrames
-            localWakeNewNodeIndex = newIndex
-            localWakeIndices = [newIndex]
-            topologyVersion &+= 1  // so render pipeline picks up the new node
-        } else if isLocalWake {
-            // Additional insert during active local wake → extend the set
-            localWakeIndices.insert(newIndex)
-            topologyVersion &+= 1
-        } else {
-            // Sim already awake → normal full-wake path
-            hasPendingTopologyChanges = true
-        }
+        hasPendingTopologyChanges = true
     }
 
     /// Surgically insert a single edge without rebuilding the entire graph.
@@ -462,28 +395,16 @@ public final class ForceSimulation3D {
         guard edgeIndexSet.insert(key).inserted else { return }
         edgeIndices.append((si, ti))
         topologyDirtyForGPU = true
-
-        if isLocalWake {
-            // Extend neighborhood to include edge endpoints
-            localWakeIndices.insert(si)
-            localWakeIndices.insert(ti)
-        } else {
-            hasPendingTopologyChanges = true
-        }
+        hasPendingTopologyChanges = true
     }
 
     /// Write external positions (e.g. from 2D positions + z jitter) into internal arrays.
     public func setPositions(_ positions: [UUID: SIMD3<Float>]) {
-        clearLocalWake()
         for (id, point) in positions {
             guard let i = idToIndex[id] else { continue }
             x[i] = point.x; y[i] = point.y; z[i] = point.z
             vx[i] = 0; vy[i] = 0; vz[i] = 0
         }
-        storedFx = [Float](repeating: 0, count: ids.count)
-        storedFy = [Float](repeating: 0, count: ids.count)
-        storedFz = [Float](repeating: 0, count: ids.count)
-        forceAge = 5
         alpha = 0.5
         syncPositions()
     }
@@ -528,60 +449,23 @@ public final class ForceSimulation3D {
             topologyVersion &+= 1
             isSettled = false
             settledFrameCount = 0
-            // Full topology change during local wake → escalate to full wake
-            if isLocalWake { clearLocalWake() }
-        }
-
-        // Local wake path: lightweight CPU-only integration for neighborhood only.
-        // Runs instead of full sim when a node was inserted while settled.
-        if isLocalWake {
-            tickLocalWake()
-            return
         }
 
         // Fast path: when settled, skip all work (no integration, no sync, no force dispatch)
         if isSettled { return }
 
-        // GPU path: GPU handles force computation + integration via ForceIntegrate.metal.
+        // GPU handles force computation + integration via ForceIntegrate.metal.
         // tick() only decays alpha, checks settle, and syncs positions.
-        // CPU path: tick() integrates stored forces locally.
-        let forceStart = CFAbsoluteTimeGetCurrent()
-        let forceMethod = useGPUForces ? "gpu" : "cpu"
-        let forceMs = 0.0  // force computation is async, not measured here
-
-        let integrateStart = CFAbsoluteTimeGetCurrent()
+        let tickStart = CFAbsoluteTimeGetCurrent()
         var maxSpeedSq: Float = 0
 
         var totalKineticEnergy: Float = 0
-        if useGPUForces {
-            // GPU integration delivered positions via applyGPUForces().
-            // Measure velocity for settle detection (from last GPU delivery).
-            for i in 0..<n {
-                let speedSq = vx[i] * vx[i] + vy[i] * vy[i] + vz[i] * vz[i]
-                maxSpeedSq = max(maxSpeedSq, speedSq)
-                totalKineticEnergy += speedSq
-            }
-        } else {
-            // CPU path: integrate stored forces locally
-            let hasForcesComputed = storedFx.count == n
-            for i in 0..<n where !pinned[i] {
-                if hasForcesComputed {
-                    vx[i] += storedFx[i]
-                    vy[i] += storedFy[i]
-                    vz[i] += storedFz[i]
-                }
-                vx[i] *= damping; vy[i] *= damping; vz[i] *= damping
-
-                let speedSq = vx[i] * vx[i] + vy[i] * vy[i] + vz[i] * vz[i]
-                maxSpeedSq = max(maxSpeedSq, speedSq)
-                totalKineticEnergy += speedSq
-                if speedSq > maxSpeed * maxSpeed {
-                    let scale = maxSpeed / sqrt(speedSq)
-                    vx[i] *= scale; vy[i] *= scale; vz[i] *= scale
-                }
-
-                x[i] += vx[i]; y[i] += vy[i]; z[i] += vz[i]
-            }
+        // GPU integration delivered positions via applyGPUForces().
+        // Measure velocity for settle detection (from last GPU delivery).
+        for i in 0..<n {
+            let speedSq = vx[i] * vx[i] + vy[i] * vy[i] + vz[i] * vz[i]
+            maxSpeedSq = max(maxSpeedSq, speedSq)
+            totalKineticEnergy += speedSq
         }
 
         // Adaptive alpha decay — larger graphs converge structurally sooner because
@@ -601,8 +485,7 @@ public final class ForceSimulation3D {
         let settleThreshold: Float = 0.05
         let relaxedThreshold: Float = 1.0
         let meanSpeedSq = totalKineticEnergy / max(Float(n), 1.0)
-        let hasForceData = useGPUForces || storedFx.count == n
-        if hasForceData && alpha < 0.08 {
+        if alpha < 0.08 {
             if maxSpeedSq < settleThreshold {
                 // All nodes barely moving
                 settledFrameCount += 1
@@ -635,37 +518,9 @@ public final class ForceSimulation3D {
 
         syncPositions()
 
-        // CPU fallback: only dispatch if GPU force encoding isn't active.
-        // When useGPUForces is true, the renderer encodes forces into its command buffer.
-        if !tickInFlight && !useGPUForces {
-            tickInFlight = true
-            let input = ForceComputationInput(
-                n: n, x: x, y: y, z: z,
-                projectGroup: projectGroup, topicGroup: topicGroup,
-                edgeIndices: edgeIndices, topicProjectGroup: topicProjectGroup,
-                alpha: alpha, center: center,
-                chargeStrength: chargeStrength, crossChargeMultiplier: crossChargeMultiplier,
-                sameProjectChargeScale: sameProjectChargeScale, sameTopicChargeScale: sameTopicChargeScale,
-                centerStrength: centerStrength,
-                springLength: springLength, crossProjectSpringLength: crossProjectSpringLength,
-                springStrength: springStrength,
-                cohesionStrength: cohesionStrength, centroidRepulsion: centroidRepulsion,
-                topicCohesionStrength: topicCohesionStrength, topicCentroidRepulsion: topicCentroidRepulsion,
-                galaxyGroup: galaxyGroup, galaxyCenters: galaxyCenters
-            )
-            Task.detached(priority: .userInitiated) {
-                let result = computeAllForces(input)
-                let forceResult = ForceResult(fx: result.fx, fy: result.fy, fz: result.fz)
-                Task { @MainActor [weak self] in
-                    self?.applyGPUForces(forceResult)
-                }
-            }
-        }
-
-        let integrateMs = (CFAbsoluteTimeGetCurrent() - integrateStart) * 1000.0
-        let totalTickMs = (CFAbsoluteTimeGetCurrent() - forceStart) * 1000.0
+        let totalTickMs = (CFAbsoluteTimeGetCurrent() - tickStart) * 1000.0
         if framesSinceWake % 60 == 1 || totalTickMs > 20 {
-            print("[engram:sim] tick n=\(n) method=\(forceMethod) force=\(String(format: "%.1f", forceMs))ms integrate=\(String(format: "%.1f", integrateMs))ms total=\(String(format: "%.1f", totalTickMs))ms maxSpeedSq=\(String(format: "%.4f", maxSpeedSq)) alpha=\(String(format: "%.4f", alpha)) settled=\(isSettled)")
+            print("[engram:sim] tick n=\(n) integrate=\(String(format: "%.1f", totalTickMs))ms maxSpeedSq=\(String(format: "%.4f", maxSpeedSq)) alpha=\(String(format: "%.4f", alpha)) settled=\(isSettled)")
         }
     }
 
@@ -673,12 +528,9 @@ public final class ForceSimulation3D {
     /// Called from MetalForceCompute's completion handler (dispatched to main actor).
     public func applyGPUForces(_ result: ForceResult) {
         // GPU-integrated positions: forces were already applied with alpha scaling on GPU.
-        // Write positions directly into CPU arrays and zero stored forces.
+        // Write positions directly into CPU arrays.
         if let gpuPositions = result.positions {
-            guard gpuPositions.count == ids.count else {
-                tickInFlight = false
-                return
-            }
+            guard gpuPositions.count == ids.count else { return }
             // Compute velocity from position delta (for settle detection).
             // GPU velocities live on GPU; this derives them from the position change.
             for i in 0..<ids.count {
@@ -689,32 +541,16 @@ public final class ForceSimulation3D {
                 y[i] = gpuPositions[i].y
                 z[i] = gpuPositions[i].z
             }
-            // Zero stored forces — GPU already integrated them.
-            storedFx = [Float](repeating: 0, count: ids.count)
-            storedFy = [Float](repeating: 0, count: ids.count)
-            storedFz = [Float](repeating: 0, count: ids.count)
-            tickInFlight = false
             syncPositions()
             return
         }
 
-        // Raw forces: store for CPU integration in next tick().
-        guard result.fx.count == ids.count else {
-            tickInFlight = false
-            return
-        }
-        storedFx = result.fx
-        storedFy = result.fy
-        storedFz = result.fz
-        tickInFlight = false
+        // Raw forces fallback (unused in GPU-only path, but kept for test compatibility).
+        guard result.fx.count == ids.count else { return }
         GPULog.log("APPLIED forces n=\(result.fx.count)")
     }
 
-    // Force computation now handled by:
-    //   CPU: computeAllForces() in EngramSceneKit (dispatched from tick())
-    //   GPU: MetalForceCompute.dispatchForces() on its own command queue
-
-    // MARK: - Local wake (targeted force computation for single-node inserts)
+    // MARK: - Positioning helpers
 
     /// Compute project cluster centroid from existing node positions.
     private func projectCentroid(group: Int, jitter: Float) -> SIMD3<Float> {
@@ -747,144 +583,6 @@ public final class ForceSimulation3D {
         )
     }
 
-    /// Expand local wake neighborhood to include same-project-group nodes, capped.
-    private func expandLocalWakeNeighborhood() {
-        let maxSize = 100
-        guard let newIdx = localWakeNewNodeIndex else { return }
-        let newProjGroup = projectGroup[newIdx]
-        for i in 0..<ids.count {
-            if projectGroup[i] == newProjGroup {
-                localWakeIndices.insert(i)
-            }
-            if localWakeIndices.count >= maxSize { break }
-        }
-    }
-
-    /// Lightweight per-frame tick for local wake: CPU-only forces on neighborhood.
-    private func tickLocalWake() {
-        // First tick: expand neighborhood to include project peers
-        if !localWakeExpanded {
-            expandLocalWakeNeighborhood()
-            localWakeExpanded = true
-        }
-
-        let localIndices = Array(localWakeIndices)
-        let k = localIndices.count
-        guard k > 0 else { finishLocalWake(); return }
-
-        // --- O(K²) charge repulsion among local nodes ---
-        for ii in 0..<k {
-            let i = localIndices[ii]
-            guard !pinned[i] else { continue }
-            for jj in (ii + 1)..<k {
-                let j = localIndices[jj]
-                let dx = x[i] - x[j], dy = y[i] - y[j], dz = z[i] - z[j]
-                var distSq = dx * dx + dy * dy + dz * dz
-                if distSq > 250_000 { continue }  // 500² cutoff
-                if distSq < 1 { distSq = 1 }
-
-                let charge: Float
-                if projectGroup[i] != projectGroup[j] {
-                    charge = chargeStrength * crossChargeMultiplier
-                } else if topicGroup[i] == topicGroup[j] {
-                    charge = chargeStrength * sameTopicChargeScale
-                } else {
-                    charge = chargeStrength * sameProjectChargeScale
-                }
-
-                let dist = sqrt(distSq)
-                let forceMag = charge / distSq
-                let ux = dx / dist, uy = dy / dist, uz = dz / dist
-                let ffx = ux * forceMag, ffy = uy * forceMag, ffz = uz * forceMag
-                vx[i] += ffx; vy[i] += ffy; vz[i] += ffz
-                vx[j] -= ffx; vy[j] -= ffy; vz[j] -= ffz
-            }
-        }
-
-        // --- Spring forces for edges touching the local set ---
-        let localSet = localWakeIndices
-        for (si, ti) in edgeIndices {
-            guard localSet.contains(si) || localSet.contains(ti) else { continue }
-            let dx = x[ti] - x[si], dy = y[ti] - y[si], dz = z[ti] - z[si]
-            var d = sqrt(dx * dx + dy * dy + dz * dz)
-            if d < 1 { d = 1 }
-            let cross = projectGroup[si] != projectGroup[ti]
-            let rest = cross ? crossProjectSpringLength : springLength
-            let force = springStrength * (d - rest)
-            let efx = (dx / d) * force, efy = (dy / d) * force, efz = (dz / d) * force
-            if localSet.contains(si) { vx[si] += efx; vy[si] += efy; vz[si] += efz }
-            if localSet.contains(ti) { vx[ti] -= efx; vy[ti] -= efy; vz[ti] -= efz }
-        }
-
-        // --- Cohesion: pull new node(s) toward project centroid ---
-        if let newIdx = localWakeNewNodeIndex {
-            let pg = projectGroup[newIdx]
-            var sumX: Float = 0, sumY: Float = 0, sumZ: Float = 0, count: Float = 0
-            for i in 0..<ids.count where projectGroup[i] == pg {
-                sumX += x[i]; sumY += y[i]; sumZ += z[i]; count += 1
-            }
-            if count > 1 {
-                let cx = sumX / count, cy = sumY / count, cz = sumZ / count
-                // Stronger cohesion for fast convergence (3x normal)
-                let str = cohesionStrength * 3.0
-                let dx = cx - x[newIdx], dy = cy - y[newIdx], dz = cz - z[newIdx]
-                vx[newIdx] += dx * str
-                vy[newIdx] += dy * str
-                vz[newIdx] += dz * str
-            }
-        }
-
-        // --- Center gravity for local nodes ---
-        for i in localIndices where !pinned[i] {
-            vx[i] += (center.x - x[i]) * alphaFloor * centerStrength
-            vy[i] += (center.y - y[i]) * alphaFloor * centerStrength
-            vz[i] += (center.z - z[i]) * alphaFloor * centerStrength
-        }
-
-        // --- Integration: only local nodes ---
-        var maxSpeedSq: Float = 0
-        for i in localIndices where !pinned[i] {
-            vx[i] *= damping; vy[i] *= damping; vz[i] *= damping
-            let speedSq = vx[i] * vx[i] + vy[i] * vy[i] + vz[i] * vz[i]
-            maxSpeedSq = max(maxSpeedSq, speedSq)
-            if speedSq > maxSpeed * maxSpeed {
-                let scale = maxSpeed / sqrt(speedSq)
-                vx[i] *= scale; vy[i] *= scale; vz[i] *= scale
-            }
-            x[i] += vx[i]; y[i] += vy[i]; z[i] += vz[i]
-        }
-
-        lastMaxSpeedSq = maxSpeedSq
-
-        // Sync only changed positions (O(K) instead of O(n))
-        for i in localIndices {
-            positions[ids[i]] = SIMD3(x[i], y[i], z[i])
-        }
-
-        // Settle: velocities converged or max frames reached
-        localWakeFramesRemaining -= 1
-        if maxSpeedSq < 0.01 || localWakeFramesRemaining <= 0 {
-            finishLocalWake()
-        }
-    }
-
-    /// Finish local wake — transition back to settled state.
-    private func finishLocalWake() {
-        clearLocalWake()
-        isSettled = true
-        lastMaxSpeedSq = 0
-        // Final full sync for consistency
-        syncPositions()
-    }
-
-    /// Reset all local wake state without changing isSettled.
-    private func clearLocalWake() {
-        isLocalWake = false
-        localWakeIndices.removeAll()
-        localWakeNewNodeIndex = nil
-        localWakeExpanded = false
-        localWakeFramesRemaining = 0
-    }
 
     // MARK: - Position sync
 

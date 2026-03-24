@@ -118,7 +118,6 @@ final class RKSceneManager {
         let sim = registry.unifiedSimulation
         guard sim.shouldDispatchForces, sim.nodeCount > 1, engine.isFullSimAvailable, !engine.isInFlight else { return }
 
-        sim.useGPUForces = true
         let snapshot = ForceEngine.SimulationSnapshot(
             nodeCount: sim.nodeCount, isSettled: sim.isSettled,
             posX: sim.posX, posY: sim.posY, posZ: sim.posZ,
@@ -135,7 +134,7 @@ final class RKSceneManager {
             topicCohesionStrength: sim.topicCohesionStrength, topicCentroidRepulsion: sim.topicCentroidRepulsion,
             topicLeashStrength: sim.topicLeashStrength,
             centerStrength: sim.centerStrength, center: sim.center,
-            alpha: sim.alpha, forceAge: sim.forceAge, damping: 0.78, maxSpeed: 12.0
+            alpha: sim.alpha, damping: 0.78, maxSpeed: 12.0
         )
 
         if let result = engine.encodeForcePassSync(queue: rkScene.commandQueue, snapshot: snapshot) {
