@@ -103,7 +103,7 @@ final class RKSceneManager {
 
         // Spatial audio handled by RKSpatialAudioSystem in EngramRealityScene.update()
 
-        // Sync minimap (~2fps to avoid cascade)
+        // Sync camera state (~2fps to avoid cascade)
         if let cam3D = camera3DState, Int.random(in: 0..<30) == 0 {
             cam3D.positions = registry.mergedPositions
         }

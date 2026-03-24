@@ -7,7 +7,7 @@ private let forceSimLog = Logger(subsystem: "com.claudememory.visualizer", categ
 
 // GPU force computation via MetalForceCompute + ForceIntegrate.metal.
 
-/// 3D force-directed graph layout engine. Same split architecture as ForceSimulation:
+/// 3D force-directed graph layout engine.
 /// O(n²) force computation runs async on @ForceSimulatorActor, O(n) integration runs sync at 60fps.
 @MainActor
 public final class ForceSimulation3D {

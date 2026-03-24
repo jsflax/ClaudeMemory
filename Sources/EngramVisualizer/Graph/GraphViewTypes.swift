@@ -14,12 +14,9 @@ struct TopicGroupInfo: Equatable {
 
 // MARK: - Camera 3D state (isolated from GraphView to avoid body re-evaluation on camera changes)
 
-/// Holds 3D camera state + minimap positions. Written by renderTick's cameraCallback.
-/// Only MinimapView reads these properties, so only MinimapView re-renders when they change —
-/// GraphView's body passes this by reference without reading properties.
-/// 3D camera state for minimap. All properties are @ObservationIgnored because
-/// MinimapView redraws on its own 10fps timer — @Observable tracking at 60fps
-/// would trigger expensive Canvas redraws every frame.
+/// Holds 3D camera state. Written by renderTick's cameraCallback.
+/// All properties are @ObservationIgnored to avoid triggering
+/// expensive re-renders every frame.
 @Observable
 @MainActor
 final class Camera3DState {

@@ -1,6 +1,9 @@
 import SwiftUI
+import EngramSceneKit
 import Lattice
+import EngramSceneKit
 import EngramKit
+import AppKit
 import simd
 
 // MARK: - 3D Layout & View
@@ -24,107 +27,6 @@ extension GraphView {
             return blended
         }
         return simulation3D.positions
-    }
-
-    // MARK: - Dimension Mode Switching
-
-    func switchDimensionMode(to mode: DimensionMode, viewSize: CGSize) {
-        guard mode != config.dimensionMode else { return }
-        config.dimensionMode = mode
-
-        switch mode {
-        case .threeD:
-            // Seed 3D simulation from current 2D positions with z-jitter proportional to spread
-            let currentPositions = effectivePositions ?? simulation.positions
-            let xs = currentPositions.values.map { Float($0.x) }
-            let ys = currentPositions.values.map { Float($0.y) }
-            let spreadX = (xs.max() ?? 0) - (xs.min() ?? 0)
-            let spreadY = (ys.max() ?? 0) - (ys.min() ?? 0)
-            let zRange = max(spreadX, spreadY) * 0.4  // z spread = 40% of largest 2D axis
-            var pos3D: [UUID: SIMD3<Float>] = [:]
-            for (id, pt) in currentPositions {
-                pos3D[id] = SIMD3(Float(pt.x), Float(pt.y), Float.random(in: -zRange...zRange))
-            }
-
-            // Rebuild 3D simulation topology
-            let filtered = renderStore.nodes
-            let currentIds = Set(filtered.map(\.id))
-            let edgePairs = renderStore.edges.map { ($0.sourceId, $0.targetId) }
-            var projectMap: [UUID: String] = [:]
-            var topicMap: [UUID: String] = [:]
-            for node in filtered { projectMap[node.id] = node.project; topicMap[node.id] = node.topic }
-            simulation3D.updateGraph(nodeIds: currentIds, edges: edgePairs,
-                                     projectForNode: projectMap, topicForNode: topicMap)
-            simulation3D.setPositions(pos3D)
-            simulation3D.isActive = (config.layoutMode == .forceDirected)
-
-            // If in semantic mode, recompute t-SNE in 3D
-            if config.layoutMode == .embedding {
-                forcePositionSnapshot3D = pos3D
-                embeddingProjection.invalidate()
-                let nodeIds = renderStore.visibleNodeIds
-                embeddingProjection.loadEmbeddings(for: nodeIds, from: lattice)
-                let nodeScale = max(1.0, sqrt(Float(nodeIds.count) / 30.0))
-                let spread = max(Float(viewSize.width), Float(viewSize.height)) * 1.2 * nodeScale
-
-                Task {
-                    await embeddingProjection.computeProjection3D(
-                        nodeIds: nodeIds, spread: spread, initialPositions: pos3D
-                    )
-                    var topics: [UUID: String] = [:]
-                    var projects: [UUID: String] = [:]
-                    var labels: [UUID: String] = [:]
-                    for node in renderStore.nodes {
-                        topics[node.id] = node.topic
-                        projects[node.id] = node.project
-                        labels[node.id] = node.label
-                    }
-                    embeddingProjection.detectClusters3D(nodeTopics: topics, nodeProjects: projects, nodeLabels: labels)
-                }
-            }
-
-        case .twoD:
-            // Project 3D positions to 2D (drop z) and inject into 2D sim
-            let current3D = positions3D
-            var pos2D: [UUID: CGPoint] = [:]
-            for (id, p) in current3D {
-                pos2D[id] = CGPoint(x: CGFloat(p.x), y: CGFloat(p.y))
-            }
-
-            simulation3D.isActive = false
-
-            if config.layoutMode == .forceDirected {
-                simulation.setPositions(pos2D)
-                simulation.isActive = true
-            } else {
-                // Back in 2D semantic — recompute 2D t-SNE
-                embeddingProjection.invalidate()
-                let nodeIds = renderStore.visibleNodeIds
-                embeddingProjection.loadEmbeddings(for: nodeIds, from: lattice)
-                let center = simulation.center
-                let nodeScale = max(1.0, sqrt(CGFloat(nodeIds.count) / 30.0))
-                let spread = max(viewSize.width, viewSize.height) * 1.2 * nodeScale
-
-                projectedPositions2DFromSwitch(pos2D)
-
-                Task {
-                    await embeddingProjection.computeProjection(
-                        nodeIds: nodeIds, center: center, spread: spread,
-                        initialPositions: pos2D
-                    )
-                    var topics: [UUID: String] = [:]
-                    var projects: [UUID: String] = [:]
-                    var labels: [UUID: String] = [:]
-                    for node in renderStore.nodes {
-                        topics[node.id] = node.topic
-                        projects[node.id] = node.project
-                        labels[node.id] = node.label
-                    }
-                    embeddingProjection.detectClusters(nodeTopics: topics, nodeProjects: projects, nodeLabels: labels)
-                    embeddingProjection.detectVoids(nodeTopics: topics, nodeProjects: projects)
-                }
-            }
-        }
     }
 
     // MARK: - Layout Mode Switching (3D)
@@ -197,5 +99,36 @@ extension GraphView {
             cameraProjectTarget: $cameraProjectTarget
         )
         .transaction { $0.animation = nil }  // prevent overlay animations from resizing the 3D view
+    }
+
+    // MARK: - Layout Mode Switching
+
+    func switchLayoutMode(to mode: LayoutMode, viewSize: CGSize) {
+        guard mode != config.layoutMode else { return }
+        config.layoutMode = mode
+        switchLayoutMode3D(to: mode, viewSize: viewSize)
+    }
+
+    // MARK: - Scroll Monitor
+
+    func installScrollMonitor() {
+        scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { event in
+            // 3D scene handles its own scroll/pan — consume nothing
+            return event
+        }
+    }
+
+    func removeScrollMonitor() {
+        if let monitor = scrollMonitor {
+            NSEvent.removeMonitor(monitor)
+            scrollMonitor = nil
+        }
+    }
+
+    // MARK: - Selection Change
+
+    func handleSelectionChange(oldId: UUID?, newId: UUID?, viewSize: CGSize) {
+        // In 3D mode, camera flies to the selected node via the scene manager.
+        // No viewport panning needed.
     }
 }

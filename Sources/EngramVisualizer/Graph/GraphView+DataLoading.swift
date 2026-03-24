@@ -1,5 +1,7 @@
 import SwiftUI
+import EngramSceneKit
 import Lattice
+import EngramSceneKit
 import Combine
 import EngramKit
 import UserNotifications
@@ -16,89 +18,88 @@ extension GraphView {
     /// Recompute all derived data for all galaxies.
     func recomputeDerivedData() {
         for galaxy in galaxyRegistry.galaxies.values {
-            GalaxyDataLoader.recomputeDerivedData(for: galaxy)
+            galaxy.recomputeDerivedData()
         }
     }
 
-    func recomputeClusters() {
-        for galaxy in galaxyRegistry.galaxies.values {
-            let store = galaxy.renderStore
-            let visibleProjects = Set(store.nodes.map(\.project))
-            var all: [[UUID]] = []
-            for project in visibleProjects {
-                let projectClusters = findMemoryClusters(in: galaxy.lattice, project: project, minClusterSize: 2, neighborLimit: 20).clusters
-                all.append(contentsOf: projectClusters)
-            }
-            store.clusterGroups = all
-        }
-    }
+//    func recomputeClusters() {
+//        for galaxy in galaxyRegistry.galaxies.values {
+//            let store = galaxy.renderStore
+//            let visibleProjects = Set(store.nodes.map(\.project))
+//            var all: [[UUID]] = []
+//            for project in visibleProjects {
+//                let projectClusters = findMemoryClusters(in: galaxy.lattice, project: project, minClusterSize: 2, neighborLimit: 20).clusters
+//                all.append(contentsOf: projectClusters)
+//            }
+//            store.clusterGroups = all
+//        }
+//    }
 
     // MARK: - Data Loading & Observation
 
+    /// Set up galaxies reactively — no async, no temporal dependencies.
+    /// `onLatticeAvailable` is idempotent so this is safe to call from both
+    /// `onAppear` and `onReceive(syncManager.didConnect)`.
     func loadData() {
-        let is3D = config.dimensionMode == .threeD
+        // Propagate initial filter config to registry (onChange only fires on subsequent changes)
+        galaxyRegistry.hiddenProjects = config.hiddenProjects
+        galaxyRegistry.hiddenRelations = config.hiddenRelations
 
-        // Create the personal galaxy from this view's lattice
-        if galaxyRegistry.galaxies["personal"] == nil {
-            let galaxy = Galaxy(id: "personal", displayName: "Personal",
-                                lattice: lattice, hierarchyLevel: 0)
-
-            // When sync is active, filter personal galaxy to exclude synced non-private memories
-            // (those live in the synced galaxy to prevent visual duplication)
-            if syncManager.isSyncing {
-                let syncedProjects = syncManager.syncedProjectNames
-                if !syncedProjects.isEmpty {
-                    galaxy.nodeFilter = { @Sendable memory in
-                        !syncedProjects.contains(memory.project) || memory.isPrivate
-                    }
-                }
+        // Personal galaxy filter
+        var personalFilter: (@Sendable (Memory) -> Bool)?
+        if syncManager.isSyncing {
+            let syncedProjects = syncManager.syncedProjectNames
+            if !syncedProjects.isEmpty {
+                personalFilter = { !syncedProjects.contains($0.project) || $0.isPrivate }
             }
-
-            galaxyRegistry.register(galaxy)
         }
 
+        // Register ALL galaxies synchronously FIRST — computeWorldLayout runs with
+        // the correct galaxy count, so worldCenter is final before any data arrives.
+        let personalRef = lattice.sendableReference
+        if galaxyRegistry.galaxies["personal"] == nil {
+            let personal = Galaxy(id: "personal", displayName: "Personal",
+                                  lattice: personalRef, hierarchyLevel: 0)
+            galaxyRegistry.register(personal)
+        }
+
+        var syncedRef: LatticeThreadSafeReference?
+        if syncManager.isSyncing, let ref = syncManager.actor.syncedLatticeRef {
+            syncedRef = ref
+            if galaxyRegistry.galaxies["synced"] == nil {
+                let synced = Galaxy(id: "synced", displayName: "Synced",
+                                    lattice: ref, hierarchyLevel: 0)
+                galaxyRegistry.register(synced)
+            }
+        }
+
+        // NOW start loading — worldCenter is already correct for all galaxies.
         if let personal = galaxyRegistry.galaxies["personal"] {
-            GalaxyDataLoader.loadData(
-                into: personal,
-                hiddenProjects: config.hiddenProjects,
-                hiddenRelations: config.hiddenRelations,
-                timeFilter: debouncedTimeSliderDate,
-                is3D: is3D,
-                soundEnabled: config.soundEnabled,
-                notificationsEnabled: config.notificationsEnabled
-            )
+            Task {
+                if let filter = personalFilter { await personal.setNodeFilter(filter) }
+                await personal.loadData()
+                await personal.startObservers()
+            }
+        }
+        if let synced = galaxyRegistry.galaxies["synced"], syncedRef != nil {
+            Task {
+                await synced.loadData()
+                await synced.startObservers()
+            }
         }
 
-        // Create synced galaxy when IPC relay sync is active
-        if syncManager.isSyncing,
-           let syncedLattice = syncManager.syncedLattice,
-           galaxyRegistry.galaxies["synced"] == nil {
-            let synced = Galaxy(id: "synced", displayName: "Synced",
-                                lattice: syncedLattice, hierarchyLevel: 0)
-            // No nodeFilter needed — memory_synced.db already contains only filtered data
-            galaxyRegistry.register(synced)
-
-            GalaxyDataLoader.loadData(
-                into: synced,
-                hiddenProjects: config.hiddenProjects,
-                hiddenRelations: config.hiddenRelations,
-                timeFilter: debouncedTimeSliderDate,
-                is3D: is3D,
-                soundEnabled: config.soundEnabled,
-                notificationsEnabled: config.notificationsEnabled
-            )
-        }
-
-        // Observe SyncConfig changes to migrate nodes between galaxies
         galaxyRegistry.syncManager = syncManager
-        galaxyRegistry.setupSyncConfigObserver(
-            hiddenProjects: config.hiddenProjects,
-            hiddenRelations: config.hiddenRelations,
-            timeFilter: debouncedTimeSliderDate,
-            is3D: is3D,
-            soundEnabled: config.soundEnabled,
-            notificationsEnabled: config.notificationsEnabled
-        )
+        galaxyRegistry.setupSyncConfigObserver()
+    }
+
+    /// Handle late-arriving synced galaxy when daemon connects.
+    func handleSyncConnect() {
+        if let ref = syncManager.actor.syncedLatticeRef {
+            galaxyRegistry.onLatticeAvailable(
+                id: "synced", displayName: "Synced", latticeRef: ref
+            )
+        }
+        galaxyRegistry.rebuildPersonalNodeFilter()
     }
 
     // Node/edge change handlers and flush methods are now in GalaxyDataLoader.
@@ -124,7 +125,7 @@ extension GraphView {
                 !config.hiddenRelations.contains(edge.relation)
             }
             store.filteredEdgeIds = Set(store.edges.map(\.id))
-            GalaxyDataLoader.recomputeDerivedData(for: galaxy)
+            galaxy.recomputeDerivedData()
             store.bumpTopology()
         }
     }
@@ -152,16 +153,8 @@ extension GraphView {
                 topicMap[node.id] = node.topic
             }
 
-            // 2D simulation only on primary galaxy
-            if galaxy.id == "personal" {
-                simulation.updateGraph(nodeIds: currentIds, edges: edgePairs, projectForNode: projectMap, topicForNode: topicMap)
-            }
-
-            // Update 3D simulation when in 3D mode
-            if config.dimensionMode == .threeD {
-                galaxy.simulation3D.updateGraph(nodeIds: currentIds, edges: edgePairs,
-                                                 projectForNode: projectMap, topicForNode: topicMap)
-            }
+            galaxy.simulation3D?.updateGraph(nodeIds: currentIds, edges: edgePairs,
+                                              projectForNode: projectMap, topicForNode: topicMap)
         }
 
         // Mark embedding projection stale if topology changed while in embedding mode

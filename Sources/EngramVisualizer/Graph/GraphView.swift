@@ -1,5 +1,7 @@
 import SwiftUI
+import EngramSceneKit
 import Lattice
+import EngramSceneKit
 import Combine
 import EngramKit
 import UniformTypeIdentifiers
@@ -33,7 +35,6 @@ struct GraphView: View {
     var embeddingProjection: EmbeddingProjection { primaryGalaxy?.embeddingProjection ?? _fallbackEmbeddingProjection }
     @State private var _fallbackEmbeddingProjection = EmbeddingProjection()
 
-    @State var simulation = ForceSimulation()
     @State var viewport = ViewportState()
     @Environment(VisualizerConfig.self) var config
     @State var selectedMemoryId: UUID?
@@ -55,10 +56,6 @@ struct GraphView: View {
     @Environment(AccountService.self) private var accountService
     var syncManager: SyncManager // don't want to observe this
     private var sidebarVisible: Bool { sidebarPinned || sidebarPeeking }
-
-    // Minimap PiP
-    @State private var minimapDetached: Bool = false
-    @State private var minimapPanel = MinimapPanelController()
 
     // Embedding projection / layout mode
     @State var transitionProgress: CGFloat = 0  // 0 = force, 1 = embedding
@@ -95,22 +92,15 @@ struct GraphView: View {
         let _ = bodyLog.warning("[BODY-EVAL] GraphView.body evaluated at frame \(CFAbsoluteTimeGetCurrent())")
         GeometryReader { geo in
             graphContent(size: geo.size)
-                .onChange(of: geo.size, initial: true) { _, newSize in
-                    simulation.center = CGPoint(x: newSize.width / 2, y: newSize.height / 2)
-                }
                 .onAppear {
                     loadData()
                     installScrollMonitor()
                 }
                 .onReceive(syncManager.didConnect) {
-                    loadData()
+                    handleSyncConnect()
                 }
                 .onDisappear {
                     removeScrollMonitor()
-                    minimapPanel.dismiss()
-                }
-                .onPreferenceChange(InlineMinimapFrameKey.self) { frame in
-                    if frame.width > 0 { minimapPanel.inlineFrame = frame }
                 }
                 .onChange(of: selectedMemoryId) { oldId, newId in
                     // Auto-track focused galaxy based on selection
@@ -132,7 +122,9 @@ struct GraphView: View {
                 .onChange(of: isSearchActive) { _, active in
                     for galaxy in galaxyRegistry.galaxies.values { galaxy.renderStore.isSearchActive = active }
                 }
-                // hiddenProjects changes handled surgically in toggleProject()
+                .onChange(of: config.hiddenProjects) { _, newProjects in
+                    galaxyRegistry.hiddenProjects = newProjects
+                }
                 .onChange(of: config.hiddenRelations) { _, newRelations in
                     galaxyRegistry.hiddenRelations = newRelations
                     recomputeFilteredData()
@@ -187,11 +179,7 @@ struct GraphView: View {
         ZStack {
             Color(red: 0.051, green: 0.067, blue: 0.09).ignoresSafeArea()
 
-            if config.dimensionMode == .threeD {
-                graph3DView(colorMap: colorMap)
-            } else {
-                graphCanvas(colorMap: colorMap)
-            }
+            graph3DView(colorMap: colorMap)
             graphOverlays(size: size, colorMap: colorMap)
             detailPanel(size: size, colorMap: colorMap)
             sidebarLayer(colorMap: colorMap)
@@ -216,10 +204,7 @@ struct GraphView: View {
                     switchLayoutMode: { mode in
                         switchLayoutMode(to: mode, viewSize: NSApp.keyWindow?.frame.size ?? CGSize(width: 800, height: 600))
                     },
-                    switchDimensionMode: { mode in
-                        switchDimensionMode(to: mode, viewSize: NSApp.keyWindow?.frame.size ?? CGSize(width: 800, height: 600))
-                    },
-                    driveToProject: config.dimensionMode == .threeD ? { cameraProjectTarget = $0 } : nil,
+                    driveToProject: { cameraProjectTarget = $0 },
                     accountService: accountService
                 )
                 .transition(.move(edge: .leading).combined(with: .opacity))
@@ -303,7 +288,7 @@ struct GraphView: View {
                     toggleProject: toggleProject,
                     toggleRelation: toggleRelation,
                     colorMap: galaxyRegistry.mergedColorMap,
-                    driveToProject: config.dimensionMode == .threeD ? { cameraProjectTarget = $0 } : nil
+                    driveToProject: { cameraProjectTarget = $0 }
                 )
                 .transition(.opacity)
             }
@@ -327,40 +312,6 @@ struct GraphView: View {
             .padding(.horizontal, 12)
             Spacer()
         }
-
-        // Minimap — inline when docked, floating NSPanel when detached
-        if !minimapDetached {
-            VStack {
-                Spacer()
-                HStack {
-                    MinimapView(
-                        renderStore: renderStore,
-                        simulation: simulation,
-                        viewport: viewport,
-                        viewportSize: size,
-                        pipAction: { minimapDetached = true },
-                        galaxyRegistry: galaxyRegistry,
-                        camera3DState: config.dimensionMode == .threeD ? camera3DState : nil
-                    )
-                    .background(GeometryReader { geo in
-                        Color.clear.preference(
-                            key: InlineMinimapFrameKey.self,
-                            value: geo.frame(in: .global)
-                        )
-                    })
-                    .padding(12)
-                    Spacer()
-                }
-                .padding(.bottom, 44)
-            }
-        }
-        MinimapPanelBridge(
-            isDetached: minimapDetached,
-            panel: minimapPanel,
-            content: floatingMinimap(size: size, colorMap: colorMap),
-            onDismiss: { minimapDetached = false }
-        )
-        .frame(width: 0, height: 0)
 
         // Timeline slider hidden — not useful in current state
         // VStack {
@@ -396,26 +347,12 @@ struct GraphView: View {
         }
     }
 
-    private func floatingMinimap(size: CGSize, colorMap: [String: Color]) -> some View {
-        MinimapView(
-            renderStore: renderStore,
-            simulation: simulation,
-            viewport: viewport,
-            viewportSize: size,
-            pipAction: { minimapPanel.animatedDismiss { minimapDetached = false } },
-            isFloating: true,
-            galaxyRegistry: galaxyRegistry,
-            camera3DState: config.dimensionMode == .threeD ? camera3DState : nil
-            // No camera chevron in floating mode (per user request)
-        )
-    }
-
     // MARK: - Selected Memory (routed to correct galaxy's Lattice)
 
     private var selectedMemory: Memory? {
         guard let id = selectedMemoryId else { return nil }
         // Route to the galaxy that owns this node, fall back to primary lattice
-        let targetLattice = galaxyRegistry.galaxyForNode(id)?.lattice ?? lattice
+        let targetLattice = galaxyRegistry.galaxyForNode(id)?.latticeRef.resolve() ?? lattice
         return targetLattice.objects(Memory.self).where { $0.__globalId == id }.first
     }
 
@@ -443,15 +380,11 @@ struct GraphView: View {
             store.edges.removeAll { removedIds.contains($0.sourceId) || removedIds.contains($0.targetId) }
             store.filteredEdgeIds.subtract(removedEdgeIds2)
             store.visibleNodeIds.subtract(removedIds)
-            // 2D simulation only on primary galaxy
-            if galaxy.id == "personal" {
-                for id in removedIds { simulation.removeNode(id) }
-            }
             store.clusterGroups = store.clusterGroups.compactMap { cluster in
                 let filtered = cluster.filter { !removedIds.contains($0) }
                 return filtered.count >= 2 ? filtered : nil
             }
-            GalaxyDataLoader.recomputeDerivedData(for: galaxy)
+            galaxy.recomputeDerivedData()
             store.bumpTopology()
         }
     }
@@ -479,16 +412,6 @@ struct GraphView: View {
             store.edges.append(contentsOf: newEdges)
             store.filteredEdgeIds.formUnion(newEdges.map(\.id))
 
-            // 2D simulation only on primary galaxy
-            if galaxy.id == "personal" {
-                for node in addedNodes {
-                    simulation.addNode(node.id, project: node.project, topic: node.topic)
-                }
-                for edge in newEdges {
-                    simulation.addEdge(from: edge.sourceId, to: edge.targetId)
-                }
-            }
-
             // Recompute hubs for this galaxy
             var hubs = Set<UUID>()
             for edge in store.allEdges.values where edge.relation == "part_of" {
@@ -496,11 +419,16 @@ struct GraphView: View {
             }
             store.hubs = hubs
 
-            GalaxyDataLoader.recomputeDerivedData(for: galaxy)
+            galaxy.recomputeDerivedData()
             store.bumpTopology()
 
-            let projectClusters = findMemoryClusters(in: galaxy.lattice, project: project, minClusterSize: 2, neighborLimit: 20).clusters
-            store.clusterGroups.append(contentsOf: projectClusters)
+            Task.detached {
+                guard let lattice = galaxy.latticeRef.resolve() else { preconditionFailure() }
+                let projectClusters = findMemoryClusters(in: lattice, project: project, minClusterSize: 2, neighborLimit: 20).clusters
+                Task { @MainActor in
+                    store.clusterGroups.append(contentsOf: projectClusters)
+                }
+            }
         }
     }
 

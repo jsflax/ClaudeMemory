@@ -22,7 +22,9 @@ struct EngramApp: App {
         func applicationDidFinishLaunching(_ notification: Notification) {
             NSApp.setActivationPolicy(.regular)
             NSApp.activate(ignoringOtherApps: true)
+            #if !SWIFT_PACKAGE
             UNUserNotificationCenter.current().delegate = self
+            #endif
         }
 
         /// Tapping a notification activates the existing window instead of opening a new instance.
@@ -57,9 +59,9 @@ struct EngramApp: App {
         // Redirect stderr to a file so Lattice C++ debug logs are captured during UI tests
         // (the app runs in a separate process whose stderr isn't in xcodebuild output)
         freopen("/tmp/lattice-debug.log", "w", stderr)
-        Lattice.setLogLevel(.debug)
+        
         #endif
-
+        Lattice.setLogLevel(.error)
         let dbPath = ProcessInfo.processInfo.environment["CLAUDE_MEMORY_DB"]
             ?? NSHomeDirectory() + "/.claude/memory.sqlite"
         self.dbPath = dbPath
@@ -81,9 +83,6 @@ struct EngramApp: App {
             local.add(c)
             return c
         }()
-        // DIAG: force 3D mode for performance testing
-        config.dimensionMode = .threeD
-
         // Allow tests to force sound on via environment
         if ProcessInfo.processInfo.environment["ENGRAM_FORCE_SOUND"] == "1" {
             config.soundEnabled = true
@@ -137,8 +136,7 @@ struct EngramApp: App {
                 .frame(minWidth: 800, minHeight: 600)
                 .ignoresSafeArea()
                 .onAppear {
-                    syncManager.localLattice = localLattice
-                    syncManager.dbPath = dbPath
+                    syncManager.initialize(lattice: localLattice)
                     autoConnectSync()
                 }
                 .onChange(of: accountService.subscription?.isActive) { _, active in

@@ -3,16 +3,19 @@ import SwiftUI
 import Lattice
 import simd
 
+// MARK: - Global Actor for background simulation work
+
+@globalActor struct ForceSimulatorActor {
+    static let shared: ActorType = .init()
+
+    actor ActorType {}
+}
+
 // MARK: - Data Types
 
 @LatticeEnum enum LayoutMode: String, CaseIterable, Equatable {
     case forceDirected = "Force"
     case embedding = "Semantic"
-}
-
-@LatticeEnum enum DimensionMode: String, CaseIterable, Equatable {
-    case twoD = "2D"
-    case threeD = "3D"
 }
 
 enum ProjectionState: Equatable {

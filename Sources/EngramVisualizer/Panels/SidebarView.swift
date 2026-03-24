@@ -28,7 +28,6 @@ struct SidebarView: View {
     let toggleProject: (String) -> Void
     let toggleRelation: (String) -> Void
     let switchLayoutMode: (LayoutMode) -> Void
-    let switchDimensionMode: (DimensionMode) -> Void
     let driveToProject: ((String) -> Void)?
 
     // Account tab
@@ -153,13 +152,6 @@ struct SidebarView: View {
             section("Layout") {
                 VStack(alignment: .leading, spacing: 10) {
                     layoutModePicker
-                    dimensionModePicker
-
-                    if config.layoutMode == .embedding && config.dimensionMode == .twoD && projectionState == .ready {
-                        toggleRow("Knowledge Voids", icon: "sparkles", isOn: config.showVoids) {
-                            config.showVoids.toggle()
-                        }
-                    }
                 }
             }
 
@@ -226,38 +218,6 @@ struct SidebarView: View {
         )
     }
 
-    private var dimensionModePicker: some View {
-        HStack(spacing: 0) {
-            ForEach(DimensionMode.allCases, id: \.rawValue) { mode in
-                Button { switchDimensionMode(mode) } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: mode == .twoD ? "square" : "cube")
-                            .font(.system(size: 10))
-                        Text(mode.rawValue)
-                            .font(.system(size: 11, weight: config.dimensionMode == mode ? .semibold : .regular, design: .monospaced))
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 6)
-                    .background(
-                        RoundedRectangle(cornerRadius: 5)
-                            .fill(config.dimensionMode == mode ? .white.opacity(0.12) : .clear)
-                    )
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(.white.opacity(config.dimensionMode == mode ? 0.9 : 0.4))
-            }
-        }
-        .padding(2)
-        .background(
-            RoundedRectangle(cornerRadius: 7)
-                .fill(Color(red: 0.08, green: 0.1, blue: 0.14))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 7)
-                        .strokeBorder(.white.opacity(0.1), lineWidth: 1)
-                )
-        )
-    }
-
     // MARK: - Project Row
 
     private func projectRow(_ project: String) -> some View {
@@ -309,7 +269,7 @@ struct SidebarView: View {
         return Button { toggleRelation(relation) } label: {
             HStack(spacing: 8) {
                 Circle()
-                    .fill(GraphCanvas.relationColors[relation] ?? .white)
+                    .fill(EdgeColors.relationColors[relation] ?? .white)
                     .frame(width: 8, height: 8)
                     .opacity(hidden ? 0.3 : 1.0)
 

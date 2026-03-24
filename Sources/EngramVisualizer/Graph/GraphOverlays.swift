@@ -2,6 +2,19 @@ import SwiftUI
 import Lattice
 import EngramKit
 
+// MARK: - Edge Relation Colors
+
+enum EdgeColors {
+    static let relationColors: [String: Color] = [
+        "part_of": .cyan,
+        "contradicts": .red,
+        "supersedes": .orange,
+        "derived_from": .yellow,
+        "relates_to": .blue,
+        "summarized_by": .purple,
+    ]
+}
+
 // MARK: - Stats Overlay
 struct StatsOverlay: View, @MainActor Equatable {
     let galaxyRegistry: GalaxyRegistry
@@ -118,7 +131,7 @@ struct StatsOverlay: View, @MainActor Equatable {
                             } label: {
                                 HStack(spacing: 6) {
                                     Circle()
-                                        .fill(GraphCanvas.relationColors[relation] ?? .white)
+                                        .fill(EdgeColors.relationColors[relation] ?? .white)
                                         .frame(width: 8, height: 8)
                                         .opacity(hiddenRelations.contains(relation) ? 0.3 : 1.0)
                                     Text("\(relation.replacingOccurrences(of: "_", with: " ")) (\(count))")
@@ -291,49 +304,6 @@ struct LayoutModePicker: View {
                 .foregroundStyle(.white.opacity(mode == m ? 0.9 : 0.4))
             }
         }
-        .padding(2)
-        .background(
-            RoundedRectangle(cornerRadius: 7)
-                .fill(Color(red: 0.08, green: 0.1, blue: 0.14))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 7)
-                        .strokeBorder(.white.opacity(0.1), lineWidth: 1)
-                )
-        )
-    }
-}
-
-// MARK: - Dimension Toggle
-
-struct DimensionToggle: View {
-    let mode: DimensionMode
-    let onModeChange: (DimensionMode) -> Void
-
-    var body: some View {
-        HStack(spacing: 0) {
-            ForEach(DimensionMode.allCases, id: \.rawValue) { m in
-                Button {
-                    onModeChange(m)
-                } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: m == .twoD ? "square" : "cube")
-                            .font(.system(size: 10))
-                        Text(m.rawValue)
-                            .font(.system(size: 11, weight: mode == m ? .semibold : .regular, design: .monospaced))
-                    }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 5)
-                    .background(
-                        RoundedRectangle(cornerRadius: 5)
-                            .fill(mode == m ? .white.opacity(0.12) : .clear)
-                    )
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(.white.opacity(mode == m ? 0.9 : 0.4))
-                .accessibilityIdentifier("dimension-\(m.rawValue)")
-            }
-        }
-        .accessibilityIdentifier("dimension-toggle")
         .padding(2)
         .background(
             RoundedRectangle(cornerRadius: 7)
