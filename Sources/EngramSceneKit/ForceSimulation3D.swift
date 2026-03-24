@@ -187,6 +187,7 @@ public final class ForceSimulation3D {
         tickInFlight = false  // discard any in-flight force result so dispatch resumes
         settledFrameCount = 0
         framesSinceWake = 0
+        framesAtAlphaFloor = 0
         forceAge = 2
         // Reset alpha so center gravity and other alpha-scaled forces are meaningful.
         // Without this, alpha decays to 0.01 after ~15s and never recovers — making
@@ -565,10 +566,9 @@ public final class ForceSimulation3D {
             let hasForcesComputed = storedFx.count == n
             for i in 0..<n where !pinned[i] {
                 if hasForcesComputed {
-                    // Scale forces by alpha (matches GPU integration: forces[gid] * params.alpha).
-                    vx[i] += storedFx[i] * alpha
-                    vy[i] += storedFy[i] * alpha
-                    vz[i] += storedFz[i] * alpha
+                    vx[i] += storedFx[i]
+                    vy[i] += storedFy[i]
+                    vz[i] += storedFz[i]
                 }
                 vx[i] *= damping; vy[i] *= damping; vz[i] *= damping
 
@@ -591,6 +591,7 @@ public final class ForceSimulation3D {
         let nScale = min(1.0, Float(n) / 10000.0)
         let effectiveDecay = alphaDecay - 0.002 * nScale
         alpha = max(alpha * effectiveDecay, alphaFloor)
+        if alpha <= alphaFloor { framesAtAlphaFloor += 1 }
         lastMaxSpeedSq = maxSpeedSq
         framesSinceWake += 1
 

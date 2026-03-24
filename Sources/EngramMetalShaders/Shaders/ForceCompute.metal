@@ -419,18 +419,12 @@ kernel void apply_cohesion_forces(
         cohStr *= ratio * ratio;
     }
 
-    // Structural forces must stay constant throughout convergence.
-    // Pre-multiply by 1/alpha so integration's `* alpha` cancels out: net = force * 1.
-    float alphaInv = 1.0 / max(params.alpha, 0.001);
-    float3 cohForce = delta * cohStr * alphaInv;
-    float3 groupF = groupForce[group] * alphaInv;
+    float3 cohForce = delta * cohStr;
+    float3 groupF = groupForce[group];
 
     forces[tid] += cohForce + groupF;
 
     // Topic leash: prevent topic centroids from drifting too far from parent project centroid.
-    // Only applies to topic groups (groupType==1). Pulls nodes back when their topic centroid
-    // exceeds maxDrift (1.5× project reference radius) from the project centroid.
-    // Force is proportional to excess drift only (normalized direction), avoiding oscillation.
     if (groupType == 1 && params.topicLeashStrength > 0) {
         int projGroup = topicProjectGroup[group];
         if (projGroup >= 0 && projectCentroids[projGroup].count > 0) {
@@ -442,7 +436,7 @@ kernel void apply_cohesion_forces(
             if (drift > maxDrift) {
                 float excess = drift - maxDrift;
                 float3 leashDir = (projCentroid - centroid) / max(drift, 1.0f);
-                float3 leashForce = leashDir * excess * params.topicLeashStrength * alphaInv;
+                float3 leashForce = leashDir * excess * params.topicLeashStrength;
                 forces[tid] += leashForce;
             }
         }

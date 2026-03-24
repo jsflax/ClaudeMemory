@@ -398,11 +398,6 @@ public func computeAllForces(_ s: ForceComputationInput) -> ForceComputationResu
     }
 
     // --- Topic centroids ---
-    // Structural forces (cohesion + centroid repulsion) decay as sqrt(alpha) instead of alpha.
-    // Pre-multiply by 1/sqrt(alpha) so integration's `* alpha` yields `* sqrt(alpha)`.
-    // At alpha=1.0: full strength. At alpha=0.01: 10% (vs 1% for other forces).
-    // This maintains cluster separation while still allowing the sim to settle.
-    let alphaInv = 1.0 / max(s.alpha, 0.001)
     let topicN = (topicGroup.max() ?? -1) + 1
     if topicN > 1 {
         var tSX = [Float](repeating: 0, count: topicN), tSY = [Float](repeating: 0, count: topicN), tSZ = [Float](repeating: 0, count: topicN)
@@ -411,9 +406,9 @@ public func computeAllForces(_ s: ForceComputationInput) -> ForceComputationResu
         for i in 0..<n { let g = topicGroup[i]; tSX[g] += x[i]; tSY[g] += y[i]; tSZ[g] += z[i]; tCnt[g] += 1; tMem[g].append(i) }
         for i in 0..<n {
             let g = topicGroup[i]; let c = Float(tCnt[g]); if c < 2 { continue }
-            fx[i] += (tSX[g]/c - x[i]) * s.topicCohesionStrength * alphaInv
-            fy[i] += (tSY[g]/c - y[i]) * s.topicCohesionStrength * alphaInv
-            fz[i] += (tSZ[g]/c - z[i]) * s.topicCohesionStrength * alphaInv
+            fx[i] += (tSX[g]/c - x[i]) * s.topicCohesionStrength
+            fy[i] += (tSY[g]/c - y[i]) * s.topicCohesionStrength
+            fz[i] += (tSZ[g]/c - z[i]) * s.topicCohesionStrength
         }
         let tpg = s.topicProjectGroup
         var tFX = [Float](repeating: 0, count: topicN), tFY = [Float](repeating: 0, count: topicN), tFZ = [Float](repeating: 0, count: topicN)
@@ -423,7 +418,7 @@ public func computeAllForces(_ s: ForceComputationInput) -> ForceComputationResu
                 guard g1 < tpg.count && g2 < tpg.count, tpg[g1] == tpg[g2] else { continue }
                 let c2 = SIMD3<Float>(tSX[g2], tSY[g2], tSZ[g2]) / Float(tCnt[g2])
                 var d = c1 - c2; var pd = simd_length(d); if pd < 1 { pd = 1; d = .init(.random(in:-1...1),.random(in:-1...1),.random(in:-1...1)) }
-                let fv = (d/pd) * (s.topicCentroidRepulsion * alphaInv / (pd*pd))
+                let fv = (d/pd) * (s.topicCentroidRepulsion / (pd*pd))
                 let f1 = 1/sqrt(Float(tCnt[g1])), f2 = 1/sqrt(Float(tCnt[g2]))
                 tFX[g1] += fv.x*f1; tFY[g1] += fv.y*f1; tFZ[g1] += fv.z*f1
                 tFX[g2] -= fv.x*f2; tFY[g2] -= fv.y*f2; tFZ[g2] -= fv.z*f2
@@ -448,9 +443,9 @@ public func computeAllForces(_ s: ForceComputationInput) -> ForceComputationResu
             for i in 0..<n { let g=projectGroup[i]; let c=Float(gCnt[g]); if c<2{continue}; let cx=gSX[g]/c,cy=gSY[g]/c,cz=gSZ[g]/c; let dx=x[i]-cx,dy=y[i]-cy,dz=z[i]-cz; gRad[g].append(sqrt(dx*dx+dy*dy+dz*dz)) }
             var gRefR = [Float](repeating:30,count:gN)
             for g in 0..<gN { guard !gRad[g].isEmpty else{continue}; gRad[g].sort(); gRefR[g]=max(30,gRad[g][gRad[g].count*3/4]) }
-            for i in 0..<n { let g=projectGroup[i]; let c=Float(gCnt[g]); if c<2{continue}; let cx=gSX[g]/c,cy=gSY[g]/c,cz=gSZ[g]/c; let dx=cx-x[i],dy=cy-y[i],dz=cz-z[i]; let dist=sqrt(dx*dx+dy*dy+dz*dz); let r=max(1.0,dist/gRefR[g]); let sc=r*r; fx[i]+=dx*s.cohesionStrength*sc*alphaInv; fy[i]+=dy*s.cohesionStrength*sc*alphaInv; fz[i]+=dz*s.cohesionStrength*sc*alphaInv }
+            for i in 0..<n { let g=projectGroup[i]; let c=Float(gCnt[g]); if c<2{continue}; let cx=gSX[g]/c,cy=gSY[g]/c,cz=gSZ[g]/c; let dx=cx-x[i],dy=cy-y[i],dz=cz-z[i]; let dist=sqrt(dx*dx+dy*dy+dz*dz); let r=max(1.0,dist/gRefR[g]); let sc=r*r; fx[i]+=dx*s.cohesionStrength*sc; fy[i]+=dy*s.cohesionStrength*sc; fz[i]+=dz*s.cohesionStrength*sc }
             var pFX=[Float](repeating:0,count:gN),pFY=[Float](repeating:0,count:gN),pFZ=[Float](repeating:0,count:gN)
-            for g1 in 0..<gN where gCnt[g1]>0 { let c1=SIMD3<Float>(gSX[g1],gSY[g1],gSZ[g1])/Float(gCnt[g1]); for g2 in (g1+1)..<gN where gCnt[g2]>0 { if hasGalaxies && projGalaxy[g1] != projGalaxy[g2] { continue }; let c2=SIMD3<Float>(gSX[g2],gSY[g2],gSZ[g2])/Float(gCnt[g2]); var d=c1-c2; var pd=simd_length(d); if pd<1{pd=1;d = .init(.random(in:-1...1),.random(in:-1...1),.random(in:-1...1))}; let fv=(d/pd)*(s.centroidRepulsion*alphaInv/(pd*pd)); let f1=1/sqrt(Float(gCnt[g1])),f2=1/sqrt(Float(gCnt[g2])); pFX[g1]+=fv.x*f1;pFY[g1]+=fv.y*f1;pFZ[g1]+=fv.z*f1; pFX[g2]-=fv.x*f2;pFY[g2]-=fv.y*f2;pFZ[g2]-=fv.z*f2 } }
+            for g1 in 0..<gN where gCnt[g1]>0 { let c1=SIMD3<Float>(gSX[g1],gSY[g1],gSZ[g1])/Float(gCnt[g1]); for g2 in (g1+1)..<gN where gCnt[g2]>0 { if hasGalaxies && projGalaxy[g1] != projGalaxy[g2] { continue }; let c2=SIMD3<Float>(gSX[g2],gSY[g2],gSZ[g2])/Float(gCnt[g2]); var d=c1-c2; var pd=simd_length(d); if pd<1{pd=1;d = .init(.random(in:-1...1),.random(in:-1...1),.random(in:-1...1))}; let fv=(d/pd)*(s.centroidRepulsion/(pd*pd)); let f1=1/sqrt(Float(gCnt[g1])),f2=1/sqrt(Float(gCnt[g2])); pFX[g1]+=fv.x*f1;pFY[g1]+=fv.y*f1;pFZ[g1]+=fv.z*f1; pFX[g2]-=fv.x*f2;pFY[g2]-=fv.y*f2;pFZ[g2]-=fv.z*f2 } }
             for g in 0..<gN where gCnt[g]>0 && (pFX[g] != 0||pFY[g] != 0||pFZ[g] != 0) { for i in pMem[g]{fx[i]+=pFX[g];fy[i]+=pFY[g];fz[i]+=pFZ[g]} }
         }
     }

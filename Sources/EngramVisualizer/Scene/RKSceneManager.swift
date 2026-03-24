@@ -116,7 +116,7 @@ final class RKSceneManager {
               let engine = forceEngine else { return }
 
         let sim = registry.unifiedSimulation
-        guard !sim.isSettled, sim.nodeCount > 1, engine.isFullSimAvailable, !engine.isInFlight else { return }
+        guard sim.shouldDispatchForces, sim.nodeCount > 1, engine.isFullSimAvailable, !engine.isInFlight else { return }
 
         sim.useGPUForces = true
         let snapshot = ForceEngine.SimulationSnapshot(

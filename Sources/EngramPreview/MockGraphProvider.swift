@@ -134,7 +134,7 @@ final class MockGraphProvider: SceneDataProvider {
         // Dispatch GPU forces if available
         if let engine = forceEngine, let queue = commandQueue {
             let sim = simulation
-            if !sim.isSettled, sim.nodeCount > 1, engine.isFullSimAvailable, !engine.isInFlight {
+            if sim.shouldDispatchForces, sim.nodeCount > 1, engine.isFullSimAvailable, !engine.isInFlight {
                 sim.useGPUForces = true
                 let snapshot = ForceEngine.SimulationSnapshot(
                     nodeCount: sim.nodeCount, isSettled: sim.isSettled,

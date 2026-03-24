@@ -15,7 +15,7 @@ kernel void integrate_positions(
 {
     if (gid >= params.nodeCount) return;
 
-    float3 f = forces[gid] * params.alpha;
+    float3 f = forces[gid];
     float3 v = (velocities[gid] + f) * params.damping;
 
     float speed = length(v);
