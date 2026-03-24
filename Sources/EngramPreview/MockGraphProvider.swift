@@ -4,6 +4,8 @@ import Metal
 import EngramRealityKit
 import EngramSceneKit
 import EngramMetalShaders
+import EngramKit
+import Lattice
 
 /// Mock SceneDataProvider using ForceSimulation3D for realistic graph layout.
 @Observable
@@ -23,6 +25,14 @@ final class MockGraphProvider: SceneDataProvider {
     var isSearchActive: Bool = false
     var projectCentroids: [String: SIMD3<Float>] = [:]
     private(set) var topologyVersion: UInt64 = 0
+
+    // MARK: - Multi-Galaxy State
+    private(set) var projectToGalaxy: [String: String] = [:]
+    private let galaxyCenters: [String: SIMD3<Float>] = [
+        "personal": SIMD3<Float>(-2000, 0, 0),
+        "synced":   SIMD3<Float>( 2000, 0, 0),
+    ]
+    var galaxyAssignment: [String: String] { projectToGalaxy }
 
     // MARK: - Instrumentation (gated on PREVIEW_INSTRUMENTATION=1)
     private var instrumentationEnabled = false
@@ -57,7 +67,9 @@ final class MockGraphProvider: SceneDataProvider {
     /// Node ID → index mapping for reading simulation positions.
     private var nodeIds: [UUID] = []
 
-    init() {
+    static let shared: MockGraphProvider = .init()
+    
+    private init() {
         // Set up GPU force engine
         if let device = MTLCreateSystemDefaultDevice(),
            let queue = device.makeCommandQueue(),
@@ -69,6 +81,7 @@ final class MockGraphProvider: SceneDataProvider {
             print("[preview] GPU force engine initialized")
         } else {
             print("[preview] GPU force engine unavailable, using CPU fallback")
+            preconditionFailure()
         }
 
         // Instrumentation setup (env vars)
@@ -82,14 +95,21 @@ final class MockGraphProvider: SceneDataProvider {
             nodeCount = count  // didSet doesn't fire in class init
         }
 
-        projectColorMap = [
-            "Architecture": SIMD3<Float>(0.15, 0.55, 1.0),   // Vivid blue
-            "Debugging":    SIMD3<Float>(1.0, 0.2, 0.25),    // Bright red
-            "Patterns":     SIMD3<Float>(0.1, 0.85, 0.35),   // Emerald green
-            "Workflow":     SIMD3<Float>(1.0, 0.75, 0.0),    // Amber
-            "Preferences":  SIMD3<Float>(0.8, 0.2, 1.0),     // Electric purple
-        ]
-        regenerateGraph()
+        // Load from Lattice if requested, otherwise use mock data
+        if ProcessInfo.processInfo.environment["PREVIEW_USE_LATTICE"] == "1" {
+            let personalPath = ProcessInfo.processInfo.environment["CLAUDE_MEMORY_DB"]
+                ?? NSHomeDirectory() + "/.claude/memory.sqlite"
+            let syncedPath = NSHomeDirectory() + "/.claude/sync/memory-synced.sqlite"
+            loadFromLattice(
+                personalDbPath: personalPath,
+                syncedDbPath: FileManager.default.fileExists(atPath: syncedPath) ? syncedPath : nil
+            )
+        }
+
+        // Fall back to mock data if Lattice didn't load or wasn't requested
+        if nodes.isEmpty {
+            regenerateGraph()
+        }
     }
 
     /// Pick a project index weighted by `projectDefs.weight`.
@@ -106,6 +126,10 @@ final class MockGraphProvider: SceneDataProvider {
     func tick(dt: Float) {
         let wallStart = instrumentationEnabled ? CFAbsoluteTimeGetCurrent() : 0
         var forceMs: Double = 0
+        var lastCpuPrepMs: Double = 0
+        var lastGpuMs: Double = 0
+        var lastReadbackMs: Double = 0
+        var lastAlgorithm: String = ""
 
         // Dispatch GPU forces if available
         if let engine = forceEngine, let queue = commandQueue {
@@ -126,13 +150,22 @@ final class MockGraphProvider: SceneDataProvider {
                     crossProjectSpringScale: sim.crossProjectSpringScale,
                     cohesionStrength: sim.cohesionStrength, centroidRepulsion: sim.centroidRepulsion,
                     topicCohesionStrength: sim.topicCohesionStrength, topicCentroidRepulsion: sim.topicCentroidRepulsion,
+                    topicLeashStrength: sim.topicLeashStrength,
                     centerStrength: sim.centerStrength, center: sim.center,
-                    alpha: sim.alpha, damping: 0.78, maxSpeed: 12.0
+                    alpha: sim.alpha, forceAge: sim.forceAge, damping: 0.78, maxSpeed: 12.0
                 )
 
                 let forceStart = instrumentationEnabled ? CFAbsoluteTimeGetCurrent() : 0
                 let result = engine.encodeForcePassSync(queue: queue, snapshot: snapshot)
-                if instrumentationEnabled { forceMs = (CFAbsoluteTimeGetCurrent() - forceStart) * 1000 }
+                if instrumentationEnabled {
+                    forceMs = (CFAbsoluteTimeGetCurrent() - forceStart) * 1000
+                    if let r = result {
+                        lastCpuPrepMs = r.cpuPrepMs
+                        lastGpuMs = r.gpuMs
+                        lastReadbackMs = r.readbackMs
+                        lastAlgorithm = r.algorithm
+                    }
+                }
 
                 if let result {
                     sim.topologyDirtyForGPU = false
@@ -175,10 +208,11 @@ final class MockGraphProvider: SceneDataProvider {
             wallMsHistory.append(wallMs)
             let minSep = computeMinProjSep()
             if let f = frameFile {
-                let line = String(format: "%d,%.2f,%.2f,%.4f,%.2f,%.1f,%d,%@\n",
-                                  frameIndex, wallMs, forceMs, simulation.alpha,
-                                  simulation.lastMaxSpeedSq, minSep, simulation.nodeCount,
-                                  settled ? "true" : "false")
+                let line = String(format: "%d,%.2f,%.2f,%.2f,%.2f,%.2f,%@,%.4f,%.2f,%.1f,%d,%@\n",
+                                  frameIndex, wallMs, forceMs,
+                                  lastCpuPrepMs, lastGpuMs, lastReadbackMs, lastAlgorithm,
+                                  simulation.alpha, simulation.lastMaxSpeedSq, minSep,
+                                  simulation.nodeCount, settled ? "true" : "false")
                 fputs(line, f)
                 fflush(f)
             }
@@ -209,6 +243,13 @@ final class MockGraphProvider: SceneDataProvider {
     // MARK: - Graph Generation
 
     func regenerateGraph() {
+        projectColorMap = [
+            "Architecture": SIMD3<Float>(0.15, 0.55, 1.0),
+            "Debugging":    SIMD3<Float>(1.0, 0.2, 0.25),
+            "Patterns":     SIMD3<Float>(0.1, 0.85, 0.35),
+            "Workflow":     SIMD3<Float>(1.0, 0.75, 0.0),
+            "Preferences":  SIMD3<Float>(0.8, 0.2, 1.0),
+        ]
         var newNodes: [RKNodeSnapshot] = []
         var newEdges: [RKEdgeSnapshot] = []
         var newHubs: Set<UUID> = []
@@ -303,6 +344,41 @@ final class MockGraphProvider: SceneDataProvider {
             projectForNode: projectForNode,
             topicForNode: topicForNode
         )
+
+        // Multi-galaxy setup: first 3 projects → personal, last 2 → synced
+        for (galaxyId, center) in galaxyCenters {
+            simulation.setGalaxyCenter(galaxyId, center)
+        }
+        projectToGalaxy = [:]
+        for (i, def) in projectDefs.enumerated() {
+            projectToGalaxy[def.name] = i < 3 ? "personal" : "synced"
+        }
+        // Group node IDs by galaxy and assign
+        var galaxyNodeIds: [String: Set<UUID>] = [:]
+        for (id, project) in projectForNode {
+            let galaxy = projectToGalaxy[project] ?? "personal"
+            galaxyNodeIds[galaxy, default: []].insert(id)
+        }
+        for (galaxy, ids) in galaxyNodeIds {
+            simulation.changeGalaxyGroup(for: ids, to: galaxy)
+        }
+        // Seed node positions near their galaxy center so clusters start separated
+        var galaxyPositions: [UUID: SIMD3<Float>] = [:]
+        for (galaxy, nodeSet) in galaxyNodeIds {
+            guard let center = galaxyCenters[galaxy] else { continue }
+            for id in nodeSet {
+                let r = Float.random(in: 80...180)
+                let angle = Float.random(in: 0..<(.pi * 2))
+                let phi = Float.random(in: -0.5...0.5)
+                galaxyPositions[id] = center + SIMD3<Float>(
+                    cos(angle) * cos(phi) * r,
+                    sin(angle) * cos(phi) * r,
+                    sin(phi) * r
+                )
+            }
+        }
+        simulation.setPositions(galaxyPositions)
+
         simulation.wake()
 
         // Reset instrumentation state for new graph
@@ -328,6 +404,191 @@ final class MockGraphProvider: SceneDataProvider {
         }
     }
 
+    // MARK: - Lattice Loading
+
+    /// Load graph data from real Lattice databases instead of mock data.
+    func loadFromLattice(personalDbPath: String, syncedDbPath: String?) {
+        var newNodes: [RKNodeSnapshot] = []
+        var newEdges: [RKEdgeSnapshot] = []
+        var newHubs: Set<UUID> = []
+        var ids: [UUID] = []
+        var edgePairs: [(UUID, UUID)] = []
+        var projectForNode: [UUID: String] = [:]
+        var topicForNode: [UUID: String] = [:]
+        var nodeGalaxy: [UUID: String] = [:]
+        var allProjects: Set<String> = []
+        var partOfTargets: Set<UUID> = []
+
+        func loadDB(path: String, galaxyId: String) {
+            let config = Lattice.Configuration(
+                fileURL: URL(fileURLWithPath: path),
+                migration: engramMigrations
+            )
+            guard let lattice = try? Lattice(Memory.self, Edge.self, configuration: config) else {
+                print("[preview] Failed to open Lattice at \(path)")
+                return
+            }
+
+            var dbNodeIds: Set<UUID> = []
+            for memory in lattice.objects(Memory.self) {
+                guard let globalId = memory.__globalId else { continue }
+                let project = memory.project
+                let topic = memory.topic
+
+                newNodes.append(RKNodeSnapshot(
+                    id: globalId,
+                    project: project,
+                    topic: topic,
+                    label: String(memory.content.prefix(40)),
+                    content: memory.content,
+                    importance: memory.importance,
+                    isHub: false,
+                    createdAt: memory.createdAt,
+                    lastAccessedAt: memory.lastAccessedAt
+                ))
+                ids.append(globalId)
+                projectForNode[globalId] = project
+                topicForNode[globalId] = topic
+                nodeGalaxy[globalId] = galaxyId
+                allProjects.insert(project)
+                dbNodeIds.insert(globalId)
+            }
+
+            for edge in lattice.objects(Edge.self) {
+                guard let globalId = edge.__globalId else { continue }
+                newEdges.append(RKEdgeSnapshot(
+                    id: globalId,
+                    sourceId: edge.sourceGlobalId,
+                    targetId: edge.targetGlobalId,
+                    relation: edge.relation.rawValue
+                ))
+                edgePairs.append((edge.sourceGlobalId, edge.targetGlobalId))
+                if edge.relation == .partOf {
+                    partOfTargets.insert(edge.targetGlobalId)
+                }
+            }
+
+            print("[preview] Loaded \(dbNodeIds.count) nodes from \(galaxyId) (\(path))")
+        }
+
+        loadDB(path: personalDbPath, galaxyId: "personal")
+        if let syncedPath = syncedDbPath {
+            loadDB(path: syncedPath, galaxyId: "synced")
+        }
+
+        guard !newNodes.isEmpty else {
+            print("[preview] No nodes loaded from Lattice, keeping mock data")
+            return
+        }
+
+        // Mark hubs (targets of part_of edges)
+        newHubs = partOfTargets
+        newNodes = newNodes.map { node in
+            guard partOfTargets.contains(node.id) else { return node }
+            return RKNodeSnapshot(
+                id: node.id, project: node.project, topic: node.topic,
+                label: node.label, content: node.content,
+                importance: max(node.importance, 4), isHub: true,
+                createdAt: node.createdAt, lastAccessedAt: node.lastAccessedAt
+            )
+        }
+
+        // Golden-angle hue spacing for project colors
+        let sortedProjects = allProjects.sorted()
+        let goldenAngle: Float = 137.508 / 360.0
+        var newProjectColors: [String: SIMD3<Float>] = [:]
+        for (i, project) in sortedProjects.enumerated() {
+            let h = (Float(i) * goldenAngle).truncatingRemainder(dividingBy: 1.0)
+            let c = Float(0.9) * Float(0.8)
+            let x = c * (1 - abs((h * 6).truncatingRemainder(dividingBy: 2) - 1))
+            let m = Float(0.9) - c
+            let (r, g, b): (Float, Float, Float)
+            switch h * 6 {
+            case 0..<1: (r, g, b) = (c, x, 0)
+            case 1..<2: (r, g, b) = (x, c, 0)
+            case 2..<3: (r, g, b) = (0, c, x)
+            case 3..<4: (r, g, b) = (0, x, c)
+            case 4..<5: (r, g, b) = (x, 0, c)
+            default:    (r, g, b) = (c, 0, x)
+            }
+            newProjectColors[project] = SIMD3<Float>(r + m, g + m, b + m)
+        }
+
+        // Filter edges to those with both endpoints present
+        let nodeIdSet = Set(ids)
+        let validEdges = newEdges.filter { nodeIdSet.contains($0.sourceId) && nodeIdSet.contains($0.targetId) }
+        let validPairs = edgePairs.filter { nodeIdSet.contains($0.0) && nodeIdSet.contains($0.1) }
+
+        self.nodes = newNodes
+        self.edges = validEdges
+        self.hubs = newHubs
+        self.projectColorMap = newProjectColors
+        self.nodeIds = ids
+        self.topologyVersion += 1
+
+        // Feed into force simulation
+        simulation.updateGraph(
+            nodeIds: Set(ids),
+            edges: validPairs,
+            projectForNode: projectForNode,
+            topicForNode: topicForNode
+        )
+
+        // Multi-galaxy setup
+        for (galaxyId, center) in galaxyCenters {
+            simulation.setGalaxyCenter(galaxyId, center)
+        }
+        projectToGalaxy = [:]
+        for (nodeId, galaxy) in nodeGalaxy {
+            if let project = projectForNode[nodeId] {
+                projectToGalaxy[project] = galaxy
+            }
+        }
+
+        var galaxyNodeIds: [String: Set<UUID>] = [:]
+        for (nodeId, galaxy) in nodeGalaxy {
+            galaxyNodeIds[galaxy, default: []].insert(nodeId)
+        }
+        for (galaxy, gIds) in galaxyNodeIds {
+            simulation.changeGalaxyGroup(for: gIds, to: galaxy)
+        }
+
+        // Seed positions near galaxy centers (wider spread for larger graphs)
+        var galaxyPositions: [UUID: SIMD3<Float>] = [:]
+        for (galaxy, nodeSet) in galaxyNodeIds {
+            guard let center = galaxyCenters[galaxy] else { continue }
+            for id in nodeSet {
+                let r = Float.random(in: 80...400)
+                let angle = Float.random(in: 0..<(.pi * 2))
+                let phi = Float.random(in: -0.5...0.5)
+                galaxyPositions[id] = center + SIMD3<Float>(
+                    cos(angle) * cos(phi) * r,
+                    sin(angle) * cos(phi) * r,
+                    sin(phi) * r
+                )
+            }
+        }
+        simulation.setPositions(galaxyPositions)
+        simulation.wake()
+
+        positions = simulation.positions
+        computeCentroids()
+
+        // Reset instrumentation for new data
+        if instrumentationEnabled {
+            frameIndex = 0
+            wasSettled = false
+            forceMsHistory.removeAll()
+            wallMsHistory.removeAll()
+            if let f = frameFile { fclose(f) }
+            openFrameCSV()
+            try? FileManager.default.removeItem(atPath: "\(instrumentLogPath)-settled")
+            try? FileManager.default.removeItem(atPath: "\(instrumentLogPath)-final.json")
+        }
+
+        print("[preview] Lattice load complete: \(nodes.count) nodes, \(edges.count) edges, \(sortedProjects.count) projects")
+    }
+
     /// Insert a new node with arrival glow, wired to a random same-project node.
     func insertNewNode() {
         let pIdx = weightedProjectIndex()
@@ -351,9 +612,51 @@ final class MockGraphProvider: SceneDataProvider {
             simulation.addEdge(from: peer.id, to: id)
         }
 
-        simulation.addNode(id, project: project, topic: topic)
+        let galaxyId = projectToGalaxy[project] ?? "personal"
+        simulation.addNode(id, project: project, topic: topic, galaxyId: galaxyId)
         newNodeGlows[id] = 0
         topologyVersion += 1
+    }
+
+    /// Migrate a random project to the other galaxy. Returns (project, targetGalaxy) on success.
+    @discardableResult
+    func migrateRandomProject() -> (project: String, targetGalaxy: String)? {
+        guard let project = projectDefs.randomElement()?.name,
+              let currentGalaxy = projectToGalaxy[project] else { return nil }
+        let targetGalaxy = currentGalaxy == "personal" ? "synced" : "personal"
+        projectToGalaxy[project] = targetGalaxy
+
+        let nodeIdsToMigrate = Set(nodes.filter { $0.project == project }.map(\.id))
+        guard !nodeIdsToMigrate.isEmpty else { return nil }
+
+        simulation.changeGalaxyGroup(for: nodeIdsToMigrate, to: targetGalaxy)
+        simulation.wake()
+        return (project, targetGalaxy)
+    }
+
+    /// Compute centroid + radius for all nodes in a galaxy (for camera teleport).
+    func galaxyBounds(_ galaxyId: String) -> (center: SIMD3<Float>, radius: Float) {
+        let galaxyNodes = nodes.filter { projectToGalaxy[$0.project] == galaxyId }
+        guard !galaxyNodes.isEmpty else {
+            return (galaxyCenters[galaxyId] ?? .zero, 500)
+        }
+        var sum = SIMD3<Float>.zero
+        var count: Float = 0
+        for node in galaxyNodes {
+            if let pos = positions[node.id] {
+                sum += pos
+                count += 1
+            }
+        }
+        guard count > 0 else { return (galaxyCenters[galaxyId] ?? .zero, 500) }
+        let centroid = sum / count
+        var maxDist: Float = 0
+        for node in galaxyNodes {
+            if let pos = positions[node.id] {
+                maxDist = max(maxDist, simd_length(pos - centroid))
+            }
+        }
+        return (centroid, max(maxDist, 200))
     }
 
     private func computeCentroids() {
@@ -376,7 +679,7 @@ final class MockGraphProvider: SceneDataProvider {
         let csvPath = "\(instrumentLogPath)-frames.csv"
         frameFile = fopen(csvPath, "w")
         if let f = frameFile {
-            fputs("frame,wall_ms,force_ms,alpha,maxSpeedSq,minProjSep,nodeCount,settled\n", f)
+            fputs("frame,wall_ms,force_ms,cpu_prep_ms,gpu_ms,readback_ms,algo,alpha,maxSpeedSq,minProjSep,nodeCount,settled\n", f)
             fflush(f)
         }
     }

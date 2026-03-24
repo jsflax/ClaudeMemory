@@ -59,20 +59,21 @@ public final class ForceSimulation3D {
 
     public private(set) var positions: [UUID: SIMD3<Float>] = [:]
 
-    // Force parameters (tuned for 3D cluster quality at 200–20K nodes)
+    // Force parameters (restored from Metal-era tuning on main)
     public let springLength: Float = 240
-    public let crossProjectSpringLength: Float = 600
+    public let crossProjectSpringLength: Float = 400
     public let springStrength: Float = 0.0004
     public let crossProjectSpringScale: Float = 1.0
     public let chargeStrength: Float = 500
-    public let crossChargeMultiplier: Float = 5.0
+    public let crossChargeMultiplier: Float = 3.0
     public let sameProjectChargeScale: Float = 1.0
-    public let sameTopicChargeScale: Float = 1.0
-    public let centerStrength: Float = 0.003
-    public let cohesionStrength: Float = 0.002
-    public let centroidRepulsion: Float = 2000
-    public let topicCohesionStrength: Float = 0.005
-    public let topicCentroidRepulsion: Float = 1000
+    public let sameTopicChargeScale: Float = 0.65
+    public let centerStrength: Float = 0.006
+    public let cohesionStrength: Float = 0.0015
+    public let centroidRepulsion: Float = 5000
+    public let topicCohesionStrength: Float = 0.009
+    public let topicCentroidRepulsion: Float = 7000
+    public let topicLeashStrength: Float = 0.01
     private let damping: Float = 0.78
     private let maxSpeed: Float = 12.0
 
@@ -125,6 +126,12 @@ public final class ForceSimulation3D {
     public private(set) var isSettled = false
     private(set) var settledFrameCount = 0
     public private(set) var framesSinceWake = 0
+    /// Frames spent at alpha floor. After 60 frames at floor, GPU force dispatch should stop
+    /// to let velocities decay via damping (matches old maxPostAlphaDispatches behavior).
+    private var framesAtAlphaFloor = 0
+    private let maxPostAlphaDispatches = 60
+    /// False after alpha floor + maxPostAlphaDispatches frames. GPU callers should check this.
+    public var shouldDispatchForces: Bool { !isSettled && framesAtAlphaFloor < maxPostAlphaDispatches }
     /// Minimum frames after wake() before settle is allowed. Prevents premature settling
     /// when the first async force results haven't arrived yet.
     private let settleGuardFrames = 30  // ~0.5s at 60fps
@@ -160,6 +167,10 @@ public final class ForceSimulation3D {
     /// Change galaxy group for a set of nodes (e.g. migration between galaxies).
     public func changeGalaxyGroup(for nodeIds: Set<UUID>, to galaxyId: String) {
         let newGroup = galaxyIndex(for: galaxyId)
+        // Lazily initialize galaxyGroup if updateGraph was used (which doesn't populate it)
+        if galaxyGroup.count < ids.count {
+            galaxyGroup.append(contentsOf: [Int](repeating: 0, count: ids.count - galaxyGroup.count))
+        }
         for id in nodeIds {
             guard let i = idToIndex[id] else { continue }
             galaxyGroup[i] = newGroup
@@ -371,11 +382,18 @@ public final class ForceSimulation3D {
 
         // Smart positioning: place at project cluster centroid + jitter when settled,
         // random sphere position when sim is actively converging.
+        // Seed near galaxy center when galaxyId is provided, so galaxies start separated.
+        let galaxyCenter: SIMD3<Float>?
+        if let gid = galaxyId, let gc = galaxyGroupToIndex[gid], gc < galaxyCenters.count {
+            galaxyCenter = galaxyCenters[gc]
+        } else {
+            galaxyCenter = nil
+        }
         let position: SIMD3<Float>
         if (isSettled || isLocalWake), let pg = projectToGroup[project] {
             position = projectCentroid(group: pg, jitter: 15.0)
         } else {
-            position = randomSpherePosition()
+            position = randomSpherePosition(around: galaxyCenter)
         }
 
         ids.append(id)
@@ -533,17 +551,18 @@ public final class ForceSimulation3D {
         let integrateStart = CFAbsoluteTimeGetCurrent()
         var maxSpeedSq: Float = 0
 
+        var totalKineticEnergy: Float = 0
         if useGPUForces {
             // GPU integration delivered positions via applyGPUForces().
-            // Just measure velocity for settle detection (from last GPU delivery).
+            // Measure velocity for settle detection (from last GPU delivery).
             for i in 0..<n {
                 let speedSq = vx[i] * vx[i] + vy[i] * vy[i] + vz[i] * vz[i]
                 maxSpeedSq = max(maxSpeedSq, speedSq)
+                totalKineticEnergy += speedSq
             }
         } else {
             // CPU path: integrate stored forces locally
             let hasForcesComputed = storedFx.count == n
-            var totalKineticEnergy: Float = 0
             for i in 0..<n where !pinned[i] {
                 if hasForcesComputed {
                     // Scale forces by alpha (matches GPU integration: forces[gid] * params.alpha).
@@ -564,20 +583,37 @@ public final class ForceSimulation3D {
                 x[i] += vx[i]; y[i] += vy[i]; z[i] += vz[i]
             }
         }
-        alpha = max(alpha * alphaDecay, alphaFloor)
+
+        // Adaptive alpha decay — larger graphs converge structurally sooner because
+        // per-node forces are individually weaker (more spread out). Gentle ramp:
+        // 0.995 at <1K, 0.994 at 5K, 0.993 at 10K+. Avoids hitting the alpha floor
+        // too early (which leaves permanent residual structural forces).
+        let nScale = min(1.0, Float(n) / 10000.0)
+        let effectiveDecay = alphaDecay - 0.002 * nScale
+        alpha = max(alpha * effectiveDecay, alphaFloor)
         lastMaxSpeedSq = maxSpeedSq
         framesSinceWake += 1
 
-        // Settle detection — only consider settling after alpha has decayed
-        // substantially (< 0.05 = ~600 frames at 0.995 decay). This ensures
-        // forces have had enough time to separate clusters before checking.
+        // Settle detection — uses both max speed (strict) and mean kinetic energy
+        // (outlier-tolerant). At high node counts, one wiggling outlier shouldn't
+        // block settling when 99.9% of nodes are stationary.
         let settleThreshold: Float = 0.05
         let relaxedThreshold: Float = 1.0
+        let meanSpeedSq = totalKineticEnergy / max(Float(n), 1.0)
         let hasForceData = useGPUForces || storedFx.count == n
-        if hasForceData && alpha < 0.05 {
+        if hasForceData && alpha < 0.08 {
             if maxSpeedSq < settleThreshold {
+                // All nodes barely moving
                 settledFrameCount += 1
                 if settledFrameCount >= 30 {
+                    isSettled = true
+                    syncPositions()
+                    return
+                }
+            } else if meanSpeedSq < 0.005 && maxSpeedSq < 5.0 {
+                // Mean energy negligible — a few outliers still moving but graph is stable
+                settledFrameCount += 1
+                if settledFrameCount >= 45 {
                     isSettled = true
                     syncPositions()
                     return
@@ -658,7 +694,6 @@ public final class ForceSimulation3D {
             storedFz = [Float](repeating: 0, count: ids.count)
             tickInFlight = false
             syncPositions()
-            GPULog.log("APPLIED GPU positions n=\(gpuPositions.count)")
             return
         }
 
@@ -699,14 +734,15 @@ public final class ForceSimulation3D {
     }
 
     /// Random position on a spherical shell around center.
-    private func randomSpherePosition() -> SIMD3<Float> {
+    private func randomSpherePosition(around c: SIMD3<Float>? = nil) -> SIMD3<Float> {
+        let o = c ?? center
         let angle = Float.random(in: 0...(2 * .pi))
         let phi = Float.random(in: -.pi/2...(.pi/2))
         let r = Float.random(in: 50...250)
         return SIMD3<Float>(
-            center.x + cos(angle) * cos(phi) * r,
-            center.y + sin(angle) * cos(phi) * r,
-            center.z + sin(phi) * r
+            o.x + cos(angle) * cos(phi) * r,
+            o.y + sin(angle) * cos(phi) * r,
+            o.z + sin(phi) * r
         )
     }
 

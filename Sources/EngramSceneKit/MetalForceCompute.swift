@@ -23,8 +23,9 @@ public final class MetalForceCompute: @unchecked Sendable {
     /// Simple flag — only one dispatch at a time. Checked/set on main thread,
     /// cleared via Task { @MainActor } from completion handler. No cross-thread lock.
     public var inFlight = false
+    public var lastChargeAlgorithm: String = ""
 
-    /// Matches the `ForceParams` struct in Shaders.metal.
+    /// Matches the `ForceParams` struct in SharedTypes.h.
     struct GPUForceParams {
         var chargeStrength: Float
         var crossChargeMultiplier: Float
@@ -32,6 +33,8 @@ public final class MetalForceCompute: @unchecked Sendable {
         var sameProjectChargeScale: Float
         var cutoffSq: Float
         var nodeCount: UInt32
+        var galaxyGroupCount: UInt32
+        var _pad: UInt32
     }
 
     /// Initialize with an external device and library (shares GPU with renderer).
@@ -58,6 +61,15 @@ public final class MetalForceCompute: @unchecked Sendable {
         }
         if let fn = library.makeFunction(name: "compute_charge_forces_bh") {
             bhChargePipeline = try? device.makeComputePipelineState(function: fn)
+        }
+        if let fn = library.makeFunction(name: "apply_center_gravity") {
+            centerGravityPipeline = try? device.makeComputePipelineState(function: fn)
+        }
+        if let fn = library.makeFunction(name: "compute_topic_centroid_repulsion") {
+            topicRepulsionPipeline = try? device.makeComputePipelineState(function: fn)
+        }
+        if let fn = library.makeFunction(name: "compute_project_refR") {
+            refRPipeline = try? device.makeComputePipelineState(function: fn)
         }
         fullSimReady = springPipeline != nil && centroidPipeline != nil
             && centroidRepulsionPipeline != nil && cohesionPipeline != nil
@@ -86,8 +98,10 @@ public final class MetalForceCompute: @unchecked Sendable {
         chargeStrength: Float, crossChargeMultiplier: Float,
         sameTopicChargeScale: Float, sameProjectChargeScale: Float,
         springLength: Float, crossProjectSpringLength: Float, springStrength: Float,
+        crossProjectSpringScale: Float = 1.0,
         cohesionStrength: Float, centroidRepulsion: Float,
         topicCohesionStrength: Float, topicCentroidRepulsion: Float,
+        topicLeashStrength: Float = 0.01,
         centerStrength: Float, center: SIMD3<Float>,
         alpha: Float, damping: Float, maxSpeed: Float
     ) {
@@ -107,6 +121,7 @@ public final class MetalForceCompute: @unchecked Sendable {
             let cap = max(n * 2, 512)
             fullNodeBuffer = device.makeBuffer(length: cap * MemoryLayout<ForceNodeFull>.stride, options: .storageModeShared)
             fullForceBuffer = device.makeBuffer(length: cap * MemoryLayout<SIMD3<Float>>.stride, options: .storageModeShared)
+            scratchBuffer = device.makeBuffer(length: cap * MemoryLayout<Float>.stride, options: .storageModeShared)
             fullNodeCapacity = cap
         }
         if maxGroups > fullGroupCapacity {
@@ -115,6 +130,7 @@ public final class MetalForceCompute: @unchecked Sendable {
             topicCentroidBuffer = device.makeBuffer(length: cap * MemoryLayout<GroupCentroid>.stride, options: .storageModeShared)
             projForceBuffer = device.makeBuffer(length: cap * MemoryLayout<SIMD3<Float>>.stride, options: .storageModeShared)
             topicForceBuffer = device.makeBuffer(length: cap * MemoryLayout<SIMD3<Float>>.stride, options: .storageModeShared)
+            refRBuffer = device.makeBuffer(length: cap * MemoryLayout<Float>.stride, options: .storageModeShared)
             fullGroupCapacity = cap
         }
 
@@ -122,7 +138,8 @@ public final class MetalForceCompute: @unchecked Sendable {
               let projCBuf = projCentroidBuffer, let topicCBuf = topicCentroidBuffer,
               let projFBuf = projForceBuffer, let topicFBuf = topicForceBuffer,
               let simPBuf = simParamBuffer, let gtBuf = groupTypeBuffer,
-              let repBuf = repulsionBuffer, let gcBuf = groupCountBuffer
+              let repBuf = repulsionBuffer, let gcBuf = groupCountBuffer,
+              let rBuf = refRBuffer, let scrBuf = scratchBuffer
         else { return }
 
         lastEncodedNodeCount = n
@@ -153,7 +170,8 @@ public final class MetalForceCompute: @unchecked Sendable {
             chargePBuf.contents().bindMemory(to: GPUForceParams.self, capacity: 1).pointee = GPUForceParams(
                 chargeStrength: chargeStrength, crossChargeMultiplier: crossChargeMultiplier,
                 sameTopicChargeScale: sameTopicChargeScale, sameProjectChargeScale: sameProjectChargeScale,
-                cutoffSq: 500 * 500, nodeCount: UInt32(n))
+                cutoffSq: 1500 * 1500, nodeCount: UInt32(n),
+                galaxyGroupCount: UInt32(galaxyCenters.count), _pad: 0)
         }
         simPBuf.contents().bindMemory(to: ForceSimParams.self, capacity: 1).pointee = ForceSimParams(
             springLength: springLength, crossProjectSpringLength: crossProjectSpringLength,
@@ -162,12 +180,35 @@ public final class MetalForceCompute: @unchecked Sendable {
             topicCentroidRepulsion: topicCentroidRepulsion, centerStrength: centerStrength,
             center: center, alpha: alpha, damping: damping, maxSpeed: maxSpeed,
             nodeCount: UInt32(n), edgeCount: UInt32(csrEdgeCount),
+            crossProjectSpringScale: crossProjectSpringScale,
             projectGroupCount: projectCount, topicGroupCount: topicCount,
-            galaxyGroupCount: UInt32(max(galaxyCenters.count, 1)))
+            galaxyGroupCount: UInt32(max(galaxyCenters.count, 1)),
+            topicLeashStrength: topicLeashStrength)
 
         let tgSize = 256
 
         // 1. Charge forces.
+        // Match CPU logic: use brute force when span < 1000 (any n).
+        // BH uses base charge for internal nodes, losing cross-project charge
+        // differentiation — this causes ~40% total force deficit and prevents
+        // cluster separation. Brute force O(n²) is fast on GPU for typical
+        // graph sizes (< 10K nodes). Only use BH for large-spread layouts.
+        var chargeSpan: Float = 0
+        do {
+            var mnX = x[0], mxX = x[0], mnY = y[0], mxY = y[0], mnZ = z[0], mxZ = z[0]
+            for i in 1..<n {
+                mnX = min(mnX, x[i]); mxX = max(mxX, x[i])
+                mnY = min(mnY, y[i]); mxY = max(mxY, y[i])
+                mnZ = min(mnZ, z[i]); mxZ = max(mxZ, z[i])
+            }
+            chargeSpan = max(mxX - mnX, max(mxY - mnY, mxZ - mnZ))
+        }
+        // Use BH only for very large spread layouts where brute force cutoff
+        // would miss distant pairs. BH uses base charge for internal nodes,
+        // losing cross-project charge differentiation (~40% total force deficit).
+        // GPU brute force O(n²) is fast enough for typical graph sizes (< 10K).
+        let useBH = n > 8192 && chargeSpan > 3000 && bhChargePipeline != nil
+
         // Swap in async-built octree if available.
         if let newTree = pendingTreeNodes.withLock({ val -> [OctreeNode]? in
             let r = val; val = nil; return r
@@ -179,15 +220,22 @@ public final class MetalForceCompute: @unchecked Sendable {
         }
 
         // Trigger async rebuild if tree is stale or dirty.
-        if bhChargePipeline != nil, n > 256,
+        if useBH,
            cachedTreeNodes == nil || bhTreeDirty || treeCacheFrameAge >= treeCacheMaxAge {
             rebuildOctreeAsync(x: x, y: y, z: z, n: n)
             bhTreeDirty = false
         }
 
-        // BH GPU kernel disabled — hangs when concurrent with render pipeline.
-        // CPU Barnes-Hut in computeAllForces() handles charge instead.
-        if false, n > 256, let bhPL = bhChargePipeline, let treeNodes = cachedTreeNodes {
+        // BH GPU kernel — uses async-built octree for O(n log n) charge forces.
+        // Only used for large-spread layouts (span > 1000) where brute force
+        // cutoff would miss distant pairs.
+        if useBH, cachedTreeNodes == nil {
+            GPULog.log("BH SYNC BUILD: n=\(n) (first tree)")
+            cachedTreeNodes = buildOctree(x: x, y: y, z: z, n: n)
+            treeCacheFrameAge = 0
+        }
+        if useBH, let bhPL = bhChargePipeline, let treeNodes = cachedTreeNodes {
+            lastChargeAlgorithm = "BH"
             let treeCount = treeNodes.count
 
             if treeCount > bhTreeCapacity {
@@ -201,10 +249,6 @@ public final class MetalForceCompute: @unchecked Sendable {
 
             if let treeBuf = bhTreeBuffer, let bhPBuf = bhParamBuffer {
                 let treePtr = treeBuf.contents().bindMemory(to: BHOctreeNode.self, capacity: treeCount)
-                // Validate tree before packing
-                var maxChildIdx: Int32 = 0
-                var invalidChildren = 0
-                var maxDepthSeen = 0
                 for i in 0..<treeCount {
                     let src = treeNodes[i]
                     treePtr[i] = BHOctreeNode(
@@ -213,6 +257,14 @@ public final class MetalForceCompute: @unchecked Sendable {
                         children: (src.child(0), src.child(1), src.child(2), src.child(3),
                                    src.child(4), src.child(5), src.child(6), src.child(7)),
                         bodyIndex: src.bodyIndex, _pad: 0)
+                }
+
+                #if DEBUG
+                // Validate tree structure + positions (expensive — debug builds only)
+                var maxChildIdx: Int32 = 0
+                var invalidChildren = 0
+                for i in 0..<treeCount {
+                    let src = treeNodes[i]
                     for oct in 0..<8 {
                         let c = src.child(oct)
                         if c >= Int32(treeCount) { invalidChildren += 1 }
@@ -220,51 +272,39 @@ public final class MetalForceCompute: @unchecked Sendable {
                     }
                     if src.bodyIndex >= Int32(n) { invalidChildren += 1 }
                 }
-
-                // Walk tree to find max depth
-                var stack = [(Int, Int)]() // (nodeIdx, depth)
-                stack.append((0, 0))
-                while let (idx, depth) = stack.popLast() {
+                var maxDepthSeen = 0
+                var depthStack = [(Int, Int)]()
+                depthStack.append((0, 0))
+                while let (idx, depth) = depthStack.popLast() {
                     guard idx >= 0, idx < treeCount else { continue }
                     maxDepthSeen = max(maxDepthSeen, depth)
-                    if depth > 50 { break } // safety
+                    if depth > 50 { break }
                     let node = treeNodes[idx]
                     for oct in 0..<8 {
                         let c = Int(node.child(oct))
-                        if c > 0 && c < treeCount { stack.append((c, depth + 1)) }
+                        if c > 0 && c < treeCount { depthStack.append((c, depth + 1)) }
                     }
                 }
-
-                // Check ALL positions for NaN/Inf and compute bounding box
                 var nanCount = 0
                 var infCount = 0
-                var minP = SIMD3<Float>(Float.greatestFiniteMagnitude, Float.greatestFiniteMagnitude, Float.greatestFiniteMagnitude)
-                var maxP = SIMD3<Float>(-Float.greatestFiniteMagnitude, -Float.greatestFiniteMagnitude, -Float.greatestFiniteMagnitude)
                 let nodeCheck = nodeBuf.contents().bindMemory(to: ForceNodeFull.self, capacity: n)
                 for i in 0..<n {
                     let p = nodeCheck[i]
                     if p.px.isNaN || p.py.isNaN || p.pz.isNaN { nanCount += 1 }
                     if p.px.isInfinite || p.py.isInfinite || p.pz.isInfinite { infCount += 1 }
-                    minP.x = min(minP.x, p.px); minP.y = min(minP.y, p.py); minP.z = min(minP.z, p.pz)
-                    maxP.x = max(maxP.x, p.px); maxP.y = max(maxP.y, p.py); maxP.z = max(maxP.z, p.pz)
                 }
-                let span = maxP - minP
+                GPULog.log("BH charge: n=\(n) tree=\(treeCount) cap=\(bhTreeCapacity) maxChild=\(maxChildIdx) invalid=\(invalidChildren) depth=\(maxDepthSeen) nan=\(nanCount) inf=\(infCount) span=\(String(format:"%.0f",chargeSpan))")
+                #endif
 
-                GPULog.log("BH charge: n=\(n) tree=\(treeCount) cap=\(bhTreeCapacity) maxChild=\(maxChildIdx) invalid=\(invalidChildren) depth=\(maxDepthSeen) nan=\(nanCount) inf=\(infCount) span=(\(String(format:"%.1f",span.x)),\(String(format:"%.1f",span.y)),\(String(format:"%.1f",span.z)))")
-
-                // cutoffSq must be relative to the graph's span, not hardcoded.
-                // With span ~500 and cutoffSq = 250000 (500²), every node is within cutoff
-                // of every other → BH degenerates to O(n²) → 1-second GPU hang.
-                // Use 30% of max span dimension — far nodes beyond this contribute negligible force.
-                let maxSpan = max(span.x, max(span.y, span.z))
-                let cutoff = maxSpan * 0.3
+                let cutoff = max(500.0, chargeSpan * 0.3)
                 let cutoffSq = cutoff * cutoff
 
                 bhPBuf.contents().bindMemory(to: BHChargeParams.self, capacity: 1).pointee = BHChargeParams(
                     chargeStrength: chargeStrength, crossChargeMultiplier: crossChargeMultiplier,
                     sameTopicChargeScale: sameTopicChargeScale, sameProjectChargeScale: sameProjectChargeScale,
-                    cutoffSq: cutoffSq, thetaSq: 0.7 * 0.7,
-                    nodeCount: UInt32(n), treeNodeCount: UInt32(treeCount))
+                    cutoffSq: cutoffSq, thetaSq: 0.85 * 0.85,
+                    nodeCount: UInt32(n), treeNodeCount: UInt32(treeCount),
+                    galaxyGroupCount: UInt32(galaxyCenters.count), _bhpad: 0)
 
                 encoder.setComputePipelineState(bhPL)
                 encoder.setBuffer(nodeBuf, offset: 0, index: 0)
@@ -276,11 +316,12 @@ public final class MetalForceCompute: @unchecked Sendable {
                                        threadsPerThreadgroup: MTLSize(width: chargeTg, height: 1, depth: 1))
                 encoder.memoryBarrier(scope: .buffers)
             }
-        } else if n <= 2048 {
-            // Brute force O(n²) — only safe for small counts.
-            // For larger n, skip charge this frame; CPU fallback handles it
-            // until the async BH tree is ready.
-            GPULog.log("BRUTE charge: n=\(n)")
+        } else {
+            // Brute force O(n²) — used when span < 1000 (correct differentiated charges)
+            // or as fallback when BH tree not yet available.
+            // GPU brute force is fast for typical graph sizes (< 10K nodes).
+            lastChargeAlgorithm = "BRUTE"
+            GPULog.log("BRUTE charge: n=\(n) span=\(String(format:"%.0f",chargeSpan))")
             encoder.setComputePipelineState(pipelineState)
             encoder.setBuffer(nodeBuf, offset: 0, index: 0)
             encoder.setBuffer(forceBuf, offset: 0, index: 1)
@@ -289,8 +330,6 @@ public final class MetalForceCompute: @unchecked Sendable {
             encoder.dispatchThreads(MTLSize(width: n, height: 1, depth: 1),
                                    threadsPerThreadgroup: MTLSize(width: chargeTg, height: 1, depth: 1))
             encoder.memoryBarrier(scope: .buffers)
-        } else {
-            GPULog.log("SKIPPED charge: n=\(n) (waiting for BH tree)")
         }
 
         // 2. Springs
@@ -309,10 +348,11 @@ public final class MetalForceCompute: @unchecked Sendable {
             encoder.memoryBarrier(scope: .buffers)
         }
 
-        // 3-6. Project centroids, repulsion, cohesion
+        // 3-6. Project centroids, refR, repulsion, cohesion
         GPULog.log("CENTROIDS: projCount=\(projectCount) topicCount=\(topicCount)")
         if let centPL = centroidPipeline, projectCount > 1,
            let projOffBuf = projMemberOffsetsBuffer, let projMemBuf = projMembersBuffer {
+            // 3. Project centroids
             encoder.setComputePipelineState(centPL)
             encoder.setBuffer(projOffBuf, offset: 0, index: 0)
             encoder.setBuffer(projMemBuf, offset: 0, index: 1)
@@ -323,6 +363,32 @@ public final class MetalForceCompute: @unchecked Sendable {
                                    threadsPerThreadgroup: MTLSize(width: min(centTg, Int(projectCount)), height: 1, depth: 1))
             encoder.memoryBarrier(scope: .buffers)
 
+            // 4. Project refR (75th-percentile reference radius)
+            if let refRPL = refRPipeline {
+                encoder.setComputePipelineState(refRPL)
+                encoder.setBuffer(projOffBuf, offset: 0, index: 0)
+                encoder.setBuffer(projMemBuf, offset: 0, index: 1)
+                encoder.setBuffer(nodeBuf, offset: 0, index: 2)
+                encoder.setBuffer(projCBuf, offset: 0, index: 3)
+                encoder.setBuffer(rBuf, offset: 0, index: 4)
+                encoder.setBuffer(scrBuf, offset: 0, index: 5)
+                let refRTg = min(Int(refRPL.maxTotalThreadsPerThreadgroup), tgSize)
+                encoder.dispatchThreads(MTLSize(width: Int(projectCount), height: 1, depth: 1),
+                                       threadsPerThreadgroup: MTLSize(width: min(refRTg, Int(projectCount)), height: 1, depth: 1))
+                encoder.memoryBarrier(scope: .buffers)
+            }
+
+            // 5. Project centroid repulsion (same-galaxy only)
+            // Build project group → galaxy mapping from node data
+            var projGalaxyMap = [Int32](repeating: -1, count: Int(projectCount))
+            if !galaxyGroups.isEmpty {
+                for i in 0..<n {
+                    let pg = projectGroups[i]
+                    if pg < projGalaxyMap.count && projGalaxyMap[pg] < 0 {
+                        projGalaxyMap[pg] = Int32(i < galaxyGroups.count ? galaxyGroups[i] : 0)
+                    }
+                }
+            }
             if let repPL = centroidRepulsionPipeline {
                 encoder.setComputePipelineState(repPL)
                 encoder.setBuffer(projCBuf, offset: 0, index: 0)
@@ -334,12 +400,21 @@ public final class MetalForceCompute: @unchecked Sendable {
                 encoder.setBuffer(gtBuf, offset: 0, index: 4)
                 repBuf.contents().bindMemory(to: Float.self, capacity: 1).pointee = centroidRepulsion
                 encoder.setBuffer(repBuf, offset: 0, index: 5)
+                // Per-project galaxy index for same-galaxy filter
+                let pgBufSize = MemoryLayout<Int32>.stride * Int(projectCount)
+                if let pgBuf = device.makeBuffer(bytes: &projGalaxyMap, length: pgBufSize, options: .storageModeShared) {
+                    encoder.setBuffer(pgBuf, offset: 0, index: 6)
+                }
+                // Dispatch totalPairs threads, not groupCount — kernel uses triangular indexing
+                let projPairs = Int(projectCount) * (Int(projectCount) - 1) / 2
                 let repTg = min(Int(repPL.maxTotalThreadsPerThreadgroup), tgSize)
-                encoder.dispatchThreads(MTLSize(width: Int(projectCount), height: 1, depth: 1),
-                                        threadsPerThreadgroup: MTLSize(width: min(repTg, Int(projectCount)), height: 1, depth: 1))
+                GPULog.log("PROJ REPULSION: groups=\(projectCount) pairs=\(projPairs)")
+                encoder.dispatchThreads(MTLSize(width: max(projPairs, 1), height: 1, depth: 1),
+                                        threadsPerThreadgroup: MTLSize(width: min(repTg, max(projPairs, 1)), height: 1, depth: 1))
                 encoder.memoryBarrier(scope: .buffers)
             }
 
+            // 6. Project cohesion (reads refR from buffer)
             if let cohPL = cohesionPipeline {
                 encoder.setComputePipelineState(cohPL)
                 encoder.setBuffer(projOffBuf, offset: 0, index: 0)
@@ -349,6 +424,12 @@ public final class MetalForceCompute: @unchecked Sendable {
                 encoder.setBuffer(projFBuf, offset: 0, index: 4)
                 encoder.setBuffer(forceBuf, offset: 0, index: 5)
                 encoder.setBuffer(simPBuf, offset: 0, index: 6)
+                gtBuf.contents().bindMemory(to: UInt32.self, capacity: 1).pointee = 0  // project
+                encoder.setBuffer(gtBuf, offset: 0, index: 7)
+                encoder.setBuffer(rBuf, offset: 0, index: 8)
+                // Buffers 9-10: project centroids + topicProjectGroup (not read for groupType==0, but must be bound)
+                encoder.setBuffer(projCBuf, offset: 0, index: 9)
+                encoder.setBuffer(topicProjectGroupBuffer ?? gcBuf, offset: 0, index: 10)
                 let cohTg = min(Int(cohPL.maxTotalThreadsPerThreadgroup), tgSize)
                 encoder.dispatchThreads(MTLSize(width: n, height: 1, depth: 1),
                                        threadsPerThreadgroup: MTLSize(width: cohTg, height: 1, depth: 1))
@@ -356,9 +437,10 @@ public final class MetalForceCompute: @unchecked Sendable {
             }
         }
 
-        // Topic centroids, repulsion, cohesion
+        // 7-9. Topic centroids, repulsion (with same-project filter), cohesion
         if let centPL = centroidPipeline, topicCount > 1,
            let topicOffBuf = topicMemberOffsetsBuffer, let topicMemBuf = topicMembersBuffer {
+            // 7. Topic centroids
             encoder.setComputePipelineState(centPL)
             encoder.setBuffer(topicOffBuf, offset: 0, index: 0)
             encoder.setBuffer(topicMemBuf, offset: 0, index: 1)
@@ -369,7 +451,25 @@ public final class MetalForceCompute: @unchecked Sendable {
                                    threadsPerThreadgroup: MTLSize(width: min(centTg, Int(topicCount)), height: 1, depth: 1))
             encoder.memoryBarrier(scope: .buffers)
 
-            if let repPL = centroidRepulsionPipeline {
+            // 8. Topic centroid repulsion — use filtered kernel if topicProjectGroup available
+            let topicPairs = Int(topicCount) * (Int(topicCount) - 1) / 2
+            if let topicRepPL = topicRepulsionPipeline, let tpgBuf = topicProjectGroupBuffer {
+                encoder.setComputePipelineState(topicRepPL)
+                encoder.setBuffer(topicCBuf, offset: 0, index: 0)
+                encoder.setBuffer(topicFBuf, offset: 0, index: 1)
+                encoder.setBuffer(simPBuf, offset: 0, index: 2)
+                gcBuf.contents().bindMemory(to: UInt32.self, capacity: 1).pointee = topicCount
+                encoder.setBuffer(gcBuf, offset: 0, index: 3)
+                repBuf.contents().bindMemory(to: Float.self, capacity: 1).pointee = topicCentroidRepulsion
+                encoder.setBuffer(repBuf, offset: 0, index: 4)
+                encoder.setBuffer(tpgBuf, offset: 0, index: 5)
+                let repTg = min(Int(topicRepPL.maxTotalThreadsPerThreadgroup), tgSize)
+                GPULog.log("TOPIC REPULSION (filtered): groups=\(topicCount) pairs=\(topicPairs)")
+                encoder.dispatchThreads(MTLSize(width: max(topicPairs, 1), height: 1, depth: 1),
+                                        threadsPerThreadgroup: MTLSize(width: min(repTg, max(topicPairs, 1)), height: 1, depth: 1))
+                encoder.memoryBarrier(scope: .buffers)
+            } else if let repPL = centroidRepulsionPipeline {
+                // Fallback: generic repulsion without same-project filter
                 encoder.setComputePipelineState(repPL)
                 encoder.setBuffer(topicCBuf, offset: 0, index: 0)
                 encoder.setBuffer(topicFBuf, offset: 0, index: 1)
@@ -381,11 +481,13 @@ public final class MetalForceCompute: @unchecked Sendable {
                 repBuf.contents().bindMemory(to: Float.self, capacity: 1).pointee = topicCentroidRepulsion
                 encoder.setBuffer(repBuf, offset: 0, index: 5)
                 let repTg = min(Int(repPL.maxTotalThreadsPerThreadgroup), tgSize)
-                encoder.dispatchThreads(MTLSize(width: Int(topicCount), height: 1, depth: 1),
-                                        threadsPerThreadgroup: MTLSize(width: min(repTg, Int(topicCount)), height: 1, depth: 1))
+                GPULog.log("TOPIC REPULSION (generic): groups=\(topicCount) pairs=\(topicPairs)")
+                encoder.dispatchThreads(MTLSize(width: max(topicPairs, 1), height: 1, depth: 1),
+                                        threadsPerThreadgroup: MTLSize(width: min(repTg, max(topicPairs, 1)), height: 1, depth: 1))
                 encoder.memoryBarrier(scope: .buffers)
             }
 
+            // 9. Topic cohesion (with leash force using project centroids)
             if let cohPL = cohesionPipeline {
                 encoder.setComputePipelineState(cohPL)
                 encoder.setBuffer(topicOffBuf, offset: 0, index: 0)
@@ -395,11 +497,39 @@ public final class MetalForceCompute: @unchecked Sendable {
                 encoder.setBuffer(topicFBuf, offset: 0, index: 4)
                 encoder.setBuffer(forceBuf, offset: 0, index: 5)
                 encoder.setBuffer(simPBuf, offset: 0, index: 6)
+                gtBuf.contents().bindMemory(to: UInt32.self, capacity: 1).pointee = 1  // topic
+                encoder.setBuffer(gtBuf, offset: 0, index: 7)
+                encoder.setBuffer(rBuf, offset: 0, index: 8)   // project refR (read by topic leash)
+                encoder.setBuffer(projCBuf, offset: 0, index: 9)  // project centroids (for topic leash)
+                encoder.setBuffer(topicProjectGroupBuffer ?? gcBuf, offset: 0, index: 10)  // topic→project mapping
                 let cohTg = min(Int(cohPL.maxTotalThreadsPerThreadgroup), tgSize)
                 encoder.dispatchThreads(MTLSize(width: n, height: 1, depth: 1),
                                        threadsPerThreadgroup: MTLSize(width: cohTg, height: 1, depth: 1))
                 encoder.memoryBarrier(scope: .buffers)
             }
+        }
+        // 7. Center gravity (per-galaxy when galaxies exist)
+        if let cgPL = centerGravityPipeline {
+            // Ensure galaxy center buffer exists with at least 1 entry
+            let gcCount = max(galaxyCenters.count, 1)
+            let gcSize = MemoryLayout<SIMD3<Float>>.stride * gcCount
+            if galaxyCenterBuffer == nil || galaxyCenterBuffer!.length < gcSize {
+                galaxyCenterBuffer = device.makeBuffer(length: gcSize, options: .storageModeShared)
+            }
+            if let gcBuf = galaxyCenterBuffer {
+                let ptr = gcBuf.contents().bindMemory(to: SIMD3<Float>.self, capacity: gcCount)
+                for (i, c) in galaxyCenters.enumerated() { ptr[i] = c }
+                if galaxyCenters.isEmpty { ptr[0] = center }
+            }
+            encoder.setComputePipelineState(cgPL)
+            encoder.setBuffer(nodeBuf, offset: 0, index: 0)
+            encoder.setBuffer(forceBuf, offset: 0, index: 1)
+            encoder.setBuffer(simPBuf, offset: 0, index: 2)
+            encoder.setBuffer(galaxyCenterBuffer, offset: 0, index: 3)
+            let cgTg = min(Int(cgPL.maxTotalThreadsPerThreadgroup), tgSize)
+            encoder.dispatchThreads(MTLSize(width: n, height: 1, depth: 1),
+                                   threadsPerThreadgroup: MTLSize(width: cgTg, height: 1, depth: 1))
+            encoder.memoryBarrier(scope: .buffers)
         }
         GPULog.log("ENCODE END n=\(n)")
     }
@@ -431,18 +561,26 @@ public final class MetalForceCompute: @unchecked Sendable {
 
     /// Rebuild topology buffers (CSR adjacency, group membership) if dirty.
     /// Call before encodeForces when encoding externally (not via dispatchForces).
-    public func rebuildTopology(nodeCount: Int, projectGroups: [Int], topicGroups: [Int]) {
+    public func rebuildTopology(nodeCount: Int, projectGroups: [Int], topicGroups: [Int],
+                                topicProjectGroup: [Int] = []) {
         guard topologyDirtyForDispatch else { return }
         rebuildTopologyBuffers(nodeCount: nodeCount, edges: dispatchEdges,
-                              projectGroups: projectGroups, topicGroups: topicGroups)
+                              projectGroups: projectGroups, topicGroups: topicGroups,
+                              topicProjectGroup: topicProjectGroup)
         topologyDirtyForDispatch = false
     }
+
+    /// Expose the GPU force output buffer so ForceEngine can feed it to integration.
+    public var outputForceBuffer: MTLBuffer? { fullForceBuffer }
 
     // Full GPU force simulation pipelines
     private var springPipeline: MTLComputePipelineState?
     private var centroidPipeline: MTLComputePipelineState?
     private var centroidRepulsionPipeline: MTLComputePipelineState?
+    private var topicRepulsionPipeline: MTLComputePipelineState?  // same-project filtered
+    private var refRPipeline: MTLComputePipelineState?            // 75th-percentile refR
     private var cohesionPipeline: MTLComputePipelineState?
+    private var centerGravityPipeline: MTLComputePipelineState?
 
     // Persistent GPU buffers for full simulation
     private var fullNodeBuffer: MTLBuffer?      // ForceNodeFull[N]
@@ -451,11 +589,14 @@ public final class MetalForceCompute: @unchecked Sendable {
     private var topicCentroidBuffer: MTLBuffer? // GroupCentroid[maxGroups]
     private var projForceBuffer: MTLBuffer?     // float3[maxGroups]
     private var topicForceBuffer: MTLBuffer?    // float3[maxGroups]
+    private var refRBuffer: MTLBuffer?          // float[maxGroups] — P75 reference radius per project
+    private var scratchBuffer: MTLBuffer?       // float[N] — reusable scratch for refR computation
     private var simParamBuffer: MTLBuffer?      // ForceSimParams
     private var groupTypeBuffer: MTLBuffer?     // uint (0=project, 1=topic)
     private var nodeCountBuffer: MTLBuffer?     // uint
     private var repulsionBuffer: MTLBuffer?     // float
     private var groupCountBuffer: MTLBuffer?    // uint
+    private var galaxyCenterBuffer: MTLBuffer?  // float3[galaxyCount] — per-galaxy center positions
     private var fullNodeCapacity: Int = 0
     private var fullGroupCapacity: Int = 0
     private var fullSimReady: Bool = false
@@ -467,6 +608,7 @@ public final class MetalForceCompute: @unchecked Sendable {
     private var projMembersBuffer: MTLBuffer?      // [N] uint — project group members
     private var topicMemberOffsetsBuffer: MTLBuffer? // [G+1] uint — topic group offsets
     private var topicMembersBuffer: MTLBuffer?     // [N] uint — topic group members
+    private var topicProjectGroupBuffer: MTLBuffer? // [T] int — maps topic group → project group
     private var adjNeighborCapacity: Int = 0
     private var csrNodeCapacity: Int = 0
     private var csrProjectGroupCapacity: Int = 0
@@ -489,6 +631,39 @@ public final class MetalForceCompute: @unchecked Sendable {
     private let treeRebuildInFlight = OSAllocatedUnfairLock<Bool>(initialState: false)
     private var treeCacheFrameAge: Int = 0
     private let treeCacheMaxAge: Int = 10      // rebuild every 10 encode-frames
+
+    /// Compute Morton-sorted permutation: perm[sortedIdx] = originalIdx.
+    private func buildMortonPermutation(x: [Float], y: [Float], z: [Float], n: Int) -> [UInt32] {
+        var mnX = x[0], mxX = x[0], mnY = y[0], mxY = y[0], mnZ = z[0], mxZ = z[0]
+        for i in 1..<n {
+            mnX = min(mnX, x[i]); mxX = max(mxX, x[i])
+            mnY = min(mnY, y[i]); mxY = max(mxY, y[i])
+            mnZ = min(mnZ, z[i]); mxZ = max(mxZ, z[i])
+        }
+        let sX = 1023.0 / max(mxX - mnX, 1e-6)
+        let sY = 1023.0 / max(mxY - mnY, 1e-6)
+        let sZ = 1023.0 / max(mxZ - mnZ, 1e-6)
+
+        func expand(_ v: UInt32) -> UInt32 {
+            var x = v & 0x3ff
+            x = (x | (x << 16)) & 0x30000ff
+            x = (x | (x <<  8)) & 0x300f00f
+            x = (x | (x <<  4)) & 0x30c30c3
+            x = (x | (x <<  2)) & 0x9249249
+            return x
+        }
+
+        var codes = [UInt64](repeating: 0, count: n)  // upper 32: morton, lower 32: index
+        for i in 0..<n {
+            let qx = UInt32(clamping: Int((x[i] - mnX) * sX))
+            let qy = UInt32(clamping: Int((y[i] - mnY) * sY))
+            let qz = UInt32(clamping: Int((z[i] - mnZ) * sZ))
+            let morton = expand(qx) | (expand(qy) << 1) | (expand(qz) << 2)
+            codes[i] = (UInt64(morton) << 32) | UInt64(i)
+        }
+        codes.sort()
+        return codes.map { UInt32($0 & 0xFFFFFFFF) }
+    }
 
     /// Kick off an async octree build on a background thread.
     /// The result is stored in `pendingTreeNodes` and swapped in on the next encode.
@@ -515,7 +690,8 @@ public final class MetalForceCompute: @unchecked Sendable {
         nodeCount n: Int,
         edges: [(Int, Int)],
         projectGroups: [Int],
-        topicGroups: [Int]
+        topicGroups: [Int],
+        topicProjectGroup: [Int] = []
     ) {
         let e = edges.count
 
@@ -584,6 +760,17 @@ public final class MetalForceCompute: @unchecked Sendable {
         if let offsetsBuf = topicMemberOffsetsBuffer, let membersBuf = topicMembersBuffer {
             buildGroupCSR(offsets: offsetsBuf, members: membersBuf,
                           groups: topicGroups, nodeCount: n, groupCount: topicCount)
+        }
+
+        // Upload topic→project group mapping for same-project topic repulsion filter
+        if !topicProjectGroup.isEmpty {
+            topicProjectGroupBuffer = ensureBuffer(topicProjectGroupBuffer, count: max(topicCount, 1), stride: MemoryLayout<Int32>.stride)
+            if let tpgBuf = topicProjectGroupBuffer {
+                let ptr = tpgBuf.contents().bindMemory(to: Int32.self, capacity: topicCount)
+                for i in 0..<min(topicProjectGroup.count, topicCount) {
+                    ptr[i] = Int32(topicProjectGroup[i])
+                }
+            }
         }
     }
 
