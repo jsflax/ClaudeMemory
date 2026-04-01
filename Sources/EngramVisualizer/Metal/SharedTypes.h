@@ -234,6 +234,158 @@ struct HoloScreenUniforms {
     float       _pad2;
 };
 
+// MARK: - GPU Node Packing
+
+// Per-node input for pack_node_instances compute kernel.
+// CPU writes this contiguously (indexed via nodeIndexMap); GPU reads → writes NodeInstance.
+struct NodePackInput {
+    simd_float3 position;       // sim-space position
+    float       baseRadius;     // pre-computed node radius (hub/importance adjusted)
+    simd_float3 baseColor;      // project color (float3)
+    float       packedState;    // encoded state (stateType + searchDimmed + intensity)
+};
+
+// Per-project centroid output from GPU node packing (atomic accumulation).
+#define MAX_PROJECTS 64
+struct ProjectCentroidGPU {
+    simd_float3 sum;            // accumulated position sum
+    int         count;          // number of nodes in this project
+    float       maxY;           // max Y position for label placement
+    float       _pad0;
+    float       _pad1;
+    float       _pad2;
+};
+
+// Parameters for pack_node_instances kernel.
+struct NodePackParams {
+    unsigned int nodeCount;
+    float        scaleFactor;   // world-space scale (1/200)
+    float        nodeRadius;    // base node radius
+    float        animationTime; // for pulse effects
+    unsigned int projectCount;  // number of active projects
+    float        _pad0;
+    float        _pad1;
+    float        _pad2;
+};
+
+// Point light output from GPU node packing (atomic counter for compaction).
+struct PointLightEntry {
+    simd_float3 position;       // world-space position
+    float       intensity;
+    simd_float3 color;          // light color
+    float       attenuation;
+};
+
+// MARK: - GPU Nebula Packing
+
+// Per-group input for pack_nebula_vertices compute kernel.
+struct NebulaGroupInput {
+    simd_float3 centroid;       // world-space centroid (already scaled)
+    float       radius;         // cluster radius (scaled)
+    simd_float4 color;          // (r, g, b, alpha) — cached from NSColor
+    float       noisePhase;     // per-group noise seed
+    float       _pad0;
+    float       _pad1;
+    float       _pad2;
+};
+
+// Parameters for pack_nebula_vertices kernel.
+struct NebulaPackParams {
+    unsigned int groupCount;
+    unsigned int quadsPerGroup;  // always 3
+    float        _pad0;
+    float        _pad1;
+};
+
+// MARK: - GPU Label Packing
+
+// Per-node label metadata for pack_label_instances compute kernel.
+struct LabelMetadata {
+    simd_float4  uvRect;        // (u0, v0, u1, v1) from atlas
+    float        halfH;         // label height
+    float        textAspect;    // width/height ratio
+    float        maxVisible;    // max visibility distance
+    float        forwardBias;   // z-offset for project labels
+    float        baseOpacity;   // base alpha
+    unsigned int flags;         // bit 0: selected, bit 1: searchMatch, bit 2: searchDimmed
+    float        _pad0;
+    float        _pad1;
+};
+
+// Parameters for pack_label_instances kernel.
+struct LabelPackParams {
+    simd_float3  cameraPos;     // world-space camera position (scaled)
+    float        minDepth;      // min camera distance
+    float        depthRange;    // max - min camera distance
+    float        scaleFactor;   // 1/200
+    float        nodeRadius;    // for anchor offset
+    unsigned int nodeCount;     // number of node labels
+};
+
+// MARK: - GPU Force Simulation
+
+// Per-node data for GPU force computation (spring + cohesion + center).
+struct ForceNodeFull {
+    float px, py, pz;          // position
+    float vx, vy, vz;          // velocity
+    int   projectGroup;
+    int   topicGroup;
+    int   galaxyGroup;         // galaxy index for per-galaxy center force + cross-galaxy spring skip
+    int   _pad;
+};
+
+// Parameters for GPU force simulation kernels.
+struct ForceSimParams {
+    float        springLength;
+    float        crossProjectSpringLength;
+    float        springStrength;
+    float        cohesionStrength;
+    float        centroidRepulsion;
+    float        topicCohesionStrength;
+    float        topicCentroidRepulsion;
+    float        centerStrength;
+    simd_float3  center;
+    float        alpha;
+    float        damping;
+    float        maxSpeed;
+    unsigned int nodeCount;
+    unsigned int edgeCount;
+    unsigned int projectGroupCount;
+    unsigned int topicGroupCount;
+    unsigned int galaxyGroupCount;
+    float        topicLeashStrength;       // leash force preventing topic drift from project centroid
+};
+
+// Per-group centroid for GPU force computation.
+struct GroupCentroid {
+    float sumX, sumY, sumZ;
+    int   count;
+};
+
+// Barnes-Hut octree node for GPU charge computation (O(n log n)).
+// Built on CPU, uploaded to GPU buffer, walked per-thread.
+struct BHOctreeNode {
+    float cx, cy, cz;          // cell geometric center
+    float halfSize;             // half-width of cubic cell
+    float comX, comY, comZ;     // center of mass
+    float mass;                 // body count (as float for division)
+    int   children[8];          // child indices (-1 = empty)
+    int   bodyIndex;            // >= 0: leaf with single body; -1: internal node
+    int   _pad;
+};
+
+// Parameters for Barnes-Hut charge kernel.
+struct BHChargeParams {
+    float chargeStrength;
+    float crossChargeMultiplier;
+    float sameTopicChargeScale;
+    float sameProjectChargeScale;
+    float cutoffSq;
+    float thetaSq;              // opening angle threshold squared (0.7² = 0.49)
+    unsigned int nodeCount;
+    unsigned int treeNodeCount;
+};
+
 // MARK: - GPU Mascot Matrix Compute
 
 // Scalar animation state (CPU → GPU) for mascot_compute_matrices kernel.

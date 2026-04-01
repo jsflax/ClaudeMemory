@@ -183,7 +183,7 @@ final class InsertStressTests: XCTestCase {
 
         struct Frame {
             let idx: Int, wallDt: Double, total: Double
-            let sim: Double, mascot: Double, nodes: Double, edges: Double
+            let drain: Double, sim: Double, mascot: Double, nodes: Double, edges: Double
             let neb: Double, labels: Double, flow: Double
             let nodeCount: Int, edgeCount: Int, reason: String, audio: Double
         }
@@ -191,15 +191,16 @@ final class InsertStressTests: XCTestCase {
         var frames: [Frame] = []
         for (i, line) in lines.enumerated() {
             let c = line.components(separatedBy: ",")
-            guard c.count >= 14 else { continue }
+            guard c.count >= 15 else { continue }
             frames.append(Frame(
                 idx: i, wallDt: Double(c[2]) ?? 0, total: Double(c[3]) ?? 0,
-                sim: Double(c[4]) ?? 0, mascot: Double(c[5]) ?? 0,
-                nodes: Double(c[6]) ?? 0, edges: Double(c[7]) ?? 0, neb: Double(c[8]) ?? 0,
-                labels: Double(c[9]) ?? 0, flow: Double(c[10]) ?? 0,
-                nodeCount: Int(c[11]) ?? 0, edgeCount: Int(c[12]) ?? 0,
-                reason: c[13].trimmingCharacters(in: .whitespacesAndNewlines),
-                audio: c.count > 14 ? (Double(c[14].trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0) : 0))
+                drain: Double(c[4]) ?? 0,
+                sim: Double(c[5]) ?? 0, mascot: Double(c[6]) ?? 0,
+                nodes: Double(c[7]) ?? 0, edges: Double(c[8]) ?? 0, neb: Double(c[9]) ?? 0,
+                labels: Double(c[10]) ?? 0, flow: Double(c[11]) ?? 0,
+                nodeCount: Int(c[12]) ?? 0, edgeCount: Int(c[13]) ?? 0,
+                reason: c[14].trimmingCharacters(in: .whitespacesAndNewlines),
+                audio: c.count > 15 ? (Double(c[15].trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0) : 0))
         }
 
         let totals = frames.map(\.total).sorted()

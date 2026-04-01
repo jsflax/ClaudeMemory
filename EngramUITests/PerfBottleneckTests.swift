@@ -347,13 +347,13 @@ final class PerfBottleneckTests: XCTestCase {
             return section
         }
 
-        // CSV: frame,dt_ms,wall_dt_ms,total_ms,sim_ms,mascot_ms,nodes_ms,edges_ms,neb_ms,labels_ms,flow_ms,node_count,edge_count,reason,audio_ms
+        // CSV: frame,dt_ms,wall_dt_ms,total_ms,drain_ms,sim_ms,mascot_ms,nodes_ms,edges_ms,neb_ms,labels_ms,flow_ms,node_count,edge_count,reason,audio_ms
         let lines = csv.components(separatedBy: "\n").dropFirst().filter { !$0.isEmpty }
         guard !lines.isEmpty else { section.addLine("[Empty]"); return section }
 
         struct Frame {
             let idx: Int, dt: Double, wallDt: Double, total: Double
-            let sim: Double, mascot: Double, nodes: Double, edges: Double
+            let drain: Double, sim: Double, mascot: Double, nodes: Double, edges: Double
             let neb: Double, labels: Double, flow: Double
             let nodeCount: Int, edgeCount: Int, reason: String
             let audio: Double
@@ -361,15 +361,16 @@ final class PerfBottleneckTests: XCTestCase {
         var frames: [Frame] = []
         for (i, line) in lines.enumerated() {
             let c = line.components(separatedBy: ",")
-            guard c.count >= 14 else { continue }
+            guard c.count >= 15 else { continue }
             frames.append(Frame(
                 idx: i, dt: Double(c[1]) ?? 0, wallDt: Double(c[2]) ?? 0,
-                total: Double(c[3]) ?? 0, sim: Double(c[4]) ?? 0, mascot: Double(c[5]) ?? 0,
-                nodes: Double(c[6]) ?? 0, edges: Double(c[7]) ?? 0, neb: Double(c[8]) ?? 0,
-                labels: Double(c[9]) ?? 0, flow: Double(c[10]) ?? 0,
-                nodeCount: Int(c[11]) ?? 0, edgeCount: Int(c[12]) ?? 0,
-                reason: c[13].trimmingCharacters(in: .whitespacesAndNewlines),
-                audio: c.count > 14 ? (Double(c[14].trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0) : 0))
+                total: Double(c[3]) ?? 0, drain: Double(c[4]) ?? 0,
+                sim: Double(c[5]) ?? 0, mascot: Double(c[6]) ?? 0,
+                nodes: Double(c[7]) ?? 0, edges: Double(c[8]) ?? 0, neb: Double(c[9]) ?? 0,
+                labels: Double(c[10]) ?? 0, flow: Double(c[11]) ?? 0,
+                nodeCount: Int(c[12]) ?? 0, edgeCount: Int(c[13]) ?? 0,
+                reason: c[14].trimmingCharacters(in: .whitespacesAndNewlines),
+                audio: c.count > 15 ? (Double(c[15].trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0) : 0))
         }
 
         let totals = frames.map(\.total).sorted()
@@ -408,7 +409,7 @@ final class PerfBottleneckTests: XCTestCase {
             section.addLine("")
             section.addLine("Sub-phase averages (sim frames only):")
             let phases: [(String, KeyPath<Frame, Double>)] = [
-                ("sim", \.sim), ("mascot", \.mascot), ("nodes", \.nodes),
+                ("drain", \.drain), ("sim", \.sim), ("mascot", \.mascot), ("nodes", \.nodes),
                 ("edges", \.edges), ("nebulae", \.neb), ("labels", \.labels), ("flow", \.flow),
                 ("audio", \.audio)
             ]
@@ -436,10 +437,10 @@ final class PerfBottleneckTests: XCTestCase {
         let worst = frames.sorted { $0.total > $1.total }.prefix(10)
         section.addLine("")
         section.addLine("Worst 10 frames:")
-        section.addLine("  frame  wall_dt  total   sim   nodes edges labels  neb  audio  reason")
+        section.addLine("  frame  wall_dt  total  drain   sim   nodes edges labels  neb  audio  reason")
         for fr in worst {
-            section.addLine(String(format: "  %5d %7.1f %6.1f %5.1f %6.1f %5.1f %6.1f %5.1f %5.1f  %@",
-                fr.idx, fr.wallDt, fr.total, fr.sim, fr.nodes, fr.edges, fr.labels, fr.neb, fr.audio, fr.reason))
+            section.addLine(String(format: "  %5d %7.1f %6.1f %5.1f %5.1f %6.1f %5.1f %6.1f %5.1f %5.1f  %@",
+                fr.idx, fr.wallDt, fr.total, fr.drain, fr.sim, fr.nodes, fr.edges, fr.labels, fr.neb, fr.audio, fr.reason))
         }
 
         return section

@@ -18,10 +18,17 @@
 		A1B2C3D400000000000004 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = D4E5F60000000000000003 /* Sparkle */; };
 		A1B2C3D400000000000005 /* GoogleSignIn in Frameworks */ = {isa = PBXBuildFile; productRef = D4E5F60000000000000004 /* GoogleSignIn */; };
 		A1B2C3D400000000000006 /* GoogleSignInSwift in Frameworks */ = {isa = PBXBuildFile; productRef = D4E5F60000000000000005 /* GoogleSignInSwift */; };
-		UITEST00000000000000101 /* EngramKit in Frameworks */ = {isa = PBXBuildFile; productRef = UITEST00000000000000201 /* EngramKit */; };
-		UITEST00000000000000102 /* Lattice in Frameworks */ = {isa = PBXBuildFile; productRef = UITEST00000000000000202 /* Lattice */; };
 		E5F60000000000000000007 /* EngramSceneKit in Frameworks */ = {isa = PBXBuildFile; productRef = E5F60000000000000000107 /* EngramSceneKit */; };
 		E5F60000000000000000008 /* CEngramSceneTypes in Frameworks */ = {isa = PBXBuildFile; productRef = E5F60000000000000000108 /* CEngramSceneTypes */; };
+		E5F60000000000000000009 /* EngramMetalShaders in Frameworks */ = {isa = PBXBuildFile; productRef = E5F60000000000000000109 /* EngramMetalShaders */; };
+		E5F6000000000000000000A /* EngramRealityKit in Frameworks */ = {isa = PBXBuildFile; productRef = E5F6000000000000000010A /* EngramRealityKit */; };
+		PREVIEW00000000000101 /* EngramRealityKit in Frameworks */ = {isa = PBXBuildFile; productRef = PREVIEW00000000000201 /* EngramRealityKit */; };
+		PREVIEW00000000000102 /* EngramSceneKit in Frameworks */ = {isa = PBXBuildFile; productRef = PREVIEW00000000000202 /* EngramSceneKit */; };
+		PREVIEW00000000000103 /* EngramMetalShaders in Frameworks */ = {isa = PBXBuildFile; productRef = PREVIEW00000000000203 /* EngramMetalShaders */; };
+		PREVIEW00000000000104 /* EngramKit in Frameworks */ = {isa = PBXBuildFile; productRef = PREVIEW00000000000204 /* EngramKit */; };
+		PREVIEW00000000000105 /* Lattice in Frameworks */ = {isa = PBXBuildFile; productRef = PREVIEW00000000000205 /* Lattice */; };
+		UITEST00000000000000101 /* EngramKit in Frameworks */ = {isa = PBXBuildFile; productRef = UITEST00000000000000201 /* EngramKit */; };
+		UITEST00000000000000102 /* Lattice in Frameworks */ = {isa = PBXBuildFile; productRef = UITEST00000000000000202 /* Lattice */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -46,6 +53,7 @@
 		53E92B8C2F4924860006B3B2 /* Engram.icon */ = {isa = PBXFileReference; lastKnownFileType = folder.iconcomposer.icon; path = Engram.icon; sourceTree = "<group>"; };
 		B2C3D4E500000000000001 /* RealityKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = RealityKit.framework; path = System/Library/Frameworks/RealityKit.framework; sourceTree = SDKROOT; };
 		B2C3D4E500000000000002 /* Engram.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Engram.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		PREVIEW00000000000010 /* EngramPreview.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = EngramPreview.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		UITEST00000000000000010 /* EngramUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = EngramUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		UNTEST00000000000000010 /* EngramUnitTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = EngramUnitTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -54,6 +62,11 @@
 		C3D4E5F600000000000001 /* Sources/EngramVisualizer */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			path = Sources/EngramVisualizer;
+			sourceTree = "<group>";
+		};
+		PREVIEW00000000000020 /* Sources/EngramPreview */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = Sources/EngramPreview;
 			sourceTree = "<group>";
 		};
 		UITEST00000000000000020 /* EngramUITests */ = {
@@ -85,6 +98,20 @@
 				A1B2C3D400000000000006 /* GoogleSignInSwift in Frameworks */,
 				E5F60000000000000000007 /* EngramSceneKit in Frameworks */,
 				E5F60000000000000000008 /* CEngramSceneTypes in Frameworks */,
+				E5F60000000000000000009 /* EngramMetalShaders in Frameworks */,
+				E5F6000000000000000000A /* EngramRealityKit in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		PREVIEW00000000000030 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				PREVIEW00000000000101 /* EngramRealityKit in Frameworks */,
+				PREVIEW00000000000102 /* EngramSceneKit in Frameworks */,
+				PREVIEW00000000000103 /* EngramMetalShaders in Frameworks */,
+				PREVIEW00000000000104 /* EngramKit in Frameworks */,
+				PREVIEW00000000000105 /* Lattice in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -112,6 +139,7 @@
 			children = (
 				534194632F53B3D000537D6F /* Engram.entitlements */,
 				C3D4E5F600000000000001 /* Sources/EngramVisualizer */,
+				PREVIEW00000000000020 /* Sources/EngramPreview */,
 				UITEST00000000000000020 /* EngramUITests */,
 				UNTEST00000000000000020 /* EngramUnitTests */,
 				F6A1B2C300000000000002 /* Frameworks */,
@@ -132,6 +160,7 @@
 			isa = PBXGroup;
 			children = (
 				B2C3D4E500000000000002 /* Engram.app */,
+				PREVIEW00000000000010 /* EngramPreview.app */,
 				UITEST00000000000000010 /* EngramUITests.xctest */,
 				UNTEST00000000000000010 /* EngramUnitTests.xctest */,
 			);
@@ -169,9 +198,37 @@
 				53DCFB722F55D76C0021613A /* EngramModels */,
 				E5F60000000000000000107 /* EngramSceneKit */,
 				E5F60000000000000000108 /* CEngramSceneTypes */,
+				E5F60000000000000000109 /* EngramMetalShaders */,
+				E5F6000000000000000010A /* EngramRealityKit */,
 			);
 			productName = Engram;
 			productReference = B2C3D4E500000000000002 /* Engram.app */;
+			productType = "com.apple.product-type.application";
+		};
+		PREVIEW00000000000040 /* EngramPreview */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = PREVIEW00000000000050 /* Build configuration list for PBXNativeTarget "EngramPreview" */;
+			buildPhases = (
+				PREVIEW00000000000031 /* Sources */,
+				PREVIEW00000000000030 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				PREVIEW00000000000020 /* Sources/EngramPreview */,
+			);
+			name = EngramPreview;
+			packageProductDependencies = (
+				PREVIEW00000000000201 /* EngramRealityKit */,
+				PREVIEW00000000000202 /* EngramSceneKit */,
+				PREVIEW00000000000203 /* EngramMetalShaders */,
+				PREVIEW00000000000204 /* EngramKit */,
+				PREVIEW00000000000205 /* Lattice */,
+			);
+			productName = EngramPreview;
+			productReference = PREVIEW00000000000010 /* EngramPreview.app */;
 			productType = "com.apple.product-type.application";
 		};
 		UITEST00000000000000040 /* EngramUITests */ = {
@@ -248,6 +305,7 @@
 			projectRoot = "";
 			targets = (
 				D4E5F60000000000000010 /* Engram */,
+				PREVIEW00000000000040 /* EngramPreview */,
 				UITEST00000000000000040 /* EngramUITests */,
 				UNTEST00000000000000040 /* EngramUnitTests */,
 			);
@@ -267,6 +325,13 @@
 
 /* Begin PBXSourcesBuildPhase section */
 		E5F6A1B200000000000001 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		PREVIEW00000000000031 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -463,6 +528,69 @@
 			};
 			name = UITesting;
 		};
+		PREVIEW00000000000051 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 2Z8M9MTEVV;
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				OTHER_SWIFT_FLAGS = "-cxx-interoperability-mode=default";
+				PRODUCT_BUNDLE_IDENTIFIER = io.engram.preview;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 6.0;
+			};
+			name = Debug;
+		};
+		PREVIEW00000000000052 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 2Z8M9MTEVV;
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				OTHER_SWIFT_FLAGS = "-cxx-interoperability-mode=default";
+				PRODUCT_BUNDLE_IDENTIFIER = io.engram.preview;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 6.0;
+			};
+			name = Release;
+		};
+		PREVIEW00000000000053 /* UITesting */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 2Z8M9MTEVV;
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				OTHER_SWIFT_FLAGS = "-cxx-interoperability-mode=default";
+				PRODUCT_BUNDLE_IDENTIFIER = io.engram.preview;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 6.0;
+			};
+			name = UITesting;
+		};
 		UITEST00000000000000051 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -588,6 +716,16 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
+		PREVIEW00000000000050 /* Build configuration list for PBXNativeTarget "EngramPreview" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				PREVIEW00000000000051 /* Debug */,
+				PREVIEW00000000000052 /* Release */,
+				PREVIEW00000000000053 /* UITesting */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
 		UITEST00000000000000050 /* Build configuration list for PBXNativeTarget "EngramUITests" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
@@ -676,14 +814,6 @@
 			isa = XCSwiftPackageProductDependency;
 			productName = EngramFoundationModels;
 		};
-		UITEST00000000000000201 /* EngramKit */ = {
-			isa = XCSwiftPackageProductDependency;
-			productName = EngramKit;
-		};
-		UITEST00000000000000202 /* Lattice */ = {
-			isa = XCSwiftPackageProductDependency;
-			productName = Lattice;
-		};
 		E5F60000000000000000107 /* EngramSceneKit */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = EngramSceneKit;
@@ -691,6 +821,42 @@
 		E5F60000000000000000108 /* CEngramSceneTypes */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = CEngramSceneTypes;
+		};
+		E5F60000000000000000109 /* EngramMetalShaders */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = EngramMetalShaders;
+		};
+		E5F6000000000000000010A /* EngramRealityKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = EngramRealityKit;
+		};
+		PREVIEW00000000000201 /* EngramRealityKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = EngramRealityKit;
+		};
+		PREVIEW00000000000202 /* EngramSceneKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = EngramSceneKit;
+		};
+		PREVIEW00000000000203 /* EngramMetalShaders */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = EngramMetalShaders;
+		};
+		PREVIEW00000000000204 /* EngramKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = EngramKit;
+		};
+		PREVIEW00000000000205 /* Lattice */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = Lattice;
+		};
+		UITEST00000000000000201 /* EngramKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = EngramKit;
+		};
+		UITEST00000000000000202 /* Lattice */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = Lattice;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

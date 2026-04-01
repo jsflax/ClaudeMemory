@@ -4,7 +4,6 @@ import simd
 
 /// Owns GPU-resident simulation buffers (positions, velocities, forces).
 /// Handles capacity management, CPU→GPU upload, GPU integration, and CPU readback.
-@MainActor
 public final class GPUSimulationState {
     private let device: MTLDevice
     public let integratePipeline: MTLComputePipelineState?
@@ -65,14 +64,16 @@ public final class GPUSimulationState {
     public func uploadPositions(x: [Float], y: [Float], z: [Float]) {
         let n = x.count
         ensureCapacity(n)
+        let topologyChanged = n != nodeCount
         nodeCount = n
         guard let pb = positionBuffer else { return }
         let ptr = pb.contents().bindMemory(to: SIMD3<Float>.self, capacity: n)
         for i in 0..<n {
             ptr[i] = SIMD3<Float>(x[i], y[i], z[i])
         }
-        // Also zero velocities on full upload (topology change)
-        if let vb = velocityBuffer {
+        // Only zero velocities on topology change (node count changed).
+        // Per-frame uploads preserve GPU-computed velocities for momentum.
+        if topologyChanged, let vb = velocityBuffer {
             memset(vb.contents(), 0, n * MemoryLayout<SIMD3<Float>>.stride)
         }
     }
@@ -81,7 +82,7 @@ public final class GPUSimulationState {
 
     /// Encode integrate_positions kernel into the compute encoder.
     /// Called after force compute, before node packing.
-    public func encodeIntegration(encoder: MTLComputeCommandEncoder, damping: Float, maxSpeed: Float) {
+    public func encodeIntegration(encoder: MTLComputeCommandEncoder, damping: Float, maxSpeed: Float, alpha: Float) {
         guard let pipeline = integratePipeline,
               let posBuf = positionBuffer,
               let velBuf = velocityBuffer,
@@ -101,6 +102,37 @@ public final class GPUSimulationState {
         encoder.setBuffer(posBuf, offset: 0, index: 0)
         encoder.setBuffer(velBuf, offset: 0, index: 1)
         encoder.setBuffer(forceBuf, offset: 0, index: 2)
+        encoder.setBuffer(paramsBuf, offset: 0, index: 3)
+
+        let tgSize = min(Int(pipeline.maxTotalThreadsPerThreadgroup), 256)
+        encoder.dispatchThreads(
+            MTLSize(width: nodeCount, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: tgSize, height: 1, depth: 1))
+        encoder.memoryBarrier(scope: .buffers)
+    }
+
+    /// Encode integration using an external force buffer (e.g. from MetalForceCompute).
+    /// Same as encodeIntegration but uses a caller-provided force buffer instead of self.forceBuffer.
+    public func encodeIntegration(encoder: MTLComputeCommandEncoder, forceBuffer: MTLBuffer,
+                                  damping: Float, maxSpeed: Float, alpha: Float) {
+        guard let pipeline = integratePipeline,
+              let posBuf = positionBuffer,
+              let velBuf = velocityBuffer,
+              let paramsBuf = integrateParamsBuffer,
+              nodeCount > 0 else { return }
+
+        var params = IntegrateParams(
+            nodeCount: UInt32(nodeCount),
+            damping: damping,
+            maxSpeed: maxSpeed,
+            alpha: alpha
+        )
+        paramsBuf.contents().copyMemory(from: &params, byteCount: MemoryLayout<IntegrateParams>.stride)
+
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(posBuf, offset: 0, index: 0)
+        encoder.setBuffer(velBuf, offset: 0, index: 1)
+        encoder.setBuffer(forceBuffer, offset: 0, index: 2)
         encoder.setBuffer(paramsBuf, offset: 0, index: 3)
 
         let tgSize = min(Int(pipeline.maxTotalThreadsPerThreadgroup), 256)

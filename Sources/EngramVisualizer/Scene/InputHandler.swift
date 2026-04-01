@@ -2,6 +2,7 @@ import simd
 import GameController
 import SwiftUI
 import os
+import EngramRealityKit
 
 /// Handles keyboard, gamepad, and selection input extracted from MetalSceneManager.
 /// Pure input state + polling — no render data, no Metal dependencies.
@@ -142,7 +143,8 @@ final class InputHandler {
 
     func teleportToNextProject(direction: Int, positions: [UUID: SIMD3<Float>],
                                 nodes: [NodeData], hubs: Set<UUID>) {
-        camera.teleportToNextProject(positions: positions, nodes: nodes,
+        let snapshots = nodes.map { RKNodeSnapshot(id: $0.id, project: $0.project, topic: $0.topic, label: $0.label, importance: $0.importance, isHub: hubs.contains($0.id)) }
+        camera.teleportToNextProject(positions: positions, nodes: snapshots,
                                      hubs: hubs, direction: direction)
         teleportLabel = camera.teleportLabel
         teleportCounter = camera.teleportCounter
@@ -152,7 +154,8 @@ final class InputHandler {
     /// Smoothly drive the camera to a named project using cached render data.
     func driveToProject(_ project: String, positions: [UUID: SIMD3<Float>],
                         nodes: [NodeData], hubs: Set<UUID>) {
-        camera.driveToProject(project, positions: positions, nodes: nodes, hubs: hubs)
+        let snapshots = nodes.map { RKNodeSnapshot(id: $0.id, project: $0.project, topic: $0.topic, label: $0.label, importance: $0.importance, isHub: hubs.contains($0.id)) }
+        camera.driveToProject(project, positions: positions, nodes: snapshots, hubs: hubs)
         teleportLabel = camera.teleportLabel
         teleportCounter = camera.teleportCounter
         teleportCallback?(teleportLabel, teleportCounter)

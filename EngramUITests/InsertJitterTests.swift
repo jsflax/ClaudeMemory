@@ -87,30 +87,31 @@ final class InsertJitterTests: XCTestCase {
         guard !lines.isEmpty else { XCTFail("No frame data collected"); return }
 
         // CSV columns:
-        // frame,dt_ms,wall_dt_ms,total_ms,sim_ms,mascot_ms,nodes_ms,edges_ms,neb_ms,labels_ms,flow_ms,node_count,edge_count,reason
+        // frame,dt_ms,wall_dt_ms,total_ms,drain_ms,sim_ms,mascot_ms,nodes_ms,edges_ms,neb_ms,labels_ms,flow_ms,node_count,edge_count,reason
 
-        var frames: [(frame: Int, dt: Double, wallDt: Double, total: Double, sim: Double, mascot: Double,
+        var frames: [(frame: Int, dt: Double, wallDt: Double, total: Double, drain: Double, sim: Double, mascot: Double,
                        nodes: Double, edges: Double, neb: Double, labels: Double, flow: Double,
                        nodeCount: Int, edgeCount: Int, reason: String)] = []
 
         for line in lines {
             let cols = line.components(separatedBy: ",")
-            guard cols.count >= 14 else { continue }
+            guard cols.count >= 15 else { continue }
             frames.append((
                 frame: Int(cols[0]) ?? 0,
                 dt: Double(cols[1]) ?? 0,
                 wallDt: Double(cols[2]) ?? 0,
                 total: Double(cols[3]) ?? 0,
-                sim: Double(cols[4]) ?? 0,
-                mascot: Double(cols[5]) ?? 0,
-                nodes: Double(cols[6]) ?? 0,
-                edges: Double(cols[7]) ?? 0,
-                neb: Double(cols[8]) ?? 0,
-                labels: Double(cols[9]) ?? 0,
-                flow: Double(cols[10]) ?? 0,
-                nodeCount: Int(cols[11]) ?? 0,
-                edgeCount: Int(cols[12]) ?? 0,
-                reason: cols[13].trimmingCharacters(in: .whitespacesAndNewlines)
+                drain: Double(cols[4]) ?? 0,
+                sim: Double(cols[5]) ?? 0,
+                mascot: Double(cols[6]) ?? 0,
+                nodes: Double(cols[7]) ?? 0,
+                edges: Double(cols[8]) ?? 0,
+                neb: Double(cols[9]) ?? 0,
+                labels: Double(cols[10]) ?? 0,
+                flow: Double(cols[11]) ?? 0,
+                nodeCount: Int(cols[12]) ?? 0,
+                edgeCount: Int(cols[13]) ?? 0,
+                reason: cols[14].trimmingCharacters(in: .whitespacesAndNewlines)
             ))
         }
 

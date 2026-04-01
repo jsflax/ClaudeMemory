@@ -19,7 +19,7 @@ extension MemoryTools {
         // Extract text from the CallTool.Result
         guard let textContent = result.content.first else { return nil }
         switch textContent {
-        case .text(let text):
+        case .text(let text, _, _):
             return text == "No memories found." ? nil : text
         default:
             return nil

@@ -3,6 +3,7 @@ import CEngramSceneTypes
 import MetalKit
 import simd
 import AppKit
+import EngramRealityKit
 
 /// Lightweight info about the node the mascot is visiting.
 struct MascotNodeInfo {

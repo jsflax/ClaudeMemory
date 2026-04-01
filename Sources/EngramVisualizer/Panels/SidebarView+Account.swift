@@ -105,11 +105,13 @@ extension SidebarView {
                 }
             }
 
+            #if DEBUG
             section("Endpoint") {
                 TextField("https://engram.io", text: $accountService.endpoint)
                     .textFieldStyle(.roundedBorder)
                     .font(.system(size: 11, design: .monospaced))
             }
+            #endif
         }
     }
 
@@ -255,6 +257,7 @@ extension SidebarView {
                 }
             }
 
+            #if DEBUG
             section("Server") {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Endpoint")
@@ -265,6 +268,7 @@ extension SidebarView {
                         .font(.system(size: 11, design: .monospaced))
                 }
             }
+            #endif
         }
     }
 }

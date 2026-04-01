@@ -72,7 +72,7 @@ struct ForceEngineTests {
             let didEncode = engine.encodeForcePass(queue: queue, snapshot: snapshot) { result in
                 cont.resume(returning: result)
             }
-            #expect(didEncode, "Should encode forces for non-settled sim")
+            #expect(didEncode != nil, "Should encode forces for non-settled sim")
         }
 
         #expect(result.fx.count == 500)
@@ -87,7 +87,7 @@ struct ForceEngineTests {
         let snapshot = makeSnapshot(nodeCount: 100, isSettled: true)
 
         let didEncode = engine.encodeForcePass(queue: queue, snapshot: snapshot) { _ in }
-        #expect(!didEncode, "Should not encode when settled")
+        #expect(didEncode == nil, "Should not encode when settled")
     }
 
     @Test("skips encoding when only 1 node")
@@ -96,7 +96,7 @@ struct ForceEngineTests {
         let snapshot = makeSnapshot(nodeCount: 1, edgeCount: 0)
 
         let didEncode = engine.encodeForcePass(queue: queue, snapshot: snapshot) { _ in }
-        #expect(!didEncode, "Should not encode for single node")
+        #expect(didEncode == nil, "Should not encode for single node")
     }
 
     @Test("topology rebuild fires when dirty — catches edges=0 bug")
@@ -127,11 +127,11 @@ struct ForceEngineTests {
         let didEncode1 = engine.encodeForcePass(queue: queue, snapshot: snapshot) { _ in
             firstCompleted = true
         }
-        #expect(didEncode1)
+        #expect(didEncode1 != nil)
 
         // While first is in flight, second should be rejected
         let didEncode2 = engine.encodeForcePass(queue: queue, snapshot: snapshot) { _ in }
-        #expect(!didEncode2, "Should reject dispatch while in flight")
+        #expect(didEncode2 == nil, "Should reject dispatch while in flight")
 
         // Wait for first to complete
         while !firstCompleted {

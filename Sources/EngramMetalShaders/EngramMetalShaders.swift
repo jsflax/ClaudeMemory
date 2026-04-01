@@ -24,7 +24,7 @@ public enum EngramMetalShaders {
         var source = "#include <metal_stdlib>\nusing namespace metal;\n\n\(header)\n"
 
         // Compile all .metal files found in the bundle
-        let shaderNames = ["Shaders", "RenderShaders", "MascotShaders"]
+        let shaderNames = ["ForceCompute", "ForceIntegrate"]
         for name in shaderNames {
             guard let url = bundle.url(forResource: name, withExtension: "metal") else { continue }
             var text = try String(contentsOf: url)

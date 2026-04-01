@@ -27,15 +27,18 @@ final class GalaxyRegistry {
     let levelSpacing: Float = 3000    // Y between hierarchy levels
     let siblingSpacing: Float = 4000  // X between same-level galaxies
 
-    // Merged data for renderer (recomputed when any galaxy's topology changes)
-    private(set) var mergedNodes: [NodeData] = []
-    private(set) var mergedEdges: [EdgeData] = []
-    private(set) var mergedHubs: Set<UUID> = []
-    private(set) var mergedColorMap: [String: Color] = [:]
-    private(set) var mergedNodeById: [UUID: NodeData] = [:]
+    // Merged data for renderer (recomputed when any galaxy's topology changes).
+    // @ObservationIgnored — these change on topology updates and are read by the
+    // RealityKit scene via GalaxyRegistryAdapter, not SwiftUI views. Without this,
+    // every topology change triggers GraphView.body re-evaluation (~400% CPU).
+    @ObservationIgnored private(set) var mergedNodes: [NodeData] = []
+    @ObservationIgnored private(set) var mergedEdges: [EdgeData] = []
+    @ObservationIgnored private(set) var mergedHubs: Set<UUID> = []
+    @ObservationIgnored private(set) var mergedColorMap: [String: Color] = [:]
+    @ObservationIgnored private(set) var mergedNodeById: [UUID: NodeData] = [:]
 
     // Node -> galaxy routing (for selection, detail panel, search)
-    private(set) var nodeToGalaxy: [UUID: String] = [:]
+    @ObservationIgnored private(set) var nodeToGalaxy: [UUID: String] = [:]
     var focusedGalaxyId: String?
 
     // Render config (pushed from VisualizerConfig, used by drain + edge filtering)

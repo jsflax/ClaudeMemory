@@ -56,7 +56,7 @@ struct Advise: AsyncParsableCommand {
                     depth: 1,
                     limit: 5
                 ) {
-                    hookLog("Advise: recall returned \(result.count) chars")
+                    logRecalledMemories(result, hook: "Advise")
                     sections.append("## Relevant memories\n\n\(result)")
                 } else {
                     hookLog("Advise: recall returned nil")

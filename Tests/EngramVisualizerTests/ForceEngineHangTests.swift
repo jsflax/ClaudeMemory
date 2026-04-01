@@ -69,7 +69,7 @@ struct ForceEngineHangTests {
             let didEncode = engine.encodeForcePass(queue: queue, snapshot: snapshot) { result in
                 cont.resume(returning: result)
             }
-            #expect(didEncode, "Should encode at production scale")
+            #expect(didEncode != nil, "Should encode at production scale")
         }
 
         let ms = (CFAbsoluteTimeGetCurrent() - start) * 1000.0
@@ -96,7 +96,7 @@ struct ForceEngineHangTests {
         let didEncode = engine.encodeForcePass(queue: queue, snapshot: snapshot) { _ in
             completionFired = true
         }
-        #expect(didEncode)
+        #expect(didEncode != nil)
         #expect(engine.isInFlight, "Should be in flight immediately after encode")
 
         // Wait for completion with timeout

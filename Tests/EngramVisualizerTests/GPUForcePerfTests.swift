@@ -113,6 +113,8 @@ struct GPUForcePerfTests {
             var sameProjectChargeScale: Float
             var cutoffSq: Float
             var nodeCount: UInt32
+            var galaxyGroupCount: UInt32
+            var _pad: UInt32
         }
         let paramBuffer = device.makeBuffer(length: MemoryLayout<GPUForceParams>.stride, options: .storageModeShared)!
         paramBuffer.contents().bindMemory(to: GPUForceParams.self, capacity: 1).pointee = GPUForceParams(
@@ -121,7 +123,8 @@ struct GPUForcePerfTests {
             sameTopicChargeScale: 0.35,
             sameProjectChargeScale: 1.0,
             cutoffSq: 500 * 500,
-            nodeCount: UInt32(n))
+            nodeCount: UInt32(n),
+            galaxyGroupCount: 0, _pad: 0)
 
         let tgSize = min(Int(pipeline.maxTotalThreadsPerThreadgroup), 256)
 
@@ -169,12 +172,14 @@ struct GPUForcePerfTests {
             var chargeStrength: Float; var crossChargeMultiplier: Float
             var sameTopicChargeScale: Float; var sameProjectChargeScale: Float
             var cutoffSq: Float; var nodeCount: UInt32
+            var galaxyGroupCount: UInt32; var _pad: UInt32
         }
         let paramBuffer = device.makeBuffer(length: MemoryLayout<GPUForceParams>.stride, options: .storageModeShared)!
         paramBuffer.contents().bindMemory(to: GPUForceParams.self, capacity: 1).pointee = GPUForceParams(
             chargeStrength: 500, crossChargeMultiplier: 3.0,
             sameTopicChargeScale: 0.35, sameProjectChargeScale: 1.0,
-            cutoffSq: 500 * 500, nodeCount: UInt32(n))
+            cutoffSq: 500 * 500, nodeCount: UInt32(n),
+            galaxyGroupCount: 0, _pad: 0)
 
         let tgSize = min(Int(pipeline.maxTotalThreadsPerThreadgroup), 256)
 

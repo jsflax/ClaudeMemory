@@ -56,7 +56,7 @@ struct PreTool: AsyncParsableCommand {
                             depth: 1,
                             limit: 5
                         ) {
-                            hookLog("PreTool: recall returned \(result.count) chars")
+                            logRecalledMemories(result, hook: "PreTool")
                             sections.append("## Project context\n\n\(result)")
                         } else {
                             hookLog("PreTool: recall returned nil")

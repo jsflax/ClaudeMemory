@@ -361,15 +361,18 @@ struct ForceSimParams {
     float        maxSpeed;
     unsigned int nodeCount;
     unsigned int edgeCount;
+    float        crossProjectSpringScale;  // multiplier for cross-project spring strength (0..1)
     unsigned int projectGroupCount;
     unsigned int topicGroupCount;
     unsigned int galaxyGroupCount;
+    float        topicLeashStrength;       // leash force preventing topic drift from project centroid
 };
 
 // Per-group centroid for GPU force computation.
 struct GroupCentroid {
     float sumX, sumY, sumZ;
     int   count;
+    float _pad0, _pad1, _pad2, _pad3;  // align to 32 bytes
 };
 
 // Barnes-Hut octree node for GPU charge computation (O(n log n)).
@@ -384,6 +387,18 @@ struct BHOctreeNode {
     int   _pad;
 };
 
+// Parameters for brute-force O(n²) charge kernel.
+struct ForceParams {
+    float chargeStrength;
+    float crossChargeMultiplier;
+    float sameTopicChargeScale;
+    float sameProjectChargeScale;
+    float cutoffSq;
+    unsigned int nodeCount;
+    unsigned int galaxyGroupCount;
+    unsigned int _pad;
+};
+
 // Parameters for Barnes-Hut charge kernel.
 struct BHChargeParams {
     float chargeStrength;
@@ -394,6 +409,8 @@ struct BHChargeParams {
     float thetaSq;              // opening angle threshold squared (0.7² = 0.49)
     unsigned int nodeCount;
     unsigned int treeNodeCount;
+    unsigned int galaxyGroupCount;
+    unsigned int _bhpad;
 };
 
 // MARK: - GPU Mascot Matrix Compute

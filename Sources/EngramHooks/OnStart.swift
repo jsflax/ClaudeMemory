@@ -35,6 +35,7 @@ struct OnStart: AsyncParsableCommand {
                 depth: 1,
                 limit: 5
             ) {
+                logRecalledMemories(result, hook: "OnStart")
                 sections.append("## Project context\n\n\(result)")
             }
         }

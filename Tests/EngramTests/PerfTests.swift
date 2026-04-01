@@ -230,6 +230,75 @@ private func milliseconds(_ elapsed: Duration) -> Int64 {
     #expect(hookMs < 5000, "KeyBERT directRecall (8 terms, depth=1) should complete in under 5s")
 }
 
+/// Regression: recall must not hang when the vec0 reconciliation loop
+/// fires on an attached (UNION ALL) lattice with many memories.
+///
+/// In production, knn_query's reconciliation compares COUNT(*) from the
+/// UNION ALL view (local + synced) against the local vec0 count. On mismatch,
+/// it does DELETE+INSERT for every row inside BEGIN IMMEDIATE. With multiple
+/// concurrent processes, this creates a lock storm where each process blocks
+/// waiting for the write lock, and the winner's reconciliation takes minutes
+/// for large DBs — causing nearest() to appear to hang.
+@Test(.timeLimit(.minutes(1)))
+func recallDoesNotHangOnAttachedLattice() async throws {
+    Lattice.setLogLevel(.debug)
+    let dbPath = NSHomeDirectory() + "/.claude/memory.sqlite"
+    let syncedPath = NSHomeDirectory() + "/.claude/sync/memory-synced.sqlite"
+    guard FileManager.default.fileExists(atPath: dbPath),
+          FileManager.default.fileExists(atPath: syncedPath) else {
+        print("Skipping: no real databases")
+        return
+    }
+
+    let local = try Lattice(
+        Memory.self, Edge.self, Checkpoint.self, HookState.self, SyncConfig.self,
+        configuration: .init(fileURL: URL(fileURLWithPath: dbPath), migration: engramMigrations)
+    )
+    let synced = try Lattice(
+        Memory.self, Edge.self, SyncConfig.self,
+        configuration: .init(fileURL: URL(fileURLWithPath: syncedPath), migration: engramMigrations)
+    )
+
+    let localCount = local.objects(Memory.self).count
+    let syncedCount = synced.objects(Memory.self).count
+    print("Local: \(localCount) memories, Synced: \(syncedCount) memories")
+
+    let embedder = sharedEmbedder
+    if await !embedder.isLoaded { await embedder.load() }
+
+    guard let queryEmbedding = try await embedder.embed(text: "camera rotation preview") else {
+        Issue.record("Failed to embed query")
+        return
+    }
+    let embedding = Vector<Float>(queryEmbedding)
+
+    // Vacuum the local vec0 to purge orphan entries that bloat chunk storage.
+    // Without this, nearest() scans ~2.66 GB of dead chunks and takes minutes.
+    let vacuumStart = ContinuousClock.now
+    let vacuumed = local._vacuumVec0(Memory(), for: \.embedding)
+    let vacuumMs = milliseconds(ContinuousClock.now - vacuumStart)
+    print("Vec0 vacuum: \(vacuumed) vectors in \(vacuumMs)ms")
+
+    // Create the attached view AFTER vacuum — attaching() opens a new connection,
+    // which must see the clean vec0 state, not the pre-vacuum bloated one.
+    let combined = local.attaching(lattice: synced)
+    let combinedCount = combined.objects(Memory.self).count
+    print("Combined (UNION ALL): \(combinedCount) memories")
+
+    // Now the actual query — should be fast with a clean vec0 index
+    let start = ContinuousClock.now
+    let results = combined.objects(Memory.self)
+        .nearest(to: embedding, on: \.embedding, limit: 15, distance: .l2)
+    let count = results.count
+    let ms = milliseconds(ContinuousClock.now - start)
+
+    print("nearest() on combined lattice: \(ms)ms, \(count) results")
+
+    // Should complete well under the 30s time limit.
+    // If reconciliation fires, it may take a few seconds — but should never hang.
+    #expect(ms < 15000, "nearest() on attached lattice must not hang (\(ms)ms)")
+}
+
 /// Cosine similarity between two Float vectors.
 private func cosineSimilarity(_ a: [Float], _ b: [Float]) -> Float {
     guard a.count == b.count, !a.isEmpty else { return 0 }

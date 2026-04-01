@@ -2,6 +2,7 @@ import Metal
 import CEngramSceneTypes
 import simd
 import SwiftUI
+import EngramRealityKit
 
 /// Notification protocol for memory lifecycle events → mascot animations.
 @MainActor

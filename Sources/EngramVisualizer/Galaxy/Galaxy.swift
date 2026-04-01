@@ -1,5 +1,7 @@
 import SwiftUI
+import EngramSceneKit
 import Lattice
+import EngramSceneKit
 import Combine
 import EngramKit
 import os
@@ -56,10 +58,12 @@ actor Galaxy: Identifiable {
 
     // Per-galaxy pipeline
     @MainActor let renderStore = GraphRenderStore()
-    @MainActor let simulation3D = ForceSimulation3D()
     @MainActor let embeddingProjection = EmbeddingProjection()
-    /// GPU force compute — created lazily by renderer with shared device/library.
-    @MainActor var metalForceCompute: MetalForceCompute?
+
+    /// Reference to the unified simulation owned by GalaxyRegistry.
+    /// Set during register(). All node/edge ops go through this.
+    @MainActor weak var simulation3D: ForceSimulation3D?
+
 
     /// Lock-protected update buffer — written by Galaxy actor, drained by MainActor.
     let pendingUpdate = OSAllocatedUnfairLock<RenderUpdate>(initialState: .init())
@@ -69,17 +73,7 @@ actor Galaxy: Identifiable {
     let edgePkToGidLock = OSAllocatedUnfairLock<[Int64: UUID]>(initialState: [:])
 
     // World-space center (set by GalaxyRegistry.computeWorldLayout)
-    @MainActor var worldCenter: SIMD3<Float> = .zero {
-        didSet {
-            simulation3D.center = worldCenter
-            // Wake the sim when center changes so nodes re-converge toward
-            // the new center. Without this, a settled galaxy ignores center
-            // shifts (e.g. when a second galaxy is added and layout recomputes).
-            if isLoaded && oldValue != worldCenter {
-                simulation3D.wake()
-            }
-        }
-    }
+    @MainActor var worldCenter: SIMD3<Float> = .zero
 
     // Per-galaxy node filter (for data partitioning — prevents duplication across galaxies)
     // Local galaxy: { !syncedProjects.contains($0.project) || $0.isPrivate }
@@ -265,7 +259,7 @@ actor Galaxy: Identifiable {
             store.visibleNodeIds.insert(nd.id)
 
             if config.is3D {
-                sim3D.addNode(nd.id, project: nd.project, topic: nd.topic)
+                sim3D?.addNode(nd.id, project: nd.project, topic: nd.topic, galaxyId: self.id)
             }
 
             // Wire edges where BOTH endpoints now exist
@@ -277,7 +271,7 @@ actor Galaxy: Identifiable {
                     store.filteredEdgeIds.insert(edge.id)
                     store.edges.append(edge)
                     if config.is3D {
-                        sim3D.addEdge(from: edge.sourceId, to: edge.targetId)
+                        sim3D?.addEdge(from: edge.sourceId, to: edge.targetId)
                     }
                 }
             }
@@ -358,7 +352,7 @@ actor Galaxy: Identifiable {
         // so simulation3D.center is already at the final world position.
         if !update.bulkNodeBatches.isEmpty {
             let totalNodes = update.bulkNodeBatches.reduce(0) { $0 + $1.count }
-            print("DRAIN: galaxy=\(id) processing \(totalNodes) bulk nodes, sim.center=\(simulation3D.center), worldCenter=\(worldCenter)")
+            print("DRAIN: galaxy=\(id) processing \(totalNodes) bulk nodes, sim.center=\(simulation3D?.center ?? .zero), worldCenter=\(worldCenter)")
         }
         for batch in update.bulkNodeBatches {
             var nodes: [NodeData] = []
@@ -377,7 +371,7 @@ actor Galaxy: Identifiable {
         if update.finalize {
             recomputeDerivedData()
             store.bumpTopology()
-            if config.is3D { simulation3D.wake() }
+            if config.is3D { simulation3D?.wake() }
             isInitialLoad = false
             isLoaded = true
         }
@@ -509,7 +503,7 @@ actor Galaxy: Identifiable {
 
         // Notify mascot fleet before removing — capture position for absorb animation
         if let nodeData = store.allNodes[gid] {
-            let lastPos = simulation3D.positions[gid]
+            let lastPos = simulation3D?.positions[gid]
             mascotFleet?.onNodeDeleted(nodeId: gid, project: nodeData.project, lastPosition: lastPos)
         }
 
@@ -570,7 +564,7 @@ actor Galaxy: Identifiable {
             }
 
             if config.is3D {
-                simulation3D.addNode(gid, project: node.project, topic: node.topic)
+                simulation3D?.addNode(gid, project: node.project, topic: node.topic, galaxyId: self.id)
             }
 
             let nodeIds = store.visibleNodeIds
@@ -579,7 +573,7 @@ actor Galaxy: Identifiable {
                 guard nodeIds.contains(otherId),
                       !config.hiddenRelations.contains(edge.relation) else { continue }
                 if config.is3D {
-                    simulation3D.addEdge(from: edge.sourceId, to: edge.targetId)
+                    simulation3D?.addEdge(from: edge.sourceId, to: edge.targetId)
                 }
                 if !store.filteredEdgeIds.contains(edge.id) {
                     store.filteredEdgeIds.insert(edge.id)
@@ -700,7 +694,7 @@ actor Galaxy: Identifiable {
                 store.filteredEdgeIds.insert(data.id)
                 store.edges.append(data)
                 if config.is3D {
-                    simulation3D.addEdge(from: data.sourceId, to: data.targetId)
+                    simulation3D?.addEdge(from: data.sourceId, to: data.targetId)
                 }
                 addedVisibleEdge = true
             }
@@ -780,62 +774,6 @@ actor Galaxy: Identifiable {
             edgeCounts[edge.targetId, default: 0] += 1
         }
         store.edgeCountByNode = edgeCounts
-    }
-    
-    @MainActor
-    func loadExtractedNodes(nodes: [NodeData],
-                            intraProjectEdges: [EdgeData],
-                            sourcePositions: [UUID: SIMD3<Float>] = [:],
-                            config: DrainConfig) {
-        let store = renderStore
-        guard !nodes.isEmpty else { return }
-
-        #if ENGRAM_INSTRUMENTATION
-        let loadStart = CFAbsoluteTimeGetCurrent()
-        let preNodeCount = store.allNodes.count
-        let preSimCount = simulation3D.positions.count
-        #endif
-
-        // Copy intra-project edges into destination's allEdges/edgesByNode
-        // so insertNodeBatch can wire them into the force simulation
-        for edge in intraProjectEdges {
-            guard store.allEdges[edge.id] == nil else { continue }
-            store.allEdges[edge.id] = edge
-            store.edgesByNode[edge.sourceId, default: []].append(edge)
-            store.edgesByNode[edge.targetId, default: []].append(edge)
-        }
-
-        // insertNodeBatch calls addNode which randomizes positions
-        insertNodeBatch(nodes, config: config)
-
-        // Override with source positions so nodes start where they were and
-        // the force simulation pulls them toward the destination galaxy center
-        for (id, pos) in sourcePositions {
-            simulation3D.setPosition(id, to: pos)
-        }
-
-        // Always wake the sim after adding nodes — without this, the sim stays
-        // in its default state with decayed alpha and near-zero smoothedAttenuation,
-        // producing negligible force application even though isSettled gets cleared
-        // by hasPendingTopologyChanges on the first tick.
-        simulation3D.wake()
-
-        // Mark initial load complete so renderTick ticks this galaxy's sim.
-        // loadData (async) may not have finished yet for newly created galaxies,
-        // but migration has populated the sim — it must tick to animate.
-        isInitialLoad = false
-
-        // insertNodeBatch already maintains visibleNodeIds, nodeById, colorMap, hubs, edges.
-        // Only rebuild stats (relation counts, topic groups, edge counts).
-        recomputeStatsOnly()
-        store.bumpTopology()
-
-        #if ENGRAM_INSTRUMENTATION
-        let loadMs = (CFAbsoluteTimeGetCurrent() - loadStart) * 1000.0
-        let ts = String(format: "%.3f", CFAbsoluteTimeGetCurrent())
-        print("\(ts),load_into,\(nodes.first?.project ?? "?"),into_\(id),,\(id),\(nodes.count),\(intraProjectEdges.count),\(sourcePositions.count),\(String(format: "%.2f", loadMs))")
-        print("\(ts),load_into_counts,\(nodes.first?.project ?? "?"),into_\(id),pre_nodes=\(preNodeCount) post_nodes=\(store.allNodes.count) pre_sim=\(preSimCount) post_sim=\(simulation3D.positions.count),,,,")
-        #endif
     }
     
     @MainActor private func recomputeStatsOnly() {

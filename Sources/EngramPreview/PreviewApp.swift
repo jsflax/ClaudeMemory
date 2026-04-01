@@ -43,7 +43,7 @@ struct EngramPreviewApp: App {
 
 struct PreviewContentView: View {
     @State private var scene = EngramRealityScene()
-    @State private var mockProvider = MockGraphProvider()
+    @State private var mockProvider = MockGraphProvider.shared
     @State private var camera = CameraController()
     @State private var inputBridge = RKInputBridge()
     @State private var controlsVisible = true

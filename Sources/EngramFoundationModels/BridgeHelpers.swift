@@ -47,7 +47,7 @@ func mcpArgs(_ pairs: [(String, (any Sendable)?)]) -> [String: MCP.Value] {
 func extractText(from result: CallTool.Result) -> String {
     guard let first = result.content.first else { return "" }
     switch first {
-    case .text(let text):
+    case .text(let text, _, _):
         return text
     default:
         return ""

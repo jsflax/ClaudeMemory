@@ -89,6 +89,7 @@ struct ForceRoundtripTests {
             var chargeStrength: Float; var crossChargeMultiplier: Float
             var sameTopicChargeScale: Float; var sameProjectChargeScale: Float
             var cutoffSq: Float; var nodeCount: UInt32
+            var galaxyGroupCount: UInt32; var _pad: UInt32
         }
         let paramBuffer = device.makeBuffer(length: MemoryLayout<GPUForceParams>.stride, options: .storageModeShared)!
 
@@ -106,7 +107,8 @@ struct ForceRoundtripTests {
         paramBuffer.contents().bindMemory(to: GPUForceParams.self, capacity: 1).pointee = GPUForceParams(
             chargeStrength: 500, crossChargeMultiplier: 3.0,
             sameTopicChargeScale: 0.35, sameProjectChargeScale: 1.0,
-            cutoffSq: 500 * 500, nodeCount: UInt32(n))
+            cutoffSq: 500 * 500, nodeCount: UInt32(n),
+            galaxyGroupCount: 0, _pad: 0)
 
         // Encode into command buffer
         guard let cmdBuf = queue.makeCommandBuffer(),
@@ -159,6 +161,7 @@ struct ForceRoundtripTests {
             var chargeStrength: Float; var crossChargeMultiplier: Float
             var sameTopicChargeScale: Float; var sameProjectChargeScale: Float
             var cutoffSq: Float; var nodeCount: UInt32
+            var galaxyGroupCount: UInt32; var _pad: UInt32
         }
         let paramBuffer = device.makeBuffer(length: MemoryLayout<GPUForceParams>.stride, options: .storageModeShared)!
 
@@ -173,7 +176,8 @@ struct ForceRoundtripTests {
         paramBuffer.contents().bindMemory(to: GPUForceParams.self, capacity: 1).pointee = GPUForceParams(
             chargeStrength: 500, crossChargeMultiplier: 3.0,
             sameTopicChargeScale: 0.35, sameProjectChargeScale: 1.0,
-            cutoffSq: 500 * 500, nodeCount: UInt32(n))
+            cutoffSq: 500 * 500, nodeCount: UInt32(n),
+            galaxyGroupCount: 0, _pad: 0)
 
         guard let cmdBuf = queue.makeCommandBuffer(),
               let enc = cmdBuf.makeComputeCommandEncoder() else { return }
@@ -223,6 +227,7 @@ struct ForceRoundtripTests {
             var chargeStrength: Float; var crossChargeMultiplier: Float
             var sameTopicChargeScale: Float; var sameProjectChargeScale: Float
             var cutoffSq: Float; var nodeCount: UInt32
+            var galaxyGroupCount: UInt32; var _pad: UInt32
         }
         let paramBuffer = device.makeBuffer(length: MemoryLayout<GPUForceParams>.stride, options: .storageModeShared)!
 
@@ -237,7 +242,8 @@ struct ForceRoundtripTests {
         paramBuffer.contents().bindMemory(to: GPUForceParams.self, capacity: 1).pointee = GPUForceParams(
             chargeStrength: 500, crossChargeMultiplier: 3.0,
             sameTopicChargeScale: 0.35, sameProjectChargeScale: 1.0,
-            cutoffSq: 500 * 500, nodeCount: UInt32(n))
+            cutoffSq: 500 * 500, nodeCount: UInt32(n),
+            galaxyGroupCount: 0, _pad: 0)
 
         guard let cmdBuf = queue.makeCommandBuffer(),
               let enc = cmdBuf.makeComputeCommandEncoder() else { return }
@@ -414,12 +420,14 @@ struct ForceRoundtripTests {
             var chargeStrength: Float; var crossChargeMultiplier: Float
             var sameTopicChargeScale: Float; var sameProjectChargeScale: Float
             var cutoffSq: Float; var nodeCount: UInt32
+            var galaxyGroupCount: UInt32; var _pad: UInt32
         }
         let chargePBuf = device.makeBuffer(length: MemoryLayout<GPUForceParams>.stride, options: .storageModeShared)!
         chargePBuf.contents().bindMemory(to: GPUForceParams.self, capacity: 1).pointee = GPUForceParams(
             chargeStrength: 500, crossChargeMultiplier: 3.0,
             sameTopicChargeScale: 0.35, sameProjectChargeScale: 1.0,
-            cutoffSq: 500 * 500, nodeCount: UInt32(n))
+            cutoffSq: 500 * 500, nodeCount: UInt32(n),
+            galaxyGroupCount: 0, _pad: 0)
 
         // Sim params
         let simPBuf = device.makeBuffer(length: MemoryLayout<ForceSimParams>.stride, options: .storageModeShared)!
@@ -428,9 +436,9 @@ struct ForceRoundtripTests {
             cohesionStrength: 0.02, centroidRepulsion: 300,
             topicCohesionStrength: 0.01, topicCentroidRepulsion: 200,
             centerStrength: 0.8, center: .init(0, 0, 0), alpha: 0.5, damping: 0.78, maxSpeed: 12.0,
-            nodeCount: UInt32(n), edgeCount: UInt32(edges.count),
+            nodeCount: UInt32(n), edgeCount: UInt32(edges.count), crossProjectSpringScale: 1.0,
             projectGroupCount: UInt32(projectCount), topicGroupCount: UInt32(topicCount),
-            galaxyGroupCount: 2)
+            galaxyGroupCount: 2, topicLeashStrength: 0.01)
         let gtBuf = device.makeBuffer(length: MemoryLayout<UInt32>.stride, options: .storageModeShared)!
         let gcBuf = device.makeBuffer(length: MemoryLayout<UInt32>.stride, options: .storageModeShared)!
         let repBuf = device.makeBuffer(length: MemoryLayout<Float>.stride, options: .storageModeShared)!
@@ -838,7 +846,8 @@ struct ForceRoundtripTests {
             chargeStrength: 500, crossChargeMultiplier: 3.0,
             sameTopicChargeScale: 0.35, sameProjectChargeScale: 1.0,
             cutoffSq: 500 * 500, thetaSq: 0.7 * 0.7,
-            nodeCount: UInt32(n), treeNodeCount: UInt32(treeCount))
+            nodeCount: UInt32(n), treeNodeCount: UInt32(treeCount),
+            galaxyGroupCount: 0, _bhpad: 0)
 
         // Force buffers
         let bhForceBuf = device.makeBuffer(length: n * MemoryLayout<SIMD3<Float>>.stride, options: .storageModeShared)!
@@ -876,12 +885,14 @@ struct ForceRoundtripTests {
             var chargeStrength: Float; var crossChargeMultiplier: Float
             var sameTopicChargeScale: Float; var sameProjectChargeScale: Float
             var cutoffSq: Float; var nodeCount: UInt32
+            var galaxyGroupCount: UInt32; var _pad: UInt32
         }
         let bruteParamBuf = device.makeBuffer(length: MemoryLayout<GPUForceParams>.stride, options: .storageModeShared)!
         bruteParamBuf.contents().bindMemory(to: GPUForceParams.self, capacity: 1).pointee = GPUForceParams(
             chargeStrength: 500, crossChargeMultiplier: 3.0,
             sameTopicChargeScale: 0.35, sameProjectChargeScale: 1.0,
-            cutoffSq: 500 * 500, nodeCount: UInt32(n))
+            cutoffSq: 500 * 500, nodeCount: UInt32(n),
+            galaxyGroupCount: 0, _pad: 0)
 
         let bruteCmd = queue.makeCommandBuffer()!
         let bruteEnc = bruteCmd.makeComputeCommandEncoder()!
@@ -953,7 +964,8 @@ struct ForceRoundtripTests {
             chargeStrength: 500, crossChargeMultiplier: 3.0,
             sameTopicChargeScale: 0.35, sameProjectChargeScale: 1.0,
             cutoffSq: 500 * 500, thetaSq: 0.7 * 0.7,
-            nodeCount: UInt32(n), treeNodeCount: 0)
+            nodeCount: UInt32(n), treeNodeCount: 0,
+            galaxyGroupCount: 0, _bhpad: 0)
 
         let memBefore = getResidentMemoryMB()
         var totalMs: Double = 0
@@ -1096,8 +1108,8 @@ struct ForceRoundtripTests {
             cohesionStrength: 0.02, centroidRepulsion: 300,
             topicCohesionStrength: 0.01, topicCentroidRepulsion: 200,
             centerStrength: 0.8, center: .init(0, 0, 0), alpha: 0.5, damping: 0.78, maxSpeed: 12,
-            nodeCount: UInt32(n), edgeCount: UInt32(edges.count),
-            projectGroupCount: 8, topicGroupCount: 30, galaxyGroupCount: 2)
+            nodeCount: UInt32(n), edgeCount: UInt32(edges.count), crossProjectSpringScale: 1.0,
+            projectGroupCount: 8, topicGroupCount: 30, galaxyGroupCount: 2, topicLeashStrength: 0.01)
 
         // Semaphore to simulate triple buffering (like the app's frameSemaphore)
         let frameSemaphore = DispatchSemaphore(value: bufferCount)
@@ -1153,7 +1165,8 @@ struct ForceRoundtripTests {
                 chargeStrength: 500, crossChargeMultiplier: 3.0,
                 sameTopicChargeScale: 0.35, sameProjectChargeScale: 1.0,
                 cutoffSq: 500 * 500, thetaSq: 0.7 * 0.7,
-                nodeCount: UInt32(n), treeNodeCount: UInt32(treeCount))
+                nodeCount: UInt32(n), treeNodeCount: UInt32(treeCount),
+            galaxyGroupCount: 0, _bhpad: 0)
 
             // Encode GPU work — BH charge + springs (like the real command buffer)
             guard let cmdBuf = queue.makeCommandBuffer(),
@@ -1284,11 +1297,13 @@ struct ForceRoundtripTests {
             var chargeStrength: Float; var crossChargeMultiplier: Float
             var sameTopicChargeScale: Float; var sameProjectChargeScale: Float
             var cutoffSq: Float; var nodeCount: UInt32
+            var galaxyGroupCount: UInt32; var _pad: UInt32
         }
         paramBuf.contents().bindMemory(to: GPUForceParams.self, capacity: 1).pointee = GPUForceParams(
             chargeStrength: 500, crossChargeMultiplier: 3.0,
             sameTopicChargeScale: 0.35, sameProjectChargeScale: 1.0,
-            cutoffSq: 500 * 500, nodeCount: UInt32(n))
+            cutoffSq: 500 * 500, nodeCount: UInt32(n),
+            galaxyGroupCount: 0, _pad: 0)
 
         // Single in-flight: matches the gpuInFlight guard behavior.
         // Without this, frame N+1 memsets the force buffer while frame N's
@@ -1364,11 +1379,13 @@ struct ForceRoundtripTests {
             var chargeStrength: Float; var crossChargeMultiplier: Float
             var sameTopicChargeScale: Float; var sameProjectChargeScale: Float
             var cutoffSq: Float; var nodeCount: UInt32
+            var galaxyGroupCount: UInt32; var _pad: UInt32
         }
         paramBuf.contents().bindMemory(to: GPUForceParams.self, capacity: 1).pointee = GPUForceParams(
             chargeStrength: 500, crossChargeMultiplier: 3.0,
             sameTopicChargeScale: 0.35, sameProjectChargeScale: 1.0,
-            cutoffSq: 500 * 500, nodeCount: UInt32(n))
+            cutoffSq: 500 * 500, nodeCount: UInt32(n),
+            galaxyGroupCount: 0, _pad: 0)
 
         let gpuInFlight = OSAllocatedUnfairLock<Bool>(initialState: false)
         let frameSem = DispatchSemaphore(value: 3)
@@ -1544,7 +1561,8 @@ struct ForceRoundtripTests {
             chargeStrength: 500, crossChargeMultiplier: 3.0,
             sameTopicChargeScale: 0.35, sameProjectChargeScale: 1.0,
             cutoffSq: 500 * 500, thetaSq: 0.7 * 0.7,
-            nodeCount: UInt32(n), treeNodeCount: UInt32(treeCount))
+            nodeCount: UInt32(n), treeNodeCount: UInt32(treeCount),
+            galaxyGroupCount: 0, _bhpad: 0)
 
         let forceBuf = device.makeBuffer(length: n * MemoryLayout<SIMD3<Float>>.stride, options: .storageModeShared)!
         memset(forceBuf.contents(), 0, n * MemoryLayout<SIMD3<Float>>.stride)
@@ -1646,7 +1664,8 @@ struct ForceRoundtripTests {
             chargeStrength: 500, crossChargeMultiplier: 3.0,
             sameTopicChargeScale: 0.35, sameProjectChargeScale: 1.0,
             cutoffSq: 500 * 500, thetaSq: 0.7 * 0.7,
-            nodeCount: UInt32(n), treeNodeCount: UInt32(treeCount))
+            nodeCount: UInt32(n), treeNodeCount: UInt32(treeCount),
+            galaxyGroupCount: 0, _bhpad: 0)
 
         let forceBuf = device.makeBuffer(length: n * MemoryLayout<SIMD3<Float>>.stride, options: .storageModeShared)!
         memset(forceBuf.contents(), 0, n * MemoryLayout<SIMD3<Float>>.stride)

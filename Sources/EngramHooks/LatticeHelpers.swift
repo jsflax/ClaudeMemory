@@ -63,6 +63,126 @@ func getSessionState(sessionId: String?) -> SessionState? {
     return state
 }
 
+// MARK: - ANSI Colors
+
+private enum ANSIColor {
+    static let reset   = "\u{1B}[0m"
+    static let bold    = "\u{1B}[1m"
+    static let dim     = "\u{1B}[2m"
+    static let cyan    = "\u{1B}[36m"
+    static let magenta = "\u{1B}[35m"
+    static let green   = "\u{1B}[32m"
+    static let yellow  = "\u{1B}[33m"
+    static let red     = "\u{1B}[31m"
+    static let blue    = "\u{1B}[34m"
+}
+
+/// Color-code a distance value: green (<0.20), yellow (0.20-0.35), red (>0.35).
+private func colorDist(_ dist: String) -> String {
+    guard let d = Double(dist) else { return dist }
+    let color = d < 0.20 ? ANSIColor.green : d < 0.35 ? ANSIColor.yellow : ANSIColor.red
+    return "\(color)\(dist)\(ANSIColor.reset)"
+}
+
+// MARK: - Recall Logging
+
+/// Parse a directRecall result string and log a compact summary of each recalled memory.
+/// Format: one line per memory with id (short), project/topic, distance, and content preview.
+func logRecalledMemories(_ result: String, hook: String) {
+    // Each memory block starts with [id:UUID] [project/topic]
+    // Direct results: [id:UUID] [project/topic] (distance: 0.123...) content
+    // Connected results come after "--- Connected (graph traversal, depth: N) ---"
+
+    var directCount = 0
+    var connectedCount = 0
+    var inConnected = false
+    var lines: [String] = []
+
+    for block in result.components(separatedBy: "\n\n") {
+        let trimmed = block.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { continue }
+
+        if trimmed.hasPrefix("--- Connected") {
+            inConnected = true
+            continue
+        }
+        if trimmed.hasPrefix("⚠️ Weak recall") {
+            lines.append("  \(ANSIColor.yellow)\(ANSIColor.bold)⚠️  weak recall signal\(ANSIColor.reset)")
+            continue
+        }
+
+        // Parse [id:UUID] [project/topic] ...
+        guard trimmed.hasPrefix("[id:") else { continue }
+
+        // Extract short ID (first 8 chars of UUID)
+        let idEnd = trimmed.firstIndex(of: "]") ?? trimmed.startIndex
+        let idStr = String(trimmed[trimmed.index(trimmed.startIndex, offsetBy: 4)..<idEnd])
+        let shortId = String(idStr.prefix(8))
+
+        // Extract [project/topic]
+        let afterId = trimmed[trimmed.index(after: idEnd)...]
+        var projTopic = ""
+        if let ptStart = afterId.firstIndex(of: "["),
+           let ptEnd = afterId.firstIndex(of: "]") {
+            projTopic = String(afterId[afterId.index(after: ptStart)..<ptEnd])
+        }
+
+        // Extract distance if present
+        var dist = ""
+        if let distRange = trimmed.range(of: "distance: ") {
+            let distStart = distRange.upperBound
+            if let distEnd = trimmed[distStart...].firstIndex(where: { $0 == "," || $0 == ")" }) {
+                dist = String(trimmed[distStart..<distEnd])
+            }
+        }
+
+        // Extract edge info for connected memories
+        var edge = ""
+        if inConnected {
+            if let edgeRange = trimmed.range(of: "--[") {
+                let edgeStart = edgeRange.lowerBound
+                if let edgeEnd = trimmed[edgeStart...].range(of: "]--") {
+                    edge = " \(ANSIColor.blue)" + String(trimmed[edgeStart...edgeEnd.upperBound]) + ANSIColor.reset
+                }
+            }
+        }
+
+        // Content preview: everything after the metadata parenthetical
+        var preview = ""
+        // Find content after last ) that follows the metadata
+        if let lastParen = trimmed.range(of: ") ", options: .backwards) {
+            preview = String(trimmed[lastParen.upperBound...].prefix(60))
+                .replacingOccurrences(of: "\n", with: " ")
+        } else {
+            // Fallback: grab last portion
+            let parts = trimmed.split(separator: " ", maxSplits: 3)
+            if parts.count > 2 {
+                preview = String(parts.last?.prefix(60) ?? "")
+                    .replacingOccurrences(of: "\n", with: " ")
+            }
+        }
+
+        if inConnected {
+            connectedCount += 1
+        } else {
+            directCount += 1
+        }
+
+        let distLabel = dist.isEmpty ? "" : " \(colorDist(dist))"
+        let prefix = inConnected
+            ? "  \(ANSIColor.dim)├\(ANSIColor.reset) "
+            : "  \(ANSIColor.dim)•\(ANSIColor.reset) "
+        lines.append("\(prefix)\(ANSIColor.cyan)\(shortId)\(ANSIColor.reset) \(ANSIColor.magenta)[\(projTopic)]\(ANSIColor.reset)\(distLabel)\(edge) \(ANSIColor.dim)\(preview)\(ANSIColor.reset)")
+    }
+
+    if lines.isEmpty { return }
+
+    hookLog("\(ANSIColor.bold)\(hook): recalled \(directCount) direct + \(connectedCount) connected\(ANSIColor.reset)")
+    for line in lines {
+        hookLog(line)
+    }
+}
+
 // MARK: - Shared Nudges
 
 /// Returns the learning nudge for the given project (always fires).
