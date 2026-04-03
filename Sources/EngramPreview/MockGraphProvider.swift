@@ -16,6 +16,10 @@ final class MockGraphProvider: SceneDataProvider {
     private(set) var hubs: Set<UUID> = []
     private(set) var projectColorMap: [String: SIMD3<Float>] = [:]
     private(set) var positions: [UUID: SIMD3<Float>] = [:]
+    /// Cached flat position array — built from sim arrays, avoids 23K UUID dict lookups per frame.
+    private(set) var positionArray: [SIMD3<Float>] = []
+    /// Maps nodes[i].id → simulation index for O(1) position lookup.
+    private var nodeToSimIndex: [UUID: Int] = [:]
     var glowingNodes: [UUID: Float] = [:]
     var newNodeGlows: [UUID: Float] = [:]
     var dyingNodes: Set<UUID> = []
@@ -125,16 +129,11 @@ final class MockGraphProvider: SceneDataProvider {
 
     func tick(dt: Float) {
         let wallStart = instrumentationEnabled ? CFAbsoluteTimeGetCurrent() : 0
-        var forceMs: Double = 0
-        var lastCpuPrepMs: Double = 0
-        var lastGpuMs: Double = 0
-        var lastReadbackMs: Double = 0
-        var lastAlgorithm: String = ""
 
-        // Dispatch GPU forces if available
+        // Dispatch GPU forces asynchronously — never block main thread
         if let engine = forceEngine, let queue = commandQueue {
             let sim = simulation
-            if sim.shouldDispatchForces, sim.nodeCount > 1, engine.isFullSimAvailable, !engine.isInFlight {
+            if !sim.isSettled, sim.nodeCount > 1, engine.isFullSimAvailable, !engine.isInFlight {
                 let snapshot = ForceEngine.SimulationSnapshot(
                     nodeCount: sim.nodeCount, isSettled: sim.isSettled,
                     posX: sim.posX, posY: sim.posY, posZ: sim.posZ,
@@ -146,49 +145,19 @@ final class MockGraphProvider: SceneDataProvider {
                     sameTopicChargeScale: sim.sameTopicChargeScale, sameProjectChargeScale: sim.sameProjectChargeScale,
                     springLength: sim.springLength, crossProjectSpringLength: sim.crossProjectSpringLength,
                     springStrength: sim.springStrength,
-                    crossProjectSpringScale: sim.crossProjectSpringScale,
                     cohesionStrength: sim.cohesionStrength, centroidRepulsion: sim.centroidRepulsion,
                     topicCohesionStrength: sim.topicCohesionStrength, topicCentroidRepulsion: sim.topicCentroidRepulsion,
-                    topicLeashStrength: sim.topicLeashStrength,
-                    centerStrength: sim.centerStrength, center: sim.center,
+                    centerStrength: sim.centerStrength,
                     alpha: sim.alpha, damping: 0.78, maxSpeed: 12.0
                 )
+                sim.topologyDirtyForGPU = false
 
-                let forceStart = instrumentationEnabled ? CFAbsoluteTimeGetCurrent() : 0
-                let result = engine.encodeForcePassSync(queue: queue, snapshot: snapshot)
-                if instrumentationEnabled {
-                    forceMs = (CFAbsoluteTimeGetCurrent() - forceStart) * 1000
-                    if let r = result {
-                        lastCpuPrepMs = r.cpuPrepMs
-                        lastGpuMs = r.gpuMs
-                        lastReadbackMs = r.readbackMs
-                        lastAlgorithm = r.algorithm
-                    }
-                }
-
-                if let result {
-                    sim.topologyDirtyForGPU = false
+                engine.encodeForcePass(queue: queue, snapshot: snapshot) { [weak self] result in
                     sim.applyGPUForces(result)
-                }
-
-                // Diagnostic: log separation quality every 60 frames
-                if sim.framesSinceWake % 60 == 1 || sim.isSettled {
-                    var projSums: [Int: (sum: SIMD3<Float>, count: Int)] = [:]
-                    for i in 0..<sim.nodeCount {
-                        let pg = sim.projectGroupPublic[i]
-                        let pos = SIMD3<Float>(sim.posX[i], sim.posY[i], sim.posZ[i])
-                        let e = projSums[pg] ?? (.zero, 0)
-                        projSums[pg] = (e.sum + pos, e.count + 1)
+                    // Log separation quality periodically
+                    if sim.framesSinceWake % 60 == 1 || sim.isSettled {
+                        self?.logSeparation(sim: sim)
                     }
-                    let centroids = projSums.mapValues { $0.sum / Float($0.count) }
-                    var minSep: Float = .infinity
-                    let keys = Array(centroids.keys).sorted()
-                    for i in 0..<keys.count {
-                        for j in (i+1)..<keys.count {
-                            minSep = min(minSep, simd_length(centroids[keys[i]]! - centroids[keys[j]]!))
-                        }
-                    }
-                    print("[preview] frame=\(sim.framesSinceWake) alpha=\(String(format:"%.4f",sim.alpha)) maxSpeedSq=\(String(format:"%.2f",sim.lastMaxSpeedSq)) sep=\(String(format:"%.0f",minSep)) settled=\(sim.isSettled)")
                 }
             }
         }
@@ -196,20 +165,33 @@ final class MockGraphProvider: SceneDataProvider {
         // Tick the force simulation (integrates whatever forces are available)
         simulation.tick()
 
-        // Read positions back from simulation
+        // Positions: sim.syncPositions() already updates the dict internally.
+        // Just reference it — no copy needed (CoW means no allocation if unchanged).
         positions = simulation.positions
+
+        // Build positionArray from sim's flat arrays — O(n), no UUID hashing.
+        let px = simulation.posX, py = simulation.posY, pz = simulation.posZ
+        if nodeToSimIndex.isEmpty || nodeToSimIndex.count != nodes.count {
+            nodeToSimIndex.removeAll(keepingCapacity: true)
+            for (si, id) in simulation.nodeIds.enumerated() { nodeToSimIndex[id] = si }
+        }
+        let n = nodes.count
+        if positionArray.count != n { positionArray = [SIMD3<Float>](repeating: .zero, count: n) }
+        for i in 0..<n {
+            if let si = nodeToSimIndex[nodes[i].id], si < px.count {
+                positionArray[i] = SIMD3<Float>(px[si], py[si], pz[si])
+            }
+        }
 
         // Instrumentation: write per-frame CSV and check settlement
         if instrumentationEnabled {
             let wallMs = (CFAbsoluteTimeGetCurrent() - wallStart) * 1000
             let settled = simulation.isSettled
-            forceMsHistory.append(forceMs)
             wallMsHistory.append(wallMs)
             let minSep = computeMinProjSep()
             if let f = frameFile {
-                let line = String(format: "%d,%.2f,%.2f,%.2f,%.2f,%.2f,%@,%.4f,%.2f,%.1f,%d,%@\n",
-                                  frameIndex, wallMs, forceMs,
-                                  lastCpuPrepMs, lastGpuMs, lastReadbackMs, lastAlgorithm,
+                let line = String(format: "%d,%.2f,0,0,0,0,async,%.4f,%.2f,%.1f,%d,%@\n",
+                                  frameIndex, wallMs,
                                   simulation.alpha, simulation.lastMaxSpeedSq, minSep,
                                   simulation.nodeCount, settled ? "true" : "false")
                 fputs(line, f)
@@ -334,6 +316,7 @@ final class MockGraphProvider: SceneDataProvider {
         self.edges = newEdges
         self.hubs = newHubs
         self.nodeIds = ids
+        self.nodeToSimIndex.removeAll()  // force rebuild on next tick
         self.topologyVersion += 1
 
         // Feed into force simulation
@@ -666,6 +649,25 @@ final class MockGraphProvider: SceneDataProvider {
             sums[node.project] = (entry.sum + pos, entry.count + 1)
         }
         projectCentroids = sums.mapValues { $0.sum / Float($0.count) }
+    }
+
+    private func logSeparation(sim: ForceSimulation3D) {
+        var projSums: [Int: (sum: SIMD3<Float>, count: Int)] = [:]
+        for i in 0..<sim.nodeCount {
+            let pg = sim.projectGroupPublic[i]
+            let pos = SIMD3<Float>(sim.posX[i], sim.posY[i], sim.posZ[i])
+            let e = projSums[pg] ?? (.zero, 0)
+            projSums[pg] = (e.sum + pos, e.count + 1)
+        }
+        let centroids = projSums.mapValues { $0.sum / Float($0.count) }
+        var minSep: Float = .infinity
+        let keys = Array(centroids.keys).sorted()
+        for i in 0..<keys.count {
+            for j in (i+1)..<keys.count {
+                minSep = min(minSep, simd_length(centroids[keys[i]]! - centroids[keys[j]]!))
+            }
+        }
+        print("[preview] frame=\(sim.framesSinceWake) alpha=\(String(format:"%.4f",sim.alpha)) maxSpeedSq=\(String(format:"%.2f",sim.lastMaxSpeedSq)) sep=\(String(format:"%.0f",minSep)) settled=\(sim.isSettled)")
     }
 
     // MARK: - Instrumentation Helpers

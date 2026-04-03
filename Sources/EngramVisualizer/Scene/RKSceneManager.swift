@@ -116,7 +116,7 @@ final class RKSceneManager {
               let engine = forceEngine else { return }
 
         let sim = registry.unifiedSimulation
-        guard sim.shouldDispatchForces, sim.nodeCount > 1, engine.isFullSimAvailable, !engine.isInFlight else { return }
+        guard !sim.isSettled, sim.nodeCount > 1, engine.isFullSimAvailable, !engine.isInFlight else { return }
 
         let snapshot = ForceEngine.SimulationSnapshot(
             nodeCount: sim.nodeCount, isSettled: sim.isSettled,
@@ -129,16 +129,16 @@ final class RKSceneManager {
             sameTopicChargeScale: sim.sameTopicChargeScale, sameProjectChargeScale: sim.sameProjectChargeScale,
             springLength: sim.springLength, crossProjectSpringLength: sim.crossProjectSpringLength,
             springStrength: sim.springStrength,
-            crossProjectSpringScale: sim.crossProjectSpringScale,
             cohesionStrength: sim.cohesionStrength, centroidRepulsion: sim.centroidRepulsion,
             topicCohesionStrength: sim.topicCohesionStrength, topicCentroidRepulsion: sim.topicCentroidRepulsion,
-            topicLeashStrength: sim.topicLeashStrength,
-            centerStrength: sim.centerStrength, center: sim.center,
+            centerStrength: sim.centerStrength,
             alpha: sim.alpha, damping: 0.78, maxSpeed: 12.0
         )
+        sim.topologyDirtyForGPU = false
 
-        if let result = engine.encodeForcePassSync(queue: rkScene.commandQueue, snapshot: snapshot) {
-            sim.topologyDirtyForGPU = false
+        // Async dispatch — GPU runs force compute while CPU/renderer continue.
+        // Results applied next frame via completion handler. Never blocks main thread.
+        engine.encodeForcePass(queue: rkScene.commandQueue, snapshot: snapshot) { result in
             sim.applyGPUForces(result)
         }
     }
