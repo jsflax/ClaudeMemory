@@ -54,21 +54,19 @@ public final class ForceSimulation3D {
 
     public private(set) var positions: [UUID: SIMD3<Float>] = [:]
 
-    // Force parameters (restored from Metal-era tuning on main)
+    // Force parameters — exact match of JS reference (force-params.ts)
     public let springLength: Float = 240
     public let crossProjectSpringLength: Float = 400
     public let springStrength: Float = 0.0004
-    public let crossProjectSpringScale: Float = 1.0
     public let chargeStrength: Float = 500
     public let crossChargeMultiplier: Float = 3.0
     public let sameProjectChargeScale: Float = 1.0
-    public let sameTopicChargeScale: Float = 0.65
+    public let sameTopicChargeScale: Float = 0.35
     public let centerStrength: Float = 0.006
     public let cohesionStrength: Float = 0.0015
-    public let centroidRepulsion: Float = 5000
+    public let centroidRepulsion: Float = 2500
     public let topicCohesionStrength: Float = 0.009
-    public let topicCentroidRepulsion: Float = 7000
-    public let topicLeashStrength: Float = 0.01
+    public let topicCentroidRepulsion: Float = 3500
     private let damping: Float = 0.78
     private let maxSpeed: Float = 12.0
 
@@ -90,20 +88,11 @@ public final class ForceSimulation3D {
     public var center: SIMD3<Float> = .zero
     public var isActive: Bool = true
 
-    /// True when the simulation has converged (velocities near-zero for consecutive frames).
+    /// True when the simulation has converged (alpha-based, matches JS).
     /// When settled, tick() skips force dispatch and position sync to save CPU/GPU.
     public private(set) var isSettled = false
     private(set) var settledFrameCount = 0
     public private(set) var framesSinceWake = 0
-    /// Frames spent at alpha floor. After 60 frames at floor, GPU force dispatch should stop
-    /// to let velocities decay via damping (matches old maxPostAlphaDispatches behavior).
-    private var framesAtAlphaFloor = 0
-    private let maxPostAlphaDispatches = 60
-    /// False after alpha floor + maxPostAlphaDispatches frames. GPU callers should check this.
-    public var shouldDispatchForces: Bool { !isSettled && framesAtAlphaFloor < maxPostAlphaDispatches }
-    /// Minimum frames after wake() before settle is allowed. Prevents premature settling
-    /// when the first async force results haven't arrived yet.
-    private let settleGuardFrames = 30  // ~0.5s at 60fps
 
     /// Max speed² from the last tick. Used by the Timer to throttle visual updates
     /// when nodes are barely moving (convergence tail).
@@ -153,10 +142,6 @@ public final class ForceSimulation3D {
         isSettled = false
         settledFrameCount = 0
         framesSinceWake = 0
-        framesAtAlphaFloor = 0
-        // Reset alpha so center gravity and other alpha-scaled forces are meaningful.
-        // Without this, alpha decays to 0.01 after ~15s and never recovers — making
-        // migration animations crawl because center force is 100x weaker.
         alpha = 1.0
     }
 
@@ -459,61 +444,30 @@ public final class ForceSimulation3D {
         let tickStart = CFAbsoluteTimeGetCurrent()
         var maxSpeedSq: Float = 0
 
-        var totalKineticEnergy: Float = 0
         // GPU integration delivered positions via applyGPUForces().
         // Measure velocity for settle detection (from last GPU delivery).
         for i in 0..<n {
             let speedSq = vx[i] * vx[i] + vy[i] * vy[i] + vz[i] * vz[i]
             maxSpeedSq = max(maxSpeedSq, speedSq)
-            totalKineticEnergy += speedSq
         }
 
-        // Adaptive alpha decay — larger graphs converge structurally sooner because
-        // per-node forces are individually weaker (more spread out). Gentle ramp:
-        // 0.995 at <1K, 0.994 at 5K, 0.993 at 10K+. Avoids hitting the alpha floor
-        // too early (which leaves permanent residual structural forces).
-        let nScale = min(1.0, Float(n) / 10000.0)
-        let effectiveDecay = alphaDecay - 0.002 * nScale
-        alpha = max(alpha * effectiveDecay, alphaFloor)
-        if alpha <= alphaFloor { framesAtAlphaFloor += 1 }
+        // Alpha decay — constant 0.995, matching JS reference exactly
+        alpha = max(alpha * alphaDecay, alphaFloor)
         lastMaxSpeedSq = maxSpeedSq
         framesSinceWake += 1
 
-        // Settle detection — uses both max speed (strict) and mean kinetic energy
-        // (outlier-tolerant). At high node counts, one wiggling outlier shouldn't
-        // block settling when 99.9% of nodes are stationary.
-        let settleThreshold: Float = 0.05
-        let relaxedThreshold: Float = 1.0
-        let meanSpeedSq = totalKineticEnergy / max(Float(n), 1.0)
-        if alpha < 0.08 {
-            if maxSpeedSq < settleThreshold {
-                // All nodes barely moving
-                settledFrameCount += 1
-                if settledFrameCount >= 30 {
-                    isSettled = true
-                    syncPositions()
-                    return
-                }
-            } else if meanSpeedSq < 0.005 && maxSpeedSq < 5.0 {
-                // Mean energy negligible — a few outliers still moving but graph is stable
-                settledFrameCount += 1
-                if settledFrameCount >= 45 {
-                    isSettled = true
-                    syncPositions()
-                    return
-                }
-            } else if maxSpeedSq < relaxedThreshold {
-                // Low energy but not zero — structural force residuals.
-                // Force settle after 120 frames of sub-pixel motion.
-                settledFrameCount += 1
-                if settledFrameCount >= 120 {
-                    isSettled = true
-                    syncPositions()
-                    return
-                }
-            } else {
-                settledFrameCount = 0
+        // Settle detection — purely alpha-based, matching JS reference.
+        // When alpha reaches floor and stays for 30 frames, stop.
+        // Forces never fully equilibrate at 18K+ nodes, so velocity checks don't work.
+        if alpha <= alphaFloor + 0.001 {
+            settledFrameCount += 1
+            if settledFrameCount >= 30 {
+                isSettled = true
+                syncPositions()
+                return
             }
+        } else {
+            settledFrameCount = 0
         }
 
         syncPositions()
