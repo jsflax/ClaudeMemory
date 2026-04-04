@@ -70,6 +70,7 @@ public final class LabelBatchSystem {
 
         let nodes = dataProvider.nodes
         let positions = dataProvider.positions
+        let positionArray = dataProvider.positionArray
         let atlasRects = scene.labelAtlasGenerator.nodeRects
         let aspectCorrection = scene.labelAtlasGenerator.aspectCorrection
         let selectedNode = dataProvider.selectedNode
@@ -102,8 +103,8 @@ public final class LabelBatchSystem {
         var instanceIdx = 0
         for nodeIdx in visibleSet.visibleLabelIndices {
             let node = nodes[nodeIdx]
-            guard let pos = positions[node.id],
-                  let rect = atlasRects[node.id] else { continue }
+            guard let rect = atlasRects[node.id] else { continue }
+            let pos = nodeIdx < positionArray.count ? positionArray[nodeIdx] : (positions[node.id] ?? .zero)
 
             let anchor = pos * scaleFactor + SIMD3<Float>(0, 12.0, 0)
 

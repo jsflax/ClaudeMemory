@@ -80,6 +80,7 @@ public final class NodeBatchSystem {
 
         let nodes = dataProvider.nodes
         let positions = dataProvider.positions
+        let positionArray = dataProvider.positionArray
         let dyingNodes = dataProvider.dyingNodes
         let colorMap = dataProvider.projectColorMap
         let vps = scene.vertsPerSphere
@@ -106,7 +107,7 @@ public final class NodeBatchSystem {
 
         func writeNode(nodeIndex: Int) {
             let node = nodes[nodeIndex]
-            guard let pos = positions[node.id] else { return }
+            let pos = nodeIndex < positionArray.count ? positionArray[nodeIndex] : (positions[node.id] ?? .zero)
 
             let scaledPos = pos * scaleFactor
             var color = colorMap[node.project] ?? SIMD3<Float>(0.5, 0.5, 0.5)
@@ -209,6 +210,7 @@ public final class NodeBatchSystem {
 
         let nodes = dataProvider.nodes
         let positions = dataProvider.positions
+        let positionArray = dataProvider.positionArray
         let dyingNodes = dataProvider.dyingNodes
         let colorMap = dataProvider.projectColorMap
         let glowingNodes = dataProvider.glowingNodes
@@ -228,7 +230,7 @@ public final class NodeBatchSystem {
             func writeNode(nodeIndex: Int) {
                 guard instanceIdx < visibleCount, instanceIdx < transforms.count else { return }
                 let node = nodes[nodeIndex]
-                guard let pos = positions[node.id] else { return }
+                let pos = nodeIndex < positionArray.count ? positionArray[nodeIndex] : (positions[node.id] ?? .zero)
 
                 let scaledPos = pos * scaleFactor
                 let baseRadius: Float = node.isHub ? 12.0 : 8.0

@@ -24,6 +24,8 @@ public final class EdgeBatchSystem {
 
     /// Cached node→project mapping — rebuilt only on topology change.
     private var cachedNodeProject: [UUID: String] = [:]
+    /// Cached node UUID→positionArray index mapping — rebuilt only on topology change.
+    private var nodeIdToIndex: [UUID: Int] = [:]
     private var lastTopologyVersion: UInt64 = 0
 
     /// Precomputed sin/cos for 6-sided cylinder (same every frame).
@@ -80,14 +82,20 @@ public final class EdgeBatchSystem {
         let isSearchActive = dataProvider.isSearchActive
         let searchMatchIds = dataProvider.searchMatchIds
 
-        // Rebuild node→project cache only on topology change
+        // Rebuild node→project and node→index caches only on topology change
         let topoVersion = dataProvider.topologyVersion
         if topoVersion != lastTopologyVersion {
             lastTopologyVersion = topoVersion
             cachedNodeProject.removeAll(keepingCapacity: true)
-            for node in nodes { cachedNodeProject[node.id] = node.project }
+            nodeIdToIndex.removeAll(keepingCapacity: true)
+            for (i, node) in nodes.enumerated() {
+                cachedNodeProject[node.id] = node.project
+                nodeIdToIndex[node.id] = i
+            }
         }
         let nodeProject = cachedNodeProject
+        let positionArray = dataProvider.positionArray
+        let idToIndex = nodeIdToIndex
 
         let totalVerts = scene.edgeBatchCapacity * Self.vertsPerEdge
         if staging.count < totalVerts {
@@ -100,8 +108,16 @@ public final class EdgeBatchSystem {
         var instanceIdx = 0
         for edgeIdx in visibleSet.visibleEdgeIndices {
             let edge = edges[edgeIdx]
-            guard let srcPos = positions[edge.sourceId],
-                  let tgtPos = positions[edge.targetId] else { continue }
+            let srcPos: SIMD3<Float>
+            let tgtPos: SIMD3<Float>
+            if let si = idToIndex[edge.sourceId], si < positionArray.count,
+               let ti = idToIndex[edge.targetId], ti < positionArray.count {
+                srcPos = positionArray[si]
+                tgtPos = positionArray[ti]
+            } else {
+                guard let sp = positions[edge.sourceId], let tp = positions[edge.targetId] else { continue }
+                srcPos = sp; tgtPos = tp
+            }
 
             let src = srcPos * scaleFactor
             let tgt = tgtPos * scaleFactor
@@ -204,14 +220,20 @@ public final class EdgeBatchSystem {
         let isSearchActive = dataProvider.isSearchActive
         let searchMatchIds = dataProvider.searchMatchIds
 
-        // Rebuild node→project cache only on topology change
+        // Rebuild node→project and node→index caches only on topology change
         let topoVersion = dataProvider.topologyVersion
         if topoVersion != lastTopologyVersion {
             lastTopologyVersion = topoVersion
             cachedNodeProject.removeAll(keepingCapacity: true)
-            for node in nodes { cachedNodeProject[node.id] = node.project }
+            nodeIdToIndex.removeAll(keepingCapacity: true)
+            for (i, node) in nodes.enumerated() {
+                cachedNodeProject[node.id] = node.project
+                nodeIdToIndex[node.id] = i
+            }
         }
         let nodeProject = cachedNodeProject
+        let positionArray = dataProvider.positionArray
+        let idToIndex = nodeIdToIndex
 
         let texWidth = scene.edgeInstanceTextureWidth
         var texData = [SIMD4<Float16>](repeating: .zero, count: texWidth)
@@ -222,8 +244,16 @@ public final class EdgeBatchSystem {
             for edgeIdx in visibleSet.visibleEdgeIndices {
                 guard instanceIdx < visibleCount, instanceIdx < transforms.count else { break }
                 let edge = edges[edgeIdx]
-                guard let srcPos = positions[edge.sourceId],
-                      let tgtPos = positions[edge.targetId] else { continue }
+                let srcPos: SIMD3<Float>
+                let tgtPos: SIMD3<Float>
+                if let si = idToIndex[edge.sourceId], si < positionArray.count,
+                   let ti = idToIndex[edge.targetId], ti < positionArray.count {
+                    srcPos = positionArray[si]
+                    tgtPos = positionArray[ti]
+                } else {
+                    guard let sp = positions[edge.sourceId], let tp = positions[edge.targetId] else { continue }
+                    srcPos = sp; tgtPos = tp
+                }
 
                 let src = srcPos * scaleFactor
                 let tgt = tgtPos * scaleFactor
