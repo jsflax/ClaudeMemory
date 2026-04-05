@@ -55,6 +55,9 @@ public actor MemoryTools {
     /// For synced projects, returns a UNION ALL view spanning both local and synced DBs
     /// so we get local memories + cross-device data in one query.
     /// For local projects, returns localLattice directly.
+    /// Cached attached Lattice — created once, reused across recalls.
+    private var _attachedLattice: Lattice?
+
     package func readLattice(for project: String?) -> Lattice {
         log("[readLattice] enter, project=\(project ?? "nil"), syncedLattice=\(syncedLattice != nil)")
         guard let syncedLattice, let project else {
@@ -76,9 +79,15 @@ public actor MemoryTools {
             log("[readLattice] no config, isSynced=false")
         }
         log("[readLattice] about to return, isSynced=\(isSynced)")
-        let result = isSynced ? localLattice.attaching(lattice: syncedLattice) : localLattice
-        log("[readLattice] returning")
-        return result
+        if isSynced {
+            if _attachedLattice == nil {
+                _attachedLattice = localLattice.attaching(lattice: syncedLattice)
+            }
+            log("[readLattice] returning cached attached lattice")
+            return _attachedLattice!
+        }
+        log("[readLattice] returning localLattice")
+        return localLattice
     }
 
     /// Finds a memory by globalId, trying localLattice first then syncedLattice.
