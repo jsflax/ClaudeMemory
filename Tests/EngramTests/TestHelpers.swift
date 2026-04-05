@@ -9,7 +9,7 @@ extension Lattice: @retroactive @unchecked Sendable {}
 
 /// Helper to extract the text string from a CallTool.Result
 func text(from result: CallTool.Result) -> String {
-    guard case .text(let text) = result.content.first else {
+    guard case .text(let text, _, _) = result.content.first else {
         return ""
     }
     return text

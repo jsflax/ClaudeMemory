@@ -380,14 +380,18 @@ extension MemoryTools {
         let hasTemporalFilter = a.since != nil || a.before != nil
 
         log("[recall] START query=\"\(query.prefix(80))\", project=\(projectFilter ?? "nil"), topic=\(topicFilter ?? "nil"), limit=\(limit), depth=\(depth)")
+        sessionLog("[recall] START query=\"\(query.prefix(60))\"")
 
         // Build base query — route reads to the right DB based on project sync policy
+        sessionLog("[recall] readLattice...")
         let db = readLattice(for: projectFilter)
         log("[recall] DB selected")
+        sessionLog("[recall] DB selected")
         var results = db.objects(Memory.self)
             .distinct(by: \.__globalId)
             .where { $0.expiresAt > Date() }
         log("[recall] Base query built")
+        sessionLog("[recall] Base query built")
 
         // Topic is still a hard filter (it's a narrow constraint)
         if let topicFilter {
@@ -412,23 +416,29 @@ extension MemoryTools {
         // Embeddings are normalized so L2 and cosine give equivalent rankings.
         // FTS5 is only used as a degraded fallback when the embedding model is unavailable.
         log("[recall] Embedding query text...")
+        sessionLog("[recall] Embedding query text...")
         if let queryEmbedding = try await embedder.embed(text: query) {
             log("[recall] Embedding complete, dims=\(queryEmbedding.count)")
+            sessionLog("[recall] Embedding complete")
             // Soft project boost: fetch wider net, then re-rank
             let fetchLimit = projectFilter != nil ? limit * 3 : limit
             let embedding = Vector<Float>(queryEmbedding)
 
             log("[recall] Running nearest() with fetchLimit=\(fetchLimit)")
+            sessionLog("[recall] Running nearest() fetchLimit=\(fetchLimit)")
             let nearest = results
                 .nearest(to: embedding, on: \.embedding, limit: fetchLimit, distance: .l2)
             log("[recall] nearest() returned \(nearest.count) results")
+            sessionLog("[recall] nearest() returned \(nearest.count) results")
 
             if nearest.isEmpty {
                 log("[recall] No results, returning empty")
+                sessionLog("[recall] No results")
                 return CallTool.Result(content: [.text("No memories found.")], isError: false)
             }
 
             // Apply soft project boosting and reinforcement scoring on distances
+            sessionLog("[recall] Starting boosting loop (\(nearest.count) items)")
             let now = Date()
             let boosted: [(object: Memory, distance: Double)] = nearest.map { match in
                 let m = match.object
@@ -469,6 +479,7 @@ extension MemoryTools {
             }
 
             log("[recall] Boosting complete for \(boosted.count) results")
+            sessionLog("[recall] Boosting complete for \(boosted.count) results")
             // Re-sort by boosted distance and take top `limit`
             let sorted = boosted.sorted { $0.distance < $1.distance }
             let topResults = Array(sorted.prefix(limit))
@@ -486,13 +497,16 @@ extension MemoryTools {
             let threshold = max(min(p75 * 1.2, bestDistance * 3.0), 1e-9)
             let filtered = topResults.filter { $0.distance <= threshold }
             log("[recall] After outlier filter: \(filtered.count) results (threshold=\(String(format: "%.3f", threshold)))")
+            sessionLog("[recall] Outlier filter: \(filtered.count) results")
 
             // Bump lastAccessedAt and accessCount on recalled memories
+            sessionLog("[recall] Bumping access timestamps")
             let accessNow = Date()
             for match in filtered {
                 match.object.lastAccessedAt = accessNow
                 match.object.accessCount += 1
             }
+            sessionLog("[recall] Access timestamps bumped")
 
             let lines = filtered.compactMap { match -> String? in
                 let m = match.object
@@ -513,10 +527,12 @@ extension MemoryTools {
             }
 
             log("[recall] Output formatted, \(lines.count) lines")
+            sessionLog("[recall] Output formatted, \(lines.count) lines")
 
             // Graph traversal when depth > 0
             if depth > 0 {
                 log("[recall] Starting graph traversal, depth=\(depth)")
+                sessionLog("[recall] Starting graph traversal, depth=\(depth)")
                 let recalledGlobalIds = Set(filtered.compactMap { $0.object.__globalId })
                 // Filter during traversal so filtered-out nodes don't propagate to deeper depths.
                 // Structural edges (part_of, derived_from, supersedes) always pass through.
@@ -537,6 +553,7 @@ extension MemoryTools {
                     }
                 )
                 log("[recall] Graph traversal returned \(connected.count) connected memories")
+                sessionLog("[recall] Graph traversal returned \(connected.count) connected")
                 if !connected.isEmpty {
                     output += "\n\n--- Connected (graph traversal, depth: \(depth)) ---"
                     let connNow = Date()
@@ -573,6 +590,7 @@ extension MemoryTools {
             }
 
             log("[recall] DONE, returning \(output.count) chars")
+            sessionLog("[recall] DONE, returning \(output.count) chars")
             return CallTool.Result(content: [.text(output)], isError: false)
         } else {
             log("[recall] No embedding available, falling back to FTS5")
@@ -919,6 +937,38 @@ extension MemoryTools {
         lines.append(contentsOf: topicLines)
 
         return CallTool.Result(content: [.text(lines.joined(separator: "\n"))], isError: false)
+    }
+
+    // MARK: - vacuum
+
+    func handleVacuum() throws -> CallTool.Result {
+        localLattice.checkpoint()
+        localLattice._vacuumVec0(Memory(), for: \.embedding)
+        localLattice.vacuum()
+        if let synced = syncedLattice {
+            synced.checkpoint()
+            synced._vacuumVec0(Memory(), for: \.embedding)
+            synced.vacuum()
+        }
+        return CallTool.Result(content: [.text("Vacuum complete: WAL checkpointed, vector index rebuilt, database compacted.")], isError: false)
+    }
+
+    // MARK: - train_vectors
+
+    func handleTrainVectors() throws -> CallTool.Result {
+        localLattice._vacuumVec0(Memory(), for: \.embedding)
+        localLattice.checkpoint()
+        let localCount = localLattice.objects(Memory.self).count
+        var syncedCount = 0
+        if let synced = syncedLattice {
+            synced._vacuumVec0(Memory(), for: \.embedding)
+            synced.checkpoint()
+            syncedCount = synced.objects(Memory.self).count
+        }
+        let detail = syncedCount > 0
+            ? "local: \(localCount), synced: \(syncedCount)"
+            : "\(localCount) vectors"
+        return CallTool.Result(content: [.text("Vector index trained (\(detail)).")], isError: false)
     }
 
     // MARK: - list_topics

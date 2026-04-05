@@ -800,6 +800,34 @@ public actor MemoryTools {
                     "additionalProperties": .bool(false),
                 ])
             ),
+            Tool(
+                name: "vacuum",
+                description: """
+                    Run database maintenance: checkpoint the WAL, vacuum the vector index \
+                    to reclaim space from deleted entries, and compact the database. \
+                    Use periodically or after large batch deletes/consolidations.
+                    """,
+                inputSchema: .object([
+                    "type": .string("object"),
+                    "properties": .object([:]),
+                    "additionalProperties": .bool(false),
+                ])
+            ),
+            Tool(
+                name: "train_vectors",
+                description: """
+                    Build or rebuild the IVF vector search index. This trains k-means \
+                    centroids for fast approximate nearest neighbor search. Run once after \
+                    upgrading, or after large bulk inserts. Queries work without training \
+                    (brute-force fallback) but are slower. Training takes ~1-5 seconds \
+                    for 10K vectors.
+                    """,
+                inputSchema: .object([
+                    "type": .string("object"),
+                    "properties": .object([:]),
+                    "additionalProperties": .bool(false),
+                ])
+            ),
         ]
     }
 
@@ -864,6 +892,10 @@ public actor MemoryTools {
             return try await handleOrganize(params.arguments)
         case "consolidate":
             return try await handleConsolidate(params.arguments)
+        case "vacuum":
+            return try handleVacuum()
+        case "train_vectors":
+            return try handleTrainVectors()
         default:
             throw MCPError.invalidParams("Unknown tool: \(params.name)")
         }
