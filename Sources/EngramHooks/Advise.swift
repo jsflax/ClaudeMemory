@@ -33,41 +33,59 @@ struct Advise: AsyncParsableCommand {
 
         let project = projectName(from: input.cwd)
         let proj = project ?? "unknown"
+        let sid = input.sessionId
+        sessionLog("Advise: START sessionId=\(sid ?? "nil"), project=\(proj)", sessionId: sid)
         hookLog("Advise: project=\(proj), prompt=\(String(prompt.prefix(80)))...")
 
         var sections: [String] = []
 
         // Gate: classify whether this prompt is worth recalling memories for.
+        sessionLog("Advise: running recall gate", sessionId: sid)
         let gate = try? RecallGateClassifier()
         let shouldRecall = gate?.shouldRecall(query: prompt) ?? true
+        sessionLog("Advise: recall gate = \(shouldRecall ? "recall" : "skip")", sessionId: sid)
         hookLog("Advise: recall gate = \(shouldRecall ? "recall" : "skip")")
 
         // Recall relevant memories (only if gate says the prompt is topical)
-        if shouldRecall, let tools = await initMemoryTools() {
-            // Extract content words to focus the embedding on key concepts.
-            // Raw prose averages all concepts into a poor vector neighborhood.
-            let contentWords = MemoryTools.extractContentWords(from: prompt)
-            let recallQuery = contentWords.isEmpty ? prompt : contentWords.joined(separator: " ")
-            hookLog("Advise: running directRecall (query: \(String(recallQuery.prefix(80)))...)")
-            do {
-                if let result = try await tools.directRecall(
-                    query: recallQuery,
-                    project: project,
-                    depth: 1,
-                    limit: 5
-                ) {
-                    logRecalledMemories(result, hook: "Advise")
-                    sections.append("## Relevant memories\n\n\(result)")
-                } else {
-                    hookLog("Advise: recall returned nil")
+        if shouldRecall {
+            sessionLog("Advise: calling initMemoryTools", sessionId: sid)
+            currentSessionId = sid
+            if let tools = await initMemoryTools(sessionId: sid) {
+                // Extract content words to focus the embedding on key concepts.
+                // Raw prose averages all concepts into a poor vector neighborhood.
+                let contentWords = MemoryTools.extractContentWords(from: prompt)
+                let recallQuery = contentWords.isEmpty ? prompt : contentWords.joined(separator: " ")
+                sessionLog("Advise: calling directRecall (query: \(String(recallQuery.prefix(60)))...)", sessionId: sid)
+                hookLog("Advise: running directRecall (query: \(String(recallQuery.prefix(80)))...)")
+                do {
+                    if let result = try await tools.directRecall(
+                        query: recallQuery,
+                        project: project,
+                        depth: 1,
+                        limit: 5
+                    ) {
+                        sessionLog("Advise: directRecall returned \(result.count) chars", sessionId: sid)
+                        logRecalledMemories(result, hook: "Advise", sessionId: sid)
+                        sessionLog("Advise: logRecalledMemories done, recall log written", sessionId: sid)
+                        sections.append("## Relevant memories\n\n\(result)")
+                    } else {
+                        sessionLog("Advise: directRecall returned nil", sessionId: sid)
+                        hookLog("Advise: recall returned nil")
+                    }
+                } catch {
+                    sessionLog("Advise: directRecall FAILED: \(error)", sessionId: sid)
+                    hookLog("Advise: recall failed: \(error)")
                 }
-            } catch {
-                hookLog("Advise: recall failed: \(error)")
+            } else {
+                sessionLog("Advise: initMemoryTools returned nil", sessionId: sid)
+                hookLog("Advise: failed to initialize memory tools")
             }
-        } else if !shouldRecall {
-            hookLog("Advise: skipped recall (conversational filler)")
         } else {
-            hookLog("Advise: failed to initialize memory tools")
+            hookLog("Advise: skipped recall (conversational filler)")
+            // Write skip indicator so statusline shows current state
+            if let sid, !sid.isEmpty {
+                writeSessionRecallSkip(sessionId: sid)
+            }
         }
 
         // Spawn maintenance subprocess if threshold crossed (fire-and-forget)

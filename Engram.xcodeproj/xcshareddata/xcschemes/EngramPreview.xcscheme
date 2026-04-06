@@ -54,7 +54,7 @@
          <EnvironmentVariable
             key = "PREVIEW_USE_LATTICE"
             value = "1"
-            isEnabled = "NO">
+            isEnabled = "YES">
          </EnvironmentVariable>
          <EnvironmentVariable
             key = "PREVIEW_INSTRUMENTATION"
@@ -64,6 +64,11 @@
          <EnvironmentVariable
             key = "PREVIEW_NODE_COUNT"
             value = "20000"
+            isEnabled = "YES">
+         </EnvironmentVariable>
+         <EnvironmentVariable
+            key = "METAL_PERFORMANCE_PER_FRAME_SIGNPOSTS"
+            value = "1"
             isEnabled = "YES">
          </EnvironmentVariable>
       </EnvironmentVariables>

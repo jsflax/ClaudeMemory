@@ -40,7 +40,7 @@ struct BHChargeGuardTests {
                 springLength: 240, crossProjectSpringLength: 400, springStrength: 0.0004,
                 cohesionStrength: 0.0015, centroidRepulsion: 2500,
                 topicCohesionStrength: 0.009, topicCentroidRepulsion: 3500,
-                centerStrength: 0.006, center: .zero,
+                centerStrength: 0.006,
                 alpha: 1.0, damping: 0.78, maxSpeed: 12.0
             )
 

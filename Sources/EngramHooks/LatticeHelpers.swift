@@ -13,15 +13,33 @@ func openLattice() -> Lattice? {
 }
 
 /// Initialize MemoryTools (Lattice + embedding model).
-func initMemoryTools() async -> MemoryTools? {
+func initMemoryTools(sessionId: String? = nil) async -> MemoryTools? {
+    sessionLog("initMemoryTools: opening lattice at \(defaultDbPath)", sessionId: sessionId)
     guard let lattice = openLattice() else {
+        sessionLog("initMemoryTools: FAILED — no database at \(defaultDbPath)", sessionId: sessionId)
         hookLog("No memory database at \(defaultDbPath)")
         return nil
     }
+    sessionLog("initMemoryTools: lattice opened", sessionId: sessionId)
+
+    // Per-session Lattice debug logging
+    if let sid = sessionId, !sid.isEmpty {
+        let logPath = memoryLogsDir + "/lattice-\(sid).log"
+        let logURL = URL(fileURLWithPath: logPath)
+        let fm = FileManager.default
+        if !fm.fileExists(atPath: memoryLogsDir) {
+            try? fm.createDirectory(atPath: memoryLogsDir, withIntermediateDirectories: true)
+        }
+        Lattice.setLogLevel(.debug)
+        Lattice.setLogFile(logURL)
+        sessionLog("initMemoryTools: lattice debug logging → \(logPath)", sessionId: sessionId)
+    }
 
     let modelPath = ProcessInfo.processInfo.environment["CLAUDE_MEMORY_MODEL"]
+    sessionLog("initMemoryTools: loading embedder (modelPath=\(modelPath ?? "bundled"))", sessionId: sessionId)
     let embedder = EmbeddingService(modelPath: modelPath)
     await embedder.load()
+    sessionLog("initMemoryTools: embedder loaded", sessionId: sessionId)
 
     return MemoryTools(localRef: lattice.sendableReference, syncedRef: nil, embedder: embedder)
 }
@@ -63,6 +81,8 @@ func getSessionState(sessionId: String?) -> SessionState? {
     return state
 }
 
+// MARK: - Per-Session Debug Log (wrapper that uses sessionId param over global)
+
 // MARK: - ANSI Colors
 
 private enum ANSIColor {
@@ -86,9 +106,13 @@ private func colorDist(_ dist: String) -> String {
 
 // MARK: - Recall Logging
 
+/// Path to the per-session recall log for the statusline.
+private let memoryLogsDir = NSHomeDirectory() + "/.claude/memory-logs"
+
 /// Parse a directRecall result string and log a compact summary of each recalled memory.
 /// Format: one line per memory with id (short), project/topic, distance, and content preview.
-func logRecalledMemories(_ result: String, hook: String) {
+/// When sessionId is provided, also writes a statusline-optimized version to the session recall log.
+func logRecalledMemories(_ result: String, hook: String, sessionId: String? = nil) {
     // Each memory block starts with [id:UUID] [project/topic]
     // Direct results: [id:UUID] [project/topic] (distance: 0.123...) content
     // Connected results come after "--- Connected (graph traversal, depth: N) ---"
@@ -97,6 +121,7 @@ func logRecalledMemories(_ result: String, hook: String) {
     var connectedCount = 0
     var inConnected = false
     var lines: [String] = []
+    var statusLines: [String] = []
 
     for block in result.components(separatedBy: "\n\n") {
         let trimmed = block.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -108,6 +133,7 @@ func logRecalledMemories(_ result: String, hook: String) {
         }
         if trimmed.hasPrefix("⚠️ Weak recall") {
             lines.append("  \(ANSIColor.yellow)\(ANSIColor.bold)⚠️  weak recall signal\(ANSIColor.reset)")
+            statusLines.append("  \(ANSIColor.yellow)\(ANSIColor.bold)⚠️  weak recall\(ANSIColor.reset)")
             continue
         }
 
@@ -138,11 +164,28 @@ func logRecalledMemories(_ result: String, hook: String) {
 
         // Extract edge info for connected memories
         var edge = ""
+        var statusEdge = ""
         if inConnected {
             if let edgeRange = trimmed.range(of: "--[") {
                 let edgeStart = edgeRange.lowerBound
                 if let edgeEnd = trimmed[edgeStart...].range(of: "]--") {
-                    edge = " \(ANSIColor.blue)" + String(trimmed[edgeStart...edgeEnd.upperBound]) + ANSIColor.reset
+                    let fullEdge = String(trimmed[edgeStart...edgeEnd.upperBound])
+                    edge = " \(ANSIColor.blue)" + fullEdge + ANSIColor.reset
+
+                    // Statusline: extract edge type and direction, plus target short ID
+                    let edgeType = String(fullEdge.drop(while: { $0 != "[" }).dropFirst()
+                        .prefix(while: { $0 != "]" }))
+                    let isOutgoing = fullEdge.hasSuffix(">")
+
+                    // Extract target short ID from content after edge
+                    var targetShortId = ""
+                    if let targetIdRange = trimmed.range(of: "[id:", range: edgeEnd.upperBound..<trimmed.endIndex) {
+                        let tidStart = targetIdRange.upperBound
+                        targetShortId = String(trimmed[tidStart...].prefix(8))
+                    }
+
+                    let arrow = isOutgoing ? "→" : "←"
+                    statusEdge = " \(ANSIColor.blue)\(edgeType) \(arrow)\(targetShortId.isEmpty ? "" : " \(targetShortId)")\(ANSIColor.reset)"
                 }
             }
         }
@@ -168,18 +211,101 @@ func logRecalledMemories(_ result: String, hook: String) {
             directCount += 1
         }
 
+        // Hook log line (verbose)
         let distLabel = dist.isEmpty ? "" : " \(colorDist(dist))"
         let prefix = inConnected
             ? "  \(ANSIColor.dim)├\(ANSIColor.reset) "
             : "  \(ANSIColor.dim)•\(ANSIColor.reset) "
         lines.append("\(prefix)\(ANSIColor.cyan)\(shortId)\(ANSIColor.reset) \(ANSIColor.magenta)[\(projTopic)]\(ANSIColor.reset)\(distLabel)\(edge) \(ANSIColor.dim)\(preview)\(ANSIColor.reset)")
+
+        // Statusline log line (compact)
+        let shortDist = dist.isEmpty ? "" : {
+            // ".22" instead of "0.216"
+            if let d = Double(dist) {
+                return " \(colorDist(String(format: ".%02d", Int(d * 100))))"
+            }
+            return " \(colorDist(dist))"
+        }()
+        let statusPrefix = inConnected
+            ? "  \(ANSIColor.dim)├\(ANSIColor.reset) "
+            : "  \(ANSIColor.dim)•\(ANSIColor.reset) "
+        let statusContent = inConnected
+            ? statusEdge
+            : "\(shortDist) \(ANSIColor.dim)\(String(preview.prefix(50)))\(ANSIColor.reset)"
+        statusLines.append("\(statusPrefix)\(ANSIColor.cyan)\(shortId)\(ANSIColor.reset) \(ANSIColor.magenta)[\(projTopic)]\(ANSIColor.reset)\(statusContent)")
     }
 
     if lines.isEmpty { return }
 
+    // Write to hooks.log (verbose format)
     hookLog("\(ANSIColor.bold)\(hook): recalled \(directCount) direct + \(connectedCount) connected\(ANSIColor.reset)")
     for line in lines {
         hookLog(line)
+    }
+
+    // Write to session recall log (statusline format)
+    if let sessionId, !sessionId.isEmpty {
+        writeSessionRecallLog(
+            sessionId: sessionId,
+            directCount: directCount,
+            connectedCount: connectedCount,
+            lines: statusLines
+        )
+    }
+}
+
+/// Write the statusline-optimized recall log for this session (overwrites on each recall).
+private func writeSessionRecallLog(sessionId: String, directCount: Int, connectedCount: Int, lines: [String]) {
+    sessionLog("writeSessionRecallLog: dir=\(memoryLogsDir), sessionId=\(sessionId), \(directCount)+\(connectedCount) entries", sessionId: sessionId)
+    let fm = FileManager.default
+    if !fm.fileExists(atPath: memoryLogsDir) {
+        sessionLog("writeSessionRecallLog: creating directory", sessionId: sessionId)
+        try? fm.createDirectory(atPath: memoryLogsDir, withIntermediateDirectories: true)
+    }
+    let path = memoryLogsDir + "/recall-\(sessionId).log"
+    var content = "\(directCount)+\(connectedCount) recalled\n"
+    for line in lines {
+        content += line + "\n"
+    }
+    do {
+        try content.write(toFile: path, atomically: true, encoding: .utf8)
+        sessionLog("writeSessionRecallLog: wrote \(content.count) bytes to \(path)", sessionId: sessionId)
+    } catch {
+        sessionLog("writeSessionRecallLog: FAILED: \(error)", sessionId: sessionId)
+        hookLog("Failed to write session recall log: \(error)")
+    }
+}
+
+/// Write a skip indicator to the recall log (keeps previous recall visible, adds skip note).
+func writeSessionRecallSkip(sessionId: String) {
+    let path = memoryLogsDir + "/recall-\(sessionId).log"
+    // If a recall log already exists, don't overwrite it — the previous recall is still useful.
+    // Only write the skip file if there's nothing to show yet.
+    if FileManager.default.fileExists(atPath: path) { return }
+    let fm = FileManager.default
+    if !fm.fileExists(atPath: memoryLogsDir) {
+        try? fm.createDirectory(atPath: memoryLogsDir, withIntermediateDirectories: true)
+    }
+    let dim = "\u{1B}[2m"
+    let rst = "\u{1B}[0m"
+    let content = "\(dim)recall skipped (conversational filler)\(rst)\n"
+    try? content.write(toFile: path, atomically: true, encoding: .utf8)
+}
+
+/// Delete session logs only if they're older than 5 minutes (avoids race with mid-session reconnects).
+func cleanupSessionLogs(sessionId: String) {
+    let fm = FileManager.default
+    let paths = [
+        memoryLogsDir + "/recall-\(sessionId).log",
+        memoryLogsDir + "/debug-\(sessionId).log",
+        memoryLogsDir + "/lattice-\(sessionId).log",
+    ]
+    let staleThreshold: TimeInterval = 300 // 5 minutes
+    for path in paths {
+        guard let attrs = try? fm.attributesOfItem(atPath: path),
+              let modified = attrs[.modificationDate] as? Date,
+              Date().timeIntervalSince(modified) > staleThreshold else { continue }
+        try? fm.removeItem(atPath: path)
     }
 }
 

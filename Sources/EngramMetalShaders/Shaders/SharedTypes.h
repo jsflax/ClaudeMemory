@@ -324,42 +324,46 @@ struct LabelPackParams {
 
 // MARK: - GPU Force Simulation
 
-// Per-node data for GPU force computation (spring + cohesion + center).
+// Per-node data for GPU force computation.
 struct ForceNodeFull {
     float px, py, pz;          // position
-    float vx, vy, vz;          // velocity
+    float vx, vy, vz;          // velocity (unused by new kernels, kept for layout compat)
     int   projectGroup;
     int   topicGroup;
     int   galaxyGroup;         // galaxy index for per-galaxy center force + cross-galaxy spring skip
     int   _pad;
 };
 
-// Parameters for GPU force simulation kernels.
-struct ForceSimParams {
+// Parameters for brute-force O(n²) charge kernel (matches JS force-charge.wgsl).
+struct ChargeParams {
+    unsigned int nodeCount;
+    float        chargeStrength;
+    float        crossChargeMultiplier;
+    float        sameProjectChargeScale;
+    float        sameTopicChargeScale;
+    float        cutoffSq;
+    float        _pad0;
+    float        _pad1;
+};
+
+// Parameters for spring + structural forces kernel (matches JS force-spring.wgsl).
+struct SpringParams {
+    unsigned int nodeCount;
+    unsigned int edgeCount;
+    float        alpha;
     float        springLength;
     float        crossProjectSpringLength;
     float        springStrength;
-    float        cohesionStrength;
-    float        centroidRepulsion;
-    float        topicCohesionStrength;
-    float        topicCentroidRepulsion;
     float        centerStrength;
-    simd_float3  center;
-    float        alpha;
-    float        damping;
-    float        maxSpeed;
-    unsigned int nodeCount;
-    unsigned int edgeCount;
-    unsigned int projectGroupCount;
-    unsigned int topicGroupCount;
-    unsigned int galaxyGroupCount;
-    float        topicLeashStrength;       // leash force preventing topic drift from project centroid
-};
-
-// Per-group centroid for GPU force computation.
-struct GroupCentroid {
-    float sumX, sumY, sumZ;
-    int   count;
+    float        cohesionStrength;
+    float        topicCohesionStrength;
+    float        centroidRepulsion;
+    float        topicCentroidRepulsion;
+    unsigned int numProjects;
+    unsigned int numTopics;
+    float        minRefRadius;
+    unsigned int numGalaxies;
+    float        _pad0;
 };
 
 // Barnes-Hut octree node for GPU charge computation (O(n log n)).
@@ -372,18 +376,6 @@ struct BHOctreeNode {
     int   children[8];          // child indices (-1 = empty)
     int   bodyIndex;            // >= 0: leaf with single body; -1: internal node
     int   _pad;
-};
-
-// Parameters for brute-force O(n²) charge kernel.
-struct ForceParams {
-    float chargeStrength;
-    float crossChargeMultiplier;
-    float sameTopicChargeScale;
-    float sameProjectChargeScale;
-    float cutoffSq;
-    unsigned int nodeCount;
-    unsigned int galaxyGroupCount;
-    unsigned int _pad;
 };
 
 // Parameters for Barnes-Hut charge kernel.

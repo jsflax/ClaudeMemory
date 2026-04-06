@@ -305,5 +305,18 @@ do {
     exit(1)
 }
 
+// Exit if orphaned (parent died, ppid becomes 1).
+// Blocking SQLite calls can prevent the stdin EOF reader from running,
+// so this is a safety net to avoid zombie processes.
+Task.detached {
+    while true {
+        try await Task.sleep(for: .seconds(5))
+        if getppid() == 1 {
+            log("Orphaned (ppid=1), exiting")
+            exit(0)
+        }
+    }
+}
+
 // Keep alive
 await server.waitUntilCompleted()

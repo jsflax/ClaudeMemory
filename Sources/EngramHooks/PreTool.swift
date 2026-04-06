@@ -47,8 +47,12 @@ struct PreTool: AsyncParsableCommand {
             } else if let query = input.toolInput?.string(forKey: "description")
                         ?? input.toolInput?.string(forKey: "prompt"),
                       !query.isEmpty {
+                let sid = input.sessionId
+                sessionLog("PreTool: recalling for \(subagentType ?? "unknown") agent", sessionId: sid)
                 hookLog("PreTool: recalling for \(subagentType ?? "unknown") agent, query=\(String(query.prefix(80)))...")
-                if let tools = await initMemoryTools() {
+                currentSessionId = sid
+                if let tools = await initMemoryTools(sessionId: sid) {
+                    sessionLog("PreTool: calling directRecall", sessionId: sid)
                     do {
                         if let result = try await tools.directRecall(
                             query: query,
@@ -56,15 +60,19 @@ struct PreTool: AsyncParsableCommand {
                             depth: 1,
                             limit: 5
                         ) {
-                            logRecalledMemories(result, hook: "PreTool")
+                            sessionLog("PreTool: directRecall returned \(result.count) chars", sessionId: sid)
+                            logRecalledMemories(result, hook: "PreTool", sessionId: sid)
                             sections.append("## Project context\n\n\(result)")
                         } else {
+                            sessionLog("PreTool: directRecall returned nil", sessionId: sid)
                             hookLog("PreTool: recall returned nil")
                         }
                     } catch {
+                        sessionLog("PreTool: directRecall FAILED: \(error)", sessionId: sid)
                         hookLog("PreTool: recall failed: \(error)")
                     }
                 } else {
+                    sessionLog("PreTool: initMemoryTools returned nil", sessionId: sid)
                     hookLog("PreTool: failed to initialize memory tools")
                 }
             }

@@ -4,8 +4,11 @@ using namespace metal;
 #include "../../CEngramSceneTypes/include/SharedTypes.h"
 
 /// GPU kernel: apply accumulated forces to positions and velocities.
-/// Runs after force compute, before node/edge packing.
-/// One thread per node — no shared memory, no atomics.
+/// Matches JS force-integrate.wgsl exactly:
+///   vel = (vel + force) * damping;
+///   if (length(vel) > maxSpeed) vel *= maxSpeed / length(vel);
+///   pos += vel;
+/// Alpha is NOT used in integration (only in center gravity, which is in the spring kernel).
 kernel void integrate_positions(
     device float3*            positions  [[buffer(0)]],
     device float3*            velocities [[buffer(1)]],

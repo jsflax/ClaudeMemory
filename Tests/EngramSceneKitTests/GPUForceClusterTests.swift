@@ -122,7 +122,10 @@ struct GPUForceClusterTests {
             nodeCount: sim.nodeCount,
             projectGroups: sim.projectGroupPublic,
             topicGroups: sim.topicGroupPublic,
-            topicProjectGroup: sim.topicProjectGroupPublic
+            topicProjectGroup: sim.topicProjectGroupPublic,
+            galaxyGroups: sim.galaxyGroupPublic,
+            galaxyCenters: sim.galaxyCentersPublic,
+            x: sim.posX, y: sim.posY, z: sim.posZ
         )
 
         // Run simulation synchronously with GPU forces
@@ -149,23 +152,20 @@ struct GPUForceClusterTests {
                 springLength: sim.springLength,
                 crossProjectSpringLength: overrides.crossProjectSpringLength ?? sim.crossProjectSpringLength,
                 springStrength: overrides.springStrength ?? sim.springStrength,
-                crossProjectSpringScale: sim.crossProjectSpringScale,
                 cohesionStrength: overrides.cohesionStrength ?? sim.cohesionStrength,
                 centroidRepulsion: overrides.centroidRepulsion ?? sim.centroidRepulsion,
                 topicCohesionStrength: overrides.topicCohesionStrength ?? sim.topicCohesionStrength,
                 topicCentroidRepulsion: overrides.topicCentroidRepulsion ?? sim.topicCentroidRepulsion,
                 centerStrength: sim.centerStrength,
-                center: sim.center,
                 alpha: sim.alpha, damping: 0.78, maxSpeed: 12.0
             )
 
             // GPU integration
             if let forceBuf = forceCompute.outputForceBuffer {
                 simState.uploadPositions(x: sim.posX, y: sim.posY, z: sim.posZ)
-                simState.alpha = sim.alpha
                 simState.encodeIntegration(
                     encoder: encoder, forceBuffer: forceBuf,
-                    damping: 0.78, maxSpeed: 12.0, alpha: sim.alpha
+                    damping: 0.78, maxSpeed: 12.0
                 )
             }
             encoder.endEncoding()
@@ -407,7 +407,11 @@ struct GPUForceClusterTests {
         sim.wake()
 
         forceCompute.setTopologyDirty(edges: sim.edgeIndicesPublic)
-        forceCompute.rebuildTopology(nodeCount: sim.nodeCount, projectGroups: sim.projectGroupPublic, topicGroups: sim.topicGroupPublic, topicProjectGroup: sim.topicProjectGroupPublic)
+        forceCompute.rebuildTopology(
+            nodeCount: sim.nodeCount, projectGroups: sim.projectGroupPublic,
+            topicGroups: sim.topicGroupPublic, topicProjectGroup: sim.topicProjectGroupPublic,
+            galaxyGroups: sim.galaxyGroupPublic, galaxyCenters: sim.galaxyCentersPublic,
+            x: sim.posX, y: sim.posY, z: sim.posZ)
 
         // Run simulation: GPU force compute + CPU integration (no GPU integration kernel)
         var frames = 0
@@ -422,14 +426,14 @@ struct GPUForceClusterTests {
                 encoder: encoder,
                 x: sim.posX, y: sim.posY, z: sim.posZ,
                 projectGroups: sim.projectGroupPublic, topicGroups: sim.topicGroupPublic,
+                galaxyGroups: sim.galaxyGroupPublic, galaxyCenters: sim.galaxyCentersPublic,
                 chargeStrength: sim.chargeStrength, crossChargeMultiplier: sim.crossChargeMultiplier,
                 sameTopicChargeScale: sim.sameTopicChargeScale, sameProjectChargeScale: sim.sameProjectChargeScale,
                 springLength: sim.springLength, crossProjectSpringLength: sim.crossProjectSpringLength,
                 springStrength: sim.springStrength,
-                crossProjectSpringScale: sim.crossProjectSpringScale,
                 cohesionStrength: sim.cohesionStrength, centroidRepulsion: sim.centroidRepulsion,
                 topicCohesionStrength: sim.topicCohesionStrength, topicCentroidRepulsion: sim.topicCentroidRepulsion,
-                centerStrength: sim.centerStrength, center: sim.center,
+                centerStrength: sim.centerStrength,
                 alpha: sim.alpha, damping: 0.78, maxSpeed: 12.0
             )
             // NO GPU integration — just force compute
