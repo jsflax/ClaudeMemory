@@ -117,9 +117,20 @@ enum CLIInstaller {
         let launchAgentsDir = NSHomeDirectory() + "/Library/LaunchAgents"
         try? fm.createDirectory(atPath: launchAgentsDir, withIntermediateDirectories: true)
 
+        // Propagate the user's configured endpoint to the daemon. Without
+        // --endpoint the daemon fell back to its hardcoded default, so a
+        // non-default endpoint set in the UI never reached sync (auth went to
+        // one host, relay to another). Only pass it when it differs from the
+        // daemon's own default, to keep the common case argument-free.
+        var args = [daemonBinary]
+        let configured = UserDefaults.standard.string(forKey: "sync_endpoint")
+        if let configured, !configured.isEmpty, configured != "https://engramdb.io" {
+            args += ["--endpoint", configured]
+        }
+
         let plist: [String: Any] = [
             "Label": daemonLabel,
-            "ProgramArguments": [daemonBinary],
+            "ProgramArguments": args,
             "KeepAlive": ["SuccessfulExit": false],
             "ThrottleInterval": 30,
             "StandardErrorPath": claudeDir + "/sync-daemon-launchd.log",

@@ -47,8 +47,11 @@ final class AccountService {
     var errorMessage: String?
 
     init() {
+        // Must match the sync daemon's default (EngramDaemon → engramdb.io);
+        // the old engram.io default sent auth to a different host than the
+        // daemon relayed sync to.
         self.endpoint = UserDefaults.standard.string(forKey: Self.endpointKey)
-            ?? "https://engram.io"
+            ?? "https://engramdb.io"
         #if TEST_AUTH_TOKEN
         self.token = ProcessInfo.processInfo.environment["TEST_AUTH_TOKEN"]
             ?? KeychainHelper.load(for: Self.tokenKey)
@@ -85,7 +88,9 @@ final class AccountService {
             var request = URLRequest(url: url)
             request.httpMethod = "POST"
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            request.httpBody = try JSONEncoder().encode(["username": email, "password": password])
+            // Server's LoginRequest decodes `email` (not `username`) — the
+            // old key silently produced a decode failure / failed login.
+            request.httpBody = try JSONEncoder().encode(["email": email, "password": password])
 
             let (data, response) = try await URLSession.shared.data(for: request)
             guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
