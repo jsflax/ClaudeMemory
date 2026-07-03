@@ -133,11 +133,13 @@ extension MemoryTools {
         }
 
         // Link each memory to hub and update its topic
-        for gid in ids {
-            if let mem = memories[gid] {
-                let edge = Edge(sourceGlobalId: gid, targetGlobalId: hubGlobalId, relation: .partOf)
-                localLattice.add(edge)
-                mem.topic = label
+        try localLattice.transaction {
+            for gid in ids {
+                if let mem = memories[gid] {
+                    let edge = Edge(sourceGlobalId: gid, targetGlobalId: hubGlobalId, relation: .partOf)
+                    localLattice.add(edge)
+                    mem.topic = label
+                }
             }
         }
 
@@ -159,16 +161,36 @@ extension MemoryTools {
 /// label among its neighbors. Converges when no labels change.
 /// Returns communities as arrays of node globalIds (sorted by size descending).
 public func labelPropagation(adjacency: [UUID: Set<UUID>], maxIterations: Int = 10) -> [[UUID]] {
+    // Iterate nodes in a stable order. Dictionary key order is non-deterministic
+    // across runs, and label propagation is order-sensitive (a node adopts its
+    // neighbours' current-majority label), so unstable order made community
+    // assignments flap between runs. Sorting the node list makes it reproducible.
+    let orderedNodes = adjacency.keys.sorted { $0.uuidString < $1.uuidString }
+
+    // Seed labels with closed-neighborhood minima instead of singletons:
+    // each clique starts at (near-)internal consensus, so a bridge label
+    // can never win the all-singleton tie that otherwise floods across a
+    // single cross-community edge on unlucky orderings.
     var labels: [UUID: UUID] = [:]
-    for id in adjacency.keys {
-        labels[id] = id
+    for id in orderedNodes {
+        var seed = id
+        for neighbor in adjacency[id] ?? [] where neighbor.uuidString < seed.uuidString {
+            seed = neighbor
+        }
+        labels[id] = seed
     }
 
     for _ in 0..<maxIterations {
-        var newLabels = labels
         var changed = false
 
-        for id in adjacency.keys {
+        // Asynchronous (in-place) updates: each node sees the labels its
+        // earlier-visited neighbours adopted THIS pass. The previous
+        // synchronous double-buffer variant is the textbook label-propagation
+        // failure mode — cliques flip wholesale between passes, and on some
+        // orderings a single bridge edge merged two 4-cliques into ONE
+        // community. In-place updates let each clique reach local consensus
+        // before bridge influence propagates.
+        for id in orderedNodes {
             guard let neighbors = adjacency[id], !neighbors.isEmpty else { continue }
 
             var labelCounts: [UUID: Int] = [:]
@@ -177,17 +199,27 @@ public func labelPropagation(adjacency: [UUID: Set<UUID>], maxIterations: Int = 
                 labelCounts[neighborLabel, default: 0] += 1
             }
 
-            guard let bestLabel = labelCounts.max(by: {
-                $0.value != $1.value ? $0.value < $1.value : $0.key.uuidString > $1.key.uuidString
-            })?.key else { continue }
+            guard let maxCount = labelCounts.values.max() else { continue }
+            let tied = labelCounts.filter { $0.value == maxCount }.keys
 
-            if newLabels[id] != bestLabel {
-                newLabels[id] = bestLabel
+            // Sticky ties: when the node's current label is among the tied
+            // maxima, keep it. Without this, arbitrary tie-breaking lets one
+            // label flood across a bridge and merge communities that only
+            // share a single edge.
+            let current = labels[id]
+            let bestLabel: UUID
+            if let current, tied.contains(current) {
+                bestLabel = current
+            } else {
+                bestLabel = tied.min { $0.uuidString < $1.uuidString }!
+            }
+
+            if labels[id] != bestLabel {
+                labels[id] = bestLabel
                 changed = true
             }
         }
 
-        labels = newLabels
         if !changed { break }
     }
 

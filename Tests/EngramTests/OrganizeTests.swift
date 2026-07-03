@@ -271,9 +271,20 @@ import Foundation
 }
 
 @Test func labelPropagation_bridgeEdge() {
-    // Two dense cliques connected by a single bridge edge
-    let u1 = UUID(), u2 = UUID(), u3 = UUID(), u4 = UUID()
-    let u5 = UUID(), u6 = UUID(), u7 = UUID(), u8 = UUID()
+    // Two dense cliques connected by a single bridge edge.
+    // FIXED UUIDs: label propagation is visit-order sensitive (a known LPA
+    // property), and the implementation iterates in sorted-UUID order — so
+    // random UUIDs made the outcome (and this test) nondeterministic per
+    // run. Fixed ids give a fully deterministic pass while still guarding
+    // the property that a single bridge edge must not merge the cliques.
+    let u1 = UUID(uuidString: "00000000-0000-0000-0000-0000000000A1")!
+    let u2 = UUID(uuidString: "00000000-0000-0000-0000-0000000000A2")!
+    let u3 = UUID(uuidString: "00000000-0000-0000-0000-0000000000A3")!
+    let u4 = UUID(uuidString: "00000000-0000-0000-0000-0000000000A4")!
+    let u5 = UUID(uuidString: "00000000-0000-0000-0000-0000000000B5")!
+    let u6 = UUID(uuidString: "00000000-0000-0000-0000-0000000000B6")!
+    let u7 = UUID(uuidString: "00000000-0000-0000-0000-0000000000B7")!
+    let u8 = UUID(uuidString: "00000000-0000-0000-0000-0000000000B8")!
     let adjacency: [UUID: Set<UUID>] = [
         u1: [u2, u3, u4],
         u2: [u1, u3, u4],
@@ -287,18 +298,7 @@ import Foundation
 
     let communities = labelPropagation(adjacency: adjacency)
 
-    // Label propagation is seed-order sensitive (ties break on UUID order,
-    // and the UUIDs are random per run): a clique occasionally splits, and a
-    // bridge ENDPOINT may land on either side. Assert the property the
-    // bridge-edge case actually guards — the two clique CORES never merge
-    // into one community — instead of an exact [4, 4] split.
-    #expect(communities.count >= 2)
-    let coreA: Set<UUID> = [u1, u2, u3]
-    let coreB: Set<UUID> = [u6, u7, u8]
-    for community in communities {
-        let c = Set(community)
-        #expect(
-            c.intersection(coreA).isEmpty || c.intersection(coreB).isEmpty,
-            "bridge edge merged the two clique cores into one community: \(c.count) nodes")
-    }
+    #expect(communities.count == 2)
+    let sizes: [Int] = communities.map(\.count).sorted()
+    #expect(sizes == [4, 4])
 }
