@@ -11,6 +11,7 @@ extension SidebarView {
     var accountContent: some View {
         if accountService.isSignedIn {
             signedInContent
+                .onAppear { refreshProjectCounts() }
         } else {
             signInContent
         }
@@ -157,7 +158,7 @@ extension SidebarView {
 
     func syncProjectRow(_ project: String) -> some View {
         let isOn = syncConfigs.first(where: { $0.project == project })?.policy == .sync
-        let count = self.lattice.objects(Memory.self).where { $0.project == project }.count
+        let count = projectCounts[project] ?? 0
         return Button {
             syncManager.toggleProject(project)
         } label: {

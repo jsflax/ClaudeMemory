@@ -36,6 +36,21 @@ struct SidebarView: View {
     @State var email = ""
     @State var password = ""
     @State var isRegistering = false
+    // Cached per-project node counts for the Projects list. Computed from
+    // the in-memory graph in one pass — the rows previously ran a
+    // synchronous SQL COUNT against the (1GB+) database per project per
+    // SwiftUI body evaluation, which made opening the drawer a lag spike.
+    @State var projectCounts: [String: Int] = [:]
+
+    func refreshProjectCounts() {
+        var counts: [String: Int] = [:]
+        for galaxy in galaxyRegistry.galaxies.values {
+            for node in galaxy.renderStore.allNodes.values {
+                counts[node.project, default: 0] += 1
+            }
+        }
+        projectCounts = counts
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -132,12 +147,23 @@ struct SidebarView: View {
 
     // MARK: - Visualizer Tab
 
+    // Cached stats — mergedVisibleNodeIds/mergedAllNodes are full dict
+    // merges across galaxies (O(n)); computing them inline re-ran the
+    // merges on every body evaluation.
+    @State private var statVisibleCount = 0
+    @State private var statTotalCount = 0
+
+    private func refreshStats() {
+        statVisibleCount = galaxyRegistry.mergedVisibleNodeIds.count
+        statTotalCount = galaxyRegistry.mergedAllNodes.count
+    }
+
     @ViewBuilder
     private var visualizerContent: some View {
         VStack(alignment: .leading, spacing: 24) {
             section("Stats") {
-                let visibleCount = galaxyRegistry.mergedVisibleNodeIds.count
-                let totalCount = galaxyRegistry.mergedAllNodes.count
+                let visibleCount = statVisibleCount
+                let totalCount = statTotalCount
                 VStack(alignment: .leading, spacing: 6) {
                     if visibleCount < totalCount {
                         statRow("Memories", value: "\(visibleCount)/\(totalCount)")
@@ -147,6 +173,7 @@ struct SidebarView: View {
                     statRow("Edges", value: "\(galaxyRegistry.mergedEdges.count)")
                     statRow("Database", value: dbFileSize)
                 }
+                .onAppear { refreshStats() }
             }
 
             section("Layout") {

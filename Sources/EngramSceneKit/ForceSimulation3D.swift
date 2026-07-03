@@ -95,6 +95,11 @@ public final class ForceSimulation3D {
     /// Set by addNode/addEdge, drained by tick(). Coalesces multiple topology changes
     /// into a single wake per tick instead of one per call.
     private var hasPendingTopologyChanges = false
+    /// Magnitude of pending topology changes (nodes/edges added or removed
+    /// since the last tick). Lets a settled graph absorb SMALL live deltas
+    /// (one remembered memory + its auto-connect edges) without re-exciting
+    /// the whole simulation.
+    private var pendingTopologyDelta = 0
 
     /// Set by topology changes, cleared after CSR rebuild in dispatchForceComputation.
     /// CSR (Compressed Sparse Row) structures are pre-built for GPU gather kernels.
@@ -151,6 +156,7 @@ public final class ForceSimulation3D {
             galaxyGroup[i] = newGroup
         }
         hasPendingTopologyChanges = true
+        pendingTopologyDelta += 1_000_000  // migrations always relayout
         topologyDirtyForGPU = true
     }
 
@@ -322,9 +328,9 @@ public final class ForceSimulation3D {
         // Nodes were removed from the flat arrays above; invalidate the
         // lazy positions dict (rebuilt on next read).
         _positionsGeneration &+= 1
-        _ = idsToRemove
 
         hasPendingTopologyChanges = true
+        pendingTopologyDelta += idsToRemove.count
         topologyDirtyForGPU = true
     }
 
@@ -391,6 +397,7 @@ public final class ForceSimulation3D {
         _positionsGeneration &+= 1
         topologyDirtyForGPU = true
         hasPendingTopologyChanges = true
+        pendingTopologyDelta += 1
     }
 
     /// Surgically insert a single edge without rebuilding the entire graph.
@@ -401,6 +408,7 @@ public final class ForceSimulation3D {
         edgeIndices.append((si, ti))
         topologyDirtyForGPU = true
         hasPendingTopologyChanges = true
+        pendingTopologyDelta += 1
     }
 
     /// Write external positions (e.g. from 2D positions + z jitter) into internal arrays.
@@ -452,8 +460,18 @@ public final class ForceSimulation3D {
         if hasPendingTopologyChanges {
             hasPendingTopologyChanges = false
             topologyVersion &+= 1
-            isSettled = false
-            settledFrameCount = 0
+            let delta = pendingTopologyDelta
+            pendingTopologyDelta = 0
+            // A settled graph absorbs small live deltas in place: addNode
+            // already seeds new nodes at their project centroid, and
+            // re-exciting the sim re-applies full-strength forces to a
+            // layout that never fully equilibrates at scale — one new
+            // memory used to visibly re-arrange the whole graph. Bulk
+            // loads/migrations (large delta) still relayout.
+            if !(isSettled && delta <= 24) {
+                isSettled = false
+                settledFrameCount = 0
+            }
         }
 
         // Fast path: when settled, skip all work (no integration, no sync, no force dispatch)
