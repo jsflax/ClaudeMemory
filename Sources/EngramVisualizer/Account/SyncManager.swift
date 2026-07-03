@@ -81,12 +81,22 @@ final class SyncManager {
             CLIInstaller.stopDaemon()
             syncedLattice = nil
 
-            // Delete the synced DB (closes connections, removes DB + WAL + SHM)
+            // Delete the synced DB (closes connections, removes DB + WAL + SHM),
+            // but ONLY after the daemon has actually released it. stopDaemon()
+            // signals the daemon; it isn't synchronous. Deleting while the
+            // daemon still holds the DB open serves the deleted inode and
+            // leaves -wal/-shm orphans. Probe the daemon's process flock: if
+            // we can take it, the daemon is gone; if not within the timeout,
+            // SKIP deletion rather than corrupt an in-use DB.
             if let dbPath {
                 let claudeDir = (dbPath as NSString).deletingLastPathComponent
                 let syncedDbPath = SyncService.syncedDbPath(claudeDir: claudeDir)
-                let config = Lattice.Configuration(fileURL: URL(fileURLWithPath: syncedDbPath))
-                try? Lattice.delete(for: config)
+                if Self.waitForDaemonExit(claudeDir: claudeDir, timeout: 5.0) {
+                    let config = Lattice.Configuration(fileURL: URL(fileURLWithPath: syncedDbPath))
+                    try? Lattice.delete(for: config)
+                } else {
+                    NSLog("[SyncManager] daemon still holds sync lock after 5s — skipping synced-DB deletion")
+                }
             }
 
             // Clear sync state on local DB so next sign-in does a full re-sync.
@@ -102,6 +112,25 @@ final class SyncManager {
         
         
         
+        /// Poll the daemon's process flock until it's free (daemon exited) or
+        /// the timeout elapses. Non-destructive: acquiring the lock proves the
+        /// daemon released it; we immediately release again. Returns false if
+        /// the daemon is still holding it — the caller must not delete the DB.
+        static func waitForDaemonExit(claudeDir: String, timeout: TimeInterval) -> Bool {
+            let lockPath = claudeDir + "/engram-sync.lock"
+            let deadline = Date().addingTimeInterval(timeout)
+            repeat {
+                let fd = open(lockPath, O_RDWR)
+                if fd < 0 { return true }  // no lock file → no daemon
+                let got = flock(fd, LOCK_EX | LOCK_NB) == 0
+                if got { flock(fd, LOCK_UN) }
+                close(fd)
+                if got { return true }
+                Thread.sleep(forTimeInterval: 0.1)
+            } while Date() < deadline
+            return false
+        }
+
         // MARK: - Sync Progress
 
         private func wireSyncProgress() {

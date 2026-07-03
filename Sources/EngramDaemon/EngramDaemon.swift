@@ -47,14 +47,34 @@ struct EngramDaemon: ParsableCommand {
             throw ExitCode.success
         }
 
-        // 2. Read auth credentials
-        guard let credentials = readCredentials(claudeDir: claudeDir, endpointOverride: endpoint) else {
-            log("No auth credentials found. Sign in via the Visualizer first.")
+        // 2. Read auth credentials — with retry. The daemon is commonly
+        // launched (by launchd, at login) BEFORE the user signs in via the
+        // Visualizer, so an immediate success-exit here meant the daemon
+        // stayed dead until the next login even after sign-in. Poll the
+        // keychain for up to 10 minutes (20 × 30s) before giving up.
+        var credentials: SyncCredentials?
+        let credRetryLimit = 20
+        for attempt in 0..<credRetryLimit {
+            if let c = readCredentials(claudeDir: claudeDir, endpointOverride: endpoint) {
+                credentials = c
+                break
+            }
+            if attempt == 0 {
+                DaemonStatus.write(state: "waiting_for_auth",
+                                   detail: "No credentials yet — sign in via the Visualizer.")
+                log("No auth credentials found — polling keychain (up to 10 min)...")
+            }
+            sleep(30)
+        }
+        guard let credentials else {
+            log("No auth credentials after \(credRetryLimit) attempts. Exiting; relaunch after sign-in.")
+            DaemonStatus.write(state: "stopped", detail: "No credentials after 10 min.")
             flock(lockFd, LOCK_UN)
             close(lockFd)
             throw ExitCode.success  // Exit cleanly — launchd won't restart on successful exit
         }
         log("Auth loaded (endpoint: \(credentials.endpoint))")
+        DaemonStatus.write(state: "starting", detail: "Credentials loaded.")
 
         // 3. Open localLattice on memory.sqlite
         let dbPath = claudeDir + "/memory.sqlite"
@@ -151,16 +171,24 @@ struct EngramDaemon: ParsableCommand {
 
         syncedLattice.onSyncError { error in
             log("WSS error: \(error)")
+            DaemonStatus.write(state: "error", detail: "\(error)")
         }
 
         syncedLattice.onSyncStateChange { connected in
             log("WSS \(connected ? "connected" : "disconnected")")
+            DaemonStatus.write(state: connected ? "connected" : "disconnected", detail: nil)
         }
 
         syncedLattice.onSyncProgress { progress in
             if progress.isUploading {
                 log("WSS upload: \(progress.acked)/\(progress.totalUpload) (\(progress.pendingUpload) pending)")
             }
+            // Record last activity + pending depth for the health file. A
+            // fully-acked idle progress event is the "caught up" signal.
+            DaemonStatus.write(state: "connected",
+                               detail: nil,
+                               pendingUpload: progress.pendingUpload,
+                               didSync: progress.acked > 0 && progress.pendingUpload == 0)
         }
 
         // Handle graceful shutdown
@@ -168,6 +196,7 @@ struct EngramDaemon: ParsableCommand {
         let termSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
         termSource.setEventHandler {
             log("SIGTERM received, shutting down...")
+            DaemonStatus.write(state: "stopped", detail: "SIGTERM")
             flock(lockFd, LOCK_UN)
             close(lockFd)
             Darwin.exit(0)
@@ -196,6 +225,7 @@ struct EngramDaemon: ParsableCommand {
                 let events = watchdog.data
                 if events.contains(.delete) || events.contains(.rename) {
                     log("CRITICAL: Synced database was deleted/renamed — restarting daemon")
+                    DaemonStatus.write(state: "restarting", detail: "synced DB deleted")
                     Darwin.close(watchdogFd)
                     flock(lockFd, LOCK_UN)
                     Darwin.close(lockFd)
@@ -212,6 +242,8 @@ struct EngramDaemon: ParsableCommand {
         }
 
         log("Sync daemon running (PID \(ProcessInfo.processInfo.processIdentifier))")
+        DaemonStatus.write(state: "running",
+                           detail: "PID \(ProcessInfo.processInfo.processIdentifier)")
 
         // 10. Sit forever — launchd manages lifecycle.
         // withExtendedLifetime keeps the observer token (and other locals)
@@ -219,6 +251,39 @@ struct EngramDaemon: ParsableCommand {
         withExtendedLifetime(syncConfigObserver) {
             dispatchMain()
         }
+    }
+}
+
+// MARK: - Daemon Status File
+
+/// Health surface for the Visualizer / user: a small JSON file the daemon
+/// updates on every state transition. Content-based (not just "is the process
+/// alive") so the UI can distinguish waiting-for-auth from connected-and-idle
+/// from error. Best-effort — a failed write never affects sync.
+enum DaemonStatus {
+    private static let path = NSHomeDirectory() + "/.claude/sync-daemon-status.json"
+    // lastSyncAt is sticky across writes that don't themselves sync.
+    // Guarded by `lock` on every access, so the unsafe global is sound.
+    nonisolated(unsafe) private static var lastSyncAt: String?
+    private static let lock = NSLock()
+
+    static func write(state: String,
+                      detail: String?,
+                      pendingUpload: Int? = nil,
+                      didSync: Bool = false) {
+        lock.lock(); defer { lock.unlock() }
+        let now = ISO8601DateFormatter().string(from: Date())
+        if didSync { lastSyncAt = now }
+        var obj: [String: Any] = [
+            "state": state,
+            "updatedAt": now,
+            "pid": ProcessInfo.processInfo.processIdentifier,
+        ]
+        if let detail { obj["detail"] = detail }
+        if let pendingUpload { obj["pendingUpload"] = pendingUpload }
+        if let lastSyncAt { obj["lastSyncAt"] = lastSyncAt }
+        guard let data = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted]) else { return }
+        try? data.write(to: URL(fileURLWithPath: path), options: [.atomic])
     }
 }
 
