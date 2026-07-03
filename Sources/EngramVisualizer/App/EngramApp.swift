@@ -51,8 +51,13 @@ struct EngramApp: App {
     #endif
 
     init() {
+        // ENGRAM_FRAME_STATS (the perf-instrumentation harness) and headless
+        // launches never want Sparkle: a terminal-launched unsigned binary
+        // can't reach the appcast, so startingUpdater:true throws a modal
+        // NSAlert that captures the main thread before the scene ever renders.
+        let startUpdater = ProcessInfo.processInfo.environment["ENGRAM_FRAME_STATS"] == nil
         updaterController = SPUStandardUpdaterController(
-            startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil
+            startingUpdater: startUpdater, updaterDelegate: nil, userDriverDelegate: nil
         )
 
         #if ENGRAM_INSTRUMENTATION

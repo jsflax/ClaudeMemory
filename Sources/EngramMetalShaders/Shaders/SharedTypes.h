@@ -237,9 +237,10 @@ struct HoloScreenUniforms {
 // MARK: - GPU Node Packing
 
 // Per-node input for pack_node_instances compute kernel.
-// CPU writes this contiguously (indexed via nodeIndexMap); GPU reads → writes NodeInstance.
+// CPU writes this contiguously; GPU reads position from separate buffer(7).
+// Position field is written by CPU but ignored by shader (reads buffer(7) instead).
 struct NodePackInput {
-    simd_float3 position;       // sim-space position
+    simd_float3 position;       // sim-space position (legacy — shader reads buffer(7))
     float       baseRadius;     // pre-computed node radius (hub/importance adjusted)
     simd_float3 baseColor;      // project color (float3)
     float       packedState;    // encoded state (stateType + searchDimmed + intensity)
@@ -322,9 +323,20 @@ struct LabelPackParams {
     unsigned int nodeCount;     // number of node labels
 };
 
+// MARK: - GPU Force Integration
+
+// Parameters for integrate_positions compute kernel.
+struct IntegrateParams {
+    unsigned int nodeCount;
+    float        damping;
+    float        maxSpeed;
+    float        _pad;
+};
+
 // MARK: - GPU Force Simulation
 
 // Per-node data for GPU force computation.
+// Used by charge and spring+structural kernels.
 struct ForceNodeFull {
     float px, py, pz;          // position
     float vx, vy, vz;          // velocity (unused by new kernels, kept for layout compat)

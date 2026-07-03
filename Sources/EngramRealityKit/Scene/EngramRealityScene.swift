@@ -3,6 +3,8 @@ import Metal
 import simd
 import CoreGraphics
 import EngramSceneKit
+import Foundation
+import AppKit
 
 /// Core RealityKit scene manager — owns entity hierarchy and wires systems to data.
 ///
@@ -212,12 +214,87 @@ public final class EngramRealityScene {
         return rootEntity
     }
 
+    // MARK: - Frame Stats (V0 instrumentation)
+
+    /// Per-phase frame timing CSV, enabled by ENGRAM_FRAME_STATS. The env
+    /// value is the output path ("1" → /tmp/engram-frame-stats.csv). Lines
+    /// are buffered and flushed every 120 frames so the harness itself
+    /// doesn't add a per-frame write syscall to the measurement.
+    private lazy var frameStatsPath: String? = {
+        guard let v = ProcessInfo.processInfo.environment["ENGRAM_FRAME_STATS"], !v.isEmpty else { return nil }
+        return v == "1" ? "/tmp/engram-frame-stats.csv" : v
+    }()
+    private var frameStatsBuffer: [String] = []
+    private var frameStatsHeaderWritten = false
+
+    @inline(__always)
+    private func nowNs() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
+
+    private func frameStatsAppend(_ line: String) {
+        frameStatsBuffer.append(line)
+        if frameStatsBuffer.count >= 120 { frameStatsFlush() }
+    }
+
+    public func frameStatsFlush() {
+        guard let path = frameStatsPath, !frameStatsBuffer.isEmpty else { return }
+        if !frameStatsHeaderWritten {
+            let refresh = NSScreen.main?.maximumFramesPerSecond ?? 0
+            let header = "# refresh_hz=\(refresh) date=\(Date())\n"
+                + "frame,dt_ms,tick_ms,lod_ms,node_ms,edge_ms,label_ms,commit_ms,nebula_ms,mascot_ms,flow_ms,lights_ms,audio_ms,total_ms,nodes,edges,vis_edges,near,mid,far\n"
+            FileManager.default.createFile(atPath: path, contents: header.data(using: .utf8))
+            frameStatsHeaderWritten = true
+        }
+        if let h = FileHandle(forWritingAtPath: path) {
+            h.seekToEndOfFile()
+            h.write(frameStatsBuffer.joined().data(using: .utf8)!)
+            try? h.close()
+        }
+        frameStatsBuffer.removeAll(keepingCapacity: true)
+    }
+
     // MARK: - Per-Frame Update
 
     /// Called from SceneEvents.Update — drives all systems.
     public func update(dt: Float) {
         guard let dataProvider else { return }
+        if frameStatsPath != nil { return updateInstrumented(dt: dt, dataProvider: dataProvider) }
+        updateBody(dt: dt, dataProvider: dataProvider)
+    }
 
+    /// Instrumented wrapper: phase timings are captured inside updateBody via
+    /// the phaseMarks array; this keeps the un-instrumented path branch-free.
+    private var phaseMarks: [UInt64] = []
+    private func updateInstrumented(dt: Float, dataProvider: SceneDataProvider) {
+        phaseMarks.removeAll(keepingCapacity: true)
+        let t0 = nowNs()
+        phaseMarks.append(t0)
+        updateBody(dt: dt, dataProvider: dataProvider)
+        let tEnd = nowNs()
+        // phaseMarks: [start, afterTick, afterLOD, afterNode, afterEdge,
+        //              afterLabel, afterCommit, afterNebula, afterMascot,
+        //              afterFlow, afterLights, afterAudio]
+        func ms(_ i: Int, _ j: Int) -> Double {
+            guard i < phaseMarks.count, j < phaseMarks.count else { return 0 }
+            return Double(phaseMarks[j] &- phaseMarks[i]) / 1_000_000
+        }
+        let totalMs = Double(tEnd &- t0) / 1_000_000
+        let line = String(
+            format: "%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%d\n",
+            frameCount, Double(dt) * 1000,
+            ms(0, 1), ms(1, 2), ms(2, 3), ms(3, 4), ms(4, 5), ms(5, 6),
+            ms(6, 7), ms(7, 8), ms(8, 9), ms(9, 10), ms(10, 11), totalMs,
+            dataProvider.nodes.count, dataProvider.edges.count,
+            visibleSet.visibleEdgeIndices.count, visibleSet.nearNodes.count,
+            visibleSet.midNodes.count, visibleSet.farNodes.count)
+        frameStatsAppend(line)
+    }
+
+    @inline(__always)
+    private func phaseMark() {
+        if frameStatsPath != nil { phaseMarks.append(nowNs()) }
+    }
+
+    private func updateBody(dt: Float, dataProvider: SceneDataProvider) {
         // 0. App-layer per-frame callback (keyboard, camera smoothing, force dispatch)
         onFrameCallback?(dt)
 
@@ -226,6 +303,7 @@ public final class EngramRealityScene {
 
         // 1. Tick data provider (drain + simulate)
         dataProvider.tick(dt: dt)
+        phaseMark()
 
         // 2. Update scene root component
         var rootComp = rootEntity.components[SceneRootComponent.self] ?? SceneRootComponent()
@@ -252,8 +330,10 @@ public final class EngramRealityScene {
             cameraPosition: cameraPos,
             selectedNode: dataProvider.selectedNode,
             glowingNodes: dataProvider.glowingNodes,
-            hubs: dataProvider.hubs
+            hubs: dataProvider.hubs,
+            topologyVersion: dataProvider.topologyVersion
         )
+        phaseMark()
 
         if frameCount % 120 == 1 {
             print("[scene] frame=\(frameCount) nodes=\(dataProvider.nodes.count) edges=\(dataProvider.edges.count) near=\(visibleSet.nearNodes.count) mid=\(visibleSet.midNodes.count) far=\(visibleSet.farNodes.count) visEdges=\(visibleSet.visibleEdgeIndices.count) cam=\(cameraPos)")
@@ -272,8 +352,10 @@ public final class EngramRealityScene {
             scaleFactor: scaleFactor,
             commandBuffer: sharedCmdBuf
         )
+        phaseMark()
 
         // 6. Edge batch update
+
         edgeBatchSystem.update(
             scene: self,
             dataProvider: dataProvider,
@@ -282,8 +364,10 @@ public final class EngramRealityScene {
             scaleFactor: scaleFactor,
             commandBuffer: sharedCmdBuf
         )
+        phaseMark()
 
         // 7. Label batch update
+
         labelBatchSystem.update(
             scene: self,
             dataProvider: dataProvider,
@@ -294,9 +378,11 @@ public final class EngramRealityScene {
             frameCount: frameCount,
             commandBuffer: sharedCmdBuf
         )
+        phaseMark()
 
         // Single GPU commit for all batch system writes
         sharedCmdBuf?.commit()
+        phaseMark()
 
         // 8. Nebula update
         nebulaBatchSystem.update(
@@ -305,25 +391,32 @@ public final class EngramRealityScene {
             topologyChanged: topologyChanged,
             scaleFactor: scaleFactor
         )
+        phaseMark()
 
         // 9. Mascot update
+
         mascotSystem.update(
             container: mascotContainer,
             dataProvider: dataProvider,
             dt: dt,
             scaleFactor: scaleFactor
         )
+        phaseMark()
 
         // 10. Flow particles
+
         flowParticleSystem.update(
             scene: self,
             dataProvider: dataProvider,
             dt: dt,
             scaleFactor: scaleFactor
         )
+        phaseMark()
 
         // 11. Point lights
+
         updatePointLights(dataProvider: dataProvider)
+        phaseMark()
 
         // 12. Spatial audio
         spatialAudioSystem.update(
@@ -332,6 +425,7 @@ public final class EngramRealityScene {
             visibleSet: visibleSet,
             dt: dt
         )
+        phaseMark()
     }
 
     // MARK: - Sphere Template

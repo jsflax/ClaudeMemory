@@ -12,6 +12,11 @@ public final class NebulaBatchSystem {
     private var colorCache: [String: (start: NSColor, end: NSColor)] = [:]
     private var lastColorMapHash: Int = 0
 
+    // Per-project node counts cached on topologyVersion — the inline
+    // full-node histogram cost O(n) dict ops per frame at 40k nodes.
+    private var cachedProjectSizes: [String: Int] = [:]
+    private var cachedSizesTopologyVersion: UInt64 = .max
+
     public init() {}
 
     public func update(
@@ -31,10 +36,15 @@ public final class NebulaBatchSystem {
         }
 
         // Determine which projects have nebulae (2+ nodes)
-        var projectSizes: [String: Int] = [:]
-        for node in dataProvider.nodes {
-            projectSizes[node.project, default: 0] += 1
+        if dataProvider.topologyVersion != cachedSizesTopologyVersion {
+            var projectSizes: [String: Int] = [:]
+            for node in dataProvider.nodes {
+                projectSizes[node.project, default: 0] += 1
+            }
+            cachedProjectSizes = projectSizes
+            cachedSizesTopologyVersion = dataProvider.topologyVersion
         }
+        let projectSizes = cachedProjectSizes
 
         let activeProjects = Set(centroids.keys.filter { (projectSizes[$0] ?? 0) >= 2 })
 
@@ -51,19 +61,20 @@ public final class NebulaBatchSystem {
             guard let centroid = centroids[project] else { continue }
             let color = colorMap[project] ?? SIMD3<Float>(0.5, 0.5, 0.5)
 
-            // Compute cluster radius
-            let radius = computeClusterRadius(
-                project: project,
-                centroid: centroid,
-                nodes: dataProvider.nodes,
-                positions: dataProvider.positions
-            )
-
             if let entity = activeNebulae[project] {
                 // Update position
                 entity.position = centroid * scaleFactor
             } else {
-                // Create new nebula
+                // Create new nebula. The cluster radius (a full node scan per
+                // project) is only needed here — computing it in the shared
+                // path cost O(nodes × projects) per frame, 427ms at 40k×70,
+                // while existing nebulae never resize.
+                let radius = computeClusterRadius(
+                    project: project,
+                    centroid: centroid,
+                    nodes: dataProvider.nodes,
+                    positions: dataProvider.positions
+                )
                 let entity = Entity()
                 entity.name = "Nebula_\(project)"
                 entity.position = centroid * scaleFactor

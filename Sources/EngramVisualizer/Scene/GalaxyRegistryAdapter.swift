@@ -23,6 +23,17 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
     private var glowStartTimes: [UUID: Date] = [:]
     private var newNodeStartTimes: [UUID: Date] = [:]
 
+    // Per-frame caches, refreshed once in tick(). The batch systems read
+    // these properties several times per frame; computed accessors rebuilt
+    // dicts/arrays on every access (positionArray alone was 4×O(n) per
+    // frame — the production analog of the preview's V0 hot path).
+    private var framePositionArray: [SIMD3<Float>] = []
+    private var frameGlowing: [UUID: Float] = [:]
+    private var frameNewGlows: [UUID: Float] = [:]
+    private var frameCentroids: [String: SIMD3<Float>] = [:]
+    private var simIndexByNodeIndex: [Int] = []
+    private var simIndexTopologyVersion: UInt64 = .max
+
     init(registry: GalaxyRegistry) {
         self.registry = registry
     }
@@ -38,23 +49,13 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
         registry?.mergedPositions ?? [:]
     }
 
-    var glowingNodes: [UUID: Float] {
-        var result: [UUID: Float] = [:]
-        let now = Date()
-        for (id, start) in glowStartTimes {
-            result[id] = Float(now.timeIntervalSince(start))
-        }
-        return result
-    }
+    /// Flat positions parallel to `nodes`, refreshed once per tick from the
+    /// unified simulation's flat arrays (no UUID hashing on access).
+    var positionArray: [SIMD3<Float>] { framePositionArray }
 
-    var newNodeGlows: [UUID: Float] {
-        var result: [UUID: Float] = [:]
-        let now = Date()
-        for (id, start) in newNodeStartTimes {
-            result[id] = Float(now.timeIntervalSince(start))
-        }
-        return result
-    }
+    var glowingNodes: [UUID: Float] { frameGlowing }
+
+    var newNodeGlows: [UUID: Float] { frameNewGlows }
 
     var dyingNodes: Set<UUID> {
         guard let registry else { return [] }
@@ -80,17 +81,7 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
         registry?.mergedIsSearchActive ?? false
     }
 
-    var projectCentroids: [String: SIMD3<Float>] {
-        guard let registry else { return [:] }
-        let positions = registry.mergedPositions
-        var sums: [String: (sum: SIMD3<Float>, count: Int)] = [:]
-        for node in registry.mergedNodes {
-            guard let pos = positions[node.id] else { continue }
-            let entry = sums[node.project] ?? (.zero, 0)
-            sums[node.project] = (entry.sum + pos, entry.count + 1)
-        }
-        return sums.mapValues { $0.sum / Float($0.count) }
-    }
+    var projectCentroids: [String: SIMD3<Float>] { frameCentroids }
 
     var topologyVersion: UInt64 {
         registry?.mergedTopologyVersion ?? 0
@@ -135,7 +126,66 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
 
         // Sync glow state from registry
         syncGlowState()
+
+        refreshFrameCaches()
     }
+
+    /// Once-per-frame snapshot of everything the batch systems poll.
+    private func refreshFrameCaches() {
+        guard let registry else { return }
+        let sim = registry.unifiedSimulation
+
+        // positionArray via flat sim arrays + a topology-cached index map.
+        let px = sim.posX, py = sim.posY, pz = sim.posZ
+        let n = cachedNodes.count
+        if simIndexByNodeIndex.count != n || simIndexTopologyVersion != lastTopologyVersion {
+            var idToSim = [UUID: Int](minimumCapacity: sim.nodeIds.count)
+            for (si, id) in sim.nodeIds.enumerated() { idToSim[id] = si }
+            simIndexByNodeIndex = cachedNodes.map { idToSim[$0.id] ?? -1 }
+            simIndexTopologyVersion = lastTopologyVersion
+        }
+        if framePositionArray.count != n {
+            framePositionArray = [SIMD3<Float>](repeating: .zero, count: n)
+        }
+        simIndexByNodeIndex.withUnsafeBufferPointer { simIdx in
+            for i in 0..<n {
+                let si = simIdx[i]
+                if si >= 0 && si < px.count {
+                    framePositionArray[i] = SIMD3<Float>(px[si], py[si], pz[si])
+                }
+            }
+        }
+
+        // Glow elapsed times — one Date() call, one dict build per frame.
+        let now = Date()
+        frameGlowing.removeAll(keepingCapacity: true)
+        for (id, start) in glowStartTimes {
+            frameGlowing[id] = Float(now.timeIntervalSince(start))
+        }
+        frameNewGlows.removeAll(keepingCapacity: true)
+        for (id, start) in newNodeStartTimes {
+            frameNewGlows[id] = Float(now.timeIntervalSince(start))
+        }
+
+        // Project centroids — full scan throttled to every 30 frames (plus
+        // topology changes): positions drift during settling, so anchors
+        // refresh continuously but not per frame.
+        frameCounter &+= 1
+        if frameCentroids.isEmpty || lastTopologyVersion != centroidsTopologyVersion
+            || frameCounter % 30 == 0 {
+            let positions = registry.mergedPositions
+            var sums: [String: (sum: SIMD3<Float>, count: Int)] = [:]
+            for node in cachedNodes {
+                guard let pos = positions[node.id] else { continue }
+                let entry = sums[node.project] ?? (.zero, 0)
+                sums[node.project] = (entry.sum + pos, entry.count + 1)
+            }
+            frameCentroids = sums.mapValues { $0.sum / Float($0.count) }
+            centroidsTopologyVersion = lastTopologyVersion
+        }
+    }
+    private var centroidsTopologyVersion: UInt64 = .max
+    private var frameCounter: UInt64 = 0
 
     // MARK: - Snapshot Rebuilding
 

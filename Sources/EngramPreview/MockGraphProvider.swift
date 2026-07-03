@@ -70,22 +70,37 @@ final class MockGraphProvider: SceneDataProvider {
 
     /// Node ID → index mapping for reading simulation positions.
     private var nodeIds: [UUID] = []
+    private var simIndexByNodeIndex: [Int] = []
+    private var simIndexTopologyVersion: UInt64 = .max
+    private var tickSubFrame: UInt64 = 0
 
     static let shared: MockGraphProvider = .init()
+
+    private enum PreviewError: Error {
+        case noMetalDevice
+        case noCommandQueue
+        case forceComputeInitFailed
+    }
     
     private init() {
-        // Set up GPU force engine
-        if let device = MTLCreateSystemDefaultDevice(),
-           let queue = device.makeCommandQueue(),
-           let library = try? EngramMetalShaders.makeLibrary(device: device),
-           let forceCompute = MetalForceCompute(device: device, library: library) {
+        // Set up GPU force engine. Failures here are fatal for the preview
+        // (it exists to exercise the GPU path), so report the underlying
+        // error on stderr — stdout's block buffer is lost when
+        // preconditionFailure fires.
+        do {
+            guard let device = MTLCreateSystemDefaultDevice() else { throw PreviewError.noMetalDevice }
+            guard let queue = device.makeCommandQueue() else { throw PreviewError.noCommandQueue }
+            let library = try EngramMetalShaders.makeLibrary(device: device)
+            guard let forceCompute = MetalForceCompute(device: device, library: library) else {
+                throw PreviewError.forceComputeInitFailed
+            }
             let simState = GPUSimulationState(device: device, library: library)
             self.forceEngine = ForceEngine(forceCompute: forceCompute, simState: simState)
             self.commandQueue = queue
             print("[preview] GPU force engine initialized")
-        } else {
-            print("[preview] GPU force engine unavailable, using CPU fallback")
-            preconditionFailure()
+        } catch {
+            FileHandle.standardError.write("[preview] GPU force engine init FAILED: \(error)\n".data(using: .utf8)!)
+            preconditionFailure("GPU force engine init failed: \(error)")
         }
 
         // Instrumentation setup (env vars)
@@ -103,7 +118,11 @@ final class MockGraphProvider: SceneDataProvider {
         if ProcessInfo.processInfo.environment["PREVIEW_USE_LATTICE"] == "1" {
             let personalPath = ProcessInfo.processInfo.environment["CLAUDE_MEMORY_DB"]
                 ?? NSHomeDirectory() + "/.claude/memory.sqlite"
-            let syncedPath = NSHomeDirectory() + "/.claude/sync/memory-synced.sqlite"
+            // CLAUDE_SYNCED_DB mirrors CLAUDE_MEMORY_DB: without it, every
+            // instrumented/baseline run opens the LIVE synced DB the daemon
+            // is actively writing.
+            let syncedPath = ProcessInfo.processInfo.environment["CLAUDE_SYNCED_DB"]
+                ?? NSHomeDirectory() + "/.claude/sync/memory-synced.sqlite"
             loadFromLattice(
                 personalDbPath: personalPath,
                 syncedDbPath: FileManager.default.fileExists(atPath: syncedPath) ? syncedPath : nil
@@ -129,6 +148,7 @@ final class MockGraphProvider: SceneDataProvider {
 
     func tick(dt: Float) {
         let wallStart = instrumentationEnabled ? CFAbsoluteTimeGetCurrent() : 0
+        let tsub0 = ProcessInfo.processInfo.environment["ENGRAM_FRAME_STATS"] != nil ? DispatchTime.now().uptimeNanoseconds : 0
 
         // Dispatch GPU forces asynchronously — never block main thread
         if let engine = forceEngine, let queue = commandQueue {
@@ -162,24 +182,54 @@ final class MockGraphProvider: SceneDataProvider {
             }
         }
 
+        let tsub = ProcessInfo.processInfo.environment["ENGRAM_FRAME_STATS"] != nil
+        let t0 = tsub ? DispatchTime.now().uptimeNanoseconds : 0
+
         // Tick the force simulation (integrates whatever forces are available)
         simulation.tick()
+        let t1 = tsub ? DispatchTime.now().uptimeNanoseconds : 0
 
         // Positions: sim.syncPositions() already updates the dict internally.
         // Just reference it — no copy needed (CoW means no allocation if unchanged).
         positions = simulation.positions
+        let t2 = tsub ? DispatchTime.now().uptimeNanoseconds : 0
 
         // Build positionArray from sim's flat arrays — O(n), no UUID hashing.
+        // The node→sim index map is flattened to [Int] on topology change:
+        // 41k UUID dict lookups per frame cost ~30ms on their own.
         let px = simulation.posX, py = simulation.posY, pz = simulation.posZ
-        if nodeToSimIndex.isEmpty || nodeToSimIndex.count != nodes.count {
+        let n = nodes.count
+        if simIndexByNodeIndex.count != n || simIndexTopologyVersion != topologyVersion {
             nodeToSimIndex.removeAll(keepingCapacity: true)
             for (si, id) in simulation.nodeIds.enumerated() { nodeToSimIndex[id] = si }
+            simIndexByNodeIndex = nodes.map { nodeToSimIndex[$0.id] ?? -1 }
+            simIndexTopologyVersion = topologyVersion
         }
-        let n = nodes.count
         if positionArray.count != n { positionArray = [SIMD3<Float>](repeating: .zero, count: n) }
-        for i in 0..<n {
-            if let si = nodeToSimIndex[nodes[i].id], si < px.count {
-                positionArray[i] = SIMD3<Float>(px[si], py[si], pz[si])
+        let pxc = px.count
+        positionArray.withUnsafeMutableBufferPointer { out in
+            simIndexByNodeIndex.withUnsafeBufferPointer { simIdx in
+                px.withUnsafeBufferPointer { xb in
+                    py.withUnsafeBufferPointer { yb in
+                        pz.withUnsafeBufferPointer { zb in
+                            for i in 0..<n {
+                                let si = Int(simIdx[i])
+                                if si >= 0 && si < pxc {
+                                    out[i] = SIMD3<Float>(xb[si], yb[si], zb[si])
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if tsub {
+            let t3 = DispatchTime.now().uptimeNanoseconds
+            tickSubFrame &+= 1
+            if tickSubFrame % 120 == 11 {
+                let ms = { (a: UInt64, b: UInt64) in Double(b &- a) / 1_000_000 }
+                print("[tick-sub] frame=\(tickSubFrame) dispatch=\(String(format: "%.1f", ms(tsub0, t0))) simTick=\(String(format: "%.1f", ms(t0, t1))) posArray=\(String(format: "%.1f", ms(t2, t3))) inFlight=\(forceEngine?.isInFlight ?? false) settled=\(simulation.isSettled)")
             }
         }
 

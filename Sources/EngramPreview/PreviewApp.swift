@@ -67,10 +67,31 @@ struct PreviewContentView: View {
                     inputBridge.scene = scene
                     inputBridge.install()
 
+                    // Baseline-harness env hooks:
+                    // PREVIEW_AUTO_ORBIT=<deg/s> — steady camera orbit so runs
+                    // exercise LOD churn deterministically without input.
+                    // PREVIEW_EXIT_AFTER_FRAMES=<n> — flush frame stats + exit(0)
+                    // so scripted runs terminate themselves.
+                    let orbitRate: Float? = ProcessInfo.processInfo.environment["PREVIEW_AUTO_ORBIT"]
+                        .flatMap(Float.init)
+                    let exitAfter: UInt64? = ProcessInfo.processInfo.environment["PREVIEW_EXIT_AFTER_FRAMES"]
+                        .flatMap(UInt64.init)
+                    var framesSeen: UInt64 = 0
+
                     // Per-frame: poll keyboard + update camera smoothing
-                    scene.onFrameCallback = { [weak camera, weak inputBridge] dt in
+                    scene.onFrameCallback = { [weak camera, weak inputBridge, weak scene] dt in
                         inputBridge?.tick(dt: dt)
+                        if let orbitRate, let camera {
+                            camera.lookRotate(deltaAz: orbitRate * dt * .pi / 180, deltaEl: 0)
+                        }
                         camera?.updateCamera(dt: dt)
+                        if let exitAfter {
+                            framesSeen += 1
+                            if framesSeen >= exitAfter {
+                                scene?.frameStatsFlush()
+                                exit(0)
+                            }
+                        }
                     }
                 }
                 .onDisappear {

@@ -22,7 +22,37 @@ public final class LabelBatchSystem {
     private var lastClusterFrame: UInt64 = 0
     private let clusterRescanInterval: UInt64 = 10
 
+    // Project/topic sets cached on topologyVersion. Building
+    // Set(nodes.map(\.topic)) inline costs ~300ms/frame at 40k nodes —
+    // it was 70% of the total frame time in the V0 baseline.
+    private var cachedProjects: Set<String> = []
+    private var cachedTopics: Set<String> = []
+    private var cachedSetsTopologyVersion: UInt64 = .max
+
+    private func projectTopicSets(_ dataProvider: SceneDataProvider) -> (projects: Set<String>, topics: Set<String>) {
+        if dataProvider.topologyVersion != cachedSetsTopologyVersion {
+            var projects = Set<String>(minimumCapacity: 64)
+            var topics = Set<String>(minimumCapacity: 256)
+            for node in dataProvider.nodes {
+                projects.insert(node.project)
+                topics.insert(node.topic)
+            }
+            cachedProjects = projects
+            cachedTopics = topics
+            cachedSetsTopologyVersion = dataProvider.topologyVersion
+        }
+        return (cachedProjects, cachedTopics)
+    }
+
     public init() {}
+
+    // Section-level timing, enabled with the frame-stats harness. Guarded by
+    // the same env var so production frames stay branch-cheap.
+    private let sectionStats = ProcessInfo.processInfo.environment["ENGRAM_FRAME_STATS"] != nil
+    private var marks: [(String, UInt64)] = []
+    @inline(__always) private func mark(_ label: String) {
+        if sectionStats { marks.append((label, DispatchTime.now().uptimeNanoseconds)) }
+    }
 
     public func update(
         scene: EngramRealityScene,
@@ -34,10 +64,13 @@ public final class LabelBatchSystem {
         frameCount: UInt64,
         commandBuffer: MTLCommandBuffer? = nil
     ) {
+        marks.removeAll(keepingCapacity: true)
+        mark("start")
         let visibleCount = visibleSet.visibleLabelIndices.count
         let projCount = dataProvider.projectCentroids.count
-        let topicCount = Set(dataProvider.nodes.map(\.topic)).count
+        let topicCount = projectTopicSets(dataProvider).topics.count
         let totalLabelCount = visibleCount + projCount + topicCount
+        mark("counts")
         if frameCount % 120 == 0 {
             print("[labels] frame=\(frameCount) visibleNodes=\(visibleCount) projects=\(projCount) topics=\(topicCount) totalNodes=\(dataProvider.nodes.count) projRects=\(scene.labelAtlasGenerator.projectRects.count) topicRects=\(scene.labelAtlasGenerator.topicRects.count) atlasFrame=\(lastAtlasFrame)")
         }
@@ -47,8 +80,7 @@ public final class LabelBatchSystem {
         let hasNodes = !dataProvider.nodes.isEmpty
         let needsInitialAtlas = lastAtlasFrame == 0 && hasNodes
         if (topologyChanged || needsInitialAtlas) && (frameCount - lastAtlasFrame) > 60 || needsInitialAtlas {
-            let projects = Set(dataProvider.nodes.map(\.project))
-            let topics = Set(dataProvider.nodes.map(\.topic))
+            let (projects, topics) = projectTopicSets(dataProvider)
             scene.labelAtlasGenerator.regenerateAtlas(
                 nodes: dataProvider.nodes,
                 hubs: dataProvider.hubs,
@@ -65,6 +97,7 @@ public final class LabelBatchSystem {
             }
         }
 
+        mark("atlas")
         LowLevelMeshFactory.ensureLabelBatchMesh(scene: scene, capacity: totalLabelCount)
         guard let mesh = scene.labelBatchMesh else { return }
 
@@ -100,6 +133,7 @@ public final class LabelBatchSystem {
             ), count: totalVerts)
         }
 
+        mark("staginit")
         var instanceIdx = 0
         for nodeIdx in visibleSet.visibleLabelIndices {
             let node = nodes[nodeIdx]
@@ -147,6 +181,7 @@ public final class LabelBatchSystem {
             instanceIdx += 1
         }
 
+        mark("visloop")
         // Compute per-project max Y + topic sums (throttled — every 10 frames or on topology change)
         if frameCount - lastClusterFrame >= clusterRescanInterval
             || cachedProjectMaxY.isEmpty || topologyChanged {
@@ -161,6 +196,7 @@ public final class LabelBatchSystem {
                 cachedTopicSums[node.topic] = (entry.sum + pos, entry.count + 1, node.project, max(entry.maxY, pos.y))
             }
         }
+        mark("rescan")
         let projectMaxY = cachedProjectMaxY
 
         // Project cluster labels — large, floating above top of cluster
@@ -240,6 +276,7 @@ public final class LabelBatchSystem {
             }
         }
 
+        mark("labelloops")
         let usedVerts = instanceIdx * Self.vertsPerLabel
         if usedVerts < totalVerts {
             memset(&labelStaging[usedVerts], 0, (totalVerts - usedVerts) * MemoryLayout<BatchVertex>.stride)
@@ -253,5 +290,14 @@ public final class LabelBatchSystem {
             dest.update(from: src.baseAddress!, count: totalVerts)
         }
         if commandBuffer == nil { cmdBuf.commit() }
+        mark("write")
+        if sectionStats && frameCount % 120 == 7 {
+            var out = "[labels-sections] frame=\(frameCount)"
+            for i in 1..<marks.count {
+                let ms = Double(marks[i].1 &- marks[i-1].1) / 1_000_000
+                out += " \(marks[i].0)=\(String(format: "%.1f", ms))"
+            }
+            print(out + " totalLabels=\(totalLabelCount) topics=\(topicCount)")
+        }
     }
 }

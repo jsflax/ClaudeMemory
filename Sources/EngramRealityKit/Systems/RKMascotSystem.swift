@@ -47,6 +47,9 @@ public final class RKMascotSystem {
     private let patrolHoverDuration: Float = 8.0
     private let patrolSpeed: Float = 0.3
 
+    private var cachedActiveProjects = Set<String>()
+    private var cachedProjectsTopologyVersion: UInt64 = .max
+
     public init() {}
 
     public func update(
@@ -59,9 +62,16 @@ public final class RKMascotSystem {
         let positions = dataProvider.positions
         let nodes = dataProvider.nodes
 
-        // Determine which projects need mascots (projects with nodes)
-        var activeProjects = Set<String>()
-        for node in nodes { activeProjects.insert(node.project) }
+        // Determine which projects need mascots (projects with nodes).
+        // Cached on topologyVersion — the inline set-build over every node
+        // cost ~33ms/frame at 40k nodes.
+        if dataProvider.topologyVersion != cachedProjectsTopologyVersion {
+            var projects = Set<String>()
+            for node in nodes { projects.insert(node.project) }
+            cachedActiveProjects = projects
+            cachedProjectsTopologyVersion = dataProvider.topologyVersion
+        }
+        let activeProjects = cachedActiveProjects
 
         // Remove mascots for gone projects
         for (project, entity) in activeMascots where !activeProjects.contains(project) {
