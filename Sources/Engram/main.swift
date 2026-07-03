@@ -3,6 +3,10 @@ import Lattice
 import MCP
 import Foundation
 
+// MARK: - Crash Reporter
+
+CrashReporter.shared.install()
+
 // MARK: - Configuration
 
 /// Override the bundled embedding model with a custom path (optional).
@@ -17,13 +21,24 @@ let dbDir = (dbPath as NSString).deletingLastPathComponent
 do {
     try FileManager.default.createDirectory(atPath: dbDir, withIntermediateDirectories: true)
 } catch {
-    log("Failed to create database directory at \(dbDir): \(error)")
+    log("EXIT: Failed to create database directory at \(dbDir): \(error)")
     exit(1)
 }
 
 // MARK: - Init Lattice
 
-Lattice.setLogLevel(.error)
+// Verbose lattice logging is opt-in: the hardcoded .debug default grew
+// ~/.claude/memory-logs past 6GB. ENGRAM_LATTICE_LOG_LEVEL: off|error|warning|info|debug.
+switch ProcessInfo.processInfo.environment["ENGRAM_LATTICE_LOG_LEVEL"]?.lowercased() {
+case "off": Lattice.setLogLevel(.off)
+case "warning", "warn": Lattice.setLogLevel(.warn)
+case "info": Lattice.setLogLevel(.info)
+case "debug": Lattice.setLogLevel(.debug)
+default: Lattice.setLogLevel(.error)
+}
+let logSuffix = ProcessInfo.processInfo.environment["CLAUDE_SESSION_ID"] ?? "\(ProcessInfo.processInfo.processIdentifier)"
+Lattice.setLogFile(URL(fileURLWithPath: NSHomeDirectory() + "/.claude/memory-logs/lattice-mcp-\(logSuffix).log"))
+log("Lattice log suffix: \(logSuffix) (session=\(ProcessInfo.processInfo.environment["CLAUDE_SESSION_ID"] ?? "nil"), pid=\(ProcessInfo.processInfo.processIdentifier))")
 let localLattice: Lattice
 
 do {
@@ -31,7 +46,7 @@ do {
     localLattice = try Lattice(Memory.self, Edge.self, Checkpoint.self, HookState.self, SessionState.self, SyncConfig.self, configuration: localConfig)
     log("Database at \(dbPath)")
 } catch {
-    log("Failed to initialize database at \(dbPath): \(error)")
+    log("EXIT: Failed to initialize database at \(dbPath): \(error)")
     exit(1)
 }
 
@@ -301,7 +316,7 @@ do {
     try await server.start(transport: transport)
     log("Server started")
 } catch {
-    log("Server transport error: \(error)")
+    log("EXIT: Server transport error: \(error)")
     exit(1)
 }
 
@@ -312,7 +327,7 @@ Task.detached {
     while true {
         try await Task.sleep(for: .seconds(5))
         if getppid() == 1 {
-            log("Orphaned (ppid=1), exiting")
+            log("EXIT: Orphaned (ppid=1)")
             exit(0)
         }
     }
@@ -320,3 +335,5 @@ Task.detached {
 
 // Keep alive
 await server.waitUntilCompleted()
+log("EXIT: Transport completed (stdin closed)")
+

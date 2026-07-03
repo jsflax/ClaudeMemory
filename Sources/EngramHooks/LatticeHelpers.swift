@@ -3,9 +3,26 @@ import Lattice
 import Foundation
 
 /// Open Lattice with the full schema at the default database path.
-func openLattice() -> Lattice? {
+func openLattice(sessionId: String? = nil) -> Lattice? {
     let dbPath = defaultDbPath
     guard FileManager.default.fileExists(atPath: dbPath) else { return nil }
+
+    // Always set up lattice debug logging so errors are captured even
+    // for short-lived hooks that crash before initMemoryTools runs.
+    // Always enable debug logging — stderr is captured in hooks.log
+    Lattice.setLogLevel(.debug)
+
+    if let sid = sessionId ?? ProcessInfo.processInfo.environment["CLAUDE_SESSION_ID"], !sid.isEmpty {
+        let logDir = NSHomeDirectory() + "/.claude/memory-logs"
+        let logPath = logDir + "/lattice-\(sid).log"
+        let fm = FileManager.default
+        if !fm.fileExists(atPath: logDir) {
+            try? fm.createDirectory(atPath: logDir, withIntermediateDirectories: true)
+        }
+        Lattice.setLogLevel(.debug)
+        Lattice.setLogFile(URL(fileURLWithPath: logPath))
+    }
+
     return try? Lattice(
         Memory.self, Edge.self, Checkpoint.self, HookState.self, SessionState.self,
         configuration: .init(fileURL: URL(fileURLWithPath: dbPath), migration: engramMigrations)
@@ -72,7 +89,7 @@ func setHookState(key: HookState.Key, value: String) {
 /// Get or create the SessionState row for a given session ID.
 func getSessionState(sessionId: String?) -> SessionState? {
     guard let sessionId, !sessionId.isEmpty else { return nil }
-    guard let lattice = openLattice() else { return nil }
+    guard let lattice = openLattice(sessionId: sessionId) else { return nil }
     if let existing = lattice.objects(SessionState.self).where({ $0.sessionId == sessionId }).first {
         return existing
     }
@@ -263,7 +280,10 @@ private func writeSessionRecallLog(sessionId: String, directCount: Int, connecte
         try? fm.createDirectory(atPath: memoryLogsDir, withIntermediateDirectories: true)
     }
     let path = memoryLogsDir + "/recall-\(sessionId).log"
-    var content = "\(directCount)+\(connectedCount) recalled\n"
+    let df = DateFormatter()
+    df.dateFormat = "h:mm a"
+    let timeStr = df.string(from: Date())
+    var content = "\(directCount)+\(connectedCount) recalled @ \(timeStr)\n"
     for line in lines {
         content += line + "\n"
     }
@@ -299,6 +319,7 @@ func cleanupSessionLogs(sessionId: String) {
         memoryLogsDir + "/recall-\(sessionId).log",
         memoryLogsDir + "/debug-\(sessionId).log",
         memoryLogsDir + "/lattice-\(sessionId).log",
+        memoryLogsDir + "/lattice-mcp-\(sessionId).log",
     ]
     let staleThreshold: TimeInterval = 300 // 5 minutes
     for path in paths {

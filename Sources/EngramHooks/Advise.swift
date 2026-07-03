@@ -145,6 +145,20 @@ struct Advise: AsyncParsableCommand {
         ) ?? 0
         let since = Date(timeIntervalSince1970: lastRunTimestamp)
 
+        // Don't spawn if maintenance is already running — but with a
+        // staleness escape: the flag is cleared by the maintenance agent on
+        // completion, so a SIGKILL mid-run used to leave it stuck at "1" and
+        // disable maintenance forever. lastRunTimestamp is set alongside the
+        // flag, so an "active" older than an hour is a corpse, not a run.
+        if getHookState(key: .maintenanceActive) == "1" {
+            let flagAge = Date().timeIntervalSince(since)
+            if flagAge < 3600 { return }
+            setHookState(key: .maintenanceActive, value: "0")
+        }
+
+        // Enforce minimum cooldown to prevent maintenance's own writes from re-triggering
+        guard Date().timeIntervalSince(since) >= maintenanceCooldownSeconds else { return }
+
         let delta = lattice.objects(AuditLog.self)
             .where { $0.tableName == "Memory" && $0.timestamp > since }
             .count
