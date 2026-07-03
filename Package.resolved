@@ -74,21 +74,20 @@
       }
     },
     {
-      "identity" : "jinja",
+      "identity" : "mlx-swift",
       "kind" : "remoteSourceControl",
-      "location" : "https://github.com/maiqingqiang/Jinja",
+      "location" : "https://github.com/ml-explore/mlx-swift",
       "state" : {
-        "revision" : "5c0a87846dfd36ca6621795ad2f09fdaab82b739",
-        "version" : "1.3.0"
+        "revision" : "0bb916c67f4b9e5c682cbe02a42c701c93ab5021",
+        "version" : "0.31.6"
       }
     },
     {
-      "identity" : "latticecore",
+      "identity" : "mlx-swift-lm",
       "kind" : "remoteSourceControl",
-      "location" : "https://github.com/jsflax/LatticeCore.git",
+      "location" : "https://github.com/ml-explore/mlx-swift-lm",
       "state" : {
-        "revision" : "e8b5917c7802e7dc421e6b288bb1d1bbe0ba4f43",
-        "version" : "0.9.2"
+        "revision" : "e3cb1e1b4fb373391a414c33e9221516d02134ef"
       }
     },
     {
@@ -218,6 +217,24 @@
       }
     },
     {
+      "identity" : "swift-huggingface",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/huggingface/swift-huggingface",
+      "state" : {
+        "revision" : "b721959445b617d0bf03910b2b4aced345fd93bf",
+        "version" : "0.9.0"
+      }
+    },
+    {
+      "identity" : "swift-jinja",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/huggingface/swift-jinja.git",
+      "state" : {
+        "revision" : "0b67ecb79139f6addef8699eff3622808aa6c7dc",
+        "version" : "2.3.6"
+      }
+    },
+    {
       "identity" : "swift-log",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/apple/swift-log.git",
@@ -319,10 +336,10 @@
     {
       "identity" : "swift-syntax",
       "kind" : "remoteSourceControl",
-      "location" : "https://github.com/apple/swift-syntax.git",
+      "location" : "https://github.com/swiftlang/swift-syntax.git",
       "state" : {
-        "branch" : "main",
-        "revision" : "6a82373fbe0d4d9bf9b3d21cadf5b52d23372412"
+        "revision" : "79e4b74a295b6eb74a8b585e3a39d29e70c1dbd1",
+        "version" : "603.0.2"
       }
     },
     {
@@ -337,10 +354,10 @@
     {
       "identity" : "swift-transformers",
       "kind" : "remoteSourceControl",
-      "location" : "https://github.com/jsflax/swift-transformers.git",
+      "location" : "https://github.com/huggingface/swift-transformers",
       "state" : {
-        "branch" : "main",
-        "revision" : "288f020a1c553f6ba594d38c75f7f6e8e545bfac"
+        "revision" : "2fa33e1f5e7131a7fc64c28e6d161dcec0d24820",
+        "version" : "1.3.3"
       }
     },
     {
@@ -349,7 +366,7 @@
       "location" : "https://github.com/jsflax/SwiftLM.git",
       "state" : {
         "branch" : "main",
-        "revision" : "8426dfdeefc2fbbd1800af88c8f7a31a5f792256"
+        "revision" : "b88e7ee167693c677d78bd74db2c1e9fe4db7e62"
       }
     },
     {
@@ -368,6 +385,15 @@
       "state" : {
         "revision" : "8666c92dbbb3c8eefc8008c9c8dcf50bfd302167",
         "version" : "2.16.1"
+      }
+    },
+    {
+      "identity" : "yyjson",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/ibireme/yyjson.git",
+      "state" : {
+        "revision" : "8b4a38dc994a110abaec8a400615567bd996105f",
+        "version" : "0.12.0"
       }
     }
   ],
