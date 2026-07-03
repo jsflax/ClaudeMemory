@@ -5,6 +5,11 @@ import Lattice
 import MCP
 import Foundation
 
+/// Tests suffixed with the prod-DB variants open the LIVE ~/.claude databases
+/// and several write to them; gate them behind ENGRAM_ALLOW_PROD_DB_TESTS=1 so
+/// a plain `swift test` never mutates real user data.
+let allowProdDBTests = ProcessInfo.processInfo.environment["ENGRAM_ALLOW_PROD_DB_TESTS"] == "1"
+
 // MARK: - IVF Vector Index Tests
 
 @Test func ivf_trainAndRecallPattern() async throws {
@@ -43,7 +48,7 @@ import Foundation
     #expect(!recallOutput.contains("No memories"), "Recall should find results after IVF training")
 }
 
-@Test func ivf_productionDB_recallPerformance() async throws {
+@Test(.enabled(if: allowProdDBTests)) func ivf_productionDB_recallPerformance() async throws {
     let localPath = URL(fileURLWithPath: NSHomeDirectory())
         .appending(path: ".claude/memory.sqlite")
     let syncedPath = URL(fileURLWithPath: NSHomeDirectory())
@@ -108,7 +113,30 @@ import Foundation
     #expect(!output.contains("No memories"))
 }
 
-@Test func ivf_productionDB_plainObjectsWrite() async throws {
+/// Verify that Collection.map on nearest results doesn't crash with index out of bounds.
+/// endIndex must match the actual number of results snapshot() returns.
+@Test(.enabled(if: allowProdDBTests)) func ivf_productionDB_collectionMapSafe() async throws {
+    let localPath = URL(fileURLWithPath: NSHomeDirectory())
+        .appending(path: ".claude/memory.sqlite")
+    guard FileManager.default.fileExists(atPath: localPath.path(percentEncoded: false)) else { return }
+    let lattice = try Lattice(Memory.self, Edge.self, Checkpoint.self, HookState.self, SyncConfig.self,
+                              configuration: .init(fileURL: localPath, migration: engramMigrations))
+
+    let dims = 384
+    let query = Vector<Float>((0..<dims).map { _ in Float.random(in: -1...1) })
+    let nearest = lattice.objects(Memory.self)
+        .nearest(to: query, on: \.embedding, limit: 15)
+
+    // This is what handleRecall does — .map on the nearest results
+    // If endIndex > actual results, this crashes with index out of bounds
+    let mapped = nearest.map { match -> (object: Memory, distance: Double) in
+        (object: match.object, distance: match.distance)
+    }
+    print("count=\(nearest.count), mapped=\(mapped.count)")
+    #expect(nearest.count == mapped.count, "count and map should agree")
+}
+
+@Test(.enabled(if: allowProdDBTests)) func ivf_productionDB_plainObjectsWrite() async throws {
     let path = URL(fileURLWithPath: NSHomeDirectory())
         .appending(path: ".claude/memory.sqlite")
     guard FileManager.default.fileExists(atPath: path.path(percentEncoded: false)) else { return }
@@ -126,7 +154,7 @@ import Foundation
     }
 }
 
-@Test func ivf_productionDB_basicReadWrite() async throws {
+@Test(.enabled(if: allowProdDBTests)) func ivf_productionDB_basicReadWrite() async throws {
     let path = URL(fileURLWithPath: NSHomeDirectory())
         .appending(path: ".claude/memory.sqlite")
     guard FileManager.default.fileExists(atPath: path.path(percentEncoded: false)) else { return }
@@ -154,7 +182,7 @@ import Foundation
     print("Write succeeded")
 }
 
-@Test func ivf_recallOnProductionDB() async throws {
+@Test(.enabled(if: allowProdDBTests)) func ivf_recallOnProductionDB() async throws {
     let path = URL(fileURLWithPath: NSHomeDirectory())
         .appending(path: ".claude/memory.sqlite")
     guard FileManager.default.fileExists(atPath: path.path(percentEncoded: false)) else {
@@ -181,7 +209,7 @@ import Foundation
     }
 }
 
-@Test func ivf_dualDB_recallAfterTraining() async throws {
+@Test(.enabled(if: allowProdDBTests)) func ivf_dualDB_recallAfterTraining() async throws {
     let localPath = FileManager.default.temporaryDirectory
         .appending(path: "ivf-dual-local-\(UUID().uuidString).sqlite")
     let syncedPath = FileManager.default.temporaryDirectory
