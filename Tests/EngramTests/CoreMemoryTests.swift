@@ -395,9 +395,9 @@ import Foundation
 @Test func definitions_hasTwentyTools() async throws {
     let tools = try await makeTools()
     let defs = await tools.definitions
-    #expect(defs.count == 22)
+    #expect(defs.count == 24)
     let names = defs.map(\.name).sorted()
-    #expect(names == ["begin_episode", "checkpoint", "connect", "consolidate", "detect_communities", "disconnect", "end_episode", "find_clusters", "forget", "graph", "list_episodes", "list_tasks", "list_topics", "merge", "organize", "recall", "recall_episode", "remember", "resume", "stats", "timeline", "update"])
+    #expect(names == ["begin_episode", "checkpoint", "connect", "consolidate", "detect_communities", "disconnect", "end_episode", "find_clusters", "forget", "graph", "list_episodes", "list_tasks", "list_topics", "merge", "organize", "recall", "recall_episode", "remember", "resume", "stats", "timeline", "train_vectors", "update", "vacuum"])
 }
 
 // MARK: - Remember with force creates new
@@ -1116,10 +1116,16 @@ import Foundation
         arguments: ["content": .string("A real memory")]
     ))
 
+    // Memory ids are UUIDs (globalId, sync-aligned) — pass two well-formed
+    // but nonexistent UUIDs to exercise the not-found path (the old int ids
+    // now fail decoding before the lookup).
     let result = try await tools.handle(CallTool.Parameters(
         name: "merge",
         arguments: [
-            "ids": .array([.int(1), .int(9999)]),
+            "ids": .array([
+                .string("00000000-0000-0000-0000-000000000001"),
+                .string("00000000-0000-0000-0000-000000009999"),
+            ]),
             "content": .string("merged"),
         ]
     ))
