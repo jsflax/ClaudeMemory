@@ -10,7 +10,7 @@ import Foundation
 /// never mutate real user data, so they are disabled unless the developer
 /// explicitly opts in with ENGRAM_ALLOW_PROD_DB_TESTS=1 (and ideally points
 /// HOME at a scratch copy). Without the flag Swift Testing skips them.
-let allowProdDBTests = ProcessInfo.processInfo.environment["ENGRAM_ALLOW_PROD_DB_TESTS"] == "1"
+private let allowProdDBTests = ProcessInfo.processInfo.environment["ENGRAM_ALLOW_PROD_DB_TESTS"] == "1"
 
 /// Reproduce the hooks crash: getField on objects from attached UNION ALL view
 @Test(.enabled(if: allowProdDBTests)) func attachedView_propertyAccess() async throws {

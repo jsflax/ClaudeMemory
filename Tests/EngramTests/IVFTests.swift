@@ -8,7 +8,7 @@ import Foundation
 /// Tests suffixed with the prod-DB variants open the LIVE ~/.claude databases
 /// and several write to them; gate them behind ENGRAM_ALLOW_PROD_DB_TESTS=1 so
 /// a plain `swift test` never mutates real user data.
-let allowProdDBTests = ProcessInfo.processInfo.environment["ENGRAM_ALLOW_PROD_DB_TESTS"] == "1"
+private let allowProdDBTests = ProcessInfo.processInfo.environment["ENGRAM_ALLOW_PROD_DB_TESTS"] == "1"
 
 // MARK: - IVF Vector Index Tests
 
