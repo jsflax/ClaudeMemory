@@ -225,6 +225,40 @@ final class SyncManager {
     /// Cross-process: derived from AuditLog observation.
     var wssProgress: Lattice.SyncProgress?
 
+    /// Daemon health read from ~/.claude/sync-daemon-status.json (written by
+    /// memory-sync on every state transition). Progress rows alone can't show
+    /// connection failures: "nothing pending" looks identical to "the WSS has
+    /// been rejected with 401 for three months" — which happened.
+    struct DaemonHealth {
+        let state: String        // connected/disconnected/error/waiting_for_auth/...
+        let detail: String?
+        let lastSyncAt: String?
+        let updatedAt: Date?
+        var isHealthy: Bool { state == "connected" || state == "starting" }
+        var isStale: Bool {
+            guard let updatedAt else { return true }
+            return Date().timeIntervalSince(updatedAt) > 180
+        }
+    }
+    var daemonHealth: DaemonHealth?
+
+    func refreshDaemonHealth() {
+        let path = NSHomeDirectory() + "/.claude/sync-daemon-status.json"
+        guard let data = FileManager.default.contents(atPath: path),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let state = obj["state"] as? String else {
+            daemonHealth = nil  // old daemon binary or daemon not running
+            return
+        }
+        let iso = ISO8601DateFormatter()
+        daemonHealth = DaemonHealth(
+            state: state,
+            detail: obj["detail"] as? String,
+            lastSyncAt: obj["lastSyncAt"] as? String,
+            updatedAt: (obj["updatedAt"] as? String).flatMap { iso.date(from: $0) }
+        )
+    }
+
     // MARK: - Sync Policy
 
     /// Current sync policy for a project (defaults to `.local`).

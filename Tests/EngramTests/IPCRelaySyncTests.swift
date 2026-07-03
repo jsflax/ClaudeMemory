@@ -105,6 +105,63 @@ struct IPCRelaySyncTests {
         #expect(syncedMemories.first?.project == "Engram")
     }
 
+    // MARK: - Regression: sync-state collapse (passive pending count drains)
+
+    /// After a relay round-trip completes and ACKs flow back, the per-sync
+    /// state rows must collapse to AuditLog.isSynchronized=1 — otherwise the
+    /// passive pending count (the sync progress UI) grows forever. Historic
+    /// binaries compared against a stale config snapshot instead of the live
+    /// replication-slot registry and never collapsed (production accumulated
+    /// 1,800+ orphaned state rows and a permanently wedged "0/365" IPC row).
+    @Test(.timeLimit(.minutes(1)))
+    func ipcRelay_syncStateCollapses_pendingCountDrains() async throws {
+        let channel = "engram-relay-\(UUID().uuidString.prefix(8))"
+        let hubURL = FileManager.default.temporaryDirectory
+            .appending(path: "relay-hub-\(UUID().uuidString).sqlite")
+        let syncedURL = FileManager.default.temporaryDirectory
+            .appending(path: "relay-synced-\(UUID().uuidString).sqlite")
+        defer {
+            try? Lattice.delete(for: .init(fileURL: hubURL))
+            try? Lattice.delete(for: .init(fileURL: syncedURL))
+        }
+
+        var hubConfig = Lattice.Configuration(fileURL: hubURL)
+        hubConfig.ipcTargets = [.init(channel: channel)]
+        let hub = try Lattice(Memory.self, Edge.self, SyncConfig.self, configuration: hubConfig)
+        try await Task.sleep(for: .milliseconds(100))
+
+        var syncedConfig = Lattice.Configuration(fileURL: syncedURL)
+        syncedConfig.ipcTargets = [.init(channel: channel)]
+        let synced = try Lattice(Memory.self, Edge.self, SyncConfig.self, configuration: syncedConfig)
+        try await Task.sleep(for: .milliseconds(200))
+
+        let deliveryTask = await waitForChange(on: syncedConfig, table: "Memory", operation: .insert)
+
+        hub.add(Memory(
+            content: "Collapse regression memory",
+            topic: "testing",
+            project: "Engram",
+            embedding: Vector<Float>([Float](repeating: 0.1, count: 384))
+        ))
+
+        try await deliveryTask.value
+        #expect(synced.objects(Memory.self).count == 1)
+
+        // The ACK collapse (UPDATE AuditLog SET isSynchronized=1) deliberately
+        // emits no observer events, so poll briefly: acks land within
+        // milliseconds of delivery in-process.
+        var pending = hub.pendingSyncEntryCount
+        for _ in 0..<100 where pending != 0 {
+            try await Task.sleep(for: .milliseconds(50))
+            pending = hub.pendingSyncEntryCount
+        }
+        #expect(
+            pending == 0,
+            "state rows must collapse after every registered slot ACKs — pending stuck at \(pending)")
+
+        withExtendedLifetime((hub, synced)) {}
+    }
+
     // MARK: - Test 2: Filtered IPC relay (only synced projects replicate)
 
     @Test(.timeLimit(.minutes(1)))

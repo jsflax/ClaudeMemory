@@ -11,7 +11,10 @@ extension SidebarView {
     var accountContent: some View {
         if accountService.isSignedIn {
             signedInContent
-                .onAppear { refreshProjectCounts() }
+                .onAppear {
+                    refreshProjectCounts()
+                    syncManager.refreshDaemonHealth()
+                }
         } else {
             signInContent
         }
@@ -75,7 +78,11 @@ extension SidebarView {
                             if let ipc = syncManager.ipcProgress {
                                 syncProgressRow(label: "IPC", progress: ipc, color: .cyan)
                             }
-                            if let wss = syncManager.wssProgress {
+                            // Connection health outranks progress: a dead WSS
+                            // with nothing pending used to render as "Synced".
+                            if let health = syncManager.daemonHealth, !health.isHealthy, !health.isStale {
+                                daemonProblemRow(health: health)
+                            } else if let wss = syncManager.wssProgress {
                                 syncProgressRow(label: "WSS", progress: wss, color: .orange)
                             }
                         }
@@ -116,6 +123,25 @@ extension SidebarView {
         }
     }
 
+
+    func daemonProblemRow(health: SyncManager.DaemonHealth) -> some View {
+        HStack(spacing: 6) {
+            Text("WSS")
+                .font(.system(size: 9, weight: .medium, design: .monospaced))
+                .foregroundStyle(.white.opacity(0.35))
+                .frame(width: 24, alignment: .leading)
+            Circle()
+                .fill(health.state == "waiting_for_auth" ? Color.yellow : Color.red)
+                .frame(width: 6, height: 6)
+            Text(health.state == "waiting_for_auth"
+                    ? "Sign in required"
+                    : (health.detail ?? health.state))
+                .font(.system(size: 9, design: .monospaced))
+                .foregroundStyle(.white.opacity(0.5))
+                .lineLimit(1)
+            Spacer()
+        }
+    }
 
     func syncProgressRow(label: String, progress: Lattice.SyncProgress, color: Color) -> some View {
         let isUploading = progress.isUploading
