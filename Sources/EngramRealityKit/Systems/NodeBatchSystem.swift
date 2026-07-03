@@ -302,9 +302,11 @@ public final class NodeBatchSystem {
             if commandBuffer == nil { cmdBuf.commit() }
         }
 
-        // Recreate MeshInstancesComponent when instance count changes.
-        // NOT every frame (that crashes), only on count change.
-        if instanceIdx != lastInstanceCount {
+        // Create MeshInstancesComponent exactly ONCE (see EdgeBatchSystem:
+        // instanceData.instanceCount already drives the drawn count, and
+        // recreating on count change races the render thread's draw-call
+        // encode — use-after-free SIGSEGV under per-frame count churn).
+        if entity.components[MeshInstancesComponent.self] == nil {
             guard let mesh = entity.model?.mesh else { return }
             do {
                 let comp = try MeshInstancesComponent(
@@ -313,7 +315,6 @@ public final class NodeBatchSystem {
                     bounds: LowLevelMeshFactory.batchMeshBounds
                 )
                 entity.components.set(comp)
-                lastInstanceCount = instanceIdx
             } catch {
                 return
             }

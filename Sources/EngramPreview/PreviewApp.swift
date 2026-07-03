@@ -1,6 +1,7 @@
 import SwiftUI
 import UserNotifications
 import EngramRealityKit
+import EngramSceneKit
 
 @main
 struct EngramPreviewApp: App {
@@ -9,6 +10,11 @@ struct EngramPreviewApp: App {
         func applicationDidFinishLaunching(_ notification: Notification) {
             NSApp.setActivationPolicy(.regular)
             NSApp.activate(ignoringOtherApps: true)
+            // ENGRAM_GPU_LOG=<path> — per-frame GPU timing + charge algorithm
+            // (GPULog.configure has no other caller since the refactor).
+            if let gpuLogPath = ProcessInfo.processInfo.environment["ENGRAM_GPU_LOG"] {
+                GPULog.configure(path: gpuLogPath)
+            }
         }
 
         nonisolated func userNotificationCenter(
@@ -61,6 +67,13 @@ struct PreviewContentView: View {
                     scene.dataProvider = mockProvider
                     scene.cameraProvider = camera
                     camera.centerOnGraph(positions: mockProvider.positions)
+                    // PREVIEW_ORBIT_SCALE=<f> — scale the auto-framed orbit
+                    // radius (e.g. 0.15 puts the camera inside the graph for
+                    // near-tier/max-edge worst-case measurement runs).
+                    if let orbitScale = ProcessInfo.processInfo.environment["PREVIEW_ORBIT_SCALE"]
+                        .flatMap(Float.init), orbitScale > 0 {
+                        camera.orbitRadius *= orbitScale
+                    }
 
                     // Wire input bridge
                     inputBridge.camera = camera

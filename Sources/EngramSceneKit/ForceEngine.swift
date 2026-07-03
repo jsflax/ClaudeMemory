@@ -232,8 +232,13 @@ public final class ForceEngine {
 
         let fc = forceCompute
         let ss = simState
+        let nodeCount = snapshot.nodeCount
         cmdBuf.addCompletedHandler { @Sendable cb in
             GPULog.log("FORCE CB complete status=\(cb.status.rawValue)")
+            // True GPU occupancy + which charge path ran — the BH-vs-BRUTE
+            // question decides where the 42k optimization effort goes.
+            let gpuMs = (cb.gpuEndTime - cb.gpuStartTime) * 1000
+            GPULog.log("FORCE GPU \(String(format: "%.2f", gpuMs))ms algo=\(fc.lastChargeAlgorithm) n=\(nodeCount)")
             if cb.status == .error {
                 GPULog.log("FORCE ERROR: \(cb.error?.localizedDescription ?? "unknown")")
                 Task { @MainActor in fc.inFlight = false }

@@ -314,9 +314,14 @@ public final class EdgeBatchSystem {
             if commandBuffer == nil { cmdBuf.commit() }
         }
 
-        // Recreate MeshInstancesComponent when instance count changes.
-        // NOT every frame (that crashes), only on count change.
-        if instanceIdx != lastInstanceCount {
+        // Create MeshInstancesComponent exactly ONCE. The component holds a
+        // reference to instanceData, whose mutable instanceCount (set above)
+        // already drives the drawn count — recreating on count change is
+        // redundant AND races RealityKit's render thread: components.set()
+        // swaps the component while re::encodeDrawCalls is encoding the old
+        // one (SIGSEGV, seen under near-camera orbit where the visible-edge
+        // count changes every frame).
+        if entity.components[MeshInstancesComponent.self] == nil {
             guard let mesh = entity.model?.mesh else { return }
             do {
                 let comp = try MeshInstancesComponent(
@@ -325,7 +330,6 @@ public final class EdgeBatchSystem {
                     bounds: LowLevelMeshFactory.batchMeshBounds
                 )
                 entity.components.set(comp)
-                lastInstanceCount = instanceIdx
             } catch { return }
         }
     }
