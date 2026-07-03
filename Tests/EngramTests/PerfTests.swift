@@ -1,4 +1,11 @@
 import Testing
+
+// PerfTests' attached-lattice test opens the REAL production DBs (memory.sqlite
+// + memory-synced.sqlite from the live HOME) and ATTACHes across them — same
+// gating as AttachRaceTest/IVFTests: only under an explicit opt-in, never in a
+// default `swift test` run (it also races the live daemon's connections).
+private let allowProdDBTests = ProcessInfo.processInfo.environment["ENGRAM_ALLOW_PROD_DB_TESTS"] == "1"
+
 import EngramKit
 import Lattice
 import MCP
@@ -239,7 +246,7 @@ private func milliseconds(_ elapsed: Duration) -> Int64 {
 /// concurrent processes, this creates a lock storm where each process blocks
 /// waiting for the write lock, and the winner's reconciliation takes minutes
 /// for large DBs — causing nearest() to appear to hang.
-@Test(.timeLimit(.minutes(1)))
+@Test(.timeLimit(.minutes(1)), .enabled(if: allowProdDBTests))
 func recallDoesNotHangOnAttachedLattice() async throws {
     Lattice.setLogLevel(.debug)
     let dbPath = NSHomeDirectory() + "/.claude/memory.sqlite"
