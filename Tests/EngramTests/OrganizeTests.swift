@@ -287,7 +287,18 @@ import Foundation
 
     let communities = labelPropagation(adjacency: adjacency)
 
-    #expect(communities.count == 2)
-    let sizes: [Int] = communities.map(\.count).sorted()
-    #expect(sizes == [4, 4])
+    // Label propagation is seed-order sensitive (ties break on UUID order,
+    // and the UUIDs are random per run): a clique occasionally splits, and a
+    // bridge ENDPOINT may land on either side. Assert the property the
+    // bridge-edge case actually guards — the two clique CORES never merge
+    // into one community — instead of an exact [4, 4] split.
+    #expect(communities.count >= 2)
+    let coreA: Set<UUID> = [u1, u2, u3]
+    let coreB: Set<UUID> = [u6, u7, u8]
+    for community in communities {
+        let c = Set(community)
+        #expect(
+            c.intersection(coreA).isEmpty || c.intersection(coreB).isEmpty,
+            "bridge edge merged the two clique cores into one community: \(c.count) nodes")
+    }
 }
