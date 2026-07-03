@@ -17,9 +17,13 @@ import Foundation
 @MainActor
 public final class LODSystem {
 
-    /// Render budget caps.
-    public var maxNodeInstances: Int = 8_000
-    public var maxEdgeInstances: Int = 30_000
+    /// Render budget caps. Env overrides (ENGRAM_LOD_NODE_BUDGET /
+    /// ENGRAM_LOD_EDGE_BUDGET) exist for perf-harness budget sweeps —
+    /// production defaults are unchanged without them.
+    public var maxNodeInstances: Int =
+        ProcessInfo.processInfo.environment["ENGRAM_LOD_NODE_BUDGET"].flatMap(Int.init) ?? 8_000
+    public var maxEdgeInstances: Int =
+        ProcessInfo.processInfo.environment["ENGRAM_LOD_EDGE_BUDGET"].flatMap(Int.init) ?? 30_000
     public var maxLabelInstances: Int = 2_000
 
     public init() {}

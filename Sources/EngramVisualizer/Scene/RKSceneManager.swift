@@ -90,13 +90,37 @@ final class RKSceneManager {
 
     // MARK: - Per-Frame
 
+    /// Perf-harness hooks (mirror EngramPreview): active only when frame-stats
+    /// instrumentation is on, so they can't affect normal app behavior.
+    /// PREVIEW_AUTO_ORBIT=<deg/s> orbits the camera; PREVIEW_EXIT_AFTER_FRAMES=<n>
+    /// flushes the stats CSV and exits — lets the real app run the percentile gate.
+    private static let harnessOrbitRate: Float? =
+        ProcessInfo.processInfo.environment["ENGRAM_FRAME_STATS"] != nil
+            ? ProcessInfo.processInfo.environment["PREVIEW_AUTO_ORBIT"].flatMap(Float.init)
+            : nil
+    private static let harnessExitAfterFrames: UInt64? =
+        ProcessInfo.processInfo.environment["ENGRAM_FRAME_STATS"] != nil
+            ? ProcessInfo.processInfo.environment["PREVIEW_EXIT_AFTER_FRAMES"].flatMap(UInt64.init)
+            : nil
+    private var harnessFramesSeen: UInt64 = 0
+
     /// Called by EngramRealityScene via SceneEvents.Update — additional per-frame work.
     func renderTick(dt: Float) {
         guard let registry = galaxyRegistry else { return }
 
         // Camera update
         camera.pollKeyboard(dt: dt)
+        if let orbitRate = Self.harnessOrbitRate {
+            camera.lookRotate(deltaAz: orbitRate * dt * .pi / 180, deltaEl: 0)
+        }
         camera.updateCamera(dt: dt)
+        if let exitAfter = Self.harnessExitAfterFrames {
+            harnessFramesSeen += 1
+            if harnessFramesSeen >= exitAfter {
+                rkScene.frameStatsFlush()
+                exit(0)
+            }
+        }
 
         // Dispatch GPU forces
         dispatchForces()
