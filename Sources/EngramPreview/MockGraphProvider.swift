@@ -15,7 +15,9 @@ final class MockGraphProvider: SceneDataProvider {
     private(set) var edges: [RKEdgeSnapshot] = []
     private(set) var hubs: Set<UUID> = []
     private(set) var projectColorMap: [String: SIMD3<Float>] = [:]
-    private(set) var positions: [UUID: SIMD3<Float>] = [:]
+    // Lazy passthrough to the sim's on-demand dict — reading this triggers a
+    // one-time build only if a consumer (hitTest/teleport) actually needs it.
+    var positions: [UUID: SIMD3<Float>] { simulation.positions }
     /// Cached flat position array — built from sim arrays, avoids 23K UUID dict lookups per frame.
     private(set) var positionArray: [SIMD3<Float>] = []
     /// Maps nodes[i].id → simulation index for O(1) position lookup.
@@ -189,9 +191,8 @@ final class MockGraphProvider: SceneDataProvider {
         simulation.tick()
         let t1 = tsub ? DispatchTime.now().uptimeNanoseconds : 0
 
-        // Positions: sim.syncPositions() already updates the dict internally.
-        // Just reference it — no copy needed (CoW means no allocation if unchanged).
-        positions = simulation.positions
+        // positions is now a lazy passthrough — NOT read here, so a
+        // render-only frame never materializes the 42k dict.
         let t2 = tsub ? DispatchTime.now().uptimeNanoseconds : 0
 
         // Build positionArray from sim's flat arrays — O(n), no UUID hashing.
@@ -426,7 +427,6 @@ final class MockGraphProvider: SceneDataProvider {
         }
 
         // Read initial positions
-        positions = simulation.positions
         computeCentroids()
 
         // Demo glow effects
@@ -603,7 +603,6 @@ final class MockGraphProvider: SceneDataProvider {
         simulation.setPositions(galaxyPositions)
         simulation.wake()
 
-        positions = simulation.positions
         computeCentroids()
 
         // Reset instrumentation for new data

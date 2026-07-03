@@ -52,7 +52,24 @@ public final class ForceSimulation3D {
     public var nodeIds: [UUID] { ids }
     public var nodeCount: Int { ids.count }
 
-    public private(set) var positions: [UUID: SIMD3<Float>] = [:]
+    /// Position dictionary — lazily materialized from the flat x/y/z arrays
+    /// on first read per generation. The render path consumes the flat
+    /// `posX/posY/posZ` arrays directly, so a render-only frame never builds
+    /// this 42k-entry dict; only hitTest/teleport/centroid consumers pay for
+    /// it, once per tick. (Eagerly rebuilding it every frame in syncPositions
+    /// was ~8-11ms/frame of pure UUID-hash inserts at 42k.)
+    private var _positionsCache: [UUID: SIMD3<Float>] = [:]
+    private var _positionsCacheGeneration: UInt64 = .max
+    private var _positionsGeneration: UInt64 = 0
+    public var positions: [UUID: SIMD3<Float>] {
+        if _positionsCacheGeneration != _positionsGeneration {
+            _positionsCache.removeAll(keepingCapacity: true)
+            _positionsCache.reserveCapacity(ids.count)
+            for i in 0..<ids.count { _positionsCache[ids[i]] = SIMD3(x[i], y[i], z[i]) }
+            _positionsCacheGeneration = _positionsGeneration
+        }
+        return _positionsCache
+    }
 
     // Force parameters — exact match of JS reference (force-params.ts)
     public let springLength: Float = 240
@@ -302,8 +319,10 @@ public final class ForceSimulation3D {
         }
         edgeIndexSet = Set(edgeIndices.map { UInt64($0.0) << 32 | UInt64($0.1) })
 
-        // Remove from positions dict
-        for id in idsToRemove { positions.removeValue(forKey: id) }
+        // Nodes were removed from the flat arrays above; invalidate the
+        // lazy positions dict (rebuilt on next read).
+        _positionsGeneration &+= 1
+        _ = idsToRemove
 
         hasPendingTopologyChanges = true
         topologyDirtyForGPU = true
@@ -368,7 +387,8 @@ public final class ForceSimulation3D {
             topicProjectGroup.append(projGroup)
         }
 
-        positions[id] = position
+        // position is already in the flat x/y/z arrays (appended above).
+        _positionsGeneration &+= 1
         topologyDirtyForGPU = true
         hasPendingTopologyChanges = true
     }
@@ -414,7 +434,7 @@ public final class ForceSimulation3D {
         guard let i = idToIndex[id] else { return }
         x[i] = pos.x; y[i] = pos.y; z[i] = pos.z
         vx[i] = 0; vy[i] = 0; vz[i] = 0
-        positions[id] = pos
+        _positionsGeneration &+= 1
     }
 
     // MARK: - Per-frame tick
@@ -540,16 +560,11 @@ public final class ForceSimulation3D {
 
     // MARK: - Position sync
 
-    private func rebuildPositions() {
-        positions.removeAll(keepingCapacity: true)
-        for i in 0..<ids.count {
-            positions[ids[i]] = SIMD3(x[i], y[i], z[i])
-        }
-    }
-
+    /// Invalidate the lazy positions dict — the flat x/y/z arrays have moved.
+    /// Cheap: bumps a counter. The dict is only rebuilt if something reads it.
     private func syncPositions() {
-        for i in 0..<ids.count {
-            positions[ids[i]] = SIMD3(x[i], y[i], z[i])
-        }
+        _positionsGeneration &+= 1
     }
+    /// Legacy name kept for the topology-rebuild call site; same invalidation.
+    private func rebuildPositions() { syncPositions() }
 }

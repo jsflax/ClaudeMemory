@@ -93,6 +93,8 @@ public final class MetalForceCompute: @unchecked Sendable {
         edgeRangeBuffer = device.makeBuffer(length: cap * MemoryLayout<SIMD2<UInt32>>.stride, options: .storageModeShared)
         centroidMappingBuffer = device.makeBuffer(length: cap * MemoryLayout<SIMD2<UInt32>>.stride, options: .storageModeShared)
         nodeCapacity = cap
+        // The new group buffer is empty — force a re-upload next encode.
+        groupsDirty = true
     }
 
     private func ensureCentroidCapacity(_ totalGroups: Int) {
@@ -108,7 +110,16 @@ public final class MetalForceCompute: @unchecked Sendable {
     public func setTopologyDirty(edges: [(Int, Int)]) {
         dispatchEdges = edges
         topologyDirtyForDispatch = true
+        groupsDirty = true
     }
+
+    /// Per-node group assignments (project/topic/galaxy) only change on
+    /// topology edits, but the group buffer + project/topic counts were being
+    /// re-uploaded/rescanned every frame (3× O(nodes) at 42k). Upload once
+    /// per topology change instead.
+    private var groupsDirty = true
+    private var cachedNumProjects = 1
+    private var cachedNumTopics = 1
 
     /// Rebuild CSR edge buffers and per-node group/centroid mapping.
     public func rebuildTopology(
@@ -358,8 +369,6 @@ public final class MetalForceCompute: @unchecked Sendable {
         lastEncodedNodeCount = n
         tickCount += 1
 
-        let numProjects = max((projectGroups.max() ?? 0) + 1, 1)
-        let numTopics = max((topicGroups.max() ?? 0) + 1, 1)
         let numGalaxies = max(galaxyCenters.count, 1)
 
         // Upload positions to GPU
@@ -371,16 +380,24 @@ public final class MetalForceCompute: @unchecked Sendable {
             posPtr[i] = SIMD3<Float>(x[i], y[i], z[i])
         }
 
-        // Update per-node groups (position changes, groups may have changed with addNode)
-        let gPtr = grpBuf.contents().bindMemory(to: SIMD4<Int32>.self, capacity: n)
-        for i in 0..<n {
-            gPtr[i] = SIMD4<Int32>(
-                Int32(projectGroups[i]),
-                Int32(i < topicGroups.count ? topicGroups[i] : 0),
-                Int32(i < galaxyGroups.count ? galaxyGroups[i] : 0),
-                0
-            )
+        // Group buffer + project/topic counts change ONLY on topology edits.
+        // Recompute + re-upload just then, not every frame.
+        if groupsDirty {
+            cachedNumProjects = max((projectGroups.max() ?? 0) + 1, 1)
+            cachedNumTopics = max((topicGroups.max() ?? 0) + 1, 1)
+            let gPtr = grpBuf.contents().bindMemory(to: SIMD4<Int32>.self, capacity: n)
+            for i in 0..<n {
+                gPtr[i] = SIMD4<Int32>(
+                    Int32(projectGroups[i]),
+                    Int32(i < topicGroups.count ? topicGroups[i] : 0),
+                    Int32(i < galaxyGroups.count ? galaxyGroups[i] : 0),
+                    0
+                )
+            }
+            groupsDirty = false
         }
+        let numProjects = cachedNumProjects
+        let numTopics = cachedNumTopics
 
         // Update centroids every 10 ticks (matches JS)
         if tickCount % 10 == 0 || tickCount <= 1 {
