@@ -110,10 +110,14 @@ actor Galaxy: Identifiable {
     /// Set up live Lattice observers. Callbacks push raw data into pendingUpdate —
     /// all filtering (hidden projects/relations, time) happens during drain via DrainConfig.
     func startObservers() {
-        guard let lattice = latticeRef.resolve() else { fatalError() }
+        // Sign-out (or any teardown) can invalidate the lattice while the
+        // initial load is still in flight — observers just don't start.
+        // Crashing here took the app down when signing out mid-load.
+        guard let lattice = latticeRef.resolve() else { return }
 
         edgeObserver = lattice.objects(MemoryEdge.self).observe { [pendingUpdate, edgePkToGidLock] change in
-            guard let bg = self.latticeRef.resolve() else { fatalError("This should not happen") }
+            // Lattice torn down (sign-out) — drop the change, observer dies with it.
+            guard let bg = self.latticeRef.resolve() else { return }
             switch change {
             case .insert(let pk):
                 guard let edge = bg.object(MemoryEdge.self, primaryKey: pk),
@@ -138,7 +142,8 @@ actor Galaxy: Identifiable {
         }
 
         nodeObserver = lattice.objects(Memory.self).observe { [pendingUpdate] change in
-            guard let bg = self.latticeRef.resolve() else { fatalError("This should not happen") }
+            // Lattice torn down (sign-out) — drop the change, observer dies with it.
+            guard let bg = self.latticeRef.resolve() else { return }
             switch change {
             case .insert(let pk):
                 guard let memory = bg.object(Memory.self, primaryKey: pk),

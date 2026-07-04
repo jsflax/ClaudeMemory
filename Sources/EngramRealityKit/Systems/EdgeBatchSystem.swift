@@ -22,6 +22,13 @@ public final class EdgeBatchSystem {
     private var texStagingCapacity: Int = 0
     private var lastInstanceCount: Int = -1
 
+    // Stable instance-slot assignment — see NodeBatchSystem: keeps per-slot
+    // color and transform associated per EDGE across frames of LOD churn.
+    private var slotForEdge: [Int: Int] = [:]
+    private var slotHighWater = 0
+    private var freeSlots: [Int] = []
+    private var slotsTopologyVersion: UInt64 = .max
+
     /// Cached node→project mapping — rebuilt only on topology change.
     private var cachedNodeProject: [UUID: String] = [:]
     /// Cached node UUID→positionArray index mapping — rebuilt only on topology change.
@@ -238,11 +245,50 @@ public final class EdgeBatchSystem {
         let texWidth = scene.edgeInstanceTextureWidth
         var texData = [SIMD4<Float16>](repeating: .zero, count: texWidth)
 
-        var instanceIdx = 0
+        // --- Stable slot maintenance (see NodeBatchSystem) ---
+        if dataProvider.topologyVersion != slotsTopologyVersion {
+            slotsTopologyVersion = dataProvider.topologyVersion
+            slotForEdge.removeAll(keepingCapacity: true)
+            freeSlots.removeAll(keepingCapacity: true)
+            slotHighWater = 0
+        }
+        let capacity = instanceData.instanceCapacity
+        let visibleEdgeSet = Set(visibleSet.visibleEdgeIndices)
+        var freed: [Int] = []
+        slotForEdge = slotForEdge.filter { (edgeIdx, slot) in
+            if visibleEdgeSet.contains(edgeIdx) { return true }
+            freed.append(slot)
+            return false
+        }
+        freeSlots.append(contentsOf: freed)
+        var occupied = [Bool](repeating: false, count: min(slotHighWater, capacity))
+        var writes: [(slot: Int, edgeIdx: Int)] = []
+        writes.reserveCapacity(min(visibleCount, capacity))
+        for edgeIdx in visibleSet.visibleEdgeIndices {
+            let slot: Int
+            if let existing = slotForEdge[edgeIdx] {
+                slot = existing
+            } else if let reused = freeSlots.popLast() {
+                slot = reused
+                slotForEdge[edgeIdx] = reused
+            } else if slotHighWater < capacity {
+                slot = slotHighWater
+                slotHighWater += 1
+                slotForEdge[edgeIdx] = slot
+            } else {
+                continue
+            }
+            if slot < occupied.count { occupied[slot] = true }
+            writes.append((slot, edgeIdx))
+        }
+        let slotWrites = writes
+        let holes = occupied.enumerated().compactMap { $1 ? nil : $0 }
+        let usedCount = min(slotHighWater, capacity)
 
         instanceData.replaceMutableTransforms { transforms in
-            for edgeIdx in visibleSet.visibleEdgeIndices {
-                guard instanceIdx < visibleCount, instanceIdx < transforms.count else { break }
+            for (slot, edgeIdx) in slotWrites {
+                let instanceIdx = slot
+                guard instanceIdx < transforms.count, instanceIdx < texData.count else { continue }
                 let edge = edges[edgeIdx]
                 let srcPos: SIMD3<Float>
                 let tgtPos: SIMD3<Float>
@@ -284,11 +330,16 @@ public final class EdgeBatchSystem {
                 texData[instanceIdx] = SIMD4<Float16>(
                     Float16(color.x), Float16(color.y), Float16(color.z), Float16(alpha)
                 )
-                instanceIdx += 1
+            }
+
+            // Zero departed slots (see NodeBatchSystem).
+            for slot in holes where slot < transforms.count {
+                transforms[slot] = matrix_identity_float4x4 * 0
+                if slot < texData.count { texData[slot] = .zero }
             }
         }
 
-        instanceData.instanceCount = instanceIdx
+        instanceData.instanceCount = usedCount
 
         // Update per-instance color texture
         let bytesPerRow = texWidth * MemoryLayout<SIMD4<Float16>>.stride

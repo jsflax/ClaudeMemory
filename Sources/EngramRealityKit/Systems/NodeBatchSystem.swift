@@ -33,6 +33,18 @@ public final class NodeBatchSystem {
     /// Last instance count — update MeshInstancesComponent part only when this changes.
     private var lastInstanceCount: Int = -1
 
+    // Stable instance-slot assignment (macOS-26 instanced path). A node keeps
+    // its slot for as long as it stays visible, so the per-slot color texture
+    // and RealityKit's per-slot transforms stay associated per NODE even when
+    // the two resources are picked up a frame apart (we can't order our color
+    // blit against RealityKit's internal instance-data upload — sequential
+    // slot assignment made LOD churn re-pair every slot every frame, which
+    // flashed random colors during camera traversal).
+    private var slotForNode: [Int: Int] = [:]
+    private var slotHighWater = 0
+    private var freeSlots: [Int] = []
+    private var slotsTopologyVersion: UInt64 = .max
+
     public init() {}
 
     public func update(
@@ -223,12 +235,61 @@ public final class NodeBatchSystem {
         let texWidth = scene.nodeInstanceTextureWidth
         var texData = [SIMD4<Float16>](repeating: .zero, count: texWidth)
 
-        var instanceIdx = 0
+        // --- Stable slot maintenance ---
+        // Node indices remap on topology change: reset the mapping.
+        if dataProvider.topologyVersion != slotsTopologyVersion {
+            slotsTopologyVersion = dataProvider.topologyVersion
+            slotForNode.removeAll(keepingCapacity: true)
+            freeSlots.removeAll(keepingCapacity: true)
+            slotHighWater = 0
+        }
+        let capacity = instanceData.instanceCapacity
+        var visibleBits = [Bool](repeating: false, count: nodes.count)
+        for idx in visibleSet.nearNodes where idx < nodes.count { visibleBits[idx] = true }
+        for idx in visibleSet.midNodes where idx < nodes.count { visibleBits[idx] = true }
+        for idx in visibleSet.farNodes where idx < nodes.count { visibleBits[idx] = true }
+        // Free slots of nodes that left the visible set.
+        var freed: [Int] = []
+        slotForNode = slotForNode.filter { (nodeIndex, slot) in
+            if nodeIndex < visibleBits.count && visibleBits[nodeIndex] { return true }
+            freed.append(slot)
+            return false
+        }
+        freeSlots.append(contentsOf: freed)
+        var occupied = [Bool](repeating: false, count: min(slotHighWater, capacity))
+        // Assign slots up front (main-actor state; the transform closure below
+        // is nonisolated). writes = (slot, nodeIndex) in tier order.
+        var writes: [(slot: Int, nodeIndex: Int)] = []
+        writes.reserveCapacity(visibleCount)
+        func assignSlot(_ nodeIndex: Int) {
+            let slot: Int
+            if let existing = slotForNode[nodeIndex] {
+                slot = existing
+            } else if let reused = freeSlots.popLast() {
+                slot = reused
+                slotForNode[nodeIndex] = reused
+            } else if slotHighWater < capacity {
+                slot = slotHighWater
+                slotHighWater += 1
+                slotForNode[nodeIndex] = slot
+            } else {
+                return  // over budget — LOD already caps at capacity
+            }
+            if slot < occupied.count { occupied[slot] = true }
+            writes.append((slot, nodeIndex))
+        }
+        for idx in visibleSet.nearNodes { assignSlot(idx) }
+        for idx in visibleSet.midNodes { assignSlot(idx) }
+        for idx in visibleSet.farNodes { assignSlot(idx) }
+        let slotWrites = writes
+        let holes = occupied.enumerated().compactMap { $1 ? nil : $0 }
+        let usedCount = min(slotHighWater, capacity)
 
         // Write transforms synchronously (GPU-safe, no command buffer)
         instanceData.replaceMutableTransforms { transforms in
-            func writeNode(nodeIndex: Int) {
-                guard instanceIdx < visibleCount, instanceIdx < transforms.count else { return }
+            func writeNode(slot: Int, nodeIndex: Int) {
+                guard slot < transforms.count, slot < texData.count else { return }
+                let instanceIdx = slot
                 let node = nodes[nodeIndex]
                 let pos = nodeIndex < positionArray.count ? positionArray[nodeIndex] : (positions[node.id] ?? .zero)
 
@@ -268,15 +329,19 @@ public final class NodeBatchSystem {
                 texData[instanceIdx] = SIMD4<Float16>(
                     Float16(color.x), Float16(color.y), Float16(color.z), Float16(packedState)
                 )
-                instanceIdx += 1
             }
 
-            for idx in visibleSet.nearNodes { writeNode(nodeIndex: idx) }
-            for idx in visibleSet.midNodes { writeNode(nodeIndex: idx) }
-            for idx in visibleSet.farNodes { writeNode(nodeIndex: idx) }
+            for w in slotWrites { writeNode(slot: w.slot, nodeIndex: w.nodeIndex) }
+
+            // Collapse holes left by departed nodes (robust to RealityKit
+            // re-reading stale slots): zero-scale transform renders nothing.
+            for slot in holes where slot < transforms.count {
+                transforms[slot] = simd_float4x4(diagonal: SIMD4<Float>(0, 0, 0, 1))
+                if slot < texData.count { texData[slot] = .zero }
+            }
         }
 
-        instanceData.instanceCount = instanceIdx
+        instanceData.instanceCount = usedCount
 
         // Update per-instance color texture via staging buffer + blit
         let bytesPerRow = texWidth * MemoryLayout<SIMD4<Float16>>.stride

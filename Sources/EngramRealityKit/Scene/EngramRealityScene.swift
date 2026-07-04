@@ -380,15 +380,14 @@ public final class EngramRealityScene {
         )
         phaseMark()
 
-        // Single GPU commit for all batch system writes. WAIT for it: the
-        // per-instance color textures ride this buffer while transforms land
-        // instantly in shared memory — if the blit finished after RealityKit
-        // encoded the frame, a churning LOD set (camera traversal reassigns
-        // instance slots every frame) rendered slot i with node X's transform
-        // but node Y's color: visible color flashing. The blits are tiny
-        // (~200KB); the wait keeps color and transform atomic per frame.
+        // Single GPU commit for all batch system writes. No CPU wait: color
+        // and transform stay associated per NODE via stable instance slots
+        // (see NodeBatchSystem) — a one-frame skew between the color-texture
+        // blit and RealityKit's transform pickup then pairs a node's own
+        // color with its own transform, so no flashing. (A waitUntilCompleted
+        // here was tried: it cost measurable frame time and still couldn't
+        // order OUR blit against RealityKit's internal instance-data upload.)
         sharedCmdBuf?.commit()
-        sharedCmdBuf?.waitUntilCompleted()
         phaseMark()
 
         // 8. Nebula update
