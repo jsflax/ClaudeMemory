@@ -87,15 +87,24 @@ func setHookState(key: HookState.Key, value: String) {
 }
 
 /// Get or create the SessionState row for a given session ID.
-func getSessionState(sessionId: String?) -> SessionState? {
+/// Run `body` with the session state while HOLDING the backing lattice.
+/// The old shape returned the object after the function-scope lattice was
+/// released — with the weak instance cache, a solo hook process then
+/// deallocated the lattice under the live object, and the next property
+/// WRITE trapped in the C++ backend (production memory-hooks OnStop
+/// crashes, Jul 3-4: SessionState.stopNudgeSent.setter → setBool SIGTRAP).
+@discardableResult
+func withSessionState<T>(sessionId: String?, _ body: (SessionState) -> T) -> T? {
     guard let sessionId, !sessionId.isEmpty else { return nil }
     guard let lattice = openLattice(sessionId: sessionId) else { return nil }
+    let state: SessionState
     if let existing = lattice.objects(SessionState.self).where({ $0.sessionId == sessionId }).first {
-        return existing
+        state = existing
+    } else {
+        state = SessionState(sessionId: sessionId)
+        lattice.add(state)
     }
-    let state = SessionState(sessionId: sessionId)
-    lattice.add(state)
-    return state
+    return withExtendedLifetime(lattice) { body(state) }
 }
 
 // MARK: - Per-Session Debug Log (wrapper that uses sessionId param over global)
@@ -353,19 +362,20 @@ private let learningNudgeInterval = 30
 /// Increments the tool call counter and returns a learning nudge only when threshold is crossed.
 /// Use this for high-frequency hooks (PostToolUseFailure) to avoid habituation.
 func throttledLearningNudge(project: String, sessionId: String?) -> String? {
-    guard let state = getSessionState(sessionId: sessionId) else { return nil }
+    let shouldNudge = withSessionState(sessionId: sessionId) { state -> Bool in
+        state.toolCallCount += 1
+        state.updatedAt = Date()
 
-    state.toolCallCount += 1
-    state.updatedAt = Date()
+        let lastNudgeAt = state.learningNudgeLastToolCount
+        let threshold = lastNudgeAt == 0 ? learningNudgeInitialThreshold : learningNudgeInterval
+        let delta = state.toolCallCount - lastNudgeAt
 
-    let lastNudgeAt = state.learningNudgeLastToolCount
-    let threshold = lastNudgeAt == 0 ? learningNudgeInitialThreshold : learningNudgeInterval
-    let delta = state.toolCallCount - lastNudgeAt
-
-    guard delta >= threshold else { return nil }
-
-    state.learningNudgeLastToolCount = state.toolCallCount
-    hookLog("Learning nudge injected (tool call \(state.toolCallCount), last nudge at \(lastNudgeAt))")
+        guard delta >= threshold else { return false }
+        state.learningNudgeLastToolCount = state.toolCallCount
+        return true
+    }
+    guard shouldNudge == true else { return nil }
+    hookLog("Learning nudge injected (throttled)")
 
     return """
     ## Action required: capture session insights

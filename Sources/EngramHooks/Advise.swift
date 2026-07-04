@@ -92,10 +92,13 @@ struct Advise: AsyncParsableCommand {
         spawnMaintenanceIfNeeded(project: proj, cwd: input.cwd)
 
         // Learning nudge — skip if stop hook just fired (session-learner already spawned)
-        if let state = getSessionState(sessionId: input.sessionId), state.stopNudgeSent {
+        let consumedStopNudge = withSessionState(sessionId: input.sessionId) { state -> Bool in
+            guard state.stopNudgeSent else { return false }
             state.stopNudgeSent = false
             state.updatedAt = Date()
-        } else {
+            return true
+        }
+        if consumedStopNudge != true {
             sections.append(learningNudge(project: proj))
         }
 

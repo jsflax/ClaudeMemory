@@ -37,7 +37,7 @@ struct OnStop: AsyncParsableCommand {
         let project = projectName(from: input.cwd) ?? "unknown"
 
         // Mark as sent so the Advise hook skips its learning nudge
-        if let state = getSessionState(sessionId: input.sessionId) {
+        withSessionState(sessionId: input.sessionId) { state in
             state.stopNudgeSent = true
             state.updatedAt = Date()
         }
