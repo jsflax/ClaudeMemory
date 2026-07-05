@@ -28,6 +28,33 @@ public func sessionLog(_ message: String, sessionId: String? = nil) {
         fm.createFile(atPath: path, contents: Data(line.utf8))
     }
 }
+/// Append a "saved" entry to the session recall log so the statusline shows it.
+public func appendSessionSaveLog(sessionId: String?, globalId: String, project: String, topic: String, preview: String) {
+    guard let sid = sessionId, !sid.isEmpty else { return }
+    let dir = memoryLogsDir
+    let path = dir + "/recall-\(sid).log"
+    let fm = FileManager.default
+    if !fm.fileExists(atPath: dir) {
+        try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    }
+    let cyan = "\u{1B}[36m"
+    let green = "\u{1B}[32m"
+    let magenta = "\u{1B}[35m"
+    let dim = "\u{1B}[2m"
+    let rst = "\u{1B}[0m"
+    let shortId = String(globalId.prefix(8))
+    let line = "  \(green)+\(rst) \(cyan)\(shortId)\(rst) \(magenta)[\(project)/\(topic)]\(rst) \(dim)\(preview)\(rst)\n"
+    if let fh = FileHandle(forWritingAtPath: path) {
+        fh.seekToEndOfFile()
+        fh.write(Data(line.utf8))
+        fh.closeFile()
+    } else {
+        // No recall log yet — create one with just the save line
+        let content = "\(dim)no recall yet\(rst)\n\(line)"
+        fm.createFile(atPath: path, contents: Data(content.utf8))
+    }
+}
+
 private let logMaxBytes = 256 * 1024
 
 private func rotateLogIfNeeded() {
@@ -42,6 +69,8 @@ private func rotateLogIfNeeded() {
 
 public func log(_ message: String) {
     let line = "[claude-memory] \(ISO8601DateFormatter().string(from: Date())) \(message)\n"
+    // Feed the crash reporter ring buffer
+    CrashReporter.shared.log(message)
     // Always write to stderr for immediate visibility
     FileHandle.standardError.write(Data(line.utf8))
     // Also append to rotating log file
