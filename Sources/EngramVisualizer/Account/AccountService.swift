@@ -50,7 +50,21 @@ final class AccountService {
         // Must match the sync daemon's default (EngramDaemon → engramdb.io);
         // the old engram.io default sent auth to a different host than the
         // daemon relayed sync to.
-        self.endpoint = UserDefaults.standard.string(forKey: Self.endpointKey)
+        //
+        // Migration: discard persisted DEV endpoints. ngrok tunnels are
+        // ephemeral by construction, and localhost only makes sense inside a
+        // dev session — a stale persisted value left machines pointed at a
+        // dead tunnel across app updates ("authentication failed" with no
+        // hint why), and the installer faithfully propagated it to the
+        // daemon via --endpoint.
+        let persisted = UserDefaults.standard.string(forKey: Self.endpointKey)
+        let isStaleDev = persisted.map {
+            $0.contains("ngrok") || $0.contains("localhost") || $0.contains("127.0.0.1")
+        } ?? false
+        if isStaleDev {
+            UserDefaults.standard.removeObject(forKey: Self.endpointKey)
+        }
+        self.endpoint = (isStaleDev ? nil : persisted)
             ?? "https://engramdb.io"
         #if TEST_AUTH_TOKEN
         self.token = ProcessInfo.processInfo.environment["TEST_AUTH_TOKEN"]
