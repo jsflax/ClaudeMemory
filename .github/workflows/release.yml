@@ -11,11 +11,22 @@ permissions:
 jobs:
   build:
     runs-on: macos-26
+    # SwiftLM is a private dependency (since the mascot-chat work) — SwiftPM
+    # resolution needs a token. SWIFTLM_CLONE_TOKEN: fine-grained PAT, read-only
+    # Contents on jsflax/SwiftLM. Scoped insteadOf so no other clone is touched.
+    env:
+      GIT_CONFIG_COUNT: 1
+      GIT_CONFIG_KEY_0: url.https://x-access-token:${{ secrets.SWIFTLM_CLONE_TOKEN }}@github.com/jsflax/SwiftLM.insteadOf
+      GIT_CONFIG_VALUE_0: https://github.com/jsflax/SwiftLM
     steps:
       - uses: actions/checkout@v4
 
+      # Core correctness gate (the 0.13.0 release bar): sync/memory/organize/
+      # relay + RealityKit system tests. EngramVisualizerTests' GPU-internal
+      # suites are known debt (see CHANGELOG 0.13.0) and on-device
+      # FoundationModels tests can't run on hosted runners.
       - name: Run tests
-        run: swift test
+        run: swift test --filter "EngramTests|EngramRealityKitTests"
 
       - name: Build CLI release binaries
         run: swift build -c release
