@@ -59,6 +59,11 @@ extension SidebarView {
                                         .font(.system(size: 10, design: .monospaced))
                                         .foregroundStyle(.white.opacity(0.35))
                                 }
+                                if sub.isActive != true {
+                                    subscribeButton
+                                }
+                            } else if accountService.isSignedIn {
+                                subscribeButton
                             } else {
                                 Text("Free")
                                     .font(.system(size: 11, design: .monospaced))
@@ -299,3 +304,20 @@ extension SidebarView {
         }
     }
 }
+
+extension SidebarView {
+    /// The app has no purchase flow — checkout lives in the web app's
+    /// paywall (Stripe). Deep-link there with the user's endpoint.
+    var subscribeButton: some View {
+        Button("Subscribe…") {
+            let base = accountService.endpoint
+                .replacingOccurrences(of: "https://engram.io", with: "https://engramdb.io")
+            if let url = URL(string: "\(base)/app") {
+                NSWorkspace.shared.open(url)
+            }
+        }
+        .buttonStyle(.borderedProminent)
+        .font(.system(size: 11, design: .monospaced))
+    }
+}
+

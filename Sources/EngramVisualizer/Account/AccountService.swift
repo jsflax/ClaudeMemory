@@ -291,9 +291,31 @@ final class AccountService {
         } catch {
             // Non-fatal — subscription check can fail silently
         }
+        if subscription?.isActive != true {
+            startSubscriptionWatcherIfNeeded()
+        }
     }
 
     /// Returns the WebSocket sync URL if the user has an active subscription.
+    /// Poll subscription status while signed in but not yet active — an
+    /// admin comp (or completed checkout) then unlocks sync WITHOUT the user
+    /// restarting the app: `subscription` flips, the app observes the change
+    /// and auto-connects. Idle cost: one GET/min only while inactive.
+    private var subscriptionWatcher: Task<Void, Never>?
+
+    func startSubscriptionWatcherIfNeeded() {
+        guard isSignedIn, subscription?.isActive != true, subscriptionWatcher == nil else { return }
+        subscriptionWatcher = Task { [weak self] in
+            while let self, !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(60))
+                guard self.isSignedIn else { break }
+                await self.refreshSubscriptionStatus()
+                if self.subscription?.isActive == true { break }
+            }
+            self?.subscriptionWatcher = nil
+        }
+    }
+
     var syncWebSocketURL: URL? {
         guard isSignedIn, subscription?.isActive == true else { return nil }
         let wsEndpoint = endpoint
