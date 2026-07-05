@@ -110,7 +110,12 @@ jobs:
           # Add to search list
           security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
 
+      # -clonedSourcePackagesDirPath .build reuses the CLI-resolved package
+      # checkouts AND the mirror-fetched Sparkle artifact — Xcode's own
+      # package resolution (which re-downloads binary artifacts with the
+      # same hanging URLSession path) never runs.
       - name: Archive app with xcodebuild
+        timeout-minutes: 60
         if: env.DEVELOPER_ID_CERT_BASE64 != ''
         env:
           DEVELOPER_ID_CERT_BASE64: ${{ secrets.DEVELOPER_ID_CERT_BASE64 }}
@@ -121,6 +126,7 @@ jobs:
           BUILD_NUMBER=$(( ${PREV_BUILD:-0} + 1 ))
           xcodebuild archive \
             -project Engram.xcodeproj \
+            -clonedSourcePackagesDirPath .build \
             -scheme Engram \
             -archivePath build/Engram.xcarchive \
             -configuration Release \
