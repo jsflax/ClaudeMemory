@@ -2,9 +2,10 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>keychain-access-groups</key>
-	<array>
-		<string>$(AppIdentifierPrefix)io.engram.app</string>
-	</array>
+	<!-- keychain-access-groups removed: it required a provisioning profile
+	     for Developer ID archives, and it was never load-bearing — the
+	     daemon is an unsigned CLI that cannot join an access group; token
+	     sharing works via per-item keychain ACLs (the Always Allow prompt),
+	     which need no entitlement. -->
 </dict>
 </plist>
