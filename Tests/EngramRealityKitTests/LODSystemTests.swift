@@ -61,8 +61,14 @@ struct LODSystemTests {
         #expect(result.farNodes.count == 1)
     }
 
-    @Test("Culled nodes beyond 5000 units")
-    func culledNodes() {
+    @Test("Distant nodes stay visible — quantile tiers, no fixed cull")
+    func distantNodesNotCulled() {
+        // The V2 LOD rewrite replaced fixed distance cutoffs with quantile
+        // tiers (min/max-distance EMA): a fixed 5000-unit cull blanked the
+        // whole graph at 42k scale where everything sits far from the
+        // camera. Density is governed by the render budget (see
+        // renderBudgetCap), not absolute distance — a lone distant node
+        // must therefore stay visible.
         let lod = LODSystem()
         let nodes = makeNodes(1)
         let positions: [UUID: SIMD3<Float>] = [nodes[0].id: SIMD3<Float>(6000, 0, 0)]
@@ -73,7 +79,7 @@ struct LODSystemTests {
             glowingNodes: [:], hubs: []
         )
 
-        #expect(result.totalNodeCount == 0)
+        #expect(result.totalNodeCount == 1)
     }
 
     @Test("Render budget caps node count")
