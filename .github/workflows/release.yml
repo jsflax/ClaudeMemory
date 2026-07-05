@@ -21,13 +21,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Split build from run: SwiftPM occasionally wedges pre-run with zero
-      # output (workspace-state artifact) — an unbounded combined step hung a
-      # release for 100+ minutes. Separate timeouts make a wedge fail fast
-      # (re-run usually clears it), and the build gets its own generous
-      # budget for the cold C++-heavy graph on slow runners.
+      # Resolution (dependency clones + binary artifacts like Sparkle) is the
+      # hang-prone phase — two release runs wedged silently mid-fetch. Isolate
+      # it with a hard per-attempt kill (perl alarm: SwiftPM resumes cached
+      # state on retry) so a stuck download costs 8 minutes, not 90.
+      - name: Resolve dependencies
+        timeout-minutes: 30
+        run: |
+          for attempt in 1 2 3; do
+            if perl -e 'alarm(8*60); exec @ARGV' -- swift package resolve; then
+              exit 0
+            fi
+            echo "::warning::resolve attempt ${attempt} failed or hung — clearing artifacts and retrying"
+            rm -rf .build/artifacts
+          done
+          exit 1
+
+      # Compile-only after a clean resolve; generous budget for the cold
+      # C++-heavy graph on slow hosted runners.
       - name: Build tests
-        timeout-minutes: 90
+        timeout-minutes: 75
         run: swift build --build-tests
       # Core correctness gate (the 0.13.0 release bar): sync/memory/organize/
       # relay + RealityKit system tests. EngramVisualizerTests' GPU-internal
