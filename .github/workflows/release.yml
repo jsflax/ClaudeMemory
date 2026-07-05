@@ -21,10 +21,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Resolution (dependency clones + binary artifacts like Sparkle) is the
-      # hang-prone phase — two release runs wedged silently mid-fetch. Isolate
-      # it with a hard per-attempt kill (perl alarm: SwiftPM resumes cached
-      # state on retry) so a stuck download costs 8 minutes, not 90.
+      # SwiftPM's URLSession-based binary-artifact download hangs
+      # DETERMINISTICALLY on this runner image (3/3 alarm-killed attempts at
+      # the Sparkle zip — the wedge behind three dead release runs), while
+      # curl fetches the same URL fine. Pre-populate the extracted artifact
+      # so resolve skips the download entirely (both SwiftPM cache layouts).
+      - name: Pre-fetch Sparkle artifact
+        timeout-minutes: 5
+        run: |
+          curl -sSfL -o /tmp/sparkle.zip \
+            https://github.com/sparkle-project/Sparkle/releases/download/2.8.1/Sparkle-for-Swift-Package-Manager.zip
+          mkdir -p .build/artifacts/sparkle/Sparkle
+          unzip -q /tmp/sparkle.zip -d .build/artifacts/sparkle/Sparkle/
+          cp -R .build/artifacts/sparkle/Sparkle/Sparkle.xcframework .build/artifacts/sparkle/ 2>/dev/null || true
+          ls .build/artifacts/sparkle/Sparkle/
+
+      # Resolution (dependency clones) — still isolated with a hard
+      # per-attempt kill so any OTHER stuck fetch costs 8 minutes, not 90.
       - name: Resolve dependencies
         timeout-minutes: 30
         run: |
@@ -32,8 +45,7 @@ jobs:
             if perl -e 'alarm(8*60); exec @ARGV' -- swift package resolve; then
               exit 0
             fi
-            echo "::warning::resolve attempt ${attempt} failed or hung — clearing artifacts and retrying"
-            rm -rf .build/artifacts
+            echo "::warning::resolve attempt ${attempt} failed or hung - retrying"
           done
           exit 1
 
