@@ -21,12 +21,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Split build from run: SwiftPM occasionally wedges pre-run with zero
+      # output (workspace-state artifact) — an unbounded combined step hung a
+      # release for 100+ minutes. Separate timeouts make a wedge fail fast
+      # (re-run usually clears it), and the build gets its own generous
+      # budget for the cold C++-heavy graph on slow runners.
+      - name: Build tests
+        timeout-minutes: 90
+        run: swift build --build-tests
       # Core correctness gate (the 0.13.0 release bar): sync/memory/organize/
       # relay + RealityKit system tests. EngramVisualizerTests' GPU-internal
       # suites are known debt (see CHANGELOG 0.13.0) and on-device
       # FoundationModels tests can't run on hosted runners.
       - name: Run tests
-        run: swift test --filter "EngramTests|EngramRealityKitTests"
+        timeout-minutes: 30
+        run: swift test --skip-build --filter "EngramTests|EngramRealityKitTests"
 
       - name: Build CLI release binaries
         run: swift build -c release
