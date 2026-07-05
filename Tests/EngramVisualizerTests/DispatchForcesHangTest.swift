@@ -67,12 +67,18 @@ struct DispatchForcesHangTest {
 
         // Submit render-like compute work on the render queue continuously
         nonisolated(unsafe) var renderRunning = true
-        let packNodePL: MTLComputePipelineState = {
-            let fn = library.makeFunction(name: "pack_node_instances")!
+        // pack_node_instances died with MetalGraphRenderer (79e4394); use the
+        // surviving integrate kernel as the render-like concurrent GPU load.
+        let renderPL: MTLComputePipelineState = {
+            let fn = library.makeFunction(name: "integrate_positions")!
             return try! device.makeComputePipelineState(function: fn)
         }()
-        let dummyBuf = device.makeBuffer(length: n * 64, options: .storageModeShared)!
+        // integrate_positions: positions/velocities/forces (float3 = 16B) + params.
+        let dummyBuf = device.makeBuffer(length: n * 16, options: .storageModeShared)!
         let paramsBuf = device.makeBuffer(length: 64, options: .storageModeShared)!
+        // params.nodeCount = n (first field); damping/maxSpeed zero — the
+        // kernel just reads+writes in-bounds, which is all the load needs.
+        paramsBuf.contents().assumingMemoryBound(to: UInt32.self).pointee = UInt32(n)
 
         // Background render loop — submits work on renderQueue like the app does
         Task.detached { @Sendable in
@@ -80,14 +86,11 @@ struct DispatchForcesHangTest {
             while renderRunning {
                 guard let cmdBuf = renderQueue.makeCommandBuffer(),
                       let enc = cmdBuf.makeComputeCommandEncoder() else { break }
-                enc.setComputePipelineState(packNodePL)
+                enc.setComputePipelineState(renderPL)
                 enc.setBuffer(dummyBuf, offset: 0, index: 0)
                 enc.setBuffer(dummyBuf, offset: 0, index: 1)
                 enc.setBuffer(dummyBuf, offset: 0, index: 2)
-                enc.setBuffer(dummyBuf, offset: 0, index: 3)
-                enc.setBuffer(dummyBuf, offset: 0, index: 4)
-                enc.setBuffer(paramsBuf, offset: 0, index: 5)
-                enc.setBuffer(dummyBuf, offset: 0, index: 6)
+                enc.setBuffer(paramsBuf, offset: 0, index: 3)
                 enc.dispatchThreadgroups(
                     MTLSize(width: (n + 255) / 256, height: 1, depth: 1),
                     threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
