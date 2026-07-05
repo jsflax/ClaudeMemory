@@ -15,7 +15,13 @@ final class AccountService {
 
     /// The sync server endpoint. Defaults to production.
     var endpoint: String {
-        didSet { UserDefaults.standard.set(endpoint, forKey: Self.endpointKey) }
+        didSet {
+            UserDefaults.standard.set(endpoint, forKey: Self.endpointKey)
+            // The daemon's plist snapshots --endpoint; keep it in step.
+            if endpoint != oldValue {
+                CLIInstaller.refreshDaemonPlist()
+            }
+        }
     }
 
     /// Current auth token, persisted in Keychain.
@@ -63,6 +69,8 @@ final class AccountService {
         } ?? false
         if isStaleDev {
             UserDefaults.standard.removeObject(forKey: Self.endpointKey)
+            // The daemon plist likely snapshotted the same dead endpoint.
+            CLIInstaller.refreshDaemonPlist()
         }
         self.endpoint = (isStaleDev ? nil : persisted)
             ?? "https://engramdb.io"

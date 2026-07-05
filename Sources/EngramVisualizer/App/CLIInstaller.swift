@@ -110,6 +110,15 @@ enum CLIInstaller {
     private static let daemonBinary = installDir + "/memory-sync"
     private static let uid = getuid()
 
+    /// Rewrite the daemon plist from current settings and restart it.
+    /// Called whenever the sync endpoint changes (or a stale dev endpoint is
+    /// migrated away) — the plist snapshots --endpoint at write time, so
+    /// without a refresh the daemon keeps launching against the old host
+    /// until the next version bump reruns the installer.
+    static func refreshDaemonPlist() {
+        installDaemonPlist()
+    }
+
     private static func installDaemonPlist() {
         let fm = FileManager.default
         guard fm.fileExists(atPath: daemonBinary) else { return }
