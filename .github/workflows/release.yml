@@ -21,20 +21,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # SwiftPM's URLSession-based binary-artifact download hangs
-      # DETERMINISTICALLY on this runner image (3/3 alarm-killed attempts at
-      # the Sparkle zip — the wedge behind three dead release runs), while
-      # curl fetches the same URL fine. Pre-populate the extracted artifact
-      # so resolve skips the download entirely (both SwiftPM cache layouts).
-      - name: Pre-fetch Sparkle artifact
+      # SwiftPM's URLSession-based binary-artifact download of the Sparkle
+      # zip hangs DETERMINISTICALLY on this runner image (6/6 alarm-killed
+      # attempts across two runs; pre-populating .build/artifacts was
+      # ignored — SwiftPM insists on downloading). curl fetches the same URL
+      # instantly, so: fetch it ourselves, serve it from localhost, and
+      # mirror the artifact URL there (mirrors apply to binary-target URLs;
+      # identical bytes keep the manifest checksum valid).
+      - name: Mirror Sparkle artifact from localhost
         timeout-minutes: 5
         run: |
-          curl -sSfL -o /tmp/sparkle.zip \
+          curl -sSfL -o /tmp/sparkle-mirror-root/Sparkle-for-Swift-Package-Manager.zip --create-dirs \
             https://github.com/sparkle-project/Sparkle/releases/download/2.8.1/Sparkle-for-Swift-Package-Manager.zip
-          mkdir -p .build/artifacts/sparkle/Sparkle
-          unzip -q /tmp/sparkle.zip -d .build/artifacts/sparkle/Sparkle/
-          cp -R .build/artifacts/sparkle/Sparkle/Sparkle.xcframework .build/artifacts/sparkle/ 2>/dev/null || true
-          ls .build/artifacts/sparkle/Sparkle/
+          (cd /tmp/sparkle-mirror-root && nohup python3 -m http.server 8765 > /tmp/mirror.log 2>&1 &)
+          sleep 2
+          curl -sSf -o /dev/null http://127.0.0.1:8765/Sparkle-for-Swift-Package-Manager.zip && echo "mirror serving OK"
+          swift package config set-mirror \
+            --original-url https://github.com/sparkle-project/Sparkle/releases/download/2.8.1/Sparkle-for-Swift-Package-Manager.zip \
+            --mirror-url http://127.0.0.1:8765/Sparkle-for-Swift-Package-Manager.zip
+          cat .swiftpm/configuration/mirrors.json
 
       # Resolution (dependency clones) — still isolated with a hard
       # per-attempt kill so any OTHER stuck fetch costs 8 minutes, not 90.
