@@ -241,11 +241,16 @@ extension MemoryTools {
         }
 
         // Deprioritize originals (importance → 0) and create summarized_by edges
-        for (source, _) in sources {
-            source.importance = 0
-            guard let sourceGlobalId = source.__globalId else { continue }
-            let edge = Edge(sourceGlobalId: sourceGlobalId, targetGlobalId: summaryGlobalId, relation: .summarizedBy)
-            localLattice.add(edge)
+        nonisolated(unsafe) let sourceMemories = sources.map(\.memory)
+        let sourceGlobalIds = sourceMemories.compactMap(\.__globalId)
+        try localLattice.transaction {
+            for mem in sourceMemories {
+                mem.importance = 0
+            }
+            for sourceGlobalId in sourceGlobalIds {
+                let edge = Edge(sourceGlobalId: sourceGlobalId, targetGlobalId: summaryGlobalId, relation: .summarizedBy)
+                localLattice.add(edge)
+            }
         }
 
         let preview = String(a.content.prefix(120))
