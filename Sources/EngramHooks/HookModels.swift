@@ -152,7 +152,10 @@ struct HookOutput: Encodable {
 // MARK: - Maintenance Constants
 
 /// Trigger maintenance when this many CRUD operations have occurred since last run.
-let maintenanceThreshold = 10
+let maintenanceThreshold = 50
+
+/// Minimum seconds between maintenance runs (prevents re-trigger from maintenance's own writes).
+let maintenanceCooldownSeconds: TimeInterval = 900  // 15 minutes
 
 // MARK: - Helpers
 

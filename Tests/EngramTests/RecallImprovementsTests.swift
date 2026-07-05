@@ -106,13 +106,14 @@ import Foundation
     #expect(words.contains("database"))
 }
 
-@Test func extractContentWords_keepsVerbsDropsPronounsDeterminers() {
-    // NLTagger can't distinguish auxiliary from main verbs (no AUX tag),
-    // so all verbs pass through. Pronouns and determiners are still dropped.
+@Test func extractContentWords_keepsMainVerbsDropsAuxiliariesPronounsDeterminers() {
+    // Main (content) verbs pass through POS filtering; copulas/auxiliaries
+    // ("have"/"been") are dropped by the explicit function-word set, since
+    // they add no recall signal. Pronouns and determiners are dropped too.
     let words = MemoryTools.extractContentWords(from: "have we been doing this")
-    #expect(words.contains("have"))
-    #expect(words.contains("been"))
     #expect(words.contains("doing"))
+    #expect(!words.contains("have"))
+    #expect(!words.contains("been"))
     #expect(!words.contains("we"))
     #expect(!words.contains("this"))
 }
@@ -160,8 +161,10 @@ import Foundation
     let words = MemoryTools.extractContentWords(from: "how does recall work")
     #expect(words.contains("recall"))
     #expect(words.contains("work"))
-    // NLTagger has no AUX tag — "does" passes through as a verb
-    #expect(words.contains("does"))
+    // Interrogative "how" and auxiliary "does" are dropped as function words —
+    // the query reduces to its content terms.
+    #expect(!words.contains("how"))
+    #expect(!words.contains("does"))
     // No whitespace tokens should leak through
     #expect(!words.contains(" "))
 }
