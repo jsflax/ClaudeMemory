@@ -37,7 +37,7 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/modelcontextprotocol/swift-sdk.git", from: "0.12.0"),
-        .package(path: "../Lattice"),
+        .package(url: "https://github.com/jsflax/lattice.git", from: "0.10.6"),
         .package(url: "https://github.com/jsflax/SwiftLM.git", branch: "main"),
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.5.0"),
         .package(url: "https://github.com/sparkle-project/Sparkle.git", from: "2.0.0"),
@@ -66,7 +66,7 @@ let package = Package(
         .target(
             name: "EngramModels",
             dependencies: [
-                .product(name: "Lattice", package: "Lattice"),
+                .product(name: "Lattice", package: "lattice"),
             ],
             swiftSettings: [
                 .interoperabilityMode(.Cxx),
@@ -77,7 +77,7 @@ let package = Package(
             dependencies: [
                 "EngramModels",
                 .product(name: "MCP", package: "swift-sdk"),
-                .product(name: "Lattice", package: "Lattice"),
+                .product(name: "Lattice", package: "lattice"),
                 .product(name: "SwiftLM", package: "SwiftLM"),
             ],
             resources: [
@@ -101,7 +101,7 @@ let package = Package(
             dependencies: [
                 "EngramKit",
                 .product(name: "MCP", package: "swift-sdk"),
-                .product(name: "Lattice", package: "Lattice"),
+                .product(name: "Lattice", package: "lattice"),
             ],
             swiftSettings: [
                 .interoperabilityMode(.Cxx),
@@ -116,7 +116,7 @@ let package = Package(
                 "EngramMetalShaders",
                 "CEngramSceneTypes",
                 "EngramRealityKit",
-                .product(name: "Lattice", package: "Lattice"),
+                .product(name: "Lattice", package: "lattice"),
                 .product(name: "Sparkle", package: "Sparkle"),
                 .product(name: "GoogleSignIn", package: "GoogleSignIn-iOS"),
                 .product(name: "GoogleSignInSwift", package: "GoogleSignIn-iOS"),
@@ -145,7 +145,7 @@ let package = Package(
             dependencies: [
                 "EngramKit",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
-                .product(name: "Lattice", package: "Lattice"),
+                .product(name: "Lattice", package: "lattice"),
             ],
             swiftSettings: [
                 .interoperabilityMode(.Cxx),
@@ -155,7 +155,7 @@ let package = Package(
             name: "EngramDaemon",
             dependencies: [
                 "EngramKit",
-                .product(name: "Lattice", package: "Lattice"),
+                .product(name: "Lattice", package: "lattice"),
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ],
             swiftSettings: [
@@ -187,7 +187,7 @@ let package = Package(
             dependencies: [
                 "EngramRealityKit", "EngramSceneKit", "EngramMetalShaders",
                 "EngramKit",
-                .product(name: "Lattice", package: "Lattice"),
+                .product(name: "Lattice", package: "lattice"),
             ],
             resources: [.copy("Resources/mascot.usdz")],
             swiftSettings: [.interoperabilityMode(.Cxx)],
@@ -202,7 +202,7 @@ let package = Package(
             name: "EngramTests",
             dependencies: [
                 "EngramKit",
-                .product(name: "Lattice", package: "Lattice"),
+                .product(name: "Lattice", package: "lattice"),
             ],
             swiftSettings: [
                 .interoperabilityMode(.Cxx),
@@ -225,7 +225,7 @@ let package = Package(
             dependencies: [
                 "EngramFoundationModels",
                 "EngramKit",
-                .product(name: "Lattice", package: "Lattice"),
+                .product(name: "Lattice", package: "lattice"),
             ],
             resources: [
                 .copy("Resources/engram_memory.fmadapter"),
