@@ -14,7 +14,10 @@ struct BHChargeGuardTests {
 
     static let device: MTLDevice? = MTLCreateSystemDefaultDevice()
 
-    /// Dispatch forces repeatedly until BH charge fires (tree builds async).
+    /// Dispatch forces repeatedly until the BH kernel fires (tree builds
+    /// async). Polls for "algo=BH" — the marker MetalForceCompute emits today
+    /// (the "BH charge" debug block these tests originally polled was removed
+    /// in 818676f, the same day the tests landed — they were dead on arrival).
     /// Returns (result, elapsed_ms, log_contents).
     @MainActor
     private func dispatchUntilBH(
@@ -54,7 +57,7 @@ struct BHChargeGuardTests {
             let ms = (CFAbsoluteTimeGetCurrent() - start) * 1000.0
             let log = (try? String(contentsOfFile: logPath)) ?? ""
 
-            if log.contains("BH charge") {
+            if log.contains("algo=BH") {
                 return (result, ms, log)
             }
             // Tree still building — yield to let async Task.detached complete

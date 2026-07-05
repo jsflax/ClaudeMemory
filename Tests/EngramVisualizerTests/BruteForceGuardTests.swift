@@ -88,13 +88,13 @@ struct BruteForceGuardTests {
         let log = try String(contentsOfFile: tmpPath)
         print("[test:log] GPU log contents:\n\(log)")
 
-        #expect(!log.contains("BRUTE charge"),
+        #expect(!log.contains("algo=BRUTE"),
                 "Brute force O(n²) must NOT fire at n=\(n) — this crashes the laptop")
-        #expect(log.contains("DISPATCH n=\(n)"),
+        #expect(log.contains("ENCODE END n=\(n)"),
                 "dispatchForces should log DISPATCH")
         // Either BH tree or SKIPPED is acceptable — brute force is the danger
-        let hasBH = log.contains("BH charge")
-        let hasSkipped = log.contains("SKIPPED charge")
+        let hasBH = log.contains("algo=BH")
+        let hasSkipped = log.contains("ENCODE SKIP")
         #expect(hasBH || hasSkipped,
                 "At n=\(n), charge should use BH tree or be skipped (not brute force)")
 
@@ -149,9 +149,9 @@ struct BruteForceGuardTests {
         let log = try String(contentsOfFile: tmpPath)
         print("[test:log] Small-n GPU log:\n\(log)")
 
-        #expect(log.contains("BRUTE charge: n=\(n)"),
+        #expect(log.contains("algo=BRUTE"),
                 "Brute force should be used at n=\(n) (safe for small counts)")
-        #expect(log.contains("DISPATCH n=\(n)"))
+        #expect(log.contains("ENCODE END n=\(n)"))
 
         try? FileManager.default.removeItem(atPath: tmpPath)
     }
