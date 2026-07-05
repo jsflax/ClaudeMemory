@@ -370,6 +370,17 @@ jobs:
               ]
             }"
 
+      # Failed releases were silent (the success notifier is if: success()) —
+      # announce failures too, with a link to the run.
+      - name: Notify Slack (failure)
+        if: failure() && env.SLACK_WEBHOOK_URL != ''
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          curl -s -X POST "$SLACK_WEBHOOK_URL" \
+            -H 'Content-Type: application/json' \
+            -d "{\"text\": \"❌ Engram ${GITHUB_REF_NAME} release FAILED — ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}"
+
       - name: Cleanup keychain
         if: always()
         run: |
