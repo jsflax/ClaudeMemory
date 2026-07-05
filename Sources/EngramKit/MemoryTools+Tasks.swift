@@ -21,7 +21,7 @@ extension MemoryTools {
         // Update existing task
         if let taskId = a.taskId?.value {
             let id64 = Int64(taskId)
-            let matches = lattice.objects(Checkpoint.self).where { $0.primaryKey == id64 }
+            let matches = localLattice.objects(Checkpoint.self).where { $0.primaryKey == id64 }
             guard let task = matches.first else {
                 return CallTool.Result(content: [.text("Task with id \(taskId) not found.")], isError: true)
             }
@@ -80,7 +80,7 @@ extension MemoryTools {
             progress: a.progress ?? "",
             context: a.context ?? ""
         )
-        lattice.add(task)
+        localLattice.add(task)
 
         guard let taskId = task.primaryKey else {
             throw MCPError.internalError("Failed to persist task — primaryKey is nil after add()")
@@ -97,7 +97,7 @@ extension MemoryTools {
     func handleResume(_ args: [String: Value]?) throws -> CallTool.Result {
         let a = try args.decode(ResumeArgs.self)
         let id64 = Int64(a.taskId.value)
-        let matches = lattice.objects(Checkpoint.self).where { $0.primaryKey == id64 }
+        let matches = localLattice.objects(Checkpoint.self).where { $0.primaryKey == id64 }
         guard let task = matches.first else {
             return CallTool.Result(content: [.text("Task with id \(a.taskId.value) not found.")], isError: true)
         }
@@ -136,7 +136,7 @@ extension MemoryTools {
             }
         }
 
-        var results = lattice.objects(Checkpoint.self)
+        var results = localLattice.objects(Checkpoint.self)
 
         if let project = a.project {
             results = results.where { $0.project == project }

@@ -6,12 +6,12 @@ import Foundation
 public final class HookState {
     @LatticeEnum
     public enum Key: String, Codable, Sendable {
-        case crudOperationCount = "crud.operationCount"
-        case maintenanceLastOpCount = "maintenance.lastOpCount"
+        case maintenanceLastRunTimestamp = "maintenance.lastRunTimestamp"
+        case maintenanceActive = "maintenance.active"
     }
 
     /// The state key.
-    public var key: Key = .crudOperationCount
+    public var key: Key = .maintenanceLastRunTimestamp
 
     /// The state value (stored as string, parsed by consumer).
     public var value: String

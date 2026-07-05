@@ -79,7 +79,7 @@ import Foundation
     // Episode should be deletable via forget (it's just a Memory)
     _ = try await tools.handle(CallTool.Parameters(
         name: "forget",
-        arguments: ["id": .int(id)]
+        arguments: ["id": .string(id)]
     ))
     let listAfter = try await tools.handle(CallTool.Parameters(
         name: "list_episodes",
@@ -135,7 +135,7 @@ import Foundation
 
     let result = try await tools.handle(CallTool.Parameters(
         name: "end_episode",
-        arguments: ["episode_id": .int(epId)]
+        arguments: ["episode_id": .string(epId)]
     ))
     #expect(text(from: result).contains("Ended episode"))
 }
@@ -154,7 +154,7 @@ import Foundation
     let tools = try await makeTools()
     let result = try await tools.handle(CallTool.Parameters(
         name: "end_episode",
-        arguments: ["episode_id": .int(99999)]
+        arguments: ["episode_id": .string(UUID().uuidString)]
     ))
     #expect(result.isError == true)
     #expect(text(from: result).contains("not found"))
@@ -183,7 +183,7 @@ import Foundation
     // Check graph — memory should have part_of edge to episode
     let graph = try await tools.handle(CallTool.Parameters(
         name: "graph",
-        arguments: ["id": .int(memId)]
+        arguments: ["id": .string(memId)]
     ))
     let graphOutput = text(from: graph)
     #expect(graphOutput.contains("part_of"))
@@ -228,7 +228,7 @@ import Foundation
     // Episode should have 0 members
     let recall = try await tools.handle(CallTool.Parameters(
         name: "recall_episode",
-        arguments: ["episode_id": .int(epId)]
+        arguments: ["episode_id": .string(epId)]
     ))
     #expect(text(from: recall).contains("No memories in this episode"))
 }
@@ -258,7 +258,7 @@ import Foundation
     // Episode should have only 1 member (before gap)
     let recall = try await tools.handle(CallTool.Parameters(
         name: "recall_episode",
-        arguments: ["episode_id": .int(epId)]
+        arguments: ["episode_id": .string(epId)]
     ))
     #expect(text(from: recall).contains("Memories (1)"))
     #expect(text(from: recall).contains("Memory before gap"))
@@ -290,7 +290,7 @@ import Foundation
 
     let result = try await tools.handle(CallTool.Parameters(
         name: "recall_episode",
-        arguments: ["episode_id": .int(epId)]
+        arguments: ["episode_id": .string(epId)]
     ))
     let output = text(from: result)
     #expect(output.contains("## Episode: Recall test episode"))
@@ -326,7 +326,7 @@ import Foundation
 
     let result = try await tools.handle(CallTool.Parameters(
         name: "recall_episode",
-        arguments: ["episode_id": .int(epId)]
+        arguments: ["episode_id": .string(epId)]
     ))
     let output = text(from: result)
     #expect(output.contains("### Summary"))
@@ -343,7 +343,7 @@ import Foundation
 
     let result = try await tools.handle(CallTool.Parameters(
         name: "recall_episode",
-        arguments: ["episode_id": .int(epId)]
+        arguments: ["episode_id": .string(epId)]
     ))
     let output = text(from: result)
     #expect(output.contains("No memories in this episode"))
@@ -353,7 +353,7 @@ import Foundation
     let tools = try await makeTools()
     let result = try await tools.handle(CallTool.Parameters(
         name: "recall_episode",
-        arguments: ["episode_id": .int(99999)]
+        arguments: ["episode_id": .string(UUID().uuidString)]
     ))
     #expect(result.isError == true)
     #expect(text(from: result).contains("not found"))
@@ -379,7 +379,7 @@ import Foundation
     // Recall with limit=2 — should show 2 of 5 with truncation notice
     let result = try await tools.handle(CallTool.Parameters(
         name: "recall_episode",
-        arguments: ["episode_id": .int(epId), "limit": .int(2)]
+        arguments: ["episode_id": .string(epId), "limit": .int(2)]
     ))
     let output = text(from: result)
     #expect(output.contains("2 of 5"))
@@ -556,7 +556,7 @@ import Foundation
     // Delete the episode via forget — it's just a memory
     _ = try await tools.handle(CallTool.Parameters(
         name: "forget",
-        arguments: ["id": .int(epId)]
+        arguments: ["id": .string(epId)]
     ))
 
     // Should be gone

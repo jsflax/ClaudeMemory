@@ -3,6 +3,10 @@ import Lattice
 import MCP
 import Foundation
 
+// MARK: - Crash Reporter
+
+CrashReporter.shared.install()
+
 // MARK: - Configuration
 
 /// Override the bundled embedding model with a custom path (optional).
@@ -12,46 +16,75 @@ let modelPath = ProcessInfo.processInfo.environment["CLAUDE_MEMORY_MODEL"]
 let dbPath = ProcessInfo.processInfo.environment["CLAUDE_MEMORY_DB"]
     ?? NSHomeDirectory() + "/.claude/memory.sqlite"
 
-/// Cloud sync configuration (optional — omit for local-only mode).
-let syncEndpoint = ProcessInfo.processInfo.environment["ENGRAM_SYNC_ENDPOINT"]
-let syncToken = ProcessInfo.processInfo.environment["ENGRAM_SYNC_TOKEN"]
-
 // Ensure parent directory exists
 let dbDir = (dbPath as NSString).deletingLastPathComponent
 do {
     try FileManager.default.createDirectory(atPath: dbDir, withIntermediateDirectories: true)
 } catch {
-    log("Failed to create database directory at \(dbDir): \(error)")
+    log("EXIT: Failed to create database directory at \(dbDir): \(error)")
     exit(1)
 }
 
 // MARK: - Init Lattice
 
-let lattice: Lattice
+// Verbose lattice logging is opt-in: the hardcoded .debug default grew
+// ~/.claude/memory-logs past 6GB. ENGRAM_LATTICE_LOG_LEVEL: off|error|warning|info|debug.
+switch ProcessInfo.processInfo.environment["ENGRAM_LATTICE_LOG_LEVEL"]?.lowercased() {
+case "off": Lattice.setLogLevel(.off)
+case "warning", "warn": Lattice.setLogLevel(.warn)
+case "info": Lattice.setLogLevel(.info)
+case "debug": Lattice.setLogLevel(.debug)
+default: Lattice.setLogLevel(.error)
+}
+let logSuffix = ProcessInfo.processInfo.environment["CLAUDE_SESSION_ID"] ?? "\(ProcessInfo.processInfo.processIdentifier)"
+Lattice.setLogFile(URL(fileURLWithPath: NSHomeDirectory() + "/.claude/memory-logs/lattice-mcp-\(logSuffix).log"))
+log("Lattice log suffix: \(logSuffix) (session=\(ProcessInfo.processInfo.environment["CLAUDE_SESSION_ID"] ?? "nil"), pid=\(ProcessInfo.processInfo.processIdentifier))")
+let localLattice: Lattice
+
 do {
-    let config: Lattice.Configuration
-    if let endpoint = syncEndpoint, let token = syncToken, let url = URL(string: endpoint) {
-        config = .init(fileURL: URL(fileURLWithPath: dbPath), authorizationToken: token, wssEndpoint: url)
-        log("Sync enabled: \(endpoint)")
-    } else {
-        config = .init(fileURL: URL(fileURLWithPath: dbPath))
-        log("Local-only mode (no sync endpoint configured)")
-    }
-    lattice = try Lattice(Memory.self, Edge.self, Checkpoint.self, HookState.self, SessionState.self, configuration: config)
+    let localConfig: Lattice.Configuration = .init(fileURL: URL(fileURLWithPath: dbPath), migration: engramMigrations)
+    localLattice = try Lattice(Memory.self, Edge.self, Checkpoint.self, HookState.self, SessionState.self, SyncConfig.self, configuration: localConfig)
+    log("Database at \(dbPath)")
 } catch {
-    log("Failed to initialize database at \(dbPath): \(error)")
+    log("EXIT: Failed to initialize database at \(dbPath): \(error)")
     exit(1)
 }
-log("Database at \(dbPath)")
 
 // MARK: - Init Embedding Service
 
 let embedder = EmbeddingService(modelPath: modelPath)
 await embedder.startLoading()
 
+// MARK: - Init Synced Lattice (optional)
+
+let syncedLattice: Lattice?
+let claudeDir = (dbPath as NSString).deletingLastPathComponent
+let syncedDbPath = SyncService.syncedDbPath(claudeDir: claudeDir)
+if FileManager.default.fileExists(atPath: syncedDbPath) {
+    let syncedConfig: Lattice.Configuration = .init(
+        fileURL: URL(fileURLWithPath: syncedDbPath),
+        migration: engramMigrations
+    )
+    syncedLattice = try? Lattice(
+        Memory.self, Edge.self, SyncConfig.self,
+        configuration: syncedConfig
+    )
+    if syncedLattice != nil {
+        log("Synced database at \(syncedDbPath)")
+    } else {
+        log("Failed to open synced database at \(syncedDbPath)")
+    }
+} else {
+    syncedLattice = nil
+}
+
 // MARK: - MCP Server
 
-let tools = MemoryTools(lattice: lattice, embedder: embedder)
+let tools = MemoryTools(
+    localRef: localLattice.sendableReference,
+    syncedRef: syncedLattice?.sendableReference,
+    embedder: embedder
+)
 
 let server = Server(
     name: "memory",
@@ -283,9 +316,24 @@ do {
     try await server.start(transport: transport)
     log("Server started")
 } catch {
-    log("Server transport error: \(error)")
+    log("EXIT: Server transport error: \(error)")
     exit(1)
+}
+
+// Exit if orphaned (parent died, ppid becomes 1).
+// Blocking SQLite calls can prevent the stdin EOF reader from running,
+// so this is a safety net to avoid zombie processes.
+Task.detached {
+    while true {
+        try await Task.sleep(for: .seconds(5))
+        if getppid() == 1 {
+            log("EXIT: Orphaned (ppid=1)")
+            exit(0)
+        }
+    }
 }
 
 // Keep alive
 await server.waitUntilCompleted()
+log("EXIT: Transport completed (stdin closed)")
+

@@ -15,7 +15,9 @@ extension MemoryTools {
         let project = a.project
 
         // Fetch all non-expired, non-episode memories for the project
-        let allMemories = lattice.objects(Memory.self)
+        let db = readLattice(for: project)
+        let allMemories = db.objects(Memory.self)
+            .distinct(by: \.__globalId)
             .where { $0.project == project && $0.expiresAt > Date() && $0.topic != "episode" }
             .snapshot()
 
@@ -26,24 +28,24 @@ extension MemoryTools {
             )
         }
 
-        // Build memory ID set and lookup
-        let memoryIds = Set(allMemories.compactMap(\.primaryKey))
-        let memoryMap: [Int64: Memory] = Dictionary(
+        // Build memory globalId set and lookup
+        let memoryGlobalIds = Set(allMemories.compactMap(\.__globalId))
+        let memoryMapByGlobalId: [UUID: Memory] = Dictionary(
             uniqueKeysWithValues: allMemories.compactMap { m in
-                guard let pk = m.primaryKey else { return nil }
-                return (pk, m)
+                guard let gid = m.__globalId else { return nil }
+                return (gid, m)
             }
         )
 
-        // Build undirected adjacency from all edges between these memories
-        var adjacency: [Int64: Set<Int64>] = [:]
-        for id in memoryIds { adjacency[id] = [] }
+        // Build undirected adjacency from all edges between these memories (keyed by globalId)
+        var adjacency: [UUID: Set<UUID>] = [:]
+        for gid in memoryGlobalIds { adjacency[gid] = [] }
 
-        let edges = lattice.objects(Edge.self).snapshot()
+        let edges = db.objects(Edge.self).distinct(by: \.__globalId).snapshot()
         for edge in edges {
-            guard memoryIds.contains(edge.sourceId) && memoryIds.contains(edge.targetId) else { continue }
-            adjacency[edge.sourceId, default: []].insert(edge.targetId)
-            adjacency[edge.targetId, default: []].insert(edge.sourceId)
+            guard memoryGlobalIds.contains(edge.sourceGlobalId) && memoryGlobalIds.contains(edge.targetGlobalId) else { continue }
+            adjacency[edge.sourceGlobalId, default: []].insert(edge.targetGlobalId)
+            adjacency[edge.targetGlobalId, default: []].insert(edge.sourceGlobalId)
         }
 
         // Run label propagation
@@ -64,20 +66,20 @@ extension MemoryTools {
         var output = "Found \(significantCommunities.count) community/communities in '\(project)':\n"
 
         for (i, community) in significantCommunities.enumerated() {
-            let sorted = community.sorted()
+            let sorted = community.sorted(by: { $0.uuidString < $1.uuidString })
             output += "\n## Community \(i + 1) (\(sorted.count) memories)"
-            for memId in sorted {
-                let mem = memoryMap[memId]
+            for memGlobalId in sorted {
+                let mem = memoryMapByGlobalId[memGlobalId]
                 let topic = mem?.topic ?? "general"
                 let content = mem?.content ?? ""
                 let preview = String(content.prefix(150))
-                output += "\n  [id:\(memId)] [\(topic)] \(preview)"
+                output += "\n  [id:\(memGlobalId.uuidString)] [\(topic)] \(preview)"
             }
             output += "\n"
         }
 
         // Show isolated nodes count
-        let isolatedCount = memoryIds.count - significantCommunities.reduce(0) { $0 + $1.count }
+        let isolatedCount = memoryGlobalIds.count - significantCommunities.reduce(0) { $0 + $1.count }
         if isolatedCount > 0 {
             output += "\n(\(isolatedCount) memories not in any community — they have no edges or are in groups smaller than \(minSize))\n"
         }
@@ -90,7 +92,7 @@ extension MemoryTools {
     /// Simple action: takes memory IDs + label, updates their topics, creates hub, links via part_of.
     func handleOrganize(_ args: [String: Value]?) async throws -> CallTool.Result {
         let a = try args.decode(OrganizeArgs.self)
-        let ids = a.ids.values.map { Int64($0) }
+        let ids = a.ids.values
         let label = a.label
 
         guard !ids.isEmpty else {
@@ -101,12 +103,12 @@ extension MemoryTools {
         }
 
         // Verify memories exist and determine project
-        var memories: [Int64: Memory] = [:]
-        for id in ids {
-            guard let mem = lattice.objects(Memory.self).where({ $0.primaryKey == id }).first else {
-                return CallTool.Result(content: [.text("Memory [id:\(id)] not found.")], isError: true)
+        var memories: [UUID: Memory] = [:]
+        for gid in ids {
+            guard let (mem, _) = findMemory(id: gid) else {
+                return CallTool.Result(content: [.text("Memory [id:\(gid.uuidString)] not found.")], isError: true)
             }
-            memories[id] = mem
+            memories[gid] = mem
         }
 
         let project = a.project ?? memories[ids[0]]?.project ?? "global"
@@ -124,27 +126,27 @@ extension MemoryTools {
             source: "organize",
             embedding: hubEmbedding
         )
-        lattice.add(hub)
+        localLattice.add(hub)
 
-        guard let hubId = hub.primaryKey else {
-            return CallTool.Result(content: [.text("Failed to create hub memory.")], isError: true)
+        guard let hubGlobalId = hub.__globalId else {
+            return CallTool.Result(content: [.text("Failed to get hub globalId.")], isError: true)
         }
 
         // Link each memory to hub and update its topic
-        for id in ids {
-            let edge = Edge(sourceId: id, targetId: hubId, relation: "part_of")
-            lattice.add(edge)
-
-            if let mem = memories[id] {
-                mem.topic = label
+        try localLattice.transaction {
+            for gid in ids {
+                if let mem = memories[gid] {
+                    let edge = Edge(sourceGlobalId: gid, targetGlobalId: hubGlobalId, relation: .partOf)
+                    localLattice.add(edge)
+                    mem.topic = label
+                }
             }
         }
 
-        log("Organized \(ids.count) memories under '\(label)' → hub [id:\(hubId)]")
-        resetMaintenanceBaseline()
+        log("Organized \(ids.count) memories under '\(label)' → hub [id:\(hubGlobalId.uuidString)]")
 
         var output = "Organized \(ids.count) memories under '\(label)':\n"
-        output += "  Hub: [id:\(hubId)]\n"
+        output += "  Hub: [id:\(hubGlobalId.uuidString)]\n"
         output += "  Topic updated to '\(label)' on all \(ids.count) memories\n"
         output += "  part_of edges created from each memory → hub"
 
@@ -157,41 +159,71 @@ extension MemoryTools {
 /// Detect communities in an undirected graph via label propagation.
 /// Each node starts with its own label, then iteratively adopts the most common
 /// label among its neighbors. Converges when no labels change.
-/// Returns communities as arrays of node IDs (sorted by size descending).
-public func labelPropagation(adjacency: [Int64: Set<Int64>], maxIterations: Int = 10) -> [[Int64]] {
-    var labels: [Int64: Int64] = [:]
-    for id in adjacency.keys {
-        labels[id] = id
+/// Returns communities as arrays of node globalIds (sorted by size descending).
+public func labelPropagation(adjacency: [UUID: Set<UUID>], maxIterations: Int = 10) -> [[UUID]] {
+    // Iterate nodes in a stable order. Dictionary key order is non-deterministic
+    // across runs, and label propagation is order-sensitive (a node adopts its
+    // neighbours' current-majority label), so unstable order made community
+    // assignments flap between runs. Sorting the node list makes it reproducible.
+    let orderedNodes = adjacency.keys.sorted { $0.uuidString < $1.uuidString }
+
+    // Seed labels with closed-neighborhood minima instead of singletons:
+    // each clique starts at (near-)internal consensus, so a bridge label
+    // can never win the all-singleton tie that otherwise floods across a
+    // single cross-community edge on unlucky orderings.
+    var labels: [UUID: UUID] = [:]
+    for id in orderedNodes {
+        var seed = id
+        for neighbor in adjacency[id] ?? [] where neighbor.uuidString < seed.uuidString {
+            seed = neighbor
+        }
+        labels[id] = seed
     }
 
     for _ in 0..<maxIterations {
-        var newLabels = labels
         var changed = false
 
-        for id in adjacency.keys {
+        // Asynchronous (in-place) updates: each node sees the labels its
+        // earlier-visited neighbours adopted THIS pass. The previous
+        // synchronous double-buffer variant is the textbook label-propagation
+        // failure mode — cliques flip wholesale between passes, and on some
+        // orderings a single bridge edge merged two 4-cliques into ONE
+        // community. In-place updates let each clique reach local consensus
+        // before bridge influence propagates.
+        for id in orderedNodes {
             guard let neighbors = adjacency[id], !neighbors.isEmpty else { continue }
 
-            var labelCounts: [Int64: Int] = [:]
+            var labelCounts: [UUID: Int] = [:]
             for neighbor in neighbors {
                 guard let neighborLabel = labels[neighbor] else { continue }
                 labelCounts[neighborLabel, default: 0] += 1
             }
 
-            guard let bestLabel = labelCounts.max(by: {
-                $0.value != $1.value ? $0.value < $1.value : $0.key > $1.key
-            })?.key else { continue }
+            guard let maxCount = labelCounts.values.max() else { continue }
+            let tied = labelCounts.filter { $0.value == maxCount }.keys
 
-            if newLabels[id] != bestLabel {
-                newLabels[id] = bestLabel
+            // Sticky ties: when the node's current label is among the tied
+            // maxima, keep it. Without this, arbitrary tie-breaking lets one
+            // label flood across a bridge and merge communities that only
+            // share a single edge.
+            let current = labels[id]
+            let bestLabel: UUID
+            if let current, tied.contains(current) {
+                bestLabel = current
+            } else {
+                bestLabel = tied.min { $0.uuidString < $1.uuidString }!
+            }
+
+            if labels[id] != bestLabel {
+                labels[id] = bestLabel
                 changed = true
             }
         }
 
-        labels = newLabels
         if !changed { break }
     }
 
-    var communities: [Int64: [Int64]] = [:]
+    var communities: [UUID: [UUID]] = [:]
     for (id, label) in labels {
         communities[label, default: []].append(id)
     }

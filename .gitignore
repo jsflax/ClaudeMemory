@@ -8,3 +8,16 @@
 .mcp.json
 xcuserdata/
 *.xcuserstate
+adapter/.venv/
+adapter/checkpoints/
+adapter/output/
+default.profraw
+*.profraw
+*.fmadapter/
+
+# Build/instrumentation artifacts
+build/
+*.trace/
+gpu-forces.log
+gpu_crash.txt
+vec0_logs.txt

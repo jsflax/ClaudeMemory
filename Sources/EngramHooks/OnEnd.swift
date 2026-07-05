@@ -29,5 +29,10 @@ struct OnEnd: AsyncParsableCommand {
             lattice.delete(state)
             hookLog("Cleaned up session state for \(sessionId)")
         }
+
+        // Clean up session recall and debug logs used by the statusline.
+        // Delay cleanup — SessionEnd can fire during mid-session reconnects
+        // while the statusline still needs the recall log.
+        cleanupSessionLogs(sessionId: sessionId)
     }
 }

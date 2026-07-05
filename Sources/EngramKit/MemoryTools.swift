@@ -16,11 +16,15 @@ import Foundation
 /// - **disconnect**: Remove edges by ID or by (from, to) pair.
 /// - **graph**: View a memory's neighborhood in the knowledge graph.
 public actor MemoryTools {
-    let lattice: Lattice
-    let embedder: EmbeddingService
+    /// Local database — all writes go here. Reads go here for local-only projects.
+    package let localLattice: Lattice
+    /// Synced database (memory-synced.sqlite) — reads go here for synced projects.
+    /// Contains cross-device data relayed by the sync daemon. Nil if no synced DB exists.
+    package let syncedLattice: Lattice?
+    package let embedder: EmbeddingService
 
-    /// Tracks the currently active episode memory ID for this session.
-    var activeEpisodeId: Int64? = nil
+    /// Tracks the currently active episode globalId for this session.
+    var activeEpisodeId: UUID? = nil
     /// Tracks when the last memory was stored, for episode gap detection.
     var lastMemoryTime: Date = .distantPast
 
@@ -37,9 +41,82 @@ public actor MemoryTools {
         return f
     }()
 
-    public init(lattice: Lattice, embedder: EmbeddingService) {
-        self.lattice = lattice
+    /// Resolves sendable references inside the actor's isolation domain.
+    public init(localRef: LatticeThreadSafeReference, syncedRef: LatticeThreadSafeReference?, embedder: EmbeddingService) {
+        guard let local = localRef.resolve() else {
+            fatalError("Failed to resolve local lattice reference")
+        }
+        self.localLattice = local
+        self.syncedLattice = syncedRef?.resolve()
         self.embedder = embedder
+    }
+
+    /// Returns the right Lattice for reading based on the project's sync policy.
+    /// For synced projects, returns a UNION ALL view spanning both local and synced DBs
+    /// so we get local memories + cross-device data in one query.
+    /// For local projects, returns localLattice directly.
+    /// Cached attached Lattice — created once, reused across recalls.
+    private var _attachedLattice: Lattice?
+
+    package func readLattice(for project: String?) -> Lattice {
+        log("[readLattice] enter, project=\(project ?? "nil"), syncedLattice=\(syncedLattice != nil)")
+        guard let syncedLattice, let project else {
+            log("[readLattice] returning localLattice (no sync or no project)")
+            return localLattice
+        }
+        let isSynced: Bool
+        log("[readLattice] querying SyncConfig for project=\(project)")
+        if let config = localLattice.objects(SyncConfig.self)
+            .where({ $0.project == project }).first {
+            isSynced = config.policy == .sync
+            log("[readLattice] found config, isSynced=\(isSynced)")
+        } else if let fallback = localLattice.objects(SyncConfig.self)
+            .where({ $0.project == "_default" }).first {
+            isSynced = fallback.policy == .sync
+            log("[readLattice] using default config, isSynced=\(isSynced)")
+        } else {
+            isSynced = false
+            log("[readLattice] no config, isSynced=false")
+        }
+        log("[readLattice] about to return, isSynced=\(isSynced)")
+        if isSynced {
+            if _attachedLattice == nil {
+                _attachedLattice = localLattice.attaching(lattice: syncedLattice)
+            }
+            log("[readLattice] returning cached attached lattice")
+            return _attachedLattice!
+        }
+        log("[readLattice] returning localLattice")
+        return localLattice
+    }
+
+    /// Finds a memory by globalId, trying localLattice first then syncedLattice.
+    /// Returns the memory and which lattice it was found in.
+    func findMemory(id: UUID) -> (memory: Memory, lattice: Lattice)? {
+        if let mem = localLattice.objects(Memory.self)
+            .where({ $0.__globalId == id }).first {
+            return (mem, localLattice)
+        }
+        if let syncedLattice,
+           let mem = syncedLattice.objects(Memory.self)
+            .where({ $0.__globalId == id }).first {
+            return (mem, syncedLattice)
+        }
+        return nil
+    }
+
+    /// Finds an edge by globalId, trying localLattice first then syncedLattice.
+    func findEdge(id: UUID) -> (edge: Edge, lattice: Lattice)? {
+        if let edge = localLattice.objects(Edge.self)
+            .where({ $0.__globalId == id }).first {
+            return (edge, localLattice)
+        }
+        if let syncedLattice,
+           let edge = syncedLattice.objects(Edge.self)
+            .where({ $0.__globalId == id }).first {
+            return (edge, syncedLattice)
+        }
+        return nil
     }
 
     #if DEBUG
@@ -80,8 +157,8 @@ public actor MemoryTools {
                             "description": .string("Where this memory came from: 'conversation', 'code-review', 'debugging-session', or a file path."),
                         ]),
                         "parent_id": .object([
-                            "type": .string("integer"),
-                            "description": .string("ID of a parent/hub memory. Automatically creates a part_of edge from this memory to the parent. Use to build hierarchies: store a brief hub, then add detail memories as children."),
+                            "type": .string("string"),
+                            "description": .string("UUID of a parent/hub memory. Automatically creates a part_of edge from this memory to the parent. Use to build hierarchies: store a brief hub, then add detail memories as children."),
                         ]),
                         "expires_in_days": .object([
                             "type": .string("integer"),
@@ -155,8 +232,8 @@ public actor MemoryTools {
                     "type": .string("object"),
                     "properties": .object([
                         "id": .object([
-                            "type": .string("integer"),
-                            "description": .string("Delete a specific memory by ID (from recall output [id:N] prefix). Takes priority over topic/project filters."),
+                            "type": .string("string"),
+                            "description": .string("Delete a specific memory by UUID (from recall output [id:UUID] prefix). Takes priority over topic/project filters."),
                         ]),
                         "topic": .object([
                             "type": .string("string"),
@@ -196,8 +273,8 @@ public actor MemoryTools {
                     "type": .string("object"),
                     "properties": .object([
                         "id": .object([
-                            "type": .string("integer"),
-                            "description": .string("Target memory by ID (from recall output [id:N] prefix). Preferred over query."),
+                            "type": .string("string"),
+                            "description": .string("Target memory by UUID (from recall output [id:UUID] prefix). Preferred over query."),
                         ]),
                         "query": .object([
                             "type": .string("string"),
@@ -282,8 +359,8 @@ public actor MemoryTools {
                     "properties": .object([
                         "ids": .object([
                             "type": .string("array"),
-                            "items": .object(["type": .string("integer")]),
-                            "description": .string("Array of memory IDs to merge (from recall output)."),
+                            "items": .object(["type": .string("string")]),
+                            "description": .string("Array of memory UUIDs to merge (from recall output)."),
                         ]),
                         "content": .object([
                             "type": .string("string"),
@@ -313,12 +390,12 @@ public actor MemoryTools {
                     "type": .string("object"),
                     "properties": .object([
                         "from": .object([
-                            "type": .string("integer"),
-                            "description": .string("Source memory ID."),
+                            "type": .string("string"),
+                            "description": .string("Source memory UUID."),
                         ]),
                         "to": .object([
-                            "type": .string("integer"),
-                            "description": .string("Target memory ID."),
+                            "type": .string("string"),
+                            "description": .string("Target memory UUID."),
                         ]),
                         "relation": .object([
                             "type": .string("string"),
@@ -347,16 +424,16 @@ public actor MemoryTools {
                     "type": .string("object"),
                     "properties": .object([
                         "id": .object([
-                            "type": .string("integer"),
-                            "description": .string("Delete a specific edge by its ID."),
+                            "type": .string("string"),
+                            "description": .string("Delete a specific edge by its UUID."),
                         ]),
                         "from": .object([
-                            "type": .string("integer"),
-                            "description": .string("Source memory ID (used with 'to')."),
+                            "type": .string("string"),
+                            "description": .string("Source memory UUID (used with 'to')."),
                         ]),
                         "to": .object([
-                            "type": .string("integer"),
-                            "description": .string("Target memory ID (used with 'from')."),
+                            "type": .string("string"),
+                            "description": .string("Target memory UUID (used with 'from')."),
                         ]),
                         "relation": .object([
                             "type": .string("string"),
@@ -376,8 +453,8 @@ public actor MemoryTools {
                     "type": .string("object"),
                     "properties": .object([
                         "id": .object([
-                            "type": .string("integer"),
-                            "description": .string("Memory ID to explore from."),
+                            "type": .string("string"),
+                            "description": .string("Memory UUID to explore from."),
                         ]),
                         "depth": .object([
                             "type": .string("integer"),
@@ -547,8 +624,8 @@ public actor MemoryTools {
                     "type": .string("object"),
                     "properties": .object([
                         "episode_id": .object([
-                            "type": .string("integer"),
-                            "description": .string("ID of the episode to end. If omitted, ends the currently active episode."),
+                            "type": .string("string"),
+                            "description": .string("UUID of the episode to end. If omitted, ends the currently active episode."),
                         ]),
                         "summary": .object([
                             "type": .string("string"),
@@ -568,8 +645,8 @@ public actor MemoryTools {
                     "type": .string("object"),
                     "properties": .object([
                         "episode_id": .object([
-                            "type": .string("integer"),
-                            "description": .string("ID of the episode to recall (from list_episodes or begin_episode output)."),
+                            "type": .string("string"),
+                            "description": .string("UUID of the episode to recall (from list_episodes or begin_episode output)."),
                         ]),
                         "limit": .object([
                             "type": .string("integer"),
@@ -673,8 +750,8 @@ public actor MemoryTools {
                     "properties": .object([
                         "ids": .object([
                             "type": .string("array"),
-                            "items": .object(["type": .string("integer")]),
-                            "description": .string("Memory IDs to organize under this label."),
+                            "items": .object(["type": .string("string")]),
+                            "description": .string("Memory UUIDs to organize under this label."),
                         ]),
                         "label": .object([
                             "type": .string("string"),
@@ -708,8 +785,8 @@ public actor MemoryTools {
                     "properties": .object([
                         "ids": .object([
                             "type": .string("array"),
-                            "items": .object(["type": .string("integer")]),
-                            "description": .string("Memory IDs to consolidate (from recall or find_clusters output)."),
+                            "items": .object(["type": .string("string")]),
+                            "description": .string("Memory UUIDs to consolidate (from recall or find_clusters output)."),
                         ]),
                         "content": .object([
                             "type": .string("string"),
@@ -732,12 +809,53 @@ public actor MemoryTools {
                     "additionalProperties": .bool(false),
                 ])
             ),
+            Tool(
+                name: "vacuum",
+                description: """
+                    Run database maintenance: checkpoint the WAL, vacuum the vector index \
+                    to reclaim space from deleted entries, and compact the database. \
+                    Use periodically or after large batch deletes/consolidations.
+                    """,
+                inputSchema: .object([
+                    "type": .string("object"),
+                    "properties": .object([:]),
+                    "additionalProperties": .bool(false),
+                ])
+            ),
+            Tool(
+                name: "train_vectors",
+                description: """
+                    Build or rebuild the IVF vector search index. This trains k-means \
+                    centroids for fast approximate nearest neighbor search. Run once after \
+                    upgrading, or after large bulk inserts. Queries work without training \
+                    (brute-force fallback) but are slower. Training takes ~1-5 seconds \
+                    for 10K vectors.
+                    """,
+                inputSchema: .object([
+                    "type": .string("object"),
+                    "properties": .object([:]),
+                    "additionalProperties": .bool(false),
+                ])
+            ),
         ]
     }
 
     // MARK: - Dispatch
 
     public func handle(_ params: CallTool.Parameters) async throws -> CallTool.Result {
+        log("Tool call: \(params.name)")
+        let result: CallTool.Result
+        do {
+            result = try await dispatch(params)
+        } catch {
+            log("Tool \(params.name) failed: \(error)")
+            throw error
+        }
+        log("Tool \(params.name) completed")
+        return result
+    }
+
+    private func dispatch(_ params: CallTool.Parameters) async throws -> CallTool.Result {
         switch params.name {
         case "remember":
             return try await handleRemember(params.arguments)
@@ -783,6 +901,10 @@ public actor MemoryTools {
             return try await handleOrganize(params.arguments)
         case "consolidate":
             return try await handleConsolidate(params.arguments)
+        case "vacuum":
+            return try handleVacuum()
+        case "train_vectors":
+            return try handleTrainVectors()
         default:
             throw MCPError.invalidParams("Unknown tool: \(params.name)")
         }

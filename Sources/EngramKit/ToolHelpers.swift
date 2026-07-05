@@ -2,8 +2,90 @@ import Lattice
 import MCP
 import Foundation
 
+private let logFilePath = NSHomeDirectory() + "/.claude/memory.log"
+private let memoryLogsDir = NSHomeDirectory() + "/.claude/memory-logs"
+
+/// Global session ID for per-session debug logging in short-lived hook processes.
+nonisolated(unsafe) public var currentSessionId: String?
+
+/// Write a timestamped line to ~/.claude/memory-logs/debug-<sessionId>.log.
+public func sessionLog(_ message: String, sessionId: String? = nil) {
+    let sid = sessionId ?? currentSessionId
+    guard let sid, !sid.isEmpty else { return }
+    let dir = memoryLogsDir
+    let path = dir + "/debug-\(sid).log"
+    let fm = FileManager.default
+    if !fm.fileExists(atPath: dir) {
+        try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    }
+    let timestamp = ISO8601DateFormatter().string(from: Date())
+    let line = "\(timestamp) \(message)\n"
+    if let fh = FileHandle(forWritingAtPath: path) {
+        fh.seekToEndOfFile()
+        fh.write(Data(line.utf8))
+        fh.closeFile()
+    } else {
+        fm.createFile(atPath: path, contents: Data(line.utf8))
+    }
+}
+/// Append a "saved" entry to the session recall log so the statusline shows it.
+public func appendSessionSaveLog(sessionId: String?, globalId: String, project: String, topic: String, preview: String) {
+    guard let sid = sessionId, !sid.isEmpty else { return }
+    let dir = memoryLogsDir
+    let path = dir + "/recall-\(sid).log"
+    let fm = FileManager.default
+    if !fm.fileExists(atPath: dir) {
+        try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    }
+    let cyan = "\u{1B}[36m"
+    let green = "\u{1B}[32m"
+    let magenta = "\u{1B}[35m"
+    let dim = "\u{1B}[2m"
+    let rst = "\u{1B}[0m"
+    let shortId = String(globalId.prefix(8))
+    let line = "  \(green)+\(rst) \(cyan)\(shortId)\(rst) \(magenta)[\(project)/\(topic)]\(rst) \(dim)\(preview)\(rst)\n"
+    if let fh = FileHandle(forWritingAtPath: path) {
+        fh.seekToEndOfFile()
+        fh.write(Data(line.utf8))
+        fh.closeFile()
+    } else {
+        // No recall log yet — create one with just the save line
+        let content = "\(dim)no recall yet\(rst)\n\(line)"
+        fm.createFile(atPath: path, contents: Data(content.utf8))
+    }
+}
+
+private let logMaxBytes = 256 * 1024
+
+private func rotateLogIfNeeded() {
+    let fm = FileManager.default
+    guard let attrs = try? fm.attributesOfItem(atPath: logFilePath),
+          let size = attrs[.size] as? Int,
+          size > logMaxBytes else { return }
+    let backup = logFilePath + ".1"
+    try? fm.removeItem(atPath: backup)
+    try? fm.moveItem(atPath: logFilePath, toPath: backup)
+}
+
 public func log(_ message: String) {
-    FileHandle.standardError.write(Data("[claude-memory] \(message)\n".utf8))
+    let line = "[claude-memory] \(ISO8601DateFormatter().string(from: Date())) \(message)\n"
+    // Feed the crash reporter ring buffer
+    CrashReporter.shared.log(message)
+    // Always write to stderr for immediate visibility
+    FileHandle.standardError.write(Data(line.utf8))
+    // Also append to rotating log file
+    rotateLogIfNeeded()
+    if let data = line.data(using: .utf8) {
+        if FileManager.default.fileExists(atPath: logFilePath) {
+            if let fh = FileHandle(forWritingAtPath: logFilePath) {
+                fh.seekToEndOfFile()
+                fh.write(data)
+                fh.closeFile()
+            }
+        } else {
+            FileManager.default.createFile(atPath: logFilePath, contents: data)
+        }
+    }
 }
 
 // MARK: - Codable Argument Decoding
@@ -58,6 +140,68 @@ struct FlexibleIntArray: Decodable {
             throw DecodingError.typeMismatch(
                 [Int].self,
                 DecodingError.Context(codingPath: decoder.codingPath, debugDescription: "Expected an array of integers or comma-separated string of integers")
+            )
+        }
+    }
+}
+
+/// Decodes a UUID from a string. Accepts standard UUID format.
+struct FlexibleUUID: Decodable {
+    let value: UUID
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let string = try container.decode(String.self)
+        guard let uuid = UUID(uuidString: string) else {
+            throw DecodingError.typeMismatch(
+                UUID.self,
+                DecodingError.Context(codingPath: decoder.codingPath, debugDescription: "Expected a valid UUID string, got '\(string)'")
+            )
+        }
+        value = uuid
+    }
+}
+
+/// Decodes an array of UUIDs from either a JSON array of strings or a comma-separated string.
+struct FlexibleUUIDArray: Decodable {
+    let values: [UUID]
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if let array = try? container.decode([String].self) {
+            values = try array.map { str in
+                guard let uuid = UUID(uuidString: str) else {
+                    throw DecodingError.typeMismatch(
+                        UUID.self,
+                        DecodingError.Context(codingPath: decoder.codingPath, debugDescription: "Expected a valid UUID string, got '\(str)'")
+                    )
+                }
+                return uuid
+            }
+        } else if let string = try? container.decode(String.self) {
+            var trimmed = string.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("[") && trimmed.hasSuffix("]") {
+                trimmed = String(trimmed.dropFirst().dropLast())
+            }
+            let parsed = try trimmed.split(separator: ",").map { part -> UUID in
+                let str = part.trimmingCharacters(in: .whitespaces)
+                guard let uuid = UUID(uuidString: str) else {
+                    throw DecodingError.typeMismatch(
+                        UUID.self,
+                        DecodingError.Context(codingPath: decoder.codingPath, debugDescription: "Expected a valid UUID string, got '\(str)'")
+                    )
+                }
+                return uuid
+            }
+            guard !parsed.isEmpty else {
+                throw DecodingError.typeMismatch(
+                    [UUID].self,
+                    DecodingError.Context(codingPath: decoder.codingPath, debugDescription: "Expected an array of UUID strings")
+                )
+            }
+            values = parsed
+        } else {
+            throw DecodingError.typeMismatch(
+                [UUID].self,
+                DecodingError.Context(codingPath: decoder.codingPath, debugDescription: "Expected an array of UUID strings or comma-separated UUID strings")
             )
         }
     }
@@ -129,7 +273,7 @@ struct RememberArgs: Decodable {
     let expiresInDays: FlexibleInt?
     let force: Bool?
     let importance: FlexibleInt?
-    let parentId: FlexibleInt?
+    let parentId: FlexibleUUID?
     let isPrivate: Bool?
 
     enum CodingKeys: String, CodingKey {
@@ -151,14 +295,14 @@ struct RecallArgs: Decodable {
 }
 
 struct ForgetArgs: Decodable {
-    let id: FlexibleInt?
+    let id: FlexibleUUID?
     let topic: String?
     let project: String?
 }
 
 struct UpdateArgs: Decodable {
     // Targeting (one required)
-    let id: FlexibleInt?
+    let id: FlexibleUUID?
     let query: String?
     let project: String?
 
@@ -186,7 +330,7 @@ struct UpdateArgs: Decodable {
 }
 
 struct MergeArgs: Decodable {
-    let ids: FlexibleIntArray
+    let ids: FlexibleUUIDArray
     let content: String
     let topic: String?
     let project: String?
@@ -201,20 +345,20 @@ struct ListTopicsArgs: Decodable {
 }
 
 struct ConnectArgs: Decodable {
-    let from: FlexibleInt
-    let to: FlexibleInt
+    let from: FlexibleUUID
+    let to: FlexibleUUID
     let relation: String
 }
 
 struct DisconnectArgs: Decodable {
-    let id: FlexibleInt?
-    let from: FlexibleInt?
-    let to: FlexibleInt?
+    let id: FlexibleUUID?      // Edge globalId
+    let from: FlexibleUUID?    // Memory globalId
+    let to: FlexibleUUID?      // Memory globalId
     let relation: String?
 }
 
 struct GraphArgs: Decodable {
-    let id: FlexibleInt
+    let id: FlexibleUUID
     let depth: FlexibleInt?
 }
 
@@ -288,7 +432,7 @@ struct BeginEpisodeArgs: Decodable {
 }
 
 struct EndEpisodeArgs: Decodable {
-    let episodeId: FlexibleInt?
+    let episodeId: FlexibleUUID?
     let summary: String?
     enum CodingKeys: String, CodingKey {
         case summary
@@ -297,7 +441,7 @@ struct EndEpisodeArgs: Decodable {
 }
 
 struct RecallEpisodeArgs: Decodable {
-    let episodeId: FlexibleInt
+    let episodeId: FlexibleUUID
     let limit: FlexibleInt?
     enum CodingKeys: String, CodingKey {
         case episodeId = "episode_id"
@@ -335,14 +479,14 @@ struct DetectCommunitiesArgs: Decodable {
 }
 
 struct OrganizeArgs: Decodable {
-    let ids: FlexibleIntArray
+    let ids: FlexibleUUIDArray
     let label: String
     let project: String?
     let summary: String?
 }
 
 struct ConsolidateArgs: Decodable {
-    let ids: FlexibleIntArray
+    let ids: FlexibleUUIDArray
     let content: String
     let topic: String?
     let project: String?

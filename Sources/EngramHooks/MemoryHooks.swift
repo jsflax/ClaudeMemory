@@ -13,6 +13,8 @@ struct MemoryHooks: AsyncParsableCommand {
             OnFailure.self,
             PreTool.self,
             PreCompact.self,
+            ClearMaintenance.self,
+            SampleGate.self,
         ]
     )
 }

@@ -35,12 +35,14 @@ public enum InstallConfig {
     /// - Returns: Dictionary ready for JSON serialization.
     public static func hooksSettings(installDir: String) -> [String: Any] {
         [
+            "autoMemoryEnabled": false,
             "permissions": ["allow": ["mcp__memory__*"]],
             "hooks": [
                 "SessionStart": [["hooks": [["type": "command", "command": "\(installDir)/memory-hooks on-start 2>/dev/null", "timeout": 5]]]],
                 "UserPromptSubmit": [["hooks": [["type": "command", "command": "\(installDir)/memory-hooks advise 2>/dev/null", "timeout": 5]]]],
                 "Stop": [["hooks": [["type": "command", "command": "\(installDir)/memory-hooks on-stop 2>/dev/null", "timeout": 5]]]],
                 "PostToolUseFailure": [["hooks": [["type": "command", "command": "\(installDir)/memory-hooks on-failure 2>/dev/null", "timeout": 5]]]],
+                "PreToolUse": [["matcher": "Agent", "hooks": [["type": "command", "command": "\(installDir)/memory-hooks pre-tool 2>/dev/null", "timeout": 5]]]],
                 "PreCompact": [["matcher": "auto", "hooks": [["type": "command", "command": "\(installDir)/memory-hooks pre-compact 2>/dev/null", "timeout": 3]]]],
                 "SessionEnd": [["hooks": [["type": "command", "command": "\(installDir)/memory-hooks on-end 2>/dev/null", "timeout": 5]]]]
             ]

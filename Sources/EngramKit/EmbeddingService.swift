@@ -104,7 +104,4 @@ public actor EmbeddingService {
         return try await model.similarity(text1, text2)
     }
 
-    private func log(_ message: String) {
-        FileHandle.standardError.write(Data("[claude-memory] \(message)\n".utf8))
-    }
 }

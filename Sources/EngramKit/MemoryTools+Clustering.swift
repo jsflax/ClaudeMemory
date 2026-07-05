@@ -11,23 +11,24 @@ public func findMemoryClusters(
     in lattice: Lattice,
     project: String? = nil,
     topic: String? = nil,
-    distanceThreshold: Double = 0.15,
+    distanceThreshold: Double = 0.547,  // L2 equivalent of cosine 0.15
     jaccardThreshold: Double = 0.2,
     minClusterSize: Int = 2,
-    maxClusters: Int = 10
-) -> (clusters: [[Int64]], distances: [Int64: [Int64: Double]]) {
+    maxClusters: Int = 10,
+    neighborLimit: Int? = nil
+) -> (clusters: [[UUID]], distances: [UUID: [UUID: Double]]) {
     let now = Date()
-    var baseQuery = lattice.objects(Memory.self).where { $0.expiresAt > now }
+    var baseQuery = lattice.objects(Memory.self).distinct(by: \.__globalId).where { $0.expiresAt > now }
     if let project { baseQuery = baseQuery.where { $0.project == project } }
     if let topic { baseQuery = baseQuery.where { $0.topic == topic } }
     let memories = baseQuery.snapshot()
 
     guard memories.count >= minClusterSize else { return ([], [:]) }
 
-    let memoryMap: [Int64: Memory] = Dictionary(
+    let memoryMap: [UUID: Memory] = Dictionary(
         uniqueKeysWithValues: memories.compactMap { m in
-            guard let pk = m.primaryKey, !m.embedding.isEmpty else { return nil }
-            return (pk, m)
+            guard let gid = m.__globalId, !m.embedding.isEmpty else { return nil }
+            return (gid, m)
         }
     )
     let validIds = Set(memoryMap.keys)
@@ -37,17 +38,17 @@ public func findMemoryClusters(
     // For each memory, run .nearest() to find neighbors within the distance threshold
     // AND Jaccard term overlap >= threshold. This prevents same-project memories about different
     // subsystems from clustering together just because they share project vocabulary.
-    var neighborMap: [Int64: [Int64]] = [:]
-    var distanceCache: [Int64: [Int64: Double]] = [:]
+    var neighborMap: [UUID: [UUID]] = [:]
+    var distanceCache: [UUID: [UUID: Double]] = [:]
 
     for (memId, mem) in memoryMap {
         let matches = baseQuery
-            .nearest(to: mem.embedding, on: \.embedding, limit: memories.count, distance: .cosine)
+            .nearest(to: mem.embedding, on: \.embedding, limit: neighborLimit ?? memories.count, distance: .l2)
 
-        var neighbors: [Int64] = []
-        var dists: [Int64: Double] = [:]
+        var neighbors: [UUID] = []
+        var dists: [UUID: Double] = [:]
         for match in matches {
-            guard let nId = match.object.primaryKey else { continue }
+            guard let nId = match.object.__globalId else { continue }
             guard nId != memId, validIds.contains(nId) else { continue }
             let dist = match.distances["embedding"] ?? 1.0
             if dist <= distanceThreshold {
@@ -62,11 +63,11 @@ public func findMemoryClusters(
     }
 
     // Greedy clustering: pick memory with most unassigned neighbors as seed
-    var assigned = Set<Int64>()
-    var clusters: [[Int64]] = []
+    var assigned = Set<UUID>()
+    var clusters: [[UUID]] = []
 
     while clusters.count < maxClusters {
-        var bestSeed: Int64? = nil
+        var bestSeed: UUID? = nil
         var bestCount = 0
         for memId in validIds where !assigned.contains(memId) {
             let unassigned = (neighborMap[memId] ?? []).filter { !assigned.contains($0) }.count
@@ -109,17 +110,21 @@ extension MemoryTools {
     func handleFindClusters(_ args: [String: Value]?) async throws -> CallTool.Result {
         let a = try args.decode(FindClustersArgs.self)
         let minSize = a.minClusterSize?.value ?? 3
-        let threshold = Double(a.distanceThreshold?.value ?? 15) / 100.0
+        // Convert user-facing cosine percentage to L2 distance: L2 = sqrt(2 * cosine)
+        let cosineThreshold = Double(a.distanceThreshold?.value ?? 15) / 100.0
+        let threshold = sqrt(2.0 * cosineThreshold)
         let maxClusters = a.maxClusters?.value ?? 10
 
+        let db = readLattice(for: a.project)
         let result = findMemoryClusters(
-            in: lattice,
+            in: db,
             project: a.project,
             topic: a.topic,
             distanceThreshold: threshold,
             jaccardThreshold: 0.2,
             minClusterSize: minSize,
-            maxClusters: maxClusters
+            maxClusters: maxClusters,
+            neighborLimit: 50
         )
 
         guard !result.clusters.isEmpty else {
@@ -127,10 +132,10 @@ extension MemoryTools {
         }
 
         // Fetch memory data for formatting
-        var memoryMap: [Int64: Memory] = [:]
-        for id in Set(result.clusters.flatMap({ $0 })) {
-            if let mem = lattice.objects(Memory.self).where({ $0.primaryKey == id }).first {
-                memoryMap[id] = mem
+        var memoryMap: [UUID: Memory] = [:]
+        for gid in Set(result.clusters.flatMap({ $0 })) {
+            if let mem = db.objects(Memory.self).where({ $0.__globalId == gid }).first {
+                memoryMap[gid] = mem
             }
         }
 
@@ -141,10 +146,11 @@ extension MemoryTools {
             var totalSim: Double = 0
             var pairCount = 0
             var distances: [Double] = []
-            for a in cluster {
-                for b in cluster where a < b {
+            for (ai, a) in cluster.enumerated() {
+                for b in cluster[(ai + 1)...] {
                     if let dist = result.distances[a]?[b] ?? result.distances[b]?[a] {
-                        totalSim += 1.0 - dist
+                        // Convert L2 distance to cosine similarity for normalized vectors
+                        totalSim += 1.0 - (dist * dist) / 2.0
                         pairCount += 1
                         distances.append(dist)
                     }
@@ -172,12 +178,12 @@ extension MemoryTools {
             output += "\n## Cluster \(i + 1): \(majorityTopic) (\(cluster.count) memories, \(uniqueTopics.count) topic(s))\n"
             output += "Avg. similarity: \(String(format: "%.2f", avgSim)) | Distance stdev: \(String(format: "%.4f", stdev))\n"
             output += "\(assessment)\n\n"
-            for memId in cluster {
-                let content = memoryMap[memId]?.content ?? ""
+            for memGid in cluster {
+                let content = memoryMap[memGid]?.content ?? ""
                 let preview = String(content.prefix(120))
-                output += "[id:\(memId)] \(preview)\n"
+                output += "[id:\(memGid.uuidString)] \(preview)\n"
             }
-            let idList = cluster.map { String($0) }.joined(separator: ",")
+            let idList = cluster.map { $0.uuidString }.joined(separator: ",")
             output += "\nIDs: \(idList)\n"
         }
 
@@ -191,26 +197,26 @@ extension MemoryTools {
         guard !a.content.isEmpty else {
             throw MCPError.invalidParams("'content' is required")
         }
-        let ids = a.ids.values.map { Int64($0) }
+        let ids = a.ids.values
         guard ids.count >= 2 else {
             throw MCPError.invalidParams("'ids' must contain at least 2 memory IDs to consolidate")
         }
         let importance = min(max(a.importance?.value ?? 3, 1), 5)
 
-        // Fetch all memories by IDs
-        var sources: [Memory] = []
-        for id in ids {
-            guard let mem = lattice.objects(Memory.self).where({ $0.primaryKey == id }).first else {
-                return CallTool.Result(content: [.text("Memory with id \(id) not found.")], isError: true)
+        // Fetch all memories by globalId
+        var sources: [(memory: Memory, lattice: Lattice)] = []
+        for gid in ids {
+            guard let found = findMemory(id: gid) else {
+                return CallTool.Result(content: [.text("Memory with id \(gid.uuidString) not found.")], isError: true)
             }
-            sources.append(mem)
+            sources.append(found)
         }
 
         // Determine project and topic
-        let project = a.project ?? sources[0].project
+        let project = a.project ?? sources[0].memory.project
         let topic = a.topic ?? {
-            let grouped = Dictionary(grouping: sources, by: { $0.topic })
-            return grouped.max(by: { $0.value.count < $1.value.count })?.key ?? sources[0].topic
+            let grouped = Dictionary(grouping: sources, by: { $0.memory.topic })
+            return grouped.max(by: { $0.value.count < $1.value.count })?.key ?? sources[0].memory.topic
         }()
 
         // Generate embedding for summary
@@ -228,27 +234,30 @@ extension MemoryTools {
             embedding: embeddingVec,
             importance: importance
         )
-        lattice.add(summary)
+        localLattice.add(summary)
 
-        guard let summaryId = summary.primaryKey else {
-            throw MCPError.internalError("Failed to persist summary — primaryKey is nil after add()")
+        guard let summaryGlobalId = summary.__globalId else {
+            throw MCPError.internalError("Failed to get summary globalId after persist")
         }
 
         // Deprioritize originals (importance → 0) and create summarized_by edges
-        for source in sources {
-            source.importance = 0
-            guard let sourceId = source.primaryKey else { continue }
-            let edge = Edge(sourceId: sourceId, targetId: summaryId, relation: "summarized_by")
-            lattice.add(edge)
+        nonisolated(unsafe) let sourceMemories = sources.map(\.memory)
+        let sourceGlobalIds = sourceMemories.compactMap(\.__globalId)
+        try localLattice.transaction {
+            for mem in sourceMemories {
+                mem.importance = 0
+            }
+            for sourceGlobalId in sourceGlobalIds {
+                let edge = Edge(sourceGlobalId: sourceGlobalId, targetGlobalId: summaryGlobalId, relation: .summarizedBy)
+                localLattice.add(edge)
+            }
         }
 
         let preview = String(a.content.prefix(120))
-        log("Consolidated \(ids.count) memories into [id:\(summaryId)]")
-        incrementCrudCounter()
-        resetMaintenanceBaseline()
+        log("Consolidated \(ids.count) memories into [id:\(summaryGlobalId.uuidString)]")
         return CallTool.Result(
             content: [.text("""
-                Created summary [id:\(summaryId)] (project: \(project), topic: \(topic), importance: \(importance))
+                Created summary [id:\(summaryGlobalId.uuidString)] (project: \(project), topic: \(topic), importance: \(importance))
                 Deprioritized \(sources.count) original memories (importance → 0)
                 Created \(sources.count) 'summarized_by' edges
 

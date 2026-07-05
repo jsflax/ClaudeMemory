@@ -14,6 +14,7 @@ echo ""
 # Clean old install
 rm -f "$INSTALL_DIR/memory"
 rm -f "$INSTALL_DIR/memory-hooks"
+rm -f "$INSTALL_DIR/memory-sync"
 rm -rf "$INSTALL_DIR/Engram_EngramKit.bundle"
 rm -rf "$INSTALL_DIR/swift-transformers_Hub.bundle"
 rm -rf "$INSTALL_DIR/SwiftLM_SwiftLM.bundle"
@@ -26,12 +27,14 @@ if [ "$1" = "--from-source" ]; then
     cd "$REPO_DIR" && swift build -c release
     cp .build/release/Engram "$INSTALL_DIR/memory"
     cp .build/release/EngramHooks "$INSTALL_DIR/memory-hooks"
+    cp .build/release/EngramDaemon "$INSTALL_DIR/memory-sync"
     cp -R .build/release/Engram_EngramKit.bundle "$INSTALL_DIR/"
     cp -R .build/release/swift-transformers_Hub.bundle "$INSTALL_DIR/"
     cp -R .build/release/SwiftLM_SwiftLM.bundle "$INSTALL_DIR/"
     # Re-sign binaries — linker-signed ad-hoc binaries can be rejected by macOS Taskgated
     codesign --force --sign - "$INSTALL_DIR/memory"
     codesign --force --sign - "$INSTALL_DIR/memory-hooks"
+    codesign --force --sign - "$INSTALL_DIR/memory-sync"
 else
     echo "Downloading latest release..."
     DOWNLOAD_URL=$(curl -sL "https://api.github.com/repos/$REPO/releases/latest" \
@@ -50,6 +53,7 @@ else
     # Re-sign binaries — linker-signed ad-hoc binaries can be rejected by macOS Taskgated
     codesign --force --sign - "$INSTALL_DIR/memory"
     codesign --force --sign - "$INSTALL_DIR/memory-hooks"
+    codesign --force --sign - "$INSTALL_DIR/memory-sync"
 fi
 
 echo "Installed to $INSTALL_DIR"
@@ -80,10 +84,31 @@ else
 fi
 echo "Installed agent definitions to $AGENTS_DIR"
 
+# Install skills (slash commands)
+echo "Installing skills..."
+SKILLS_DIR="$HOME/.claude/skills"
+if [ "$1" = "--from-source" ]; then
+    SKILLS_SRC="$REPO_DIR/skills"
+else
+    SKILLS_SRC="$INSTALL_DIR/skills"
+fi
+if [ -d "$SKILLS_SRC" ]; then
+    for skill_dir in "$SKILLS_SRC"/*/; do
+        skill_name="$(basename "$skill_dir")"
+        mkdir -p "$SKILLS_DIR/$skill_name"
+        cp "$skill_dir"SKILL.md "$SKILLS_DIR/$skill_name/" 2>/dev/null
+    done
+    [ "$1" != "--from-source" ] && rm -rf "$INSTALL_DIR/skills"
+    echo "Installed skills to $SKILLS_DIR"
+else
+    echo "No skills found to install"
+fi
+
 # Register hooks with Claude Code
 echo "Registering hooks..."
 SETTINGS_FILE="$HOME/.claude/settings.json"
 HOOKS_CONFIG='{
+  "autoMemoryEnabled": false,
   "permissions": {
     "allow": [
       "mcp__memory__*"
@@ -94,28 +119,36 @@ HOOKS_CONFIG='{
       "hooks": [{
         "type": "command",
         "command": "'"$INSTALL_DIR"'/memory-hooks on-start 2>/dev/null",
-        "timeout": 5
+        "timeout": 300
       }]
     }],
     "UserPromptSubmit": [{
       "hooks": [{
         "type": "command",
         "command": "'"$INSTALL_DIR"'/memory-hooks advise 2>/dev/null",
-        "timeout": 5
+        "timeout": 300
       }]
     }],
     "Stop": [{
       "hooks": [{
         "type": "command",
         "command": "'"$INSTALL_DIR"'/memory-hooks on-stop 2>/dev/null",
-        "timeout": 5
+        "timeout": 300
       }]
     }],
     "PostToolUseFailure": [{
       "hooks": [{
         "type": "command",
         "command": "'"$INSTALL_DIR"'/memory-hooks on-failure 2>/dev/null",
-        "timeout": 5
+        "timeout": 300
+      }]
+    }],
+    "PreToolUse": [{
+      "matcher": "Agent",
+      "hooks": [{
+        "type": "command",
+        "command": "'"$INSTALL_DIR"'/memory-hooks pre-tool 2>/dev/null",
+        "timeout": 300
       }]
     }],
     "PreCompact": [{
@@ -123,14 +156,14 @@ HOOKS_CONFIG='{
       "hooks": [{
         "type": "command",
         "command": "'"$INSTALL_DIR"'/memory-hooks pre-compact 2>/dev/null",
-        "timeout": 3
+        "timeout": 30
       }]
     }],
     "SessionEnd": [{
       "hooks": [{
         "type": "command",
         "command": "'"$INSTALL_DIR"'/memory-hooks on-end 2>/dev/null",
-        "timeout": 5
+        "timeout": 300
       }]
     }]
   }
@@ -138,12 +171,11 @@ HOOKS_CONFIG='{
 
 if [ -f "$SETTINGS_FILE" ]; then
     if command -v jq &>/dev/null; then
-        # Merge hooks (overwrite ours, preserve user-added), append permission if missing, remove stale PreToolUse
+        # Merge hooks (overwrite ours, preserve user-added), append permission if missing
         jq -s '
             (.[0] // {}) as $existing | (.[1] // {}) as $new |
             $existing * $new |
-            .permissions.allow = (($existing.permissions.allow // []) + ($new.permissions.allow // []) | unique) |
-            .hooks |= del(.PreToolUse)
+            .permissions.allow = (($existing.permissions.allow // []) + ($new.permissions.allow // []) | unique)
         ' "$SETTINGS_FILE" <(echo "$HOOKS_CONFIG") > "$SETTINGS_FILE.tmp"
         mv "$SETTINGS_FILE.tmp" "$SETTINGS_FILE"
         echo "Merged hooks into $SETTINGS_FILE"
@@ -156,6 +188,52 @@ else
     echo "$HOOKS_CONFIG" > "$SETTINGS_FILE"
     echo "Created $SETTINGS_FILE with hooks"
 fi
+
+# Install sync daemon as launchd agent
+echo "Installing sync daemon..."
+LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
+DAEMON_LABEL="io.engram.sync"
+PLIST_PATH="$LAUNCH_AGENTS_DIR/$DAEMON_LABEL.plist"
+mkdir -p "$LAUNCH_AGENTS_DIR"
+
+# Bootout existing agent if running
+launchctl bootout "gui/$(id -u)/$DAEMON_LABEL" 2>/dev/null || true
+
+# Clean up old label if present
+OLD_PLIST="$LAUNCH_AGENTS_DIR/io.engram.sync-daemon.plist"
+if [ -f "$OLD_PLIST" ]; then
+    launchctl bootout "gui/$(id -u)/io.engram.sync-daemon" 2>/dev/null || true
+    rm -f "$OLD_PLIST"
+fi
+
+cat > "$PLIST_PATH" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$DAEMON_LABEL</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$INSTALL_DIR/memory-sync</string>
+    </array>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    <key>StandardErrorPath</key>
+    <string>$HOME/.claude/sync-daemon-launchd.log</string>
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
+PLIST
+
+launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"
+echo "Sync daemon installed and started"
 
 # Add user-level instruction to always use memory MCP
 # Canonical source: Sources/EngramKit/InstallConfig.swift — keep in sync

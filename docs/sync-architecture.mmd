@@ -1,0 +1,40 @@
+---
+title: Engram Sync Architecture
+---
+
+%% Phase 1 — Single User (two devices)
+
+graph TB
+    subgraph LaptopA["Laptop A"]
+        subgraph memA["memory.db (local)"]
+            memA_priv["🔒 canary-ios-sdk:<br/>salary notes<br/>job offer"]
+            memA_local["my-side-project:<br/>todo app idea<br/>db schema"]
+            memA_config["SyncConfig:<br/>canary-ios: .sync<br/>engram: .sync<br/>side-proj: .local<br/>_default: .local"]
+        end
+        subgraph persA["personal.db (synced)"]
+            persA_canary["canary-ios-sdk:<br/>auth bug fix<br/>API pattern<br/>retry logic"]
+            persA_engram["engram:<br/>sync config design<br/>ATTACH pattern"]
+        end
+        queryA["queryLattice = ATTACH(memory + personal)<br/>recall('canary-ios') →<br/>auth bug, API pattern, retry logic,<br/>🔒 salary notes, 🔒 job offer"]
+    end
+
+    memA --> queryA
+    persA --> queryA
+
+    subgraph Server["Server"]
+        serverDB["personal.db (replica)"]
+    end
+
+    persA <-->|"Lattice bidirectional sync"| serverDB
+
+    subgraph LaptopB["Laptop B"]
+        subgraph memB["memory.db (local)"]
+            memB_config["SyncConfig:<br/>canary-ios: .sync<br/>engram: .sync<br/>_default: .local"]
+        end
+        subgraph persB["personal.db (synced)"]
+            persB_canary["canary-ios-sdk:<br/>auth bug fix<br/>API pattern<br/>retry logic"]
+            persB_engram["engram:<br/>sync config design<br/>ATTACH pattern"]
+        end
+    end
+
+    serverDB <-->|"Lattice bidirectional sync"| persB

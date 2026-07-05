@@ -4,6 +4,85 @@ All notable changes to Engram are documented in this file.
 
 > Formerly "ClaudeMemory" — renamed in v0.12.0 to be tool-agnostic.
 
+## [0.13.0] - 2026-07-05
+
+The revival release: three months of accumulated breakage fixed across the
+full stack — visualizer, IPC/cloud sync, hooks, and the production relay.
+Cloud sync is live end-to-end for the first time since April 5.
+
+### Fixed — sync (15 production bugs)
+- **Cloud sync outage root causes**: expired auth token silently rejected every 60s
+  for 3 months (the UI's green "Synced" showed pending-count, not connection state —
+  now a real health surface); relay dropped each connection's first frames
+  (handler-registration race); no at-least-once redelivery (unACKed entries now
+  resend on a 10s timeout); IPC wedged at 0/365 by sync-state collapse against a
+  stale config snapshot (live slot registry + startup heal).
+- **The relay killer**: Swift C++-interop on aarch64 Linux crashes (null protocol
+  witness) on Collection ops over imported std::vector — the production relay
+  segfaulted on every received frame. macOS unaffected, so every local gate stayed
+  green. Index loops now (lattice 0.10.6); reproduced + validated in a Linux container.
+- **Unshare destroyed peers' data**: narrowing a sync filter fleet-deleted rows on
+  every device (the February data-loss bug). Filter removals now stop at the
+  device's own synced DB; peers retain their copies (E2E-pinned).
+- **URLSession 401 poisoning**: one 401 during server boot made CFNetwork silently
+  drop the Authorization header on all later connects in that session — fresh
+  ephemeral session per attempt + stale-session delegate guard.
+- **Upload flow control**: full-backlog bursts (25×1MB frames) overran the relay;
+  sends are now windowed per ack round-trip. Transport errors without close events
+  left the synchronizer "connected" and unable to reconnect — fixed.
+- **April recall crash**: Results live-fetch subscript TOCTOU under Collection.map —
+  KNN results materialized via Array().
+- **Hooks crash**: session state mutated after its backing lattice deallocated
+  (weak instance cache) — all access now scoped via withSessionState.
+
+### Fixed — visualizer
+- **Traversal color flash**: MeshInstancesComponent slots are now stable across
+  topology changes (color texture and transforms aren't versioned together by
+  RealityKit); departed slots collapse to zero scale.
+- **Mascot "camo" texture**: the scene sets no IBL, so RealityKit's default studio
+  environment mirrored in glossy regions — reflections damped (roughness floor,
+  specular cut, clearcoat off). The asset itself was never broken.
+- **Sign-out crash during galaxy load** (Galaxy.startObservers fatalErrors → graceful).
+- **New-memory relayout**: a settled simulation absorbs small topology deltas (≤24)
+  without a full re-layout jolt.
+- **MeshInstancesComponent UAF crash** on near-camera orbit (create-once components).
+- **Sidebar lag**: per-project counts cached (was 77 synchronous SQL COUNTs per
+  SwiftUI body evaluation against a 1.1GB database).
+
+### Performance
+- Visualizer at 42k nodes / 232k edges: orbit worst-case 434ms → **12.4ms p50**
+  (preview, full 8k-instance render budget + 30k edges). Idle LOD is ~free
+  (cached visible-set); GPU force pass confirmed 0.4–1.0ms (Barnes-Hut).
+- Production adapter now maintains indexed position arrays + per-tick caches
+  (glow/centroid/topic), quantile-tier LOD replaces fixed cutoffs (fixed
+  5000-unit cull blanked the whole graph at 42k scale).
+- Label propagation rewritten: async in-place, sticky ties, closed-neighborhood
+  seeding — deterministic communities.
+
+### Added
+- **CrashReporter**: async-signal-safe crash reports for the MCP server (ring
+  buffer + signal handlers, no allocation in the handler).
+- **Statusline**: remember-events render in the Claude Code statusline
+  (engram-statusline.sh + installer).
+- **Sync health surface**: daemon status JSON (state/pending/lastSync) + red/yellow
+  problem rows in the sync UI.
+- **vacuum / train_vectors MCP tools**; nuclear-compact escape hatch for full
+  re-upload; fresh-peer replay handshake for IPC catch-up.
+
+### Changed
+- Package now depends on tagged releases (lattice 0.10.6) instead of a local
+  path — remote-resolved builds are the release gate.
+- Maintenance trigger: 10 → 50 CRUD ops + 15-minute cooldown (self-retrigger fix).
+- Lattice logging env-gated (default error) + session-log cleanup covers all
+  binaries; memory-logs no longer grow unbounded.
+
+### Known debt
+- EngramVisualizerTests' GPU-internal suites (BH roundtrip internals, hybrid
+  CPU-integration path, pipelining-count asserts) predate the April Metal refactor
+  and were dead-on-arrival with it (a deleted-kernel crash blocked the whole target
+  until this release); their timing budgets are idle-machine calibrated. The public
+  ForceEngine path is green. Reconciliation tracked for a follow-up.
+
 ## [0.12.4] - 2026-02-26
 
 ### Fixed

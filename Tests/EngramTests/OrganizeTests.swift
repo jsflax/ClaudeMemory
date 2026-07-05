@@ -10,7 +10,7 @@ import Foundation
     let tools = try await makeTools()
 
     // Group 1: networking (3 memories, connected)
-    var netIds: [Int] = []
+    var netIds: [String] = []
     for i in 1...3 {
         let r = try await tools.handle(CallTool.Parameters(
             name: "remember",
@@ -26,13 +26,13 @@ import Foundation
         for j in (i+1)..<netIds.count {
             _ = try await tools.handle(CallTool.Parameters(
                 name: "connect",
-                arguments: ["from": .int(netIds[i]), "to": .int(netIds[j]), "relation": .string("relates_to")]
+                arguments: ["from": .string(netIds[i]), "to": .string(netIds[j]), "relation": .string("relates_to")]
             ))
         }
     }
 
     // Group 2: database (3 memories, connected)
-    var dbIds: [Int] = []
+    var dbIds: [String] = []
     for i in 1...3 {
         let r = try await tools.handle(CallTool.Parameters(
             name: "remember",
@@ -48,7 +48,7 @@ import Foundation
         for j in (i+1)..<dbIds.count {
             _ = try await tools.handle(CallTool.Parameters(
                 name: "connect",
-                arguments: ["from": .int(dbIds[i]), "to": .int(dbIds[j]), "relation": .string("relates_to")]
+                arguments: ["from": .string(dbIds[i]), "to": .string(dbIds[j]), "relation": .string("relates_to")]
             ))
         }
     }
@@ -106,7 +106,7 @@ import Foundation
     let tools = try await makeTools()
 
     // Store 3 memories
-    var memIds: [Int] = []
+    var memIds: [String] = []
     for i in 1...3 {
         let r = try await tools.handle(CallTool.Parameters(
             name: "remember",
@@ -123,7 +123,7 @@ import Foundation
     let result = try await tools.handle(CallTool.Parameters(
         name: "organize",
         arguments: [
-            "ids": .array(memIds.map { Value.int($0) }),
+            "ids": .array(memIds.map { Value.string($0) }),
             "label": .string("compiler-optimization"),
         ]
     ))
@@ -144,7 +144,7 @@ import Foundation
     // Verify part_of edges exist
     let graph = try await tools.handle(CallTool.Parameters(
         name: "graph",
-        arguments: ["id": .int(memIds[0])]
+        arguments: ["id": .string(memIds[0])]
     ))
     let graphOutput = text(from: graph)
     #expect(graphOutput.contains("part_of"))
@@ -154,7 +154,7 @@ import Foundation
     let tools = try await makeTools()
 
     // Store memories with default topic
-    var memIds: [Int] = []
+    var memIds: [String] = []
     for i in 1...2 {
         let r = try await tools.handle(CallTool.Parameters(
             name: "remember",
@@ -171,7 +171,7 @@ import Foundation
     _ = try await tools.handle(CallTool.Parameters(
         name: "organize",
         arguments: [
-            "ids": .array(memIds.map { Value.int($0) }),
+            "ids": .array(memIds.map { Value.string($0) }),
             "label": .string("rendering"),
         ]
     ))
@@ -192,7 +192,7 @@ import Foundation
     let result = try await tools.handle(CallTool.Parameters(
         name: "organize",
         arguments: [
-            "ids": .array([.int(99999)]),
+            "ids": .array([.string(UUID().uuidString)]),
             "label": .string("nonexistent"),
         ]
     ))
@@ -230,7 +230,7 @@ import Foundation
     let result = try await tools.handle(CallTool.Parameters(
         name: "organize",
         arguments: [
-            "ids": .array([.int(memId)]),
+            "ids": .array([.string(memId)]),
             "label": .string("auth"),
         ]
     ))
@@ -249,42 +249,56 @@ import Foundation
 
 @Test func labelPropagation_findsCommunities() {
     // Two disconnected cliques of 3
-    let adjacency: [Int64: Set<Int64>] = [
-        1: [2, 3],
-        2: [1, 3],
-        3: [1, 2],
-        4: [5, 6],
-        5: [4, 6],
-        6: [4, 5],
+    let u1 = UUID(), u2 = UUID(), u3 = UUID(), u4 = UUID(), u5 = UUID(), u6 = UUID()
+    let adjacency: [UUID: Set<UUID>] = [
+        u1: [u2, u3],
+        u2: [u1, u3],
+        u3: [u1, u2],
+        u4: [u5, u6],
+        u5: [u4, u6],
+        u6: [u4, u5],
     ]
 
     let communities = labelPropagation(adjacency: adjacency)
 
     #expect(communities.count == 2)
-    let sizes = communities.map(\.count).sorted()
+    let sizes: [Int] = communities.map(\.count).sorted()
     #expect(sizes == [3, 3])
 
     let c1 = Set(communities[0])
     let c2 = Set(communities[1])
-    #expect((c1 == [1, 2, 3] && c2 == [4, 5, 6]) || (c1 == [4, 5, 6] && c2 == [1, 2, 3]))
+    #expect((c1 == [u1, u2, u3] && c2 == [u4, u5, u6]) || (c1 == [u4, u5, u6] && c2 == [u1, u2, u3]))
 }
 
 @Test func labelPropagation_bridgeEdge() {
-    // Two dense cliques connected by a single bridge edge
-    let adjacency: [Int64: Set<Int64>] = [
-        1: [2, 3, 4],
-        2: [1, 3, 4],
-        3: [1, 2, 4],
-        4: [1, 2, 3, 5],
-        5: [4, 6, 7, 8],
-        6: [5, 7, 8],
-        7: [5, 6, 8],
-        8: [5, 6, 7],
+    // Two dense cliques connected by a single bridge edge.
+    // FIXED UUIDs: label propagation is visit-order sensitive (a known LPA
+    // property), and the implementation iterates in sorted-UUID order — so
+    // random UUIDs made the outcome (and this test) nondeterministic per
+    // run. Fixed ids give a fully deterministic pass while still guarding
+    // the property that a single bridge edge must not merge the cliques.
+    let u1 = UUID(uuidString: "00000000-0000-0000-0000-0000000000A1")!
+    let u2 = UUID(uuidString: "00000000-0000-0000-0000-0000000000A2")!
+    let u3 = UUID(uuidString: "00000000-0000-0000-0000-0000000000A3")!
+    let u4 = UUID(uuidString: "00000000-0000-0000-0000-0000000000A4")!
+    let u5 = UUID(uuidString: "00000000-0000-0000-0000-0000000000B5")!
+    let u6 = UUID(uuidString: "00000000-0000-0000-0000-0000000000B6")!
+    let u7 = UUID(uuidString: "00000000-0000-0000-0000-0000000000B7")!
+    let u8 = UUID(uuidString: "00000000-0000-0000-0000-0000000000B8")!
+    let adjacency: [UUID: Set<UUID>] = [
+        u1: [u2, u3, u4],
+        u2: [u1, u3, u4],
+        u3: [u1, u2, u4],
+        u4: [u1, u2, u3, u5],
+        u5: [u4, u6, u7, u8],
+        u6: [u5, u7, u8],
+        u7: [u5, u6, u8],
+        u8: [u5, u6, u7],
     ]
 
     let communities = labelPropagation(adjacency: adjacency)
 
     #expect(communities.count == 2)
-    let sizes = communities.map(\.count).sorted()
+    let sizes: [Int] = communities.map(\.count).sorted()
     #expect(sizes == [4, 4])
 }
