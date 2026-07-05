@@ -64,5 +64,10 @@ if [ -n "$SESSION_ID" ] && [ -f "$RECALL_LOG" ]; then
   grep "•" "$RECALL_LOG" | head -5
   grep "├" "$RECALL_LOG" | head -3
   SAVES=$(grep "+" "$RECALL_LOG" | grep -v "recalled" | tail -3)
-  [ -n "$SAVES" ] && echo "$SAVES"
+  if [ -n "$SAVES" ]; then echo "$SAVES"; fi
 fi
+
+# A bare `[ -n ] &&` as the final command makes the whole script exit 1 when
+# the condition is false — Claude Code discards statusline output on nonzero
+# exit, so the statusline silently vanishes.
+exit 0
