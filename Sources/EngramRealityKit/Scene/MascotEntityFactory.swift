@@ -34,6 +34,7 @@ enum MascotEntityFactory {
             do {
                 let entity = try await Entity(contentsOf: url)
                 entity.scale = SIMD3<Float>(repeating: mascotScale)
+                tameMascotMaterials(entity)
                 return entity
             } catch {}
         }
@@ -43,6 +44,7 @@ enum MascotEntityFactory {
             do {
                 let entity = try await Entity(contentsOf: url)
                 entity.scale = SIMD3<Float>(repeating: mascotScale)
+                tameMascotMaterials(entity)
                 return entity
             } catch {}
         }
@@ -51,10 +53,35 @@ enum MascotEntityFactory {
         do {
             let entity = try await Entity(named: "mascot", in: .main)
             entity.scale = SIMD3<Float>(repeating: mascotScale)
+            tameMascotMaterials(entity)
             return entity
         } catch {}
 
         return nil
+    }
+
+    /// Damp the mascot's environment-reflection response. The scene sets no
+    /// ImageBasedLight, so RealityKit's default studio environment mirrors in
+    /// the asset's glossy (low-roughness) regions as harsh white/blue patches
+    /// — the "broken camo texture" look. (Preview.app renders the same USDZ
+    /// cleanly under its own gentler IBL; the asset itself is fine.) Raising
+    /// the roughness floor and cutting specular keeps the authored basecolor
+    /// while killing the mirror shards.
+    private static func tameMascotMaterials(_ root: Entity) {
+        func visit(_ e: Entity) {
+            if var model = e.components[ModelComponent.self] {
+                model.materials = model.materials.map { mat in
+                    guard var pbr = mat as? PhysicallyBasedMaterial else { return mat }
+                    pbr.roughness.scale = max(pbr.roughness.scale, 1.0) * 2.0
+                    pbr.specular.scale = 0.2
+                    pbr.clearcoat.scale = 0.0
+                    return pbr
+                }
+                e.components.set(model)
+            }
+            for child in e.children { visit(child) }
+        }
+        visit(root)
     }
 
     /// Create a full mascot entity group with child effect entities.
