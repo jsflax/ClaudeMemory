@@ -7,6 +7,11 @@ enum CLIInstaller {
     private static let agentsDir = claudeDir + "/agents"
     private static let skillsDir = claudeDir + "/skills"
     private static let versionFile = installDir + "/.memory-version"
+
+    enum InstallError: Error {
+        case missingBundledBinary(String)
+        case verificationFailed(String)
+    }
     private static let claudeMDPath = claudeDir + "/CLAUDE.md"
     private static let settingsPath = claudeDir + "/settings.json"
 
@@ -30,16 +35,26 @@ enum CLIInstaller {
         do {
             try fm.createDirectory(atPath: installDir, withIntermediateDirectories: true)
 
-            // Copy CLI binaries
+            // Copy CLI binaries. Two field failures shaped this loop:
+            // (1) Sparkle-updated app bundles carry com.apple.quarantine on
+            //     every file — a faithful copy is then BLOCKED by Gatekeeper
+            //     when Claude Code spawns it (silent, hooks swallow stderr).
+            //     Strip the xattr after each copy (signature stays intact).
+            // (2) A missing source or failed copy used to skip silently and
+            //     still stamp the version, wedging the install until the
+            //     next release. Missing binaries are now an error, and the
+            //     result is verified below before the version stamp.
             let binaries = ["memory", "memory-hooks", "memory-sync"]
             for binary in binaries {
                 let src = cliDir.appendingPathComponent(binary)
                 let dst = URL(fileURLWithPath: installDir).appendingPathComponent(binary)
-                if fm.fileExists(atPath: src.path) {
-                    try? fm.removeItem(at: dst)
-                    try fm.copyItem(at: src, to: dst)
-                    try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dst.path)
+                guard fm.fileExists(atPath: src.path) else {
+                    throw InstallError.missingBundledBinary(binary)
                 }
+                try? fm.removeItem(at: dst)
+                try fm.copyItem(at: src, to: dst)
+                try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dst.path)
+                removexattr(dst.path, "com.apple.quarantine", 0)  // ENOATTR is fine
             }
 
             // Copy .bundle resources
@@ -88,6 +103,19 @@ enum CLIInstaller {
 
             // Install sync daemon launchd plist
             installDaemonPlist()
+
+            // Verify before stamping: every binary must exist, be executable,
+            // and carry no quarantine. A failed install retries next launch
+            // instead of wedging until the next release.
+            for binary in binaries {
+                let path = installDir + "/" + binary
+                guard fm.isExecutableFile(atPath: path) else {
+                    throw InstallError.verificationFailed(binary)
+                }
+                if getxattr(path, "com.apple.quarantine", nil, 0, 0, 0) >= 0 {
+                    throw InstallError.verificationFailed("\(binary) (still quarantined)")
+                }
+            }
 
             // Write version marker
             try bundledVersion.write(toFile: versionFile, atomically: true, encoding: .utf8)

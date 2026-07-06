@@ -4,6 +4,21 @@ All notable changes to Engram are documented in this file.
 
 > Formerly "ClaudeMemory" — renamed in v0.12.0 to be tool-agnostic.
 
+## [0.13.2] - 2026-07-06
+
+First field-report fix (thanks to the first external install).
+
+### Fixed
+- **CLI binaries broken after app auto-update** — the installer copied
+  binaries out of a Sparkle-updated bundle without stripping
+  `com.apple.quarantine`, so Gatekeeper blocked the memory MCP server when
+  Claude Code spawned it; a partial copy could also stamp the version and
+  wedge the install until the next release. The installer now strips
+  quarantine after each copy, treats missing bundled binaries as an error,
+  verifies every binary (executable + unquarantined) before stamping the
+  version, and logs failures to `~/.claude/cli-install-error.log` instead of
+  dying silently.
+
 ## [0.13.1] - 2026-07-05
 
 Same-day follow-up to 0.13.0 focused on onboarding and first-run polish.
