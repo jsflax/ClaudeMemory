@@ -194,8 +194,15 @@ public final class RKSpatialAudioSystem {
             audioLog.debug("Proximity rescan: nearNodes=\(visibleSet.nearNodes.count) candidates=\(candidates.count) active=\(activeCount) cam=(\(cameraPos.x, format: .fixed(precision: 0)),\(cameraPos.y, format: .fixed(precision: 0)),\(cameraPos.z, format: .fixed(precision: 0)))")
         }
 
+        // Hard audibility cutoff. Two bugs made tones audible from anywhere:
+        // the manual gain floored at -30 dB (quiet but never silent), and the
+        // quantile LOD rewrite made near-tier membership RELATIVE — the 8
+        // relatively-nearest nodes qualified even with the camera far from
+        // everything. Beyond this range a voice mutes outright.
+        let audibleRange: Float = 420
+
         for i in 0..<maxProximityVoices {
-            if i < activeCount {
+            if i < activeCount, candidates[i].distance < audibleRange {
                 let idx = candidates[i].index
                 let node = nodes[idx]
                 let dist = candidates[i].distance
@@ -231,9 +238,10 @@ public final class RKSpatialAudioSystem {
                     }
                 }
 
-                // Distance-based gain
-                let volume = max(0.0, 1.0 - dist / 500.0)
-                proximityPool[i].controller?.gain = Double(-30.0 + volume * 15.0)
+                // Distance-based gain: -12 dB up close fading to -34 dB at
+                // the edge of audibleRange (the hard mute above catches the rest).
+                let volume = max(0.0, 1.0 - dist / audibleRange)
+                proximityPool[i].controller?.gain = Double(-34.0 + volume * 22.0)
             } else {
                 muteVoice(&proximityPool[i])
             }
