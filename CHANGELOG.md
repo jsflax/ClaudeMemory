@@ -4,6 +4,37 @@ All notable changes to Engram are documented in this file.
 
 > Formerly "ClaudeMemory" — renamed in v0.12.0 to be tool-agnostic.
 
+## [0.13.1] - 2026-07-05
+
+Same-day follow-up to 0.13.0 focused on onboarding and first-run polish.
+
+### Fixed
+- **Stale dev endpoints purged at launch** — a persisted ngrok/localhost
+  `sync_endpoint` from an old dev session survived app updates and silently
+  pointed both the app and the sync daemon at a dead tunnel ("authentication
+  failed" with no hint why). Ephemeral dev endpoints are now discarded;
+  genuine custom endpoints still persist.
+- **Daemon endpoint follows the app** — the sync daemon's launchd plist
+  snapshots its `--endpoint` at install time; endpoint changes (and the
+  migration above) now rewrite the plist and restart the daemon immediately
+  instead of waiting for the next app version bump.
+- **Proximity audio audible from anywhere** — the manual distance gain never
+  fully silenced (floored at −30 dB) and the quantile LOD near-tier is
+  relative, so the nearest tones hummed at any camera distance. Voices now
+  hard-mute beyond an absolute audibility range.
+
+### Added
+- **Live subscription unlock** — while signed in without an active
+  subscription, the app polls status once a minute; an admin-granted (or
+  newly purchased) subscription connects sync immediately, no restart.
+- **Subscribe button** in the Account tab for signed-in users without a
+  subscription — opens the web checkout.
+
+### Notes
+- Email registration works end-to-end as of the 0.13.0 server deploy (the
+  server now returns a session token on register; previously registration
+  failed silently in all app versions).
+
 ## [0.13.0] - 2026-07-05
 
 The revival release: three months of accumulated breakage fixed across the
