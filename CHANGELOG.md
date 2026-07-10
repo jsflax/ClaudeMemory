@@ -4,6 +4,41 @@ All notable changes to Engram are documented in this file.
 
 > Formerly "ClaudeMemory" — renamed in v0.12.0 to be tool-agnostic.
 
+## [0.13.3] - 2026-07-08
+
+Performance release: kills the sync-daemon busy-spin, the unbounded WAL
+growth, and the recall slowdown they compounded into (Claude Code's
+UserPromptSubmit hook timing out — recall observed at 228s on a churned
+database; now sub-second).
+
+### Fixed
+- **Sync daemon busy-spin** — upload passes were re-invoked with zero delay
+  from four sites and each pass re-scanned the entire audit log (the daemon
+  burned ~46 CPU-hours in 2 days against a slow server). Upload ticks are
+  now paced (leading-edge immediate + coalescing window; WSS 750ms, IPC
+  relay 50ms), each pass is bounded to one send window by a new per-slot
+  `upload_floor` cursor, and a stalled server backs the resend cadence off
+  exponentially instead of being re-hammered every 10s.
+- **Unbounded WAL growth** — nothing at runtime ever checkpointed the WAL
+  while the daemon's long-lived connections pinned the passive autocheckpoint
+  (`memory.sqlite-wal` observed at 1.1GB; every SQL statement then pays an
+  O(WAL) page-lookup penalty). The sync engine now runs PASSIVE checkpoints
+  every 60s — including while disconnected — and TRUNCATE every 5 minutes
+  when idle.
+- **Reconnect storms** — the exponential backoff reset itself on every
+  successful open, so a flapping endpoint reconnected at ~1s forever. The
+  counter now resets only after a connection proves stable (≥60s).
+- **Recall N×K statement explosion** — every property read on a recalled
+  memory issued its own `SELECT` (~300 statements per depth-1 recall).
+  Recall now materializes each hit from the row its query already fetched
+  (zero further SQL), reads embeddings once per traversal candidate, and
+  batches access-stat bumps into one transaction of atomic increments on
+  the correct database handle (they silently autocommitted individually on
+  synced projects before).
+- **Sync progress counters** — `pending` accumulated the whole backlog on
+  every pass and never returned to zero; it now mirrors exactly the
+  sent-but-unACKed set, so the daemon health surface is trustworthy.
+
 ## [0.13.2] - 2026-07-06
 
 First field-report fix (thanks to the first external install).

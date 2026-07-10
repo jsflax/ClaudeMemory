@@ -14,7 +14,7 @@ import Foundation
 ///   (e.g., "preferences", "architecture", "debugging").
 /// - **Provenance tracking**: The `source` field records where the memory originated
 ///   (e.g., "conversation", "code-review", a file path).
-@Model
+@Model @Detached
 public final class Memory {
     /// The memory content — a natural-language description of the knowledge to store.
     @FullText public var content: String

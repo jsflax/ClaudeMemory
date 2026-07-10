@@ -238,8 +238,11 @@ extension MemoryTools {
         for d in stride(from: 1, through: depth, by: 1) {
             var nextFrontier = Set<UUID>()
             for nodeGlobalId in frontier {
-                // Outgoing edges
+                // Outgoing edges. materialize(): the query hydrated each edge
+                // row already — the 2-3 field reads here plus the formatting
+                // reads in the caller become statement-free.
                 for edge in db.objects(Edge.self).where({ $0.sourceGlobalId == nodeGlobalId }) {
+                    edge.materialize()
                     if !visited.contains(edge.targetGlobalId) {
                         visited.insert(edge.targetGlobalId)
                         nextFrontier.insert(edge.targetGlobalId)
@@ -248,6 +251,7 @@ extension MemoryTools {
                 }
                 // Incoming edges
                 for edge in db.objects(Edge.self).where({ $0.targetGlobalId == nodeGlobalId }) {
+                    edge.materialize()
                     if !visited.contains(edge.sourceGlobalId) {
                         visited.insert(edge.sourceGlobalId)
                         nextFrontier.insert(edge.sourceGlobalId)
@@ -260,6 +264,10 @@ extension MemoryTools {
             for gid in nextFrontier {
                 if let mem = db.objects(Memory.self).where({ $0.__globalId == gid && $0.expiresAt > now }).first,
                    let edge = connectingEdges[gid] {
+                    // Hydrated by the fetch — the filter's embedding read and
+                    // the caller's formatting reads (content up to 4x per
+                    // large memory) serve from the snapshot.
+                    mem.materialize()
                     if let filter, !filter(mem, edge) {
                         continue  // excluded from results and frontier
                     }

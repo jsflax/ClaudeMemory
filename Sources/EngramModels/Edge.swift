@@ -5,7 +5,7 @@ import Foundation
 ///
 /// Edges reference memories by their globally unique `globalId` (UUID),
 /// enabling cross-database edges in multi-DB sync scenarios.
-@Model
+@Model @Detached
 public final class Edge {
     @LatticeEnum
     public enum Relation: String, Codable, Sendable {

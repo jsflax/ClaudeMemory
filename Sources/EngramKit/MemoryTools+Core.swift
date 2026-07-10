@@ -454,6 +454,14 @@ extension MemoryTools {
             log("[recall] nearest() returned \(nearest.count) results")
             sessionLog("[recall] nearest() returned \(nearest.count) results")
 
+            // Materialize every match: the KNN hydration already fetched each
+            // full row, so the boosting + formatting reads below become
+            // statement-free. Without this, every property access is its own
+            // `SELECT col WHERE id=?`, and recall issued ~300 statements per
+            // call — each scanning the WAL the sync daemon churns (observed
+            // 228s for a single depth-1 recall on a bloated WAL).
+            for match in nearest { match.object.materialize() }
+
             if nearest.isEmpty {
                 log("[recall] No results, returning empty")
                 sessionLog("[recall] No results")
@@ -522,16 +530,13 @@ extension MemoryTools {
             log("[recall] After outlier filter: \(filtered.count) results (threshold=\(String(format: "%.3f", threshold)))")
             sessionLog("[recall] Outlier filter: \(filtered.count) results")
 
-            // Bump lastAccessedAt and accessCount on recalled memories
-            sessionLog("[recall] Bumping access timestamps")
-            let accessNow = Date()
-            try localLattice.transaction {
-                for match in filtered {
-                    match.object.lastAccessedAt = accessNow
-                    match.object.accessCount += 1
-                }
-            }
-            sessionLog("[recall] Access timestamps bumped")
+            // Access-stat bumps are DEFERRED to one batched transaction after
+            // the output is composed (see below) — the old per-loop
+            // `localLattice.transaction` was a silent no-op for synced
+            // projects: the recalled objects live on the attaching lattice's
+            // connection, so the txn wrapped nothing and every bump
+            // autocommitted individually.
+            var bumpTargets: [Memory] = filtered.map(\.object)
 
             let lines = filtered.compactMap { match -> String? in
                 let m = match.object
@@ -572,22 +577,19 @@ extension MemoryTools {
                     filter: { mem, connectingEdge in
                         // The connecting edge is the specific edge that reached this memory
                         if structuralRelations.contains(connectingEdge.relation) { return true }
-                        // Loose edges: filter by cosine distance to query
-                        guard mem.embedding.dimensions > 0 else { return false }
-                        return Double(mem.embedding.cosineDistance(to: queryVec)) <= 0.15
+                        // Loose edges: filter by cosine distance to query.
+                        // Bind the embedding ONCE — each read used to be its
+                        // own full 384-float BLOB SELECT per candidate.
+                        let emb = mem.embedding
+                        guard emb.dimensions > 0 else { return false }
+                        return Double(emb.cosineDistance(to: queryVec)) <= 0.15
                     }
                 )
                 log("[recall] Graph traversal returned \(connected.count) connected memories")
                 sessionLog("[recall] Graph traversal returned \(connected.count) connected")
                 if !connected.isEmpty {
                     output += "\n\n--- Connected (graph traversal, depth: \(depth)) ---"
-                    let connNow = Date()
-                    try localLattice.transaction {
-                        for mem in connected {
-                            mem.memory.lastAccessedAt = connNow
-                            mem.memory.accessCount += 1
-                        }
-                    }
+                    bumpTargets.append(contentsOf: connected.map(\.memory))
                     for mem in connected {
                         let m = mem.memory
                         guard let memGlobalId = m.__globalId else { continue }
@@ -618,6 +620,27 @@ extension MemoryTools {
                 }
             }
 
+            // Access-stat bumps: best-effort ranking metadata, batched into
+            // ONE transaction on `db` — the handle the recalled objects
+            // actually belong to (for synced projects that's the attaching
+            // lattice; a localLattice txn silently wrapped nothing).
+            // `increment` is a SQL-side atomic `SET c = c + 1` (no
+            // read-modify-write race, no stale-snapshot hazard). Non-fatal:
+            // a busy synced DB must not throw away a composed recall result.
+            sessionLog("[recall] Bumping access stats (\(bumpTargets.count) memories)")
+            let accessNow = Date()
+            do {
+                try db.transaction {
+                    for m in bumpTargets {
+                        m.lastAccessedAt = accessNow
+                        m.increment("accessCount")
+                    }
+                }
+            } catch {
+                log("[recall] access-stat bump skipped: \(error)")
+                sessionLog("[recall] access-stat bump skipped (non-fatal)")
+            }
+
             log("[recall] DONE, returning \(output.count) chars")
             sessionLog("[recall] DONE, returning \(output.count) chars")
             return CallTool.Result(content: [.text(output)], isError: false)
@@ -635,6 +658,7 @@ extension MemoryTools {
             var lines: [String] = []
             for match in ftsResults {
                 let m = match.object
+                m.materialize()  // hydrated by the FTS query — format for free
                 let ftsInfo = match.distances["content"].map { " (fts5: \(String(format: "%.3f", $0)))" } ?? ""
                 let expires = m.expiresAt == .distantFuture ? "" : ", expires: \(Self.dateFormatter.string(from: m.expiresAt))"
                 let created = hasTemporalFilter ? ", created: \(Self.dateFormatter.string(from: m.createdAt))" : ""

@@ -78,6 +78,15 @@ jobs:
           --skip "recall_semanticRelevanceOrdering"
           --skip "recall_connectedMemory_showsEdgeRelation"
           --skip "recall_graphTraversal_relatesToDoesNotLeakViaUnrelatedStructuralEdge"
+          --skip "recall_statementBudget"
+
+      # The statement-budget regression test reads the process-global SQL
+      # statement counter; suites running in parallel pollute every
+      # measurement window (sustained, not bursty — min-of-N can't rescue
+      # it). It runs alone in a quiet invocation instead.
+      - name: Run statement-budget regression (serial)
+        timeout-minutes: 5
+        run: swift test --skip-build --filter "recall_statementBudget"
 
       - name: Build CLI release binaries
         run: swift build -c release
