@@ -43,8 +43,8 @@ extension MemoryTools {
             )
         }
 
-        // Create edge (always in localLattice)
-        let edge = Edge(sourceGlobalId: fromGid, targetGlobalId: toGid, relation: relationEnum)
+        // Create edge (always in localLattice), attributed to the writer
+        let edge = Edge(sourceGlobalId: fromGid, targetGlobalId: toGid, relation: relationEnum, authorUserId: currentUserId)
         localLattice.add(edge)
 
         guard let edgeGid = edge.__globalId else {
@@ -133,8 +133,9 @@ extension MemoryTools {
         for d in stride(from: 1, through: depth, by: 1) {
             var nextFrontier = Set<UUID>()
             for nodeGlobalId in frontier {
-                // Outgoing edges
-                let outgoing = rootLattice.objects(Edge.self).where { $0.sourceGlobalId == nodeGlobalId }
+                // Outgoing edges (tombstoned edges excluded — their endpoint
+                // memory is tombstoned too)
+                let outgoing = rootLattice.objects(Edge.self).where { $0.sourceGlobalId == nodeGlobalId && $0.deletedAt == nil }
                 for edge in outgoing {
                     allEdges.append((edge: edge, depth: d))
                     if !visited.contains(edge.targetGlobalId) {
@@ -143,7 +144,7 @@ extension MemoryTools {
                     }
                 }
                 // Incoming edges
-                let incoming = rootLattice.objects(Edge.self).where { $0.targetGlobalId == nodeGlobalId }
+                let incoming = rootLattice.objects(Edge.self).where { $0.targetGlobalId == nodeGlobalId && $0.deletedAt == nil }
                 for edge in incoming {
                     allEdges.append((edge: edge, depth: d))
                     if !visited.contains(edge.sourceGlobalId) {
@@ -215,6 +216,29 @@ extension MemoryTools {
         return total
     }
 
+    /// Tombstone (soft-delete) all edges touching the given memories — the
+    /// group-shared counterpart of deleteEdgesForMemories: a hard edge
+    /// delete would LWW-replicate to every member, and the memory these
+    /// edges reference is itself only tombstoned (recoverable).
+    @discardableResult
+    func tombstoneEdgesForMemories(_ globalIds: [UUID]) -> Int {
+        var total = 0
+        let now = Date()
+        for gid in globalIds {
+            let edges = localLattice.objects(Edge.self)
+                .where { ($0.sourceGlobalId == gid || $0.targetGlobalId == gid) && $0.deletedAt == nil }
+                .snapshot()
+            guard !edges.isEmpty else { continue }
+            localLattice.transaction {
+                for edge in edges {
+                    edge.deletedAt = now
+                }
+            }
+            total += edges.count
+        }
+        return total
+    }
+
     /// BFS graph traversal from a set of starting memory globalIds, returning connected memories
     /// annotated with the depth at which they were discovered and the edge that connected them.
     ///
@@ -241,7 +265,7 @@ extension MemoryTools {
                 // Outgoing edges. materialize(): the query hydrated each edge
                 // row already — the 2-3 field reads here plus the formatting
                 // reads in the caller become statement-free.
-                for edge in db.objects(Edge.self).where({ $0.sourceGlobalId == nodeGlobalId }) {
+                for edge in db.objects(Edge.self).where({ $0.sourceGlobalId == nodeGlobalId && $0.deletedAt == nil }) {
                     edge.materialize()
                     if !visited.contains(edge.targetGlobalId) {
                         visited.insert(edge.targetGlobalId)
@@ -250,7 +274,7 @@ extension MemoryTools {
                     }
                 }
                 // Incoming edges
-                for edge in db.objects(Edge.self).where({ $0.targetGlobalId == nodeGlobalId }) {
+                for edge in db.objects(Edge.self).where({ $0.targetGlobalId == nodeGlobalId && $0.deletedAt == nil }) {
                     edge.materialize()
                     if !visited.contains(edge.sourceGlobalId) {
                         visited.insert(edge.sourceGlobalId)
@@ -262,7 +286,10 @@ extension MemoryTools {
             // Fetch memories and apply filter; only memories that pass continue in BFS
             var passingFrontier = Set<UUID>()
             for gid in nextFrontier {
-                if let mem = db.objects(Memory.self).where({ $0.__globalId == gid && $0.expiresAt > now }).first,
+                // Tombstone filter INSIDE the BFS hydration — a handler-level
+                // filter alone would leak tombstoned memories into recall's
+                // Connected section via traversal.
+                if let mem = db.objects(Memory.self).where({ $0.__globalId == gid && $0.expiresAt > now && $0.deletedAt == nil }).first,
                    let edge = connectingEdges[gid] {
                     // Hydrated by the fetch — the filter's embedding read and
                     // the caller's formatting reads (content up to 4x per

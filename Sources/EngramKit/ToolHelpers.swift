@@ -321,8 +321,12 @@ struct UpdateArgs: Decodable {
     let importance: FlexibleInt?
     let isPrivate: Bool?
 
+    /// Clears a tombstone (deletedAt/deletedBy) — restores a soft-deleted
+    /// group-shared memory for every member.
+    let undelete: Bool?
+
     enum CodingKeys: String, CodingKey {
-        case id, query, project, content, append, prepend, find, replace, topic, source, importance
+        case id, query, project, content, append, prepend, find, replace, topic, source, importance, undelete
         case setProject = "set_project"
         case expiresInDays = "expires_in_days"
         case isPrivate = "is_private"
@@ -491,4 +495,7 @@ struct ConsolidateArgs: Decodable {
     let topic: String?
     let project: String?
     let importance: FlexibleInt?
+    /// Required to consolidate clusters containing FOREIGN-authored (group)
+    /// memories — the demotion mutates teammates' rows group-wide.
+    let force: Bool?
 }

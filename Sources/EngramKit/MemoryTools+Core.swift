@@ -138,7 +138,7 @@ extension MemoryTools {
             log("[remember] got lattice ref, building query")
             let baseQuery = latticeRef.objects(Memory.self)
                 .distinct(by: \.__globalId)
-                .where { $0.expiresAt > Date() && $0.topic != "episode" }
+                .where { $0.expiresAt > Date() && $0.topic != "episode" && $0.deletedAt == nil }
                 .where { $0.project == project || $0.project == "global" }
             log("[remember] query built, calling nearest() with embedding dim=\(embeddingVec.count)")
             // Array() materializes once — see the recall nearest() comment.
@@ -194,7 +194,7 @@ extension MemoryTools {
         let isPrivate = a.isPrivate ?? false
 
         log("[remember] creating Memory object")
-        let memory = Memory(content: content, topic: topic, project: project, source: source, embedding: embeddingVec, expiresAt: expiresAt, importance: importance, isPrivate: isPrivate)
+        let memory = Memory(content: content, topic: topic, project: project, source: source, embedding: embeddingVec, expiresAt: expiresAt, importance: importance, isPrivate: isPrivate, authorUserId: currentUserId, modifiedAt: Date())
         log("[remember] calling localLattice.add()")
         localLattice.add(memory)
         log("[remember] add() complete")
@@ -217,7 +217,7 @@ extension MemoryTools {
         try localLattice.transaction {
             // Auto-create part_of edge when parent_id is provided
             if let parentGid = parentGidValue {
-                let edge = Edge(sourceGlobalId: memoryGlobalId, targetGlobalId: parentGid, relation: .partOf)
+                let edge = Edge(sourceGlobalId: memoryGlobalId, targetGlobalId: parentGid, relation: .partOf, authorUserId: currentUserId)
                 localLattice.add(edge)
                 parentNote = ", parent: \(parentGid.uuidString)"
                 log("Auto-created part_of edge: \(memoryGlobalId.uuidString) -> \(parentGid.uuidString)")
@@ -226,7 +226,7 @@ extension MemoryTools {
             // Link to active episode via part_of edge
             if let epGid = activeEpisodeId,
                localLattice.objects(Memory.self).where({ $0.__globalId == epGid }).first != nil {
-                let edge = Edge(sourceGlobalId: memoryGlobalId, targetGlobalId: epGid, relation: .partOf)
+                let edge = Edge(sourceGlobalId: memoryGlobalId, targetGlobalId: epGid, relation: .partOf, authorUserId: currentUserId)
                 localLattice.add(edge)
                 log("Linked memory \(memoryGlobalId.uuidString) to episode \(epGid.uuidString)")
             }
@@ -244,7 +244,7 @@ extension MemoryTools {
                     .first != nil
                 guard !(forwardEdge || reverseEdge) else { continue }
 
-                let edge = Edge(sourceGlobalId: memoryGlobalId, targetGlobalId: candidateGlobalId, relation: .relatesTo)
+                let edge = Edge(sourceGlobalId: memoryGlobalId, targetGlobalId: candidateGlobalId, relation: .relatesTo, authorUserId: currentUserId)
                 localLattice.add(edge)
                 autoLinkedGids.append(candidateGlobalId)
                 log("Auto-connected [\(memoryGlobalId.uuidString)] --[relates_to]--> [\(candidateGlobalId.uuidString)] (distance: \(String(format: "%.3f", candidate.distance)))")
@@ -290,7 +290,7 @@ extension MemoryTools {
                         .first != nil
                     guard !(forwardLinked || reverseLinked) else { continue }
 
-                    let edge = Edge(sourceGlobalId: memoryGlobalId, targetGlobalId: hubGlobalId, relation: .relatesTo)
+                    let edge = Edge(sourceGlobalId: memoryGlobalId, targetGlobalId: hubGlobalId, relation: .relatesTo, authorUserId: currentUserId)
                     localLattice.add(edge)
                     autoLinkedGids.append(hubGlobalId)
                     log("Cross-project link [\(memoryGlobalId.uuidString)] --[relates_to]--> [\(hubGlobalId.uuidString)] (project '\(otherProject)' mentioned in content)")
@@ -333,7 +333,7 @@ extension MemoryTools {
                             .where { $0.sourceGlobalId == memoryGlobalId && $0.targetGlobalId == hubGlobalId && $0.relation == .partOf }
                             .first != nil
                         if !alreadyLinked {
-                            let edge = Edge(sourceGlobalId: memoryGlobalId, targetGlobalId: hubGlobalId, relation: .partOf)
+                            let edge = Edge(sourceGlobalId: memoryGlobalId, targetGlobalId: hubGlobalId, relation: .partOf, authorUserId: currentUserId)
                             localLattice.add(edge)
                             log("Auto-organized [\(memoryGlobalId.uuidString)] into hub [\(hubGlobalId.uuidString)]")
                         }
@@ -406,7 +406,7 @@ extension MemoryTools {
         sessionLog("[recall] DB selected")
         var results = db.objects(Memory.self)
             .distinct(by: \.__globalId)
-            .where { $0.expiresAt > Date() }
+            .where { $0.expiresAt > Date() && $0.deletedAt == nil }  // tombstone filter
         log("[recall] Base query built")
         sessionLog("[recall] Base query built")
 
@@ -538,6 +538,7 @@ extension MemoryTools {
             // autocommitted individually.
             var bumpTargets: [Memory] = filtered.map(\.object)
 
+            let selfId = currentUserId
             let lines = filtered.compactMap { match -> String? in
                 let m = match.object
                 guard let mGid = m.__globalId else { return nil }
@@ -545,7 +546,13 @@ extension MemoryTools {
                 let impInfo = m.importance > 0 ? ", importance: \(m.importance)" : ""
                 let expires = m.expiresAt == .distantFuture ? "" : ", expires: \(Self.dateFormatter.string(from: m.expiresAt))"
                 let created = hasTemporalFilter ? ", created: \(Self.dateFormatter.string(from: m.createdAt))" : ""
-                return "[id:\(mGid.uuidString)] [\(m.project)/\(m.topic)] (distance: \(dist)\(impInfo)\(expires)\(created)) \(m.content)"
+                // Author badge for FOREIGN-authored (group) memories only —
+                // own + legacy rows stay clean. Placement after
+                // [project/topic] is load-bearing: logRecalledMemories
+                // anchors on [id: and the FIRST bracket pair after it.
+                let badge = (m.authorUserId != nil && m.authorUserId != selfId)
+                    ? " [by:\(GroupDirectory.badgeName(for: m.authorUserId))]" : ""
+                return "[id:\(mGid.uuidString)] [\(m.project)/\(m.topic)]\(badge) (distance: \(dist)\(impInfo)\(expires)\(created)) \(m.content)"
             }
 
             var output = lines.joined(separator: "\n\n")
@@ -674,6 +681,47 @@ extension MemoryTools {
 
     // MARK: - forget
 
+    /// Per-row forget partition (decisions 4/9): group-shared rows are
+    /// TOMBSTONED (soft delete — a hard delete would LWW-replicate to every
+    /// member; tombstones are recoverable and converge everywhere), while
+    /// never-shared rows keep the hard delete + edge cascade.
+    private func forgetPartitioned(
+        _ memories: [(memory: Memory, lattice: Lattice)]
+    ) -> (tombstoned: Int, deleted: Int, edgesRemoved: Int) {
+        var tombstoned = 0
+        var hardDeleteGids: [UUID] = []
+        var hardDeleteByLattice: [(lattice: Lattice, gid: UUID)] = []
+
+        for entry in memories {
+            let mem = entry.memory
+            let lattice = entry.lattice
+            guard let gid = mem.__globalId else { continue }
+            if isGroupShared(mem) {
+                tombstone(mem, in: lattice)
+                tombstoneEdgesForMemories([gid])
+                tombstoned += 1
+            } else {
+                hardDeleteGids.append(gid)
+                hardDeleteByLattice.append((lattice, gid))
+            }
+        }
+        let edgesRemoved = deleteEdgesForMemories(hardDeleteGids)
+        for (lattice, gid) in hardDeleteByLattice {
+            lattice.delete(Memory.self, where: { $0.__globalId == gid })
+        }
+        return (tombstoned, hardDeleteByLattice.count, edgesRemoved)
+    }
+
+    private func forgetResultNote(tombstoned: Int, deleted: Int, edgesRemoved: Int) -> String {
+        var parts: [String] = []
+        if deleted > 0 { parts.append("\(deleted) deleted") }
+        if tombstoned > 0 {
+            parts.append("\(tombstoned) group-shared → tombstoned (hidden for all members, recoverable via update with undelete: true)")
+        }
+        if edgesRemoved > 0 { parts.append("\(edgesRemoved) edge(s) removed") }
+        return parts.joined(separator: "; ")
+    }
+
     func handleForget(_ args: [String: Value]?) throws -> CallTool.Result {
         let a = try args.decode(ForgetArgs.self)
 
@@ -683,57 +731,63 @@ extension MemoryTools {
                 return CallTool.Result(content: [.text("Memory with id \(gid.uuidString) not found.")], isError: true)
             }
             let summary = mem.content.prefix(80)
+            let project = mem.project
+            let topic = mem.topic
 
-            // Cascade: delete edges referencing this memory
+            if isGroupShared(mem) {
+                tombstone(mem, in: foundLattice)
+                let edgeCount = tombstoneEdgesForMemories([gid])
+                let edgeNote = edgeCount > 0 ? " Tombstoned \(edgeCount) edge(s)." : ""
+                log("Tombstoned group-shared memory [id:\(gid.uuidString)]: \(summary)")
+                return CallTool.Result(
+                    content: [.text("Removed memory (id: \(gid.uuidString), project: \(project), topic: \(topic)): \(summary)\nThis memory is shared with a group — it is tombstoned (hidden for all members, attributed to you) rather than hard-deleted. Restore with update(id:, undelete: true).\(edgeNote)")],
+                    isError: false
+                )
+            }
+
+            // Never-shared: hard delete + edge cascade (unchanged semantics).
             let edgeCount = deleteEdgesForMemories([gid])
-
             foundLattice.delete(Memory.self, where: { $0.__globalId == gid })
             let edgeNote = edgeCount > 0 ? " Removed \(edgeCount) edge(s)." : ""
             log("Deleted memory [id:\(gid.uuidString)]: \(summary)")
             return CallTool.Result(
-                content: [.text("Deleted memory (id: \(gid.uuidString), project: \(mem.project), topic: \(mem.topic)): \(summary)\(edgeNote)")],
+                content: [.text("Deleted memory (id: \(gid.uuidString), project: \(project), topic: \(topic)): \(summary)\(edgeNote)")],
                 isError: false
             )
         }
 
+        // Bulk paths: iterate a snapshot and partition per row — a blanket
+        // db.delete over the union would emit hard DELETEs for group-shared
+        // rows (exactly the propagation the tombstone design exists to stop).
         switch (a.topic, a.project) {
         case let (topic?, project?):
             let db = readLattice(for: project)
-            let query = db.objects(Memory.self).where { $0.topic == topic && $0.project == project }.distinct(by: \.__globalId)
-            let memories = query.snapshot()
-            let globalIds = memories.compactMap(\.__globalId)
-            let edgeCount = deleteEdgesForMemories(globalIds)
-            let count = memories.count
-            db.delete(Memory.self, where: { $0.topic == topic && $0.project == project })
-            let edgeNote = edgeCount > 0 ? " Removed \(edgeCount) edge(s)." : ""
+            let memories = db.objects(Memory.self)
+                .where { $0.topic == topic && $0.project == project && $0.deletedAt == nil }
+                .distinct(by: \.__globalId).snapshot()
+            let r = forgetPartitioned(memories.map { (memory: $0, lattice: db) })
             return CallTool.Result(
-                content: [.text("Deleted \(count) memories (project: \(project), topic: \(topic)).\(edgeNote)")],
+                content: [.text("Removed \(memories.count) memories (project: \(project), topic: \(topic)). \(forgetResultNote(tombstoned: r.tombstoned, deleted: r.deleted, edgesRemoved: r.edgesRemoved))")],
                 isError: false
             )
         case let (topic?, nil):
-            // No project → delete from localLattice only
-            let query = localLattice.objects(Memory.self).where { $0.topic == topic }
-            let memories = query.snapshot()
-            let globalIds = memories.compactMap(\.__globalId)
-            let edgeCount = deleteEdgesForMemories(globalIds)
-            let count = memories.count
-            localLattice.delete(Memory.self, where: { $0.topic == topic })
-            let edgeNote = edgeCount > 0 ? " Removed \(edgeCount) edge(s)." : ""
+            // No project → localLattice only (rows there can still be
+            // group-shared via their project's exposure — partition anyway).
+            let memories = localLattice.objects(Memory.self)
+                .where { $0.topic == topic && $0.deletedAt == nil }.snapshot()
+            let r = forgetPartitioned(memories.map { (memory: $0, lattice: localLattice) })
             return CallTool.Result(
-                content: [.text("Deleted \(count) memories with topic '\(topic)'.\(edgeNote)")],
+                content: [.text("Removed \(memories.count) memories with topic '\(topic)'. \(forgetResultNote(tombstoned: r.tombstoned, deleted: r.deleted, edgesRemoved: r.edgesRemoved))")],
                 isError: false
             )
         case let (nil, project?):
             let db = readLattice(for: project)
-            let query = db.objects(Memory.self).where { $0.project == project }.distinct(by: \.__globalId)
-            let memories = query.snapshot()
-            let globalIds = memories.compactMap(\.__globalId)
-            let edgeCount = deleteEdgesForMemories(globalIds)
-            let count = memories.count
-            db.delete(Memory.self, where: { $0.project == project })
-            let edgeNote = edgeCount > 0 ? " Removed \(edgeCount) edge(s)." : ""
+            let memories = db.objects(Memory.self)
+                .where { $0.project == project && $0.deletedAt == nil }
+                .distinct(by: \.__globalId).snapshot()
+            let r = forgetPartitioned(memories.map { (memory: $0, lattice: db) })
             return CallTool.Result(
-                content: [.text("Deleted \(count) memories for project '\(project)'.\(edgeNote)")],
+                content: [.text("Removed \(memories.count) memories for project '\(project)'. \(forgetResultNote(tombstoned: r.tombstoned, deleted: r.deleted, edgesRemoved: r.edgesRemoved))")],
                 isError: false
             )
         case (nil, nil):
@@ -753,9 +807,9 @@ extension MemoryTools {
 
         // 2. Validate at least one edit field
         let hasContentEdit = a.content != nil || a.append != nil || a.prepend != nil || a.find != nil
-        let hasMetadataEdit = a.setProject != nil || a.topic != nil || a.source != nil || a.expiresInDays != nil || a.importance != nil || a.isPrivate != nil
+        let hasMetadataEdit = a.setProject != nil || a.topic != nil || a.source != nil || a.expiresInDays != nil || a.importance != nil || a.isPrivate != nil || a.undelete == true
         guard hasContentEdit || hasMetadataEdit else {
-            throw MCPError.invalidParams("Provide at least one edit: content, append, prepend, find+replace, set_project, topic, source, or expires_in_days.")
+            throw MCPError.invalidParams("Provide at least one edit: content, append, prepend, find+replace, set_project, topic, source, expires_in_days, or undelete.")
         }
 
         // 3. Validate content edit modes are mutually exclusive
@@ -779,7 +833,7 @@ extension MemoryTools {
         } else {
             let query = a.query!
             let db = readLattice(for: a.project)
-            var results = db.objects(Memory.self).distinct(by: \.__globalId)
+            var results = db.objects(Memory.self).distinct(by: \.__globalId).where { $0.deletedAt == nil }
             if let projectFilter = a.project {
                 results = results.where { $0.project == projectFilter }
             }
@@ -792,6 +846,32 @@ extension MemoryTools {
                 return CallTool.Result(content: [.text("No matching memory found to update.")], isError: false)
             }
             mem = match.object
+        }
+
+        // 5b. Tombstone gate: a soft-deleted memory only accepts undelete —
+        // otherwise its author gets zero signal that edits are landing on an
+        // invisible row (e.g. an offline edit arriving after a teammate's
+        // tombstone).
+        if mem.deletedAt != nil && a.undelete != true {
+            let by = GroupDirectory.badgeName(for: mem.deletedBy)
+            let when = mem.deletedAt.map { Self.dateFormatter.string(from: $0) } ?? "?"
+            return CallTool.Result(
+                content: [.text("Memory \(mem.__globalId?.uuidString ?? "?") is tombstoned by \(by) on \(when) — restore it first with update(id:, undelete: true).")],
+                isError: true
+            )
+        }
+
+        // 5c. `is_private` flips are AUTHOR-ONLY (decision 12): flipping it
+        // on a group-shared row hard-retracts THAT AUTHOR's memory from the
+        // group DB (row-level filter unmatch emits a real DELETE, removing
+        // the group's copy including teammates' edits). Only its author may
+        // trigger that.
+        if a.isPrivate != nil, let author = mem.authorUserId,
+           author != currentUserId {
+            return CallTool.Result(
+                content: [.text("is_private is author-only: this memory was written by \(GroupDirectory.badgeName(for: author)), and flipping privacy retracts THEIR memory from the group. Use forget (tombstone) or connect(contradicts) instead.")],
+                isError: true
+            )
         }
 
         // 6. Apply content edits + metadata in a single transaction
@@ -877,6 +957,14 @@ extension MemoryTools {
                 let old = mem.isPrivate
                 mem.isPrivate = priv
                 changes.append("private: \(old) → \(priv)")
+                if priv && !old && isGroupShared(mem) {
+                    changes.append("⚠️ retracted from the group: the group's copy (including any teammate edits) is removed for all members")
+                }
+            }
+            if a.undelete == true, mem.deletedAt != nil {
+                mem.deletedAt = nil
+                mem.deletedBy = nil
+                changes.append("undeleted (restored for all members)")
             }
 
             if contentChanged, let emb = newEmbedding {
@@ -884,12 +972,21 @@ extension MemoryTools {
             }
 
             mem.lastAccessedAt = Date()
+            // authorUserId is NEVER touched by edits — attribution follows
+            // the original author, and the sync firewall keys on it.
+            mem.modifiedAt = Date()
         }
 
         let memGidStr = mem.__globalId?.uuidString ?? "unknown"
+        // Foreign-authored (group) rows: say so — the model should know it
+        // just edited shared state written by someone else.
+        var foreignNote = ""
+        if let author = mem.authorUserId, author != currentUserId {
+            foreignNote = "\nNote: this memory is group-shared, originally by \(GroupDirectory.badgeName(for: author)) — your edit syncs to all members. Prefer connect(relation: \"contradicts\") over destructive edits when you merely disagree."
+        }
         log("Updated memory [id:\(memGidStr)] [\(mem.project)/\(mem.topic)]: \(changes.joined(separator: ", "))")
         return CallTool.Result(
-            content: [.text("Updated memory (id: \(memGidStr), project: \(mem.project), topic: \(mem.topic)).\nChanges:\n\(changes.joined(separator: "\n"))")],
+            content: [.text("Updated memory (id: \(memGidStr), project: \(mem.project), topic: \(mem.topic)).\nChanges:\n\(changes.joined(separator: "\n"))\(foreignNote)")],
             isError: false
         )
     }
@@ -926,12 +1023,19 @@ extension MemoryTools {
         }
         let embeddingVec = Vector<Float>(floats)
 
-        // Create merged memory, clean up edges, delete originals — all in one transaction
-        let merged = Memory(content: content, topic: topic, project: project, source: "merged", embedding: embeddingVec)
+        // Create merged memory, clean up edges, remove originals — all in one
+        // transaction. Group-shared and FOREIGN-AUTHORED sources are
+        // TOMBSTONED (never hard-deleted): a hard delete would replicate to
+        // every member, and destroying a teammate's original is not merge's
+        // call to make. The merged summary is authored by the runner.
+        let merged = Memory(content: content, topic: topic, project: project, source: "merged", embedding: embeddingVec, authorUserId: currentUserId, modifiedAt: Date())
         let oldSummaries = sources.map { "[id:\($0.memory.__globalId?.uuidString ?? "?")] \($0.memory.content.prefix(60))" }
 
         var mergedGid: UUID!
+        var hardDeleted = 0
+        var tombstonedCount = 0
         var edgeCount = 0
+        let selfId = currentUserId
         try localLattice.transaction {
             localLattice.add(merged)
 
@@ -940,18 +1044,30 @@ extension MemoryTools {
             }
             mergedGid = gid
 
-            edgeCount = deleteEdgesForMemories(gids)
-
-            for (_, source) in sources.enumerated() {
+            for source in sources {
                 guard let gid = source.memory.__globalId else { continue }
-                source.lattice.delete(Memory.self, where: { $0.__globalId == gid })
+                let foreign = source.memory.authorUserId != nil && source.memory.authorUserId != selfId
+                if foreign || isGroupShared(source.memory) {
+                    source.memory.deletedAt = Date()
+                    source.memory.deletedBy = selfId
+                    source.memory.modifiedAt = Date()
+                    edgeCount += tombstoneEdgesForMemories([gid])
+                    tombstonedCount += 1
+                } else {
+                    edgeCount += deleteEdgesForMemories([gid])
+                    source.lattice.delete(Memory.self, where: { $0.__globalId == gid })
+                    hardDeleted += 1
+                }
             }
         }
 
-        let edgeNote = edgeCount > 0 ? " Removed \(edgeCount) edge(s) from source memories." : ""
+        var notes: [String] = []
+        if hardDeleted > 0 { notes.append("\(hardDeleted) source(s) deleted") }
+        if tombstonedCount > 0 { notes.append("\(tombstonedCount) group-shared/foreign source(s) tombstoned (recoverable)") }
+        if edgeCount > 0 { notes.append("\(edgeCount) edge(s) removed") }
         log("Merged \(gids.count) memories into [id:\(mergedGid.uuidString)]")
         return CallTool.Result(
-            content: [.text("Merged \(gids.count) memories into new memory (id: \(mergedGid.uuidString), project: \(project), topic: \(topic)).\(edgeNote)\n\nDeleted:\n\(oldSummaries.joined(separator: "\n"))\n\nNew:\n\(content)")],
+            content: [.text("Merged \(gids.count) memories into new memory (id: \(mergedGid.uuidString), project: \(project), topic: \(topic)). \(notes.joined(separator: "; ")).\n\nSources:\n\(oldSummaries.joined(separator: "\n"))\n\nNew:\n\(content)")],
             isError: false
         )
     }
@@ -963,7 +1079,7 @@ extension MemoryTools {
         let projectFilter = a.project
         let db = readLattice(for: projectFilter)
 
-        var base = db.objects(Memory.self).distinct(by: \.__globalId)
+        var base = db.objects(Memory.self).distinct(by: \.__globalId).where { $0.deletedAt == nil }  // tombstone filter
         if let projectFilter {
             base = base.where { $0.project == projectFilter }
         }
@@ -1045,7 +1161,7 @@ extension MemoryTools {
         let projectFilter = a.project
         let db = readLattice(for: projectFilter)
 
-        var base = db.objects(Memory.self).distinct(by: \.__globalId)
+        var base = db.objects(Memory.self).distinct(by: \.__globalId).where { $0.deletedAt == nil }  // tombstone filter
         if let projectFilter {
             base = base.where { $0.project == projectFilter }
         }

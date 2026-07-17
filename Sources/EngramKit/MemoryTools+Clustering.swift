@@ -18,7 +18,7 @@ public func findMemoryClusters(
     neighborLimit: Int? = nil
 ) -> (clusters: [[UUID]], distances: [UUID: [UUID: Double]]) {
     let now = Date()
-    var baseQuery = lattice.objects(Memory.self).distinct(by: \.__globalId).where { $0.expiresAt > now }
+    var baseQuery = lattice.objects(Memory.self).distinct(by: \.__globalId).where { $0.expiresAt > now && $0.deletedAt == nil }
     if let project { baseQuery = baseQuery.where { $0.project == project } }
     if let topic { baseQuery = baseQuery.where { $0.topic == topic } }
     let memories = baseQuery.snapshot()
@@ -178,10 +178,17 @@ extension MemoryTools {
             output += "\n## Cluster \(i + 1): \(majorityTopic) (\(cluster.count) memories, \(uniqueTopics.count) topic(s))\n"
             output += "Avg. similarity: \(String(format: "%.2f", avgSim)) | Distance stdev: \(String(format: "%.4f", stdev))\n"
             output += "\(assessment)\n\n"
+            let selfId = currentUserId
             for memGid in cluster {
-                let content = memoryMap[memGid]?.content ?? ""
+                let mem = memoryMap[memGid]
+                let content = mem?.content ?? ""
                 let preview = String(content.prefix(120))
-                output += "[id:\(memGid.uuidString)] \(preview)\n"
+                // Foreign-author label — the consolidation decision needs to
+                // know whose memories a cluster contains (demoting them is
+                // group-wide; the consolidate handler enforces force: true).
+                let badge = (mem?.authorUserId != nil && mem?.authorUserId != selfId)
+                    ? " [by:\(GroupDirectory.badgeName(for: mem?.authorUserId))]" : ""
+                output += "[id:\(memGid.uuidString)]\(badge) \(preview)\n"
             }
             let idList = cluster.map { $0.uuidString }.joined(separator: ",")
             output += "\nIDs: \(idList)\n"
@@ -212,6 +219,28 @@ extension MemoryTools {
             sources.append(found)
         }
 
+        // Hard backstop (not just agent-prompt guidance): consolidating a
+        // cluster with FOREIGN-authored members demotes teammates' memories
+        // group-wide. Require an explicit force acknowledgment. Tombstoned
+        // members are never consolidated.
+        if sources.contains(where: { $0.memory.deletedAt != nil }) {
+            return CallTool.Result(
+                content: [.text("One or more memories are tombstoned — undelete them first or drop them from the cluster.")],
+                isError: true
+            )
+        }
+        let selfId = currentUserId
+        let foreignMembers = sources.filter { $0.memory.authorUserId != nil && $0.memory.authorUserId != selfId }
+        if !foreignMembers.isEmpty && a.force != true {
+            let names = foreignMembers
+                .map { GroupDirectory.badgeName(for: $0.memory.authorUserId) }
+            let uniqueNames = Array(Set(names)).sorted().joined(separator: ", ")
+            return CallTool.Result(
+                content: [.text("This cluster contains \(foreignMembers.count) memory(ies) written by teammates (\(uniqueNames)) — consolidating demotes THEIR memories for the whole group. Prefer connect(relation: \"relates_to\") to link without demoting, or pass force: true to proceed deliberately.")],
+                isError: true
+            )
+        }
+
         // Determine project and topic
         let project = a.project ?? sources[0].memory.project
         let topic = a.topic ?? {
@@ -225,14 +254,16 @@ extension MemoryTools {
         }
         let embeddingVec = Vector<Float>(floats)
 
-        // Create summary memory
+        // Create summary memory (authored by the runner)
         let summary = Memory(
             content: a.content,
             topic: topic,
             project: project,
             source: "consolidation",
             embedding: embeddingVec,
-            importance: importance
+            importance: importance,
+            authorUserId: currentUserId,
+            modifiedAt: Date()
         )
         localLattice.add(summary)
 
@@ -248,7 +279,7 @@ extension MemoryTools {
                 mem.importance = 0
             }
             for sourceGlobalId in sourceGlobalIds {
-                let edge = Edge(sourceGlobalId: sourceGlobalId, targetGlobalId: summaryGlobalId, relation: .summarizedBy)
+                let edge = Edge(sourceGlobalId: sourceGlobalId, targetGlobalId: summaryGlobalId, relation: .summarizedBy, authorUserId: currentUserId)
                 localLattice.add(edge)
             }
         }

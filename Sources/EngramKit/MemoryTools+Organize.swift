@@ -16,7 +16,7 @@ extension MemoryTools {
 
         // Fetch all non-expired, non-episode memories for the project
         let db = readLattice(for: project)
-        let allMemories = db.objects(Memory.self)
+        let allMemories = db.objects(Memory.self).where { $0.deletedAt == nil }
             .distinct(by: \.__globalId)
             .where { $0.project == project && $0.expiresAt > Date() && $0.topic != "episode" }
             .snapshot()
@@ -136,7 +136,7 @@ extension MemoryTools {
         try localLattice.transaction {
             for gid in ids {
                 if let mem = memories[gid] {
-                    let edge = Edge(sourceGlobalId: gid, targetGlobalId: hubGlobalId, relation: .partOf)
+                    let edge = Edge(sourceGlobalId: gid, targetGlobalId: hubGlobalId, relation: .partOf, authorUserId: currentUserId)
                     localLattice.add(edge)
                     mem.topic = label
                 }

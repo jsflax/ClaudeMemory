@@ -90,6 +90,34 @@ public actor MemoryTools {
         return localLattice
     }
 
+    /// The signed-in user's id for authorUserId stamping — from the
+    /// daemon-authored groups.json (never the Keychain; short-lived
+    /// processes can't reliably read it). Nil when signed out — writers
+    /// stamp nil and the daemon-start backfill sweep repairs later.
+    var currentUserId: UUID? { GroupDirectory.currentUserId() }
+
+    /// Whether this memory is (or would be) shared with any group: not
+    /// private, and its project is exposed to at least one group. Drives
+    /// tombstone-vs-hard-delete — hard deletes must never propagate into a
+    /// shared graph (they LWW-replicate to every member).
+    func isGroupShared(_ mem: Memory) -> Bool {
+        guard !mem.isPrivate else { return false }
+        guard let config = localLattice.objects(SyncConfig.self)
+            .where({ $0.project == mem.project }).first else { return false }
+        return !config.exposedGroups.isEmpty
+    }
+
+    /// Tombstones a memory in place (soft delete): hidden from every read
+    /// path, recoverable via `update(undelete: true)`, propagates as a
+    /// field-delta UPDATE that survives LWW.
+    func tombstone(_ mem: Memory, in lattice: Lattice) {
+        lattice.transaction {
+            mem.deletedAt = Date()
+            mem.deletedBy = currentUserId
+            mem.modifiedAt = Date()
+        }
+    }
+
     /// Finds a memory by globalId, trying localLattice first then syncedLattice.
     /// Returns the memory and which lattice it was found in.
     func findMemory(id: UUID) -> (memory: Memory, lattice: Lattice)? {
@@ -174,7 +202,7 @@ public actor MemoryTools {
                         ]),
                         "is_private": .object([
                             "type": .string("boolean"),
-                            "description": .string("Mark this memory as private. Private memories sync to your cloud backup but are excluded from team shared graphs and the hive mind. Default: false."),
+                            "description": .string("Mark this memory as private. Private memories sync to your cloud backup but are excluded from group shared graphs. Default: false."),
                         ]),
                     ]),
                     "required": .array([.string("content")]),
@@ -326,7 +354,11 @@ public actor MemoryTools {
                         ]),
                         "is_private": .object([
                             "type": .string("boolean"),
-                            "description": .string("Update the memory's private flag. Private memories sync to your cloud backup but are excluded from team shared graphs and the hive mind."),
+                            "description": .string("Update the memory's private flag. Private memories sync to your cloud backup but are excluded from group shared graphs. AUTHOR-ONLY on group-shared memories, and flipping to true RETRACTS the memory from the group — the group's copy (including teammates' edits) is removed for all members."),
+                        ]),
+                        "undelete": .object([
+                            "type": .string("boolean"),
+                            "description": .string("Restore a tombstoned (soft-deleted) memory — clears the tombstone for all group members."),
                         ]),
                     ]),
                     "additionalProperties": .bool(false),

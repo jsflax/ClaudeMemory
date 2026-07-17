@@ -104,7 +104,7 @@ extension MemoryTools {
         // Fetch and sort member memories chronologically
         var members: [Memory] = []
         for edge in edges {
-            if let mem = episodeLattice.objects(Memory.self).where({ $0.__globalId == edge.sourceGlobalId && $0.topic != "episode" }).first {
+            if let mem = episodeLattice.objects(Memory.self).where({ $0.__globalId == edge.sourceGlobalId && $0.topic != "episode" && $0.deletedAt == nil }).first {
                 members.append(mem)
             }
         }
@@ -160,7 +160,7 @@ extension MemoryTools {
         let limit = a.limit?.value ?? 20
 
         let db = readLattice(for: a.project)
-        var results = db.objects(Memory.self).distinct(by: \.__globalId).where { $0.topic == "episode" }
+        var results = db.objects(Memory.self).distinct(by: \.__globalId).where { $0.topic == "episode" && $0.deletedAt == nil }
 
         if let project = a.project {
             results = results.where { $0.project == project }
@@ -220,7 +220,7 @@ extension MemoryTools {
         let edges = episodeLattice.objects(Edge.self).where { $0.targetGlobalId == episodeGid && $0.relation == .partOf }
         var latest = startedAt
         for edge in edges {
-            if let mem = episodeLattice.objects(Memory.self).where({ $0.__globalId == edge.sourceGlobalId }).first {
+            if let mem = episodeLattice.objects(Memory.self).where({ $0.__globalId == edge.sourceGlobalId && $0.deletedAt == nil }).first {
                 if mem.createdAt > latest { latest = mem.createdAt }
             }
         }
