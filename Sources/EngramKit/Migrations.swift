@@ -26,7 +26,16 @@ public enum V1 {
 // MARK: - Schema Version Constants
 
 /// Current schema version. Bump this when adding new migrations.
-public let currentSchemaVersion = 2
+///
+/// v3 (Groups): `Memory.{authorUserId, deletedAt, deletedBy, modifiedAt}`,
+/// `Edge.{authorUserId, deletedAt}`, and the group-DB-only `GroupProjectMap`
+/// model. All additions are nullable columns handled by Lattice's
+/// `ensure_swift_tables` — no transform block needed (the v1→v2 entry below
+/// shows the transform pattern when one IS needed). The stored
+/// `SyncConfig.exposedTeams` column name is deliberately KEPT (renaming
+/// would skew the personal-sync wire format across the user's own app
+/// versions); new code uses the `exposedGroups` computed alias.
+public let currentSchemaVersion = 3
 
 // MARK: - Migration Definitions
 

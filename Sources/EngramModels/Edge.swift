@@ -37,15 +37,28 @@ public final class Edge {
     /// When this edge was created.
     public var createdAt: Date
 
+    /// Who authored this edge (schema v3, Groups). Nil for legacy rows.
+    /// Never changed by edits.
+    public var authorUserId: UUID?
+
+    /// Soft-delete tombstone (schema v3, Groups). Non-nil = excluded from
+    /// graph traversal/reads. Set alongside memory tombstones when the edge
+    /// is group-shared; edges need no deletion attribution.
+    public var deletedAt: Date?
+
     public init(
         sourceGlobalId: UUID,
         targetGlobalId: UUID,
         relation: Relation,
-        createdAt: Date = Date()
+        createdAt: Date = Date(),
+        authorUserId: UUID? = nil,
+        deletedAt: Date? = nil
     ) {
         self.sourceGlobalId = sourceGlobalId
         self.targetGlobalId = targetGlobalId
         self.relation = relation
         self.createdAt = createdAt
+        self.authorUserId = authorUserId
+        self.deletedAt = deletedAt
     }
 }

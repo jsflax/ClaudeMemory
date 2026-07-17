@@ -51,9 +51,35 @@ public final class Memory {
     /// Explicit importance rating (1-5). 0 means unset. Higher values boost recall ranking.
     public var importance: Int
 
-    /// Whether this memory is private (excluded from team shared graphs and hive mind).
+    /// Whether this memory is private (excluded from group shared graphs).
     /// Private memories still sync to the user's own cloud backup. Default: false.
+    ///
+    /// Retract semantics: flipping this to `true` on a memory ALREADY shared
+    /// with a group emits a real DELETE to the group DB (row-level filter
+    /// unmatch), removing the group's copy including teammates' edits.
+    /// Author-only — enforced at the MCP handler.
     public var isPrivate: Bool
+
+    /// Who authored this memory (schema v3, Groups). Nil for legacy and
+    /// never-signed-in rows. Stamped at creation from groups.json's
+    /// `selfUserId`; NEVER changed by edits — attribution follows the
+    /// original author, and the spoke→hub sync firewall keys on it.
+    public var authorUserId: UUID?
+
+    /// Soft-delete tombstone (schema v3, Groups). Non-nil = hidden from all
+    /// recall/FTS/vector reads everywhere it syncs. Used instead of hard
+    /// delete whenever the memory is group-shared; recoverable by clearing
+    /// (undelete). Hard purge is an admin-only server-side operation.
+    public var deletedAt: Date?
+
+    /// Who tombstoned this memory (attribution for "tombstoned by X" notices).
+    public var deletedBy: UUID?
+
+    /// When this memory's content/metadata was last modified (schema v3).
+    /// Stamped by MemoryTools on every write. Instruments how often
+    /// last-arrival-wins loses newer data today, and gives field-timestamp
+    /// LWW a column to compare when it lands.
+    public var modifiedAt: Date?
 
     public init(
         content: String,
@@ -66,7 +92,11 @@ public final class Memory {
         expiresAt: Date = Date.distantFuture,
         accessCount: Int = 0,
         importance: Int = 0,
-        isPrivate: Bool = false
+        isPrivate: Bool = false,
+        authorUserId: UUID? = nil,
+        deletedAt: Date? = nil,
+        deletedBy: UUID? = nil,
+        modifiedAt: Date? = nil
     ) {
         self.content = content
         self.topic = topic
@@ -79,5 +109,9 @@ public final class Memory {
         self.accessCount = accessCount
         self.importance = importance
         self.isPrivate = isPrivate
+        self.authorUserId = authorUserId
+        self.deletedAt = deletedAt
+        self.deletedBy = deletedBy
+        self.modifiedAt = modifiedAt
     }
 }

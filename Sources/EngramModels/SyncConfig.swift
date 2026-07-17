@@ -30,9 +30,27 @@ public final class SyncConfig {
     /// Whether this project's memories should sync.
     public var policy: Policy = .local
 
-    /// Team IDs this project is exposed to (Phase 2).
-    /// Non-empty requires `policy == .sync`. Empty set = no team exposure.
+    /// Group IDs this project is exposed to (the Groups feature).
+    ///
+    /// STORED COLUMN NAME IS `exposedTeams` for wire/schema stability across
+    /// the user's own devices (SyncConfig replicates via personal sync; a
+    /// rename would skew across app versions). Use the `exposedGroups`
+    /// alias in new code.
+    ///
+    /// Exposure gates WRITES only: the daemon's per-group hub filters relay
+    /// non-private memories of exposed projects into that group's spoke.
+    /// Reads are membership-scoped (every membership spoke attaches on
+    /// recall) regardless of exposure. Un-exposing stops NEW sharing;
+    /// already-shared rows remain with the group (retract an individual
+    /// memory via `is_private`).
     public var exposedTeams: Set<String> = []
+
+    /// Preferred accessor for `exposedTeams` (the stored name predates the
+    /// team→group rename).
+    public var exposedGroups: Set<String> {
+        get { exposedTeams }
+        set { exposedTeams = newValue }
+    }
 
     /// When this config was last updated.
     public var updatedAt: Date
