@@ -74,6 +74,14 @@ struct MemoryDetailPanel: View {
                             .font(.system(size: 10, design: .monospaced))
                             .foregroundStyle(.white.opacity(0.4))
                     }
+                    // Attribution for group-shared rows; self/legacy stay
+                    // clean (nil author or the signed-in user's own id).
+                    if let author = memory.authorUserId,
+                       author != GroupDirectory.currentUserId() {
+                        Text("by \(GroupDirectory.badgeName(for: author))")
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(.cyan.opacity(0.5))
+                    }
                     Spacer()
                     Text(memory.createdAt, style: .date)
                         .font(.system(size: 10, design: .monospaced))
