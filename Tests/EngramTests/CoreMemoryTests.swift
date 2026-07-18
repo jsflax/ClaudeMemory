@@ -206,7 +206,10 @@ import Foundation
         arguments: ["topic": .string("debugging")]
     ))
     let output = text(from: result)
-    #expect(output.contains("Deleted 2 memories"))
+    // Post-groups format: bulk forget reports its shared/private partition
+    // ("Removed N memories … N deleted[; M tombstoned]").
+    #expect(output.contains("Removed 2 memories"))
+    #expect(output.contains("2 deleted"))
 
     // architecture memory should still exist
     let recall = try await tools.handle(CallTool.Parameters(
@@ -232,7 +235,9 @@ import Foundation
         name: "forget",
         arguments: ["project": .string("Lattice")]
     ))
-    #expect(text(from: result).contains("Deleted 1 memories"))
+    let projectOut = text(from: result)
+    #expect(projectOut.contains("Removed 1 memories"))
+    #expect(projectOut.contains("1 deleted"))
 
     // global memory should remain
     let recall = try await tools.handle(CallTool.Parameters(
@@ -262,7 +267,9 @@ import Foundation
         name: "forget",
         arguments: ["topic": .string("debug"), "project": .string("X")]
     ))
-    #expect(text(from: result).contains("Deleted 1 memories"))
+    let bothOut = text(from: result)
+    #expect(bothOut.contains("Removed 1 memories"))
+    #expect(bothOut.contains("1 deleted"))
 }
 
 @Test func forget_all_requiresFilter() async throws {

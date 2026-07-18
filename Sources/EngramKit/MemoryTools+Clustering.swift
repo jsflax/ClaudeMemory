@@ -15,13 +15,22 @@ public func findMemoryClusters(
     jaccardThreshold: Double = 0.2,
     minClusterSize: Int = 2,
     maxClusters: Int = 10,
-    neighborLimit: Int? = nil
+    neighborLimit: Int? = nil,
+    excludeForeign: Bool = false,
+    selfUserId: UUID? = nil
 ) -> (clusters: [[UUID]], distances: [UUID: [UUID: Double]]) {
     let now = Date()
     var baseQuery = lattice.objects(Memory.self).distinct(by: \.__globalId).where { $0.expiresAt > now && $0.deletedAt == nil }
     if let project { baseQuery = baseQuery.where { $0.project == project } }
     if let topic { baseQuery = baseQuery.where { $0.topic == topic } }
-    let memories = baseQuery.snapshot()
+    var memories = baseQuery.snapshot()
+    // Maintenance guard: the maintenance subprocess must never receive
+    // foreign-authored content in cluster listings (its prompts are a
+    // Bash-capable injection target). Handlers pass their exclusion policy
+    // through; nil-author rows are the user's own legacy rows.
+    if excludeForeign {
+        memories = memories.filter { $0.authorUserId == nil || $0.authorUserId == selfUserId }
+    }
 
     guard memories.count >= minClusterSize else { return ([], [:]) }
 
@@ -124,7 +133,9 @@ extension MemoryTools {
             jaccardThreshold: 0.2,
             minClusterSize: minSize,
             maxClusters: maxClusters,
-            neighborLimit: 50
+            neighborLimit: 50,
+            excludeForeign: excludeForeignAuthored,
+            selfUserId: currentUserId
         )
 
         guard !result.clusters.isEmpty else {

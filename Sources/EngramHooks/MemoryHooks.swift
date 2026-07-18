@@ -15,6 +15,7 @@ struct MemoryHooks: AsyncParsableCommand {
             PreCompact.self,
             ClearMaintenance.self,
             SampleGate.self,
+            GroupAdvise.self,
         ]
     )
 }

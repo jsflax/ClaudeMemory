@@ -58,7 +58,17 @@ func initMemoryTools(sessionId: String? = nil) async -> MemoryTools? {
     await embedder.load()
     sessionLog("initMemoryTools: embedder loaded", sessionId: sessionId)
 
-    return MemoryTools(localRef: lattice.sendableReference, syncedRef: nil, embedder: embedder)
+    let tools = MemoryTools(localRef: lattice.sendableReference, syncedRef: nil, embedder: embedder)
+    // Every hook recall INJECTS its output into a tool-capable session, so
+    // the hook path always fences foreign-authored content; the per-device
+    // opt-out ("memory-hooks group-advise off" or the visualizer settings
+    // row) excludes it entirely. One site — Advise, OnStart, and PreTool
+    // all init through here.
+    let includeGroup = lattice.objects(HookState.self)
+        .where { $0.key == .adviseIncludeGroupMemories }
+        .first?.value != "false"
+    await tools.setForeignContentPolicy(fence: true, exclude: !includeGroup)
+    return tools
 }
 
 /// Get the current total memory count from the database.

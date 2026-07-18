@@ -511,8 +511,13 @@ extension MemoryTools {
 
             log("[recall] Boosting complete for \(boosted.count) results")
             sessionLog("[recall] Boosting complete for \(boosted.count) results")
+            // Foreign exclusion (advise opt-out / maintenance guard) happens
+            // BEFORE the limit so it never under-fills the result set.
+            let candidates = excludeForeignAuthored
+                ? boosted.filter { !isForeignAuthored($0.object) }
+                : boosted
             // Re-sort by boosted distance and take top `limit`
-            let sorted = boosted.sorted { $0.distance < $1.distance }
+            let sorted = candidates.sorted { $0.distance < $1.distance }
             let topResults = Array(sorted.prefix(limit))
 
             if topResults.isEmpty {
@@ -550,9 +555,14 @@ extension MemoryTools {
                 // own + legacy rows stay clean. Placement after
                 // [project/topic] is load-bearing: logRecalledMemories
                 // anchors on [id: and the FIRST bracket pair after it.
-                let badge = (m.authorUserId != nil && m.authorUserId != selfId)
+                let isForeign = m.authorUserId != nil && m.authorUserId != selfId
+                let badge = isForeign
                     ? " [by:\(GroupDirectory.badgeName(for: m.authorUserId))]" : ""
-                return "[id:\(mGid.uuidString)] [\(m.project)/\(m.topic)]\(badge) (distance: \(dist)\(impInfo)\(expires)\(created)) \(m.content)"
+                // Advise-injection path: foreign content renders inside the
+                // escape-hardened indentation fence.
+                let body = (isForeign && fenceForeignContent)
+                    ? Self.fencedForeignContent(m.content) : m.content
+                return "[id:\(mGid.uuidString)] [\(m.project)/\(m.topic)]\(badge) (distance: \(dist)\(impInfo)\(expires)\(created)) \(body)"
             }
 
             var output = lines.joined(separator: "\n\n")
@@ -576,12 +586,21 @@ extension MemoryTools {
                 // Loose edges (relates_to, contradicts) require semantic proximity to the query.
                 let queryVec = Vector<Float>(queryEmbedding)
                 let structuralRelations: Set<Edge.Relation> = [.partOf, .derivedFrom, .supersedes, .summarizedBy]
+                // Value-captured so the filter closure doesn't reference
+                // actor state.
+                let dropForeign = excludeForeignAuthored
+                let traversalSelfId = selfId
                 let connected = traverseGraph(
                     from: recalledGlobalIds,
                     depth: depth,
                     excludeGlobalIds: recalledGlobalIds,
                     db: db,
                     filter: { mem, connectingEdge in
+                        // Foreign exclusion applies to traversal too — the
+                        // Connected section injects content just like the
+                        // direct results do.
+                        if dropForeign, let author = mem.authorUserId,
+                           author != traversalSelfId { return false }
                         // The connecting edge is the specific edge that reached this memory
                         if structuralRelations.contains(connectingEdge.relation) { return true }
                         // Loose edges: filter by cosine distance to query.
@@ -612,16 +631,20 @@ extension MemoryTools {
                             edgeInfo = " --[\(edge.relation.rawValue)]--> [id:\(edge.targetGlobalId.uuidString)]"
                         }
 
+                        let connBadge = isForeignAuthored(m)
+                            ? " [by:\(GroupDirectory.badgeName(for: m.authorUserId))]" : ""
                         // Small memories shown in full; large ones get a compact preview
-                        if m.content.count <= 500 {
-                            output += "\n\n[id:\(memGlobalId.uuidString)] [\(m.project)/\(m.topic)]\(expires)\(edgeInfo) \(m.content)"
+                        if isForeignAuthored(m) && fenceForeignContent {
+                            output += "\n\n[id:\(memGlobalId.uuidString)] [\(m.project)/\(m.topic)]\(connBadge)\(expires)\(edgeInfo) \(Self.fencedForeignContent(m.content))"
+                        } else if m.content.count <= 500 {
+                            output += "\n\n[id:\(memGlobalId.uuidString)] [\(m.project)/\(m.topic)]\(connBadge)\(expires)\(edgeInfo) \(m.content)"
                         } else {
                             let firstLine = m.content.split(separator: "\n", maxSplits: 1).first.map(String.init) ?? m.content
                             let preview = String(firstLine.prefix(120))
                             let charCount = m.content.count
                             let sectionCount = m.content.components(separatedBy: "\n").filter { $0.hasPrefix("## ") || $0.hasPrefix("### ") }.count
                             let sizeInfo = sectionCount > 0 ? "\(sectionCount) sections, \(charCount) chars" : "\(charCount) chars"
-                            output += "\n\n[id:\(memGlobalId.uuidString)] [\(m.project)/\(m.topic)] (\(sizeInfo)\(expires))\(edgeInfo) \(preview)\(charCount > 120 ? "..." : "")"
+                            output += "\n\n[id:\(memGlobalId.uuidString)] [\(m.project)/\(m.topic)]\(connBadge) (\(sizeInfo)\(expires))\(edgeInfo) \(preview)\(charCount > 120 ? "..." : "")"
                         }
                     }
                 }
@@ -666,13 +689,17 @@ extension MemoryTools {
             for match in ftsResults {
                 let m = match.object
                 m.materialize()  // hydrated by the FTS query — format for free
+                let isForeign = isForeignAuthored(m)
+                if excludeForeignAuthored && isForeign { continue }
                 let ftsInfo = match.distances["content"].map { " (fts5: \(String(format: "%.3f", $0)))" } ?? ""
                 let expires = m.expiresAt == .distantFuture ? "" : ", expires: \(Self.dateFormatter.string(from: m.expiresAt))"
                 let created = hasTemporalFilter ? ", created: \(Self.dateFormatter.string(from: m.createdAt))" : ""
                 guard let mGid = m.__globalId else { continue }
-                let badge = (m.authorUserId != nil && m.authorUserId != currentUserId)
+                let badge = isForeign
                     ? " [by:\(GroupDirectory.badgeName(for: m.authorUserId))]" : ""
-                lines.append("[id:\(mGid.uuidString)] [\(m.project)/\(m.topic)]\(badge)\(ftsInfo)\(expires)\(created) \(m.content)")
+                let body = (isForeign && fenceForeignContent)
+                    ? Self.fencedForeignContent(m.content) : m.content
+                lines.append("[id:\(mGid.uuidString)] [\(m.project)/\(m.topic)]\(badge)\(ftsInfo)\(expires)\(created) \(body)")
             }
             if lines.isEmpty {
                 return CallTool.Result(content: [.text("No memories found.")], isError: false)
