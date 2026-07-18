@@ -125,14 +125,19 @@ final class GalaxyRegistry {
     func onLatticeAvailable(id: String, displayName: String,
                             latticeRef: LatticeThreadSafeReference,
                             hierarchyLevel: Int = 0,
+                            parentGalaxyId: String? = nil,
                             nodeFilter: (@Sendable (Memory) -> Bool)? = nil) {
         guard galaxies[id] == nil else { return }
+        // parentGalaxyId must reach the Galaxy init — it is what
+        // interGalaxyConnections draws hierarchy lines from; dropping it
+        // here meant no parent→child line ever rendered.
         let galaxy = Galaxy(id: id, displayName: displayName,
-                            lattice: latticeRef, hierarchyLevel: hierarchyLevel)
+                            lattice: latticeRef, hierarchyLevel: hierarchyLevel,
+                            parentGalaxyId: parentGalaxyId)
         register(galaxy)
 
         Task {
-            if let filter = nodeFilter { await galaxy.setNodeFilter(filter) }
+            if let filter = nodeFilter { galaxy.setNodeFilter(filter) }
             await galaxy.loadData()
             await galaxy.startObservers()
         }
@@ -819,14 +824,12 @@ final class GalaxyRegistry {
         for config in lattice.objects(SyncConfig.self).where({ $0.policy == .sync }) {
             syncedProjects.insert(config.project)
         }
-        Task {
-            if syncedProjects.isEmpty {
-                await personal.setNodeFilter(nil)
-            } else {
-                let captured = syncedProjects
-                await personal.setNodeFilter { @Sendable memory in
-                    !captured.contains(memory.project) || memory.isPrivate
-                }
+        if syncedProjects.isEmpty {
+            personal.setNodeFilter(nil)
+        } else {
+            let captured = syncedProjects
+            personal.setNodeFilter { @Sendable memory in
+                !captured.contains(memory.project) || memory.isPrivate
             }
         }
     }

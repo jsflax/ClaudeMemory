@@ -76,7 +76,7 @@ extension GraphView {
         // NOW start loading — worldCenter is already correct for all galaxies.
         if let personal = galaxyRegistry.galaxies["personal"] {
             Task {
-                if let filter = personalFilter { await personal.setNodeFilter(filter) }
+                if let filter = personalFilter { personal.setNodeFilter(filter) }
                 await personal.loadData()
                 await personal.startObservers()
             }

@@ -15,7 +15,9 @@ private let stallLog = OSLog(subsystem: "io.engram.app", category: "FrameStall")
 struct RenderUpdate: Sendable {
     // Incremental changes (from observers)
     var insertedNodes: [(pk: Int64, node: NodeData)] = []
-    var updatedNodes: [NodeData] = []
+    // pk rides along so a node entering the galaxy's partition via the
+    // update path (unknown to the render store) can take the insert route.
+    var updatedNodes: [(pk: Int64, node: NodeData)] = []
     var removedNodePks: [Int64] = []
     var insertedEdges: [(pk: Int64, edge: EdgeData)] = []
     var updatedEdges: [EdgeData] = []
@@ -78,10 +80,16 @@ actor Galaxy: Identifiable {
     // Per-galaxy node filter (for data partitioning — prevents duplication across galaxies)
     // Local galaxy: { !syncedProjects.contains($0.project) || $0.isPrivate }
     // Synced/team galaxies: nil (show everything in that DB)
-    // @Sendable to allow use from background threads in loadData.
-    var nodeFilter: (@Sendable (Memory) -> Bool)?
-    func setNodeFilter(_ filter: (@Sendable (Memory) -> Bool)?) {
-        nodeFilter = filter
+    // Lock-protected (not actor state): the live observers apply it from
+    // Lattice's background callback thread, outside this actor — without
+    // observer-path filtering, every post-load memory appeared in BOTH the
+    // personal and synced galaxies until restart.
+    private let nodeFilterLock = OSAllocatedUnfairLock<(@Sendable (Memory) -> Bool)?>(initialState: nil)
+    nonisolated var nodeFilter: (@Sendable (Memory) -> Bool)? {
+        nodeFilterLock.withLock { $0 }
+    }
+    nonisolated func setNodeFilter(_ filter: (@Sendable (Memory) -> Bool)?) {
+        nodeFilterLock.withLock { $0 = filter }
     }
     
     // Per-galaxy mascot fleet (nil until Metal device is available)
@@ -148,6 +156,9 @@ actor Galaxy: Identifiable {
             case .insert(let pk):
                 guard let memory = bg.object(Memory.self, primaryKey: pk),
                       let gid = memory.__globalId else { return }
+                // Same structural partition loadData applies — without it a
+                // post-load memory lands in every galaxy whose DB has it.
+                if let filter = self.nodeFilter, !filter(memory) { return }
                 let node = NodeData(
                     id: gid, project: memory.project, topic: memory.topic,
                     label: extractLabel(content: memory.content, topic: memory.topic),
@@ -158,13 +169,19 @@ actor Galaxy: Identifiable {
             case .update(let pk):
                 guard let memory = bg.object(Memory.self, primaryKey: pk),
                       let gid = memory.__globalId else { return }
+                if let filter = self.nodeFilter, !filter(memory) {
+                    // Fell out of this galaxy's partition (e.g. project
+                    // toggled to sync) — remove; no-op if never present.
+                    pendingUpdate.withLock { $0.removedNodePks.append(pk) }
+                    return
+                }
                 let node = NodeData(
                     id: gid, project: memory.project, topic: memory.topic,
                     label: extractLabel(content: memory.content, topic: memory.topic),
                     content: memory.content,
                     createdAt: memory.createdAt, lastAccessedAt: memory.lastAccessedAt,
                     importance: memory.importance)
-                pendingUpdate.withLock { $0.updatedNodes.append(node) }
+                pendingUpdate.withLock { $0.updatedNodes.append((pk, node)) }
             case .delete(let pk):
                 pendingUpdate.withLock { $0.removedNodePks.append(pk) }
             }
@@ -393,8 +410,8 @@ actor Galaxy: Identifiable {
         for (pk, node) in update.insertedNodes {
             handleNodeInsert(pk: pk, node: node, config: config)
         }
-        for node in update.updatedNodes {
-            handleNodeUpdate(node: node)
+        for (pk, node) in update.updatedNodes {
+            handleNodeUpdate(pk: pk, node: node, config: config)
         }
         for pk in update.removedNodePks {
             handleNodeDelete(pk, config: config)
@@ -425,15 +442,22 @@ actor Galaxy: Identifiable {
         }
     }
     
-    @MainActor func handleNodeUpdate(node: NodeData) {
+    @MainActor func handleNodeUpdate(pk: Int64, node: NodeData, config: DrainConfig) {
         let t0 = CFAbsoluteTimeGetCurrent()
         defer { ObserverAccumulator.shared.record("nodeUpdate", ms: (CFAbsoluteTimeGetCurrent() - t0) * 1000.0) }
         let store = renderStore
         let gid = node.id
-        let old = store.allNodes[gid]
+        guard let old = store.allNodes[gid] else {
+            // Unknown to this galaxy — either filtered at load or just now
+            // entering the partition. A plain dict write here half-inserted
+            // (allNodes/nodeById but never nodes[]/simulation); take the
+            // real insert path instead.
+            handleNodeInsert(pk: pk, node: node, config: config)
+            return
+        }
 
         // Notify mascot fleet of the update
-        if let old {
+        do {
             if old.project != node.project {
                 // Project changed: farewell from old mascot, welcome from new
                 mascotFleet?.onNodeUpdated(
@@ -455,7 +479,7 @@ actor Galaxy: Identifiable {
                 mascotFleet?.onNodeUpdated(nodeId: gid, project: node.project, changes: changes)
             }
         }
-        if let old, node.lastAccessedAt > old.lastAccessedAt {
+        if node.lastAccessedAt > old.lastAccessedAt {
             #if ENGRAM_INSTRUMENTATION
             let wasAlreadyGlowing = store.glowingNodes[gid] != nil
             #endif
@@ -479,11 +503,10 @@ actor Galaxy: Identifiable {
             }
             #endif
         }
-        let structuralChange = old == nil ||
-            old!.project != node.project ||
-            old!.topic != node.topic ||
-            old!.importance != node.importance ||
-            old!.label != node.label
+        let structuralChange = old.project != node.project ||
+            old.topic != node.topic ||
+            old.importance != node.importance ||
+            old.label != node.label
         if !structuralChange {
             // Access-only change: update dicts (O(1)), skip O(n) array scan.
             // nodes[] array gets stale lastAccessedAt but that field doesn't affect
