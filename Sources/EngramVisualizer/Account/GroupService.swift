@@ -152,6 +152,24 @@ final class GroupService {
         return result
     }
 
+    /// Sign-out teardown: drop every cache (member emails, invite URLs
+    /// carrying live tokens, registries) and close any open panels — cached
+    /// group data must not survive into a signed-out session or a different
+    /// account on the same machine.
+    func reset() {
+        groups = []
+        incomingInvites = []
+        membersByGroup = [:]
+        outboundInvitesByGroup = [:]
+        projectsByGroup = [:]
+        lastRefreshError = nil
+        errorMessage = nil
+        hasLoadedOnce = false
+        selectedGroupId = nil
+        showCreateGroup = false
+        createGroupParentId = nil
+    }
+
     // MARK: - Refresh
 
     func refresh() async {

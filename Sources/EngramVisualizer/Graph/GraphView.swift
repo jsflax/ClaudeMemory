@@ -192,7 +192,10 @@ struct GraphView: View {
 
     @ViewBuilder
     private func groupPanels(size: CGSize) -> some View {
-        if let groupId = groupService.selectedGroupId {
+        // Belt to GroupService.reset()'s suspenders: group panels never
+        // render signed out (reset closes them, but sign-out paths outside
+        // the sidebar button — e.g. token invalidation — bypass it).
+        if accountService.isSignedIn, let groupId = groupService.selectedGroupId {
             GroupDetailPanel(
                 groupId: groupId,
                 onClose: { groupService.selectedGroupId = nil }
@@ -205,7 +208,7 @@ struct GraphView: View {
             .transition(.move(edge: .trailing).combined(with: .opacity))
             .animation(.spring(duration: 0.4, bounce: 0.2), value: groupService.selectedGroupId)
         }
-        if groupService.showCreateGroup {
+        if accountService.isSignedIn, groupService.showCreateGroup {
             CreateGroupPanel(onClose: { groupService.showCreateGroup = false })
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
                 .transition(.opacity)

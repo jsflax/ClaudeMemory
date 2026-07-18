@@ -36,6 +36,12 @@ struct SidebarView: View {
     // Account tab
     @Bindable var accountService: AccountService
     @LatticeQuery<SyncConfig>(sort: \SyncConfig.project) var syncConfigs
+    // The advise toggle must read through @LatticeQuery: a raw
+    // lattice.objects() call in body registers no SwiftUI dependency (and
+    // an empty first result not even per-instance observation), so the
+    // pill would render dead — each hopeful re-click silently flipping the
+    // stored value.
+    @LatticeQuery<HookState>(sort: \HookState.updatedAt) var hookStates
     @State var email = ""
     @State var password = ""
     @State var isRegistering = false
@@ -349,14 +355,11 @@ struct SidebarView: View {
     /// Per-device knob read by the advise hook. Default ON (beta posture);
     /// stored as a HookState row so hooks see it without extra plumbing.
     var adviseIncludesGroupMemories: Bool {
-        lattice.objects(HookState.self)
-            .where { $0.key == .adviseIncludeGroupMemories }
-            .first?.value != "false"
+        hookStates.first { $0.key == .adviseIncludeGroupMemories }?.value != "false"
     }
 
     func setAdviseIncludesGroupMemories(_ include: Bool) {
-        if let row = lattice.objects(HookState.self)
-            .where({ $0.key == .adviseIncludeGroupMemories }).first {
+        if let row = hookStates.first(where: { $0.key == .adviseIncludeGroupMemories }) {
             row.value = include ? "true" : "false"
             row.updatedAt = Date()
         } else {

@@ -217,8 +217,14 @@ final class SyncManager {
 
             guard exposed else { return }
             if let me = GroupDirectory.currentUserId() {
+                // .snapshot() materializes BEFORE mutating: the live cursor
+                // paginates by re-running the WHERE with a moving OFFSET, so
+                // writing authorUserId inside iteration shrinks the match
+                // set under the cursor and silently skips alternating
+                // batch-size blocks of rows.
                 for memory in localLattice.objects(Memory.self)
-                    .where({ $0.project == project && $0.authorUserId == nil }) {
+                    .where({ $0.project == project && $0.authorUserId == nil })
+                    .snapshot() {
                     memory.authorUserId = me
                 }
                 writeGroupProjectMap(groupId: groupId, localProject: project, me: me)
@@ -234,11 +240,19 @@ final class SyncManager {
         private func writeGroupProjectMap(groupId: UUID, localProject: String, me: UUID) {
             let spokePath = NSHomeDirectory()
                 + "/.claude/sync/group-\(groupId.uuidString).sqlite"
-            guard FileManager.default.fileExists(atPath: spokePath),
-                  let spoke = try? Lattice(
-                    Memory.self, Edge.self, GroupProjectMap.self,
-                    configuration: .init(fileURL: URL(fileURLWithPath: spokePath))
-                  ) else { return }
+            guard FileManager.default.fileExists(atPath: spokePath) else { return }
+            // migration: must match every other Engram DB open — without it
+            // the open runs at target_schema_version 1 and LatticeCore
+            // rejects a daemon-created (current-version) spoke as "newer
+            // than this binary supports".
+            guard let spoke = try? Lattice(
+                Memory.self, Edge.self, GroupProjectMap.self,
+                configuration: .init(fileURL: URL(fileURLWithPath: spokePath),
+                                     migration: engramMigrations)
+            ) else {
+                print("[SyncManager] group spoke open failed for \(spokePath) — GroupProjectMap upsert skipped")
+                return
+            }
             if let existing = spoke.objects(GroupProjectMap.self)
                 .where({ $0.memberUserId == me && $0.localProject == localProject })
                 .first {

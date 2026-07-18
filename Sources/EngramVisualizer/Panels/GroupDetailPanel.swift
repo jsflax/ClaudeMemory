@@ -114,8 +114,11 @@ struct GroupDetailPanel: View {
     private func memberRow(_ member: GroupService.MemberInfo) -> some View {
         let isSelf = member.userId == myUserId
         let memberRole = GroupService.GroupRole(rawValue: member.role) ?? .member
-        // Role edits: admin+ over lower roles; owner grants need owner.
-        let canEdit = isAdmin && !isSelf && memberRole < myRole
+        // Role edits: admin+ over lower roles; owner grants need owner; and
+        // DIRECT members only — the server's updateMember/removeMember 404
+        // on subtree-implied rows ("via sub-group" members are managed from
+        // their own group's panel).
+        let canEdit = isAdmin && !isSelf && member.direct && memberRole < myRole
         return HStack(spacing: 8) {
             Image(systemName: "person.circle.fill")
                 .font(.system(size: 14))
@@ -343,10 +346,43 @@ struct GroupDetailPanel: View {
 
     // MARK: - Leave / delete
 
+    /// The viewer's own membership row (nil until members load).
+    private var myMemberRow: GroupService.MemberInfo? {
+        guard let myUserId else { return nil }
+        return (groupService.membersByGroup[groupId] ?? [])
+            .first { $0.userId == myUserId }
+    }
+    /// Sole direct owner — the server's last-owner protection would 409.
+    private var isSoleOwner: Bool {
+        let directOwners = (groupService.membersByGroup[groupId] ?? [])
+            .filter { $0.direct && $0.role == "owner" }
+        return myRole == .owner && directOwners.count <= 1
+    }
+
     private var dangerBlock: some View {
         block("") {
             HStack(spacing: 12) {
-                if confirmingLeave {
+                if let mine = myMemberRow, !mine.direct {
+                    // Membership implied via a descendant — the server has
+                    // no direct row here to delete; leave from the sub-group.
+                    Text("membership is via a sub-group — leave from there")
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(.white.opacity(0.35))
+                    Spacer()
+                } else if isSoleOwner && !confirmingDelete {
+                    Text("transfer ownership before leaving")
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(.white.opacity(0.35))
+                    if myRole == .owner {
+                        Button("Delete group") {
+                            confirmingDelete = true
+                        }
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(.red.opacity(0.7))
+                        .buttonStyle(.plain)
+                    }
+                    Spacer()
+                } else if confirmingLeave {
                     confirmPair("Leave \(group?.name ?? "group")?") {
                         Task { await groupService.leaveGroup(groupId) }
                     } onCancel: {

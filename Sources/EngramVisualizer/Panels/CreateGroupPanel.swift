@@ -97,5 +97,11 @@ struct CreateGroupPanel: View {
         .onAppear {
             parentId = groupService.createGroupParentId
         }
+        // The panel stays mounted while showCreateGroup is true — a second
+        // "New Group"/"New sub-group" click re-seeds the parent without an
+        // onAppear, so track the source of truth directly.
+        .onChange(of: groupService.createGroupParentId) { _, newValue in
+            parentId = newValue
+        }
     }
 }

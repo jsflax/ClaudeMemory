@@ -74,6 +74,7 @@ extension SidebarView {
 
                     Button("Sign Out") {
                         syncManager.disconnectSync()
+                        groupService.reset()
                         accountService.signOut()
                     }
                     .font(.system(size: 11, design: .monospaced))
