@@ -535,12 +535,12 @@ final class GalaxyRegistry {
                             self.migrationLog("\(ts),migrate,\(project),synced→personal,synced,personal,\(extracted.nodes.count),\(extracted.intraEdges.count),0,\(String(format: "%.2f", migMs))")
 #endif
                         }
-                        self.rebuildPersonalNodeFilter()
+                        self.rebuildNodeFilters()
                     }
                 case .delete:
                     Task { @MainActor [weak self] in
                         self?.reconcileSyncState()
-                        self?.rebuildPersonalNodeFilter()
+                        self?.rebuildNodeFilters()
                     }
                 }
             }
@@ -815,21 +815,52 @@ final class GalaxyRegistry {
         store.edgeCountByNode = edgeCounts
     }
 
-    /// Rebuild the personal galaxy's nodeFilter from current SyncConfig state in Lattice.
-    func rebuildPersonalNodeFilter() {
+    /// Rebuild every galaxy's nodeFilter from current SyncConfig state.
+    ///
+    /// Node-dedup precedence is group > synced > personal: a project claimed
+    /// by an ATTACHED group galaxy (id "group:<uuid>") renders there — the
+    /// group galaxy owns its spoke's copies — so personal AND synced exclude
+    /// it. Private rows always stay personal (they never relay anywhere).
+    /// Dormant until group galaxies register; personal↔synced behavior is
+    /// unchanged until then. The SyncConfig observer fires on any row write
+    /// — policy flips AND exposedGroups edits — and lands here.
+    func rebuildNodeFilters() {
         guard let personal = galaxies["personal"] else { return }
         guard let lattice = personal.latticeRef.resolve() else { preconditionFailure() }
 
+        let attachedGroupIds = Set(galaxies.keys.compactMap {
+            $0.hasPrefix("group:") ? String($0.dropFirst("group:".count)) : nil
+        })
         var syncedProjects = Set<String>()
-        for config in lattice.objects(SyncConfig.self).where({ $0.policy == .sync }) {
-            syncedProjects.insert(config.project)
+        var groupClaimedProjects = Set<String>()
+        for config in lattice.objects(SyncConfig.self) {
+            if config.policy == .sync { syncedProjects.insert(config.project) }
+            if !attachedGroupIds.isEmpty,
+               !config.exposedGroups.isDisjoint(with: attachedGroupIds) {
+                groupClaimedProjects.insert(config.project)
+            }
         }
-        if syncedProjects.isEmpty {
+
+        let personalExcluded = syncedProjects.union(groupClaimedProjects)
+        if personalExcluded.isEmpty {
             personal.setNodeFilter(nil)
         } else {
-            let captured = syncedProjects
+            let captured = personalExcluded
             personal.setNodeFilter { @Sendable memory in
                 !captured.contains(memory.project) || memory.isPrivate
+            }
+        }
+
+        if let synced = galaxies["synced"] {
+            if groupClaimedProjects.isEmpty {
+                synced.setNodeFilter(nil)
+            } else {
+                // Private rows never reach the synced DB, so a pure project
+                // check suffices (group > synced precedence).
+                let captured = groupClaimedProjects
+                synced.setNodeFilter { @Sendable memory in
+                    !captured.contains(memory.project)
+                }
             }
         }
     }

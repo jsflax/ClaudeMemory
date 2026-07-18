@@ -99,7 +99,7 @@ extension GraphView {
                 id: "synced", displayName: "Synced", latticeRef: ref
             )
         }
-        galaxyRegistry.rebuildPersonalNodeFilter()
+        galaxyRegistry.rebuildNodeFilters()
     }
 
     // Node/edge change handlers and flush methods are now in GalaxyDataLoader.
