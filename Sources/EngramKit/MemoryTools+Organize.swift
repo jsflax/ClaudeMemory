@@ -16,10 +16,16 @@ extension MemoryTools {
 
         // Fetch all non-expired, non-episode memories for the project
         let db = readLattice(for: project)
-        let allMemories = db.objects(Memory.self).where { $0.deletedAt == nil }
+        var query = db.objects(Memory.self).where { $0.deletedAt == nil }
             .distinct(by: \.__globalId)
             .where { $0.project == project && $0.expiresAt > Date() && $0.topic != "episode" }
-            .snapshot()
+        if excludeForeignAuthored {
+            // Maintenance guard: community detection is part of the
+            // maintenance workflow — foreign rows stay invisible to it.
+            let me = currentUserId
+            query = query.where { $0.authorUserId == nil || $0.authorUserId == me }
+        }
+        let allMemories = query.snapshot()
 
         guard allMemories.count >= 3 else {
             return CallTool.Result(

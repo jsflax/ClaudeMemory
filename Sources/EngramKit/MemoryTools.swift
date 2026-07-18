@@ -152,7 +152,16 @@ public actor MemoryTools {
     /// sequence, so downstream block-splitting parsers (logRecalledMemories)
     /// keep the fence as one block.
     public static func fencedForeignContent(_ content: String) -> String {
+        // Normalize EVERY line-break form to \n before indenting — a lone
+        // CR could visually overwrite the indent on terminals, and
+        // U+2028/U+2029/NEL/VT/FF are line breaks to some renderers while
+        // components(separatedBy: "\n") would leave them mid-line,
+        // producing a "new line" without the 4-space prefix.
         var text = content
+            .replacingOccurrences(of: "\r\n", with: "\n")
+        for separator in ["\r", "\u{2028}", "\u{2029}", "\u{0085}", "\u{000B}", "\u{000C}"] {
+            text = text.replacingOccurrences(of: separator, with: "\n")
+        }
         var truncated = false
         if text.count > foreignContentCap {
             text = String(text.prefix(foreignContentCap))

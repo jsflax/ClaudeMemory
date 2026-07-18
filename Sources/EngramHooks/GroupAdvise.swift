@@ -16,12 +16,19 @@ struct GroupAdvise: ParsableCommand {
 
     func run() throws {
         switch mode {
-        case "on":
-            setHookState(key: .adviseIncludeGroupMemories, value: "true")
-            print("Teammates' group memories in hook injection: ON")
-        case "off":
-            setHookState(key: .adviseIncludeGroupMemories, value: "false")
-            print("Teammates' group memories in hook injection: OFF (this device only)")
+        case "on", "off":
+            let value = mode == "on" ? "true" : "false"
+            setHookState(key: .adviseIncludeGroupMemories, value: value)
+            // setHookState silently no-ops when the memory DB doesn't exist
+            // yet (openLattice requires the file) — a privacy setting must
+            // never claim success it didn't persist. Read back to prove it.
+            guard getHookState(key: .adviseIncludeGroupMemories) == value else {
+                print("FAILED: no memory database at ~/.claude/memory.sqlite yet — run a Claude session (or the visualizer) once, then retry.")
+                throw ExitCode(1)
+            }
+            print(mode == "on"
+                ? "Teammates' group memories in hook injection: ON"
+                : "Teammates' group memories in hook injection: OFF (this device only)")
         case "status":
             let include = getHookState(key: .adviseIncludeGroupMemories) != "false"
             print("Teammates' group memories in hook injection: \(include ? "ON (default)" : "OFF")")

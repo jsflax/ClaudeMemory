@@ -173,6 +173,11 @@ extension MemoryTools {
                 isError: false
             )
         }
+        // Maintenance/opt-out guard: a foreign root is indistinguishable
+        // from a missing one.
+        if excludeForeignAuthored, isForeignAuthored(rootMem) {
+            return CallTool.Result(content: [.text("Memory with id \(memGid.uuidString) not found.")], isError: true)
+        }
 
         // BFS traversal using globalIds on the same lattice the root was found in
         var visited = Set<UUID>([memGid])
@@ -220,6 +225,18 @@ extension MemoryTools {
         // Format output — look up memories by globalId for display
         var output = "[id:\(memGid.uuidString)] \(rootMem.content)"
 
+        // Foreign-authored neighbors: badge them ([by:Name] — graph is the
+        // tool consulted right before connect/update decisions), or drop
+        // them entirely under the maintenance/opt-out guard.
+        func excluded(_ m: Memory?) -> Bool {
+            guard let m else { return false }
+            return excludeForeignAuthored && isForeignAuthored(m)
+        }
+        func badge(_ m: Memory?) -> String {
+            guard let m, isForeignAuthored(m) else { return "" }
+            return " [by:\(GroupDirectory.badgeName(for: m.authorUserId))]"
+        }
+
         if uniqueEdges.isEmpty {
             output += "\n\nNo connections."
         } else {
@@ -228,20 +245,23 @@ extension MemoryTools {
                 if edge.sourceGlobalId == memGid {
                     // Outgoing
                     let targetMem = rootLattice.objects(Memory.self).where { $0.__globalId == edge.targetGlobalId }.first
+                    if excluded(targetMem) { continue }
                     let targetContent = targetMem?.content ?? "(deleted)"
-                    output += "\n  --[\(edge.relation.rawValue)]--> [id:\(edge.targetGlobalId.uuidString)] \(targetContent.prefix(80))"
+                    output += "\n  --[\(edge.relation.rawValue)]--> [id:\(edge.targetGlobalId.uuidString)]\(badge(targetMem)) \(targetContent.prefix(80))"
                 } else if edge.targetGlobalId == memGid {
                     // Incoming
                     let sourceMem = rootLattice.objects(Memory.self).where { $0.__globalId == edge.sourceGlobalId }.first
+                    if excluded(sourceMem) { continue }
                     let sourceContent = sourceMem?.content ?? "(deleted)"
-                    output += "\n  <--[\(edge.relation.rawValue)]-- [id:\(edge.sourceGlobalId.uuidString)] \(sourceContent.prefix(80))"
+                    output += "\n  <--[\(edge.relation.rawValue)]-- [id:\(edge.sourceGlobalId.uuidString)]\(badge(sourceMem)) \(sourceContent.prefix(80))"
                 } else {
                     // Edge between two non-root nodes (deeper traversal)
                     let sourceMem = rootLattice.objects(Memory.self).where { $0.__globalId == edge.sourceGlobalId }.first
                     let targetMem = rootLattice.objects(Memory.self).where { $0.__globalId == edge.targetGlobalId }.first
+                    if excluded(sourceMem) || excluded(targetMem) { continue }
                     let sourceContent = sourceMem?.content ?? "(deleted)"
                     let targetContent = targetMem?.content ?? "(deleted)"
-                    output += "\n  [id:\(edge.sourceGlobalId.uuidString)] \(sourceContent.prefix(40))... --[\(edge.relation.rawValue)]--> [id:\(edge.targetGlobalId.uuidString)] \(targetContent.prefix(40))..."
+                    output += "\n  [id:\(edge.sourceGlobalId.uuidString)]\(badge(sourceMem)) \(sourceContent.prefix(40))... --[\(edge.relation.rawValue)]--> [id:\(edge.targetGlobalId.uuidString)]\(badge(targetMem)) \(targetContent.prefix(40))..."
                 }
             }
         }

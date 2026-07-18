@@ -683,6 +683,14 @@ extension MemoryTools {
             if let projectFilter {
                 results = results.where { $0.project == projectFilter || $0.project == "global" }
             }
+            // Exclusion BEFORE the limit (verification finding): otherwise
+            // foreign rows consume limit slots and then get dropped in the
+            // render loop, under-filling — or emptying — the result set
+            // while the user's own matches sit just past the cap.
+            if excludeForeignAuthored {
+                let me = currentUserId
+                results = results.where { $0.authorUserId == nil || $0.authorUserId == me }
+            }
             let ftsResults = results.matching(ftsQuery, on: \.content, limit: limit)
 
             var lines: [String] = []
@@ -1135,6 +1143,13 @@ extension MemoryTools {
         if let projectFilter {
             base = base.where { $0.project == projectFilter }
         }
+        // Maintenance/opt-out guard: even counts and topic/project NAMES of
+        // foreign rows stay invisible (a hostile topic string is a short
+        // injection surface).
+        let me = currentUserId
+        if excludeForeignAuthored {
+            base = base.where { $0.authorUserId == nil || $0.authorUserId == me }
+        }
 
         let total = base.count
         if total == 0 {
@@ -1150,8 +1165,11 @@ extension MemoryTools {
             let grouped = base.group(by: \.project)
             var projectLines: [String] = []
             for mem in grouped {
-                let count = db.objects(Memory.self).distinct(by: \.__globalId).where { $0.project == mem.project && $0.deletedAt == nil }.count
-                projectLines.append("  \(mem.project): \(count)")
+                var countQuery = db.objects(Memory.self).distinct(by: \.__globalId).where { $0.project == mem.project && $0.deletedAt == nil }
+                if excludeForeignAuthored {
+                    countQuery = countQuery.where { $0.authorUserId == nil || $0.authorUserId == me }
+                }
+                projectLines.append("  \(mem.project): \(countQuery.count)")
             }
             projectLines.sort()
             lines.append(contentsOf: projectLines)
@@ -1165,6 +1183,9 @@ extension MemoryTools {
             var countQuery = db.objects(Memory.self).distinct(by: \.__globalId).where { $0.topic == mem.topic && $0.deletedAt == nil }
             if let projectFilter {
                 countQuery = countQuery.where { $0.project == projectFilter }
+            }
+            if excludeForeignAuthored {
+                countQuery = countQuery.where { $0.authorUserId == nil || $0.authorUserId == me }
             }
             topicLines.append("  \(mem.topic): \(countQuery.count)")
         }
@@ -1217,6 +1238,10 @@ extension MemoryTools {
         if let projectFilter {
             base = base.where { $0.project == projectFilter }
         }
+        let me = currentUserId
+        if excludeForeignAuthored {
+            base = base.where { $0.authorUserId == nil || $0.authorUserId == me }
+        }
 
         let grouped = base.group(by: \.topic)
         if grouped.endIndex == 0 {
@@ -1228,6 +1253,9 @@ extension MemoryTools {
             var countQuery = db.objects(Memory.self).distinct(by: \.__globalId).where { $0.topic == memory.topic && $0.deletedAt == nil }
             if let projectFilter {
                 countQuery = countQuery.where { $0.project == projectFilter }
+            }
+            if excludeForeignAuthored {
+                countQuery = countQuery.where { $0.authorUserId == nil || $0.authorUserId == me }
             }
             let count = countQuery.count
             lines.append("\(memory.topic): \(count) memories")
@@ -1257,6 +1285,10 @@ extension MemoryTools {
             .distinct(by: \.__globalId)
             .where { $0.expiresAt > Date() && $0.deletedAt == nil }  // tombstone filter
 
+        if excludeForeignAuthored {
+            let me = currentUserId
+            results = results.where { $0.authorUserId == nil || $0.authorUserId == me }
+        }
         if let project = a.project {
             results = results.where { $0.project == project }
         }

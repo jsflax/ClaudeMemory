@@ -138,6 +138,85 @@ private func addForeign(_ content: String, project: String, in lattice: Lattice)
     #expect(out.contains(" Teammate insight on retry backoff tuning"))
 }
 
+// MARK: - Fence line-separator normalization
+
+@Test func fence_normalizesExoticLineBreaks() {
+    // CR, CRLF, U+2028, U+2029, NEL, VT, FF must all become indented \n
+    // lines — left mid-line they render as breaks WITHOUT the 4-space
+    // prefix on some consumers (and a lone CR can visually overwrite the
+    // indent on terminals).
+    let hostile = "a\rb\r\nc\u{2028}## fake\u{2029}d\u{0085}e\u{000B}f\u{000C}g"
+    let fenced = MemoryTools.fencedForeignContent(hostile)
+    for line in fenced.components(separatedBy: "\n").dropFirst() {
+        #expect(line.hasPrefix("    "), "unindented: \(line.debugDescription)")
+    }
+    for separator in ["\r", "\u{2028}", "\u{2029}", "\u{0085}", "\u{000B}", "\u{000C}"] {
+        #expect(!fenced.contains(separator))
+    }
+    #expect(fenced.contains("    ## fake"))
+}
+
+// MARK: - Exclusion coverage beyond recall (maintenance-workflow surface)
+
+@Test func timelineStatsTopicsGraphEpisodes_excludeForeign_whenPolicySet() async throws {
+    let ctx = try await makeHardeningTools()
+    // Own memory + foreign memory in one project; a foreign episode too.
+    let ownGid = try await {
+        let result = try await ctx.tools.handle(CallTool.Parameters(
+            name: "remember",
+            arguments: ["content": .string("Own note about the ingest pipeline"),
+                        "project": .string("guard-proj"), "topic": .string("pipeline"),
+                        "force": .bool(true)]))
+        return UUID(uuidString: extractMemoryId(from: text(from: result))!)!
+    }()
+    let foreignGid = try await addForeign(
+        "HOSTILE teammate note about the ingest pipeline", project: "guard-proj", in: ctx.lattice)
+    let foreignEpisode = Memory(
+        content: "Teammate debugging session", topic: "episode", project: "guard-proj",
+        embedding: Vector<Float>(try await sharedEmbedder.embed(text: "Teammate debugging session")!),
+        authorUserId: UUID())
+    ctx.lattice.add(foreignEpisode)
+
+    await ctx.tools.setForeignContentPolicy(fence: false, exclude: true)
+
+    // timeline: foreign content invisible.
+    let timeline = text(from: try await ctx.tools.handle(CallTool.Parameters(
+        name: "timeline", arguments: ["project": .string("guard-proj")])))
+    #expect(!timeline.contains("HOSTILE"))
+    #expect(timeline.contains(ownGid.uuidString) || timeline.contains("Own note"))
+
+    // stats + list_topics: counts exclude the foreign rows (1 own memory +
+    // no foreign topic leakage).
+    let stats = text(from: try await ctx.tools.handle(CallTool.Parameters(
+        name: "stats", arguments: ["project": .string("guard-proj")])))
+    #expect(stats.contains("Total memories: 1"))
+    let topics = text(from: try await ctx.tools.handle(CallTool.Parameters(
+        name: "list_topics", arguments: ["project": .string("guard-proj")])))
+    #expect(topics.contains("pipeline: 1"))
+    #expect(!topics.contains("episode"))
+
+    // graph: foreign ROOT reads as not-found; foreign NEIGHBOR is dropped.
+    let foreignRoot = text(from: try await ctx.tools.handle(CallTool.Parameters(
+        name: "graph", arguments: ["id": .string(foreignGid.uuidString)])))
+    #expect(foreignRoot.contains("not found"))
+    _ = try await ctx.tools.handle(CallTool.Parameters(
+        name: "connect",
+        arguments: ["from": .string(ownGid.uuidString), "to": .string(foreignGid.uuidString),
+                    "relation": .string("relates_to")]))
+    let ownGraph = text(from: try await ctx.tools.handle(CallTool.Parameters(
+        name: "graph", arguments: ["id": .string(ownGid.uuidString)])))
+    #expect(!ownGraph.contains("HOSTILE"))
+
+    // list_episodes: the foreign episode is invisible; recall_episode on it
+    // reads as not-found.
+    let episodes = text(from: try await ctx.tools.handle(CallTool.Parameters(
+        name: "list_episodes", arguments: ["project": .string("guard-proj")])))
+    #expect(!episodes.contains("Teammate debugging session"))
+    let epRecall = text(from: try await ctx.tools.handle(CallTool.Parameters(
+        name: "recall_episode", arguments: ["episode_id": .string(foreignEpisode.__globalId!.uuidString)])))
+    #expect(epRecall.contains("not found"))
+}
+
 // MARK: - Clustering maintenance guard
 
 @Test func findClusters_excludesForeign_whenPolicySet() async throws {

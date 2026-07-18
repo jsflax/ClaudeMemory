@@ -96,15 +96,23 @@ extension MemoryTools {
         guard episode.topic == "episode" else {
             return CallTool.Result(content: [.text("Memory \(epGid.uuidString) is not an episode.")], isError: true)
         }
+        // Maintenance/opt-out guard: a foreign episode is invisible, like a
+        // missing one.
+        if excludeForeignAuthored, isForeignAuthored(episode) {
+            return CallTool.Result(content: [.text("Episode with id \(epGid.uuidString) not found.")], isError: true)
+        }
 
         // Find memories linked via part_of edges to this episode
         let edges = episodeLattice.objects(Edge.self)
             .where { $0.targetGlobalId == epGid && $0.relation == .partOf }
 
         // Fetch and sort member memories chronologically
+        let dropForeign = excludeForeignAuthored
+        let me = currentUserId
         var members: [Memory] = []
         for edge in edges {
             if let mem = episodeLattice.objects(Memory.self).where({ $0.__globalId == edge.sourceGlobalId && $0.topic != "episode" && $0.deletedAt == nil }).first {
+                if dropForeign, let author = mem.authorUserId, author != me { continue }
                 members.append(mem)
             }
         }
@@ -162,6 +170,10 @@ extension MemoryTools {
         let db = readLattice(for: a.project)
         var results = db.objects(Memory.self).distinct(by: \.__globalId).where { $0.topic == "episode" && $0.deletedAt == nil }
 
+        if excludeForeignAuthored {
+            let me = currentUserId
+            results = results.where { $0.authorUserId == nil || $0.authorUserId == me }
+        }
         if let project = a.project {
             results = results.where { $0.project == project }
         }
