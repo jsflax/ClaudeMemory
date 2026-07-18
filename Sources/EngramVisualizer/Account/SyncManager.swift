@@ -188,6 +188,70 @@ final class SyncManager {
                 }
             }
         }
+
+        /// Expose/un-expose a project to a group (decision 5: per-member,
+        /// per-project, multi-group; exposure gates WRITES only).
+        ///
+        /// Writes the SyncConfig row — the daemon's SyncConfig observer owns
+        /// pushing per-group hub filters (increment 3), so there is no
+        /// filter push here (the personal channel's filter doesn't reference
+        /// exposedGroups). On expose it also backfills authorUserId on the
+        /// project's nil-author rows (rows about to relay must be
+        /// attributed; the daemon-start sweep is the recurring backstop) and
+        /// upserts the member's GroupProjectMap row into the group spoke
+        /// when the daemon has created it.
+        func setGroupExposure(project: String, groupId: UUID, exposed: Bool) {
+            guard let localLattice else { return }
+            let gid = groupId.uuidString
+
+            if let existing = localLattice.objects(SyncConfig.self)
+                .where({ $0.project == project }).first {
+                var groups = existing.exposedGroups
+                if exposed { groups.insert(gid) } else { groups.remove(gid) }
+                existing.exposedGroups = groups
+                existing.updatedAt = Date()
+            } else if exposed {
+                localLattice.add(SyncConfig(project: project, policy: .local,
+                                            exposedTeams: [gid]))
+            }
+
+            guard exposed else { return }
+            if let me = GroupDirectory.currentUserId() {
+                for memory in localLattice.objects(Memory.self)
+                    .where({ $0.project == project && $0.authorUserId == nil }) {
+                    memory.authorUserId = me
+                }
+                writeGroupProjectMap(groupId: groupId, localProject: project, me: me)
+            }
+        }
+
+        /// Upsert this member's local→group project mapping into the group
+        /// spoke (decision 13's default: group project named after the local
+        /// project; the registry entry is created server-side by the
+        /// caller). The spoke is daemon-created — absent before the daemon's
+        /// first multi-spoke run, and that's fine: exposure is recorded in
+        /// SyncConfig and the daemon writes maps for missing spokes later.
+        private func writeGroupProjectMap(groupId: UUID, localProject: String, me: UUID) {
+            let spokePath = NSHomeDirectory()
+                + "/.claude/sync/group-\(groupId.uuidString).sqlite"
+            guard FileManager.default.fileExists(atPath: spokePath),
+                  let spoke = try? Lattice(
+                    Memory.self, Edge.self, GroupProjectMap.self,
+                    configuration: .init(fileURL: URL(fileURLWithPath: spokePath))
+                  ) else { return }
+            if let existing = spoke.objects(GroupProjectMap.self)
+                .where({ $0.memberUserId == me && $0.localProject == localProject })
+                .first {
+                if existing.groupProject != localProject {
+                    existing.groupProject = localProject
+                    existing.updatedAt = Date()
+                }
+            } else {
+                spoke.add(GroupProjectMap(memberUserId: me,
+                                          localProject: localProject,
+                                          groupProject: localProject))
+            }
+        }
     }
     
     var actor: Actor!
@@ -212,8 +276,21 @@ final class SyncManager {
             await actor.disconnectSync()
         }
     }
-    var teamLattices: [String: Lattice] = [:]  // teamId → Lattice (Phase 2)
+    /// groupId → read-only spoke Lattice, populated when group galaxies
+    /// attach (increment 6); spoke files are daemon-owned, never deleted or
+    /// written here beyond GroupProjectMap upserts.
+    var groupLattices: [String: Lattice] = [:]
     var statusMessage: String?
+
+    /// Expose/un-expose a project to a group. See Actor.setGroupExposure.
+    func setGroupExposure(project: String, groupId: UUID, exposed: Bool) {
+        Task {
+            await actor.setGroupExposure(project: project, groupId: groupId, exposed: exposed)
+            statusMessage = exposed
+                ? "Sharing \(project) with group"
+                : "Stopped sharing \(project) — already-shared memories remain"
+        }
+    }
 
     /// Whether sync is configured (daemon may or may not be running).
     var isSyncing: Bool { actor.syncedLatticeRef != nil }

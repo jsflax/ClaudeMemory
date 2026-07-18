@@ -95,25 +95,33 @@ extension SidebarView {
                 }
             }
 
-            if syncManager.isSyncing {
-                section("Projects") {
-                    VStack(alignment: .leading, spacing: 4) {
-                        if projects.isEmpty {
-                            Text("No projects yet")
-                                .font(.system(size: 11, design: .monospaced))
-                                .foregroundStyle(.white.opacity(0.35))
-                        } else {
-                            ForEach(projects, id: \.self) { project in
-                                syncProjectRow(project)
+            invitesSection
+            groupsSection
+
+            // Gated on isSignedIn (the enclosing signedInContent), NOT on
+            // syncManager.isSyncing: a group-seat-only account (no personal
+            // sub) still needs the exposure controls — exposure requires the
+            // daemon, not personal sync.
+            section("Projects") {
+                VStack(alignment: .leading, spacing: 4) {
+                    if projects.isEmpty {
+                        Text("No projects yet")
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(.white.opacity(0.35))
+                    } else {
+                        ForEach(projects, id: \.self) { project in
+                            syncProjectRow(project)
+                            if expandedExposureProject == project {
+                                exposureExpansion(for: project)
                             }
                         }
+                    }
 
-                        if let status = syncManager.statusMessage {
-                            Text(status)
-                                .font(.system(size: 10, design: .monospaced))
-                                .foregroundStyle(.cyan.opacity(0.7))
-                                .padding(.top, 4)
-                        }
+                    if let status = syncManager.statusMessage {
+                        Text(status)
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(.cyan.opacity(0.7))
+                            .padding(.top, 4)
                     }
                 }
             }
@@ -190,6 +198,8 @@ extension SidebarView {
     func syncProjectRow(_ project: String) -> some View {
         let isOn = syncConfigs.first(where: { $0.project == project })?.policy == .sync
         let count = projectCounts[project] ?? 0
+        let exposedCount = exposedGroupIds(for: project).count
+        let expanded = expandedExposureProject == project
         return Button {
             syncManager.toggleProject(project)
         } label: {
@@ -202,6 +212,33 @@ extension SidebarView {
                     .lineLimit(1)
 
                 Spacer()
+
+                if !groupService.groups.isEmpty {
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.15)) {
+                            expandedExposureProject = expanded ? nil : project
+                        }
+                    } label: {
+                        HStack(spacing: 3) {
+                            Image(systemName: "person.2")
+                                .font(.system(size: 10))
+                            if exposedCount > 0 {
+                                Text("\(exposedCount)")
+                                    .font(.system(size: 9, design: .monospaced))
+                            }
+                        }
+                        .foregroundStyle(exposedCount > 0 || expanded
+                            ? .cyan.opacity(0.8) : .white.opacity(0.3))
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 2)
+                        .background(
+                            Capsule().fill(.white.opacity(expanded ? 0.1 : 0.04))
+                        )
+                        .contentShape(Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .help("Share with groups")
+                }
 
                 Text("\(count)")
                     .font(.system(size: 10, design: .monospaced))

@@ -54,6 +54,7 @@ struct GraphView: View {
     @State private var sidebarPeeking: Bool = false
     @State private var sidebarHideTask: Task<Void, Never>?
     @Environment(AccountService.self) private var accountService
+    @Environment(GroupService.self) private var groupService
     var syncManager: SyncManager // don't want to observe this
     private var sidebarVisible: Bool { sidebarPinned || sidebarPeeking }
 
@@ -182,7 +183,32 @@ struct GraphView: View {
             graph3DView(colorMap: colorMap)
             graphOverlays(size: size, colorMap: colorMap)
             detailPanel(size: size, colorMap: colorMap)
+            groupPanels(size: size)
             sidebarLayer(colorMap: colorMap)
+        }
+    }
+
+    // MARK: - Group panels (management UI overlays, same idiom as detailPanel)
+
+    @ViewBuilder
+    private func groupPanels(size: CGSize) -> some View {
+        if let groupId = groupService.selectedGroupId {
+            GroupDetailPanel(
+                groupId: groupId,
+                onClose: { groupService.selectedGroupId = nil }
+            )
+            .id(groupId)
+            .frame(maxWidth: min(420, size.width * 0.4), maxHeight: min(560, size.height * 0.75))
+            .frame(maxWidth: .infinity, alignment: .trailing)
+            .padding(24)
+            .compositingGroup()
+            .transition(.move(edge: .trailing).combined(with: .opacity))
+            .animation(.spring(duration: 0.4, bounce: 0.2), value: groupService.selectedGroupId)
+        }
+        if groupService.showCreateGroup {
+            CreateGroupPanel(onClose: { groupService.showCreateGroup = false })
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+                .transition(.opacity)
         }
     }
 

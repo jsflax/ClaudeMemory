@@ -8,6 +8,10 @@ public final class HookState {
     public enum Key: String, Codable, Sendable {
         case maintenanceLastRunTimestamp = "maintenance.lastRunTimestamp"
         case maintenanceActive = "maintenance.active"
+        /// Per-device opt-out: when "false", the advise hook excludes
+        /// teammates' group-shared memories from context injection.
+        /// Absent/any-other-value = included (beta default is ON).
+        case adviseIncludeGroupMemories = "advise.includeGroupMemories"
     }
 
     /// The state key.

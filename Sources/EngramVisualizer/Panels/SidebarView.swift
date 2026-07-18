@@ -18,7 +18,10 @@ struct SidebarView: View {
     @Environment(VisualizerConfig.self) private var config
     @Environment(\.lattice) var lattice
     @Environment(SyncManager.self) var syncManager
+    @Environment(GroupService.self) var groupService
     @State private var isCompacting = false
+    /// Project whose group-exposure expansion is open (Account tab).
+    @State var expandedExposureProject: String?
 
     // Visualizer tab
     let projects: [String]
@@ -341,6 +344,27 @@ struct SidebarView: View {
         .buttonStyle(.plain)
     }
 
+    // MARK: - Advise group-memory opt-out (decision 15's escape hatch)
+
+    /// Per-device knob read by the advise hook. Default ON (beta posture);
+    /// stored as a HookState row so hooks see it without extra plumbing.
+    var adviseIncludesGroupMemories: Bool {
+        lattice.objects(HookState.self)
+            .where { $0.key == .adviseIncludeGroupMemories }
+            .first?.value != "false"
+    }
+
+    func setAdviseIncludesGroupMemories(_ include: Bool) {
+        if let row = lattice.objects(HookState.self)
+            .where({ $0.key == .adviseIncludeGroupMemories }).first {
+            row.value = include ? "true" : "false"
+            row.updatedAt = Date()
+        } else {
+            lattice.add(HookState(key: .adviseIncludeGroupMemories,
+                                  value: include ? "true" : "false"))
+        }
+    }
+
     func togglePill(isOn: Bool) -> some View {
         RoundedRectangle(cornerRadius: 8)
             .fill(isOn ? Color.cyan.opacity(0.5) : .white.opacity(0.1))
@@ -443,6 +467,22 @@ struct SidebarView: View {
                     isOn: config.soundEnabled
                 ) {
                     config.soundEnabled.toggle()
+                }
+            }
+
+            section("Advise") {
+                VStack(alignment: .leading, spacing: 6) {
+                    toggleRow(
+                        "Teammates' memories in advise",
+                        icon: "person.2.wave.2",
+                        isOn: adviseIncludesGroupMemories
+                    ) {
+                        setAdviseIncludesGroupMemories(!adviseIncludesGroupMemories)
+                    }
+                    Text("When off, group-shared memories from teammates are excluded from automatic context injection on this device.")
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.white.opacity(0.3))
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
 

@@ -14,7 +14,8 @@ struct EngramApp: App {
     let config: VisualizerConfig
     let dbPath: String
     private let updaterController: SPUStandardUpdaterController
-    @State private var accountService = AccountService()
+    @State private var accountService: AccountService
+    @State private var groupService: GroupService
     @State private var syncManager = SyncManager()
 
     #if SWIFT_PACKAGE && os(macOS)
@@ -59,6 +60,10 @@ struct EngramApp: App {
         updaterController = SPUStandardUpdaterController(
             startingUpdater: startUpdater, updaterDelegate: nil, userDriverDelegate: nil
         )
+
+        let account = AccountService()
+        _accountService = State(initialValue: account)
+        _groupService = State(initialValue: GroupService(account: account))
 
         #if ENGRAM_INSTRUMENTATION
         // Redirect stderr to a file so Lattice C++ debug logs are captured during UI tests
@@ -137,6 +142,7 @@ struct EngramApp: App {
                 .environment(\.lattice, lattice)
                 .environment(config)
                 .environment(accountService)
+                .environment(groupService)
                 .environment(syncManager)
                 .frame(minWidth: 800, minHeight: 600)
                 .ignoresSafeArea()
