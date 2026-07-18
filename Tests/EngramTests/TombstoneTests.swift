@@ -223,6 +223,87 @@ private func remember(_ tools: MemoryTools, _ content: String, project: String) 
     #expect(forcedOut.contains("Created summary"))
 }
 
+// MARK: - Verification-workflow regression fixes
+
+@Test func timeline_excludesTombstoned() async throws {
+    let ctx = try await makeToolsWithLattice()
+    expose("tl-proj", in: ctx.lattice)
+    let gid = try await remember(ctx.tools, "Timeline-visible memory about migrations", project: "tl-proj")
+    _ = try await ctx.tools.handle(CallTool.Parameters(
+        name: "forget", arguments: ["id": .string(gid.uuidString)]))
+
+    let out = text(from: try await ctx.tools.handle(CallTool.Parameters(
+        name: "timeline", arguments: ["project": .string("tl-proj")])))
+    #expect(!out.contains(gid.uuidString))
+}
+
+@Test func undelete_revivesEdgesAndConnectRevivesTombstonedEdge() async throws {
+    let ctx = try await makeToolsWithLattice()
+    expose("edge-proj", in: ctx.lattice)
+    let a = try await remember(ctx.tools, "Hub note on cache invalidation strategies", project: "edge-proj")
+    let b = try await remember(ctx.tools, "Detail on TTL-based cache invalidation", project: "edge-proj")
+    _ = try await ctx.tools.handle(CallTool.Parameters(
+        name: "connect", arguments: ["from": .string(a.uuidString), "to": .string(b.uuidString), "relation": .string("part_of")]))
+
+    // Tombstone B → its edge tombstones with it.
+    _ = try await ctx.tools.handle(CallTool.Parameters(name: "forget", arguments: ["id": .string(b.uuidString)]))
+    #expect(ctx.lattice.objects(Edge.self).where { $0.targetGlobalId == b && $0.deletedAt != nil }.count == 1)
+
+    // Undelete B → the edge revives (its other endpoint A is live) and the
+    // graph is whole again.
+    let out = text(from: try await ctx.tools.handle(CallTool.Parameters(
+        name: "update", arguments: ["id": .string(b.uuidString), "undelete": .bool(true)])))
+    // Two edges revive: the explicit part_of plus remember's auto-connect.
+    #expect(out.contains("revived"))
+    #expect(ctx.lattice.objects(Edge.self).where { $0.targetGlobalId == b && $0.deletedAt == nil }.count == 1)
+    let graphOut = text(from: try await ctx.tools.handle(CallTool.Parameters(
+        name: "graph", arguments: ["id": .string(a.uuidString)])))
+    #expect(graphOut.contains(b.uuidString))
+
+    // Tombstone the edge alone (disconnect on shared endpoints), then
+    // connect the same triple — it must REVIVE, not report already-exists.
+    _ = try await ctx.tools.handle(CallTool.Parameters(
+        name: "disconnect", arguments: ["from": .string(a.uuidString), "to": .string(b.uuidString)]))
+    #expect(ctx.lattice.objects(Edge.self).where { $0.targetGlobalId == b && $0.deletedAt != nil }.count == 1)
+    let reconnectOut = text(from: try await ctx.tools.handle(CallTool.Parameters(
+        name: "connect", arguments: ["from": .string(a.uuidString), "to": .string(b.uuidString), "relation": .string("part_of")]))
+    )
+    #expect(reconnectOut.contains("Revived"))
+    #expect(ctx.lattice.objects(Edge.self).where { $0.targetGlobalId == b && $0.deletedAt == nil }.count == 1)
+}
+
+@Test func merge_refusesTombstonedSources() async throws {
+    let ctx = try await makeToolsWithLattice()
+    expose("merge-proj", in: ctx.lattice)
+    let live = try await remember(ctx.tools, "Live memory about rate limiting", project: "merge-proj")
+    let dead = try await remember(ctx.tools, "Soon-tombstoned memory about rate limiting", project: "merge-proj")
+    _ = try await ctx.tools.handle(CallTool.Parameters(name: "forget", arguments: ["id": .string(dead.uuidString)]))
+    let deadRow = ctx.lattice.objects(Memory.self).where { $0.__globalId == dead }.first
+    let originalDeletedAt = deadRow?.deletedAt
+
+    let out = text(from: try await ctx.tools.handle(CallTool.Parameters(
+        name: "merge",
+        arguments: ["ids": .array([.string(live.uuidString), .string(dead.uuidString)]),
+                    "content": .string("Rate limiting: merged knowledge")])))
+    #expect(out.contains("tombstoned"))
+    #expect(out.contains("undelete"))
+    // Tombstone attribution untouched (no deletedBy/At clobber).
+    #expect(ctx.lattice.objects(Memory.self).where { $0.__globalId == dead }.first?.deletedAt == originalDeletedAt)
+}
+
+@Test func graph_onTombstonedRoot_returnsNotice() async throws {
+    let ctx = try await makeToolsWithLattice()
+    expose("root-proj", in: ctx.lattice)
+    let gid = try await remember(ctx.tools, "Root memory soon to be tombstoned", project: "root-proj")
+    _ = try await ctx.tools.handle(CallTool.Parameters(name: "forget", arguments: ["id": .string(gid.uuidString)]))
+
+    let out = text(from: try await ctx.tools.handle(CallTool.Parameters(
+        name: "graph", arguments: ["id": .string(gid.uuidString)])))
+    #expect(out.contains("tombstoned"))
+    #expect(out.contains("undelete"))
+    #expect(!out.contains("Root memory soon to be tombstoned"))
+}
+
 // MARK: - GroupDirectory fixture parsing
 
 @Test func groupDirectory_fixtureParsing() throws {

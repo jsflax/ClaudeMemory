@@ -32,11 +32,22 @@ extension MemoryTools {
             return CallTool.Result(content: [.text("Memory with id \(toGid.uuidString) not found.")], isError: true)
         }
 
-        // Check for duplicate edge
+        // Check for duplicate edge. A TOMBSTONED identical edge is revived
+        // instead of blocking creation — otherwise a tombstoned edge would
+        // squat the (from, to, relation) slot forever ("already exists"
+        // without actually linking anything).
         let existing = localLattice.objects(Edge.self)
             .where { $0.sourceGlobalId == fromGid && $0.targetGlobalId == toGid && $0.relation == relationEnum }
         if let edge = existing.first {
             let edgeGid = edge.__globalId?.uuidString ?? "?"
+            if edge.deletedAt != nil {
+                edge.deletedAt = nil
+                log("Revived tombstoned edge [id:\(edgeGid)]")
+                return CallTool.Result(
+                    content: [.text("Revived tombstoned edge (edge id: \(edgeGid), \(fromGid.uuidString) --[\(relation)]--> \(toGid.uuidString)).")],
+                    isError: false
+                )
+            }
             return CallTool.Result(
                 content: [.text("Edge already exists (edge id: \(edgeGid), \(fromGid.uuidString) --[\(relation)]--> \(toGid.uuidString)).")],
                 isError: false
@@ -63,10 +74,20 @@ extension MemoryTools {
     func handleDisconnect(_ args: [String: Value]?) throws -> CallTool.Result {
         let a = try args.decode(DisconnectArgs.self)
 
-        // By edge UUID
+        // By edge UUID. Edges whose endpoints are group-shared TOMBSTONE
+        // (a hard edge delete replicates to every member); purely-local
+        // edges keep the hard delete.
         if let edgeGid = a.id?.value {
-            guard let (_, foundLattice) = findEdge(id: edgeGid) else {
+            guard let (edge, foundLattice) = findEdge(id: edgeGid) else {
                 return CallTool.Result(content: [.text("Edge with id \(edgeGid.uuidString) not found.")], isError: true)
+            }
+            if edgeTouchesGroupSharedMemory(edge) {
+                edge.deletedAt = Date()
+                log("Tombstoned group-shared edge [id:\(edgeGid.uuidString)]")
+                return CallTool.Result(
+                    content: [.text("Removed edge (id: \(edgeGid.uuidString)) — tombstoned (its endpoints are group-shared; hidden for all members).")],
+                    isError: false
+                )
             }
             foundLattice.delete(Edge.self, where: { $0.__globalId == edgeGid })
             log("Disconnected edge [id:\(edgeGid.uuidString)]")
@@ -95,22 +116,42 @@ extension MemoryTools {
             query = query.where { $0.relation == relationEnum }
         }
 
-        let count = query.count
-        if count == 0 {
+        let edges = query.snapshot()
+        if edges.isEmpty {
             return CallTool.Result(content: [.text("No edges found from \(fromGid.uuidString) to \(toGid.uuidString).")], isError: false)
         }
 
-        if let relation = a.relation, let relationEnum = Edge.Relation(rawValue: relation) {
-            localLattice.delete(Edge.self, where: { $0.sourceGlobalId == fromGid && $0.targetGlobalId == toGid && $0.relation == relationEnum })
-        } else {
-            localLattice.delete(Edge.self, where: { $0.sourceGlobalId == fromGid && $0.targetGlobalId == toGid })
+        var tombstoned = 0
+        var deleted = 0
+        for edge in edges {
+            if edgeTouchesGroupSharedMemory(edge) {
+                if edge.deletedAt == nil { edge.deletedAt = Date() }
+                tombstoned += 1
+            } else if let egid = edge.__globalId {
+                localLattice.delete(Edge.self, where: { $0.__globalId == egid })
+                deleted += 1
+            }
         }
 
-        log("Disconnected \(count) edge(s) from [id:\(fromGid.uuidString)] to [id:\(toGid.uuidString)]")
+        var parts: [String] = []
+        if deleted > 0 { parts.append("\(deleted) deleted") }
+        if tombstoned > 0 { parts.append("\(tombstoned) group-shared → tombstoned") }
+        log("Disconnected \(edges.count) edge(s) from [id:\(fromGid.uuidString)] to [id:\(toGid.uuidString)]")
         return CallTool.Result(
-            content: [.text("Deleted \(count) edge(s) from [id:\(fromGid.uuidString)] to [id:\(toGid.uuidString)].")],
+            content: [.text("Removed \(edges.count) edge(s) from [id:\(fromGid.uuidString)] to [id:\(toGid.uuidString)] (\(parts.joined(separator: "; "))).")],
             isError: false
         )
+    }
+
+    /// Whether either endpoint of this edge is a group-shared memory —
+    /// drives tombstone-vs-hard-delete for edge removal.
+    func edgeTouchesGroupSharedMemory(_ edge: Edge) -> Bool {
+        for gid in [edge.sourceGlobalId, edge.targetGlobalId] {
+            if let (mem, _) = findMemory(id: gid), isGroupShared(mem) {
+                return true
+            }
+        }
+        return false
     }
 
     // MARK: - graph
@@ -123,6 +164,14 @@ extension MemoryTools {
         // Validate memory exists
         guard let (rootMem, rootLattice) = findMemory(id: memGid) else {
             return CallTool.Result(content: [.text("Memory with id \(memGid.uuidString) not found.")], isError: true)
+        }
+        if rootMem.deletedAt != nil {
+            let by = GroupDirectory.badgeName(for: rootMem.deletedBy)
+            let when = rootMem.deletedAt.map { Self.dateFormatter.string(from: $0) } ?? "?"
+            return CallTool.Result(
+                content: [.text("Memory \(memGid.uuidString) is tombstoned by \(by) on \(when) — update(id:, undelete: true) to restore it before exploring its graph.")],
+                isError: false
+            )
         }
 
         // BFS traversal using globalIds on the same lattice the root was found in
@@ -220,21 +269,52 @@ extension MemoryTools {
     /// group-shared counterpart of deleteEdgesForMemories: a hard edge
     /// delete would LWW-replicate to every member, and the memory these
     /// edges reference is itself only tombstoned (recoverable).
+    ///
+    /// Deliberately TRANSACTION-FREE (each setter is its own implicit
+    /// transaction): callers include paths already inside a transaction
+    /// (merge), and Lattice's beginTransaction does not guard nesting.
+    /// Covers both the local and synced lattices — edges for synced-project
+    /// rows live in the synced DB too.
     @discardableResult
     func tombstoneEdgesForMemories(_ globalIds: [UUID]) -> Int {
         var total = 0
         let now = Date()
-        for gid in globalIds {
-            let edges = localLattice.objects(Edge.self)
-                .where { ($0.sourceGlobalId == gid || $0.targetGlobalId == gid) && $0.deletedAt == nil }
-                .snapshot()
-            guard !edges.isEmpty else { continue }
-            localLattice.transaction {
+        var lattices: [Lattice] = [localLattice]
+        if let syncedLattice { lattices.append(syncedLattice) }
+        for lattice in lattices {
+            for gid in globalIds {
+                let edges = lattice.objects(Edge.self)
+                    .where { ($0.sourceGlobalId == gid || $0.targetGlobalId == gid) && $0.deletedAt == nil }
+                    .snapshot()
                 for edge in edges {
                     edge.deletedAt = now
                 }
+                total += edges.count
             }
-            total += edges.count
+        }
+        return total
+    }
+
+    /// Reverse of tombstoneEdgesForMemories, run on undelete: revive edges
+    /// touching the restored memory whose OTHER endpoint is still live —
+    /// edges pointing at still-tombstoned (or hard-deleted) memories stay
+    /// tombstoned, so restoring one memory never resurrects links into
+    /// removed content.
+    @discardableResult
+    func reviveEdgesForMemory(_ gid: UUID) -> Int {
+        var total = 0
+        var lattices: [Lattice] = [localLattice]
+        if let syncedLattice { lattices.append(syncedLattice) }
+        for lattice in lattices {
+            let edges = lattice.objects(Edge.self)
+                .where { ($0.sourceGlobalId == gid || $0.targetGlobalId == gid) && $0.deletedAt != nil }
+                .snapshot()
+            for edge in edges {
+                let otherGid = edge.sourceGlobalId == gid ? edge.targetGlobalId : edge.sourceGlobalId
+                guard let (other, _) = findMemory(id: otherGid), other.deletedAt == nil else { continue }
+                edge.deletedAt = nil
+                total += 1
+            }
         }
         return total
     }

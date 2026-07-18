@@ -670,7 +670,9 @@ extension MemoryTools {
                 let expires = m.expiresAt == .distantFuture ? "" : ", expires: \(Self.dateFormatter.string(from: m.expiresAt))"
                 let created = hasTemporalFilter ? ", created: \(Self.dateFormatter.string(from: m.createdAt))" : ""
                 guard let mGid = m.__globalId else { continue }
-                lines.append("[id:\(mGid.uuidString)] [\(m.project)/\(m.topic)]\(ftsInfo)\(expires)\(created) \(m.content)")
+                let badge = (m.authorUserId != nil && m.authorUserId != currentUserId)
+                    ? " [by:\(GroupDirectory.badgeName(for: m.authorUserId))]" : ""
+                lines.append("[id:\(mGid.uuidString)] [\(m.project)/\(m.topic)]\(badge)\(ftsInfo)\(expires)\(created) \(m.content)")
             }
             if lines.isEmpty {
                 return CallTool.Result(content: [.text("No memories found.")], isError: false)
@@ -877,6 +879,7 @@ extension MemoryTools {
         // 6. Apply content edits + metadata in a single transaction
         let oldContent = mem.content
         var contentChanged = false
+        var didUndelete = false
         var changes: [String] = []
 
         // Pre-compute embedding if content will change
@@ -964,6 +967,7 @@ extension MemoryTools {
             if a.undelete == true, mem.deletedAt != nil {
                 mem.deletedAt = nil
                 mem.deletedBy = nil
+                didUndelete = true
                 changes.append("undeleted (restored for all members)")
             }
 
@@ -975,6 +979,16 @@ extension MemoryTools {
             // authorUserId is NEVER touched by edits — attribution follows
             // the original author, and the sync firewall keys on it.
             mem.modifiedAt = Date()
+        }
+
+        // Restore graph connectivity alongside the memory: edges tombstoned
+        // with it revive when their other endpoint is live (edges into
+        // still-removed content stay tombstoned).
+        // (didUndelete, not a mem.deletedAt re-read — the materialized
+        // snapshot can serve the stale pre-transaction value.)
+        if didUndelete, let gid = mem.__globalId {
+            let revived = reviveEdgesForMemory(gid)
+            if revived > 0 { changes.append("revived \(revived) edge(s)") }
         }
 
         let memGidStr = mem.__globalId?.uuidString ?? "unknown"
@@ -1011,6 +1025,17 @@ extension MemoryTools {
                 return CallTool.Result(content: [.text("Memory with id \(gid.uuidString) not found.")], isError: true)
             }
             sources.append(found)
+        }
+
+        // Tombstoned sources are refused (like consolidate): merging one
+        // would bake removed content into a fresh live row (a tombstone
+        // bypass) and clobber the original tombstone attribution.
+        if let dead = sources.first(where: { $0.memory.deletedAt != nil }) {
+            let gidStr = dead.memory.__globalId?.uuidString ?? "?"
+            return CallTool.Result(
+                content: [.text("Memory \(gidStr) is tombstoned (by \(GroupDirectory.badgeName(for: dead.memory.deletedBy))) — undelete it first or drop it from the merge.")],
+                isError: true
+            )
         }
 
         // Use first source for defaults
@@ -1098,7 +1123,7 @@ extension MemoryTools {
             let grouped = base.group(by: \.project)
             var projectLines: [String] = []
             for mem in grouped {
-                let count = db.objects(Memory.self).distinct(by: \.__globalId).where { $0.project == mem.project }.count
+                let count = db.objects(Memory.self).distinct(by: \.__globalId).where { $0.project == mem.project && $0.deletedAt == nil }.count
                 projectLines.append("  \(mem.project): \(count)")
             }
             projectLines.sort()
@@ -1110,7 +1135,7 @@ extension MemoryTools {
         let topicGrouped = base.group(by: \.topic)
         var topicLines: [String] = []
         for mem in topicGrouped {
-            var countQuery = db.objects(Memory.self).distinct(by: \.__globalId).where { $0.topic == mem.topic }
+            var countQuery = db.objects(Memory.self).distinct(by: \.__globalId).where { $0.topic == mem.topic && $0.deletedAt == nil }
             if let projectFilter {
                 countQuery = countQuery.where { $0.project == projectFilter }
             }
@@ -1173,7 +1198,7 @@ extension MemoryTools {
 
         var lines: [String] = []
         for memory in grouped {
-            var countQuery = db.objects(Memory.self).distinct(by: \.__globalId).where { $0.topic == memory.topic }
+            var countQuery = db.objects(Memory.self).distinct(by: \.__globalId).where { $0.topic == memory.topic && $0.deletedAt == nil }
             if let projectFilter {
                 countQuery = countQuery.where { $0.project == projectFilter }
             }
@@ -1203,7 +1228,7 @@ extension MemoryTools {
         // Build query with filters — route to right DB based on project
         var results = readLattice(for: a.project).objects(Memory.self)
             .distinct(by: \.__globalId)
-            .where { $0.expiresAt > Date() }
+            .where { $0.expiresAt > Date() && $0.deletedAt == nil }  // tombstone filter
 
         if let project = a.project {
             results = results.where { $0.project == project }
