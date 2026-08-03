@@ -39,6 +39,24 @@ func initMemoryTools(sessionId: String? = nil) async -> MemoryTools? {
     }
     sessionLog("initMemoryTools: lattice opened", sessionId: sessionId)
 
+    // Synced DB — same open the MCP server does (main.swift). Without it,
+    // hook recall (advise/on-start/pre-tool) was blind to cross-device
+    // memories: readLattice saw syncedLattice == nil and every synced
+    // project silently fell back to local-only. Plain open, no WSS/IPC —
+    // the daemon owns sync; hooks only read.
+    var syncedRef: LatticeThreadSafeReference?
+    let claudeDir = (defaultDbPath as NSString).deletingLastPathComponent
+    let syncedDbPath = SyncService.syncedDbPath(claudeDir: claudeDir)
+    if FileManager.default.fileExists(atPath: syncedDbPath) {
+        let synced = try? Lattice(
+            Memory.self, Edge.self, SyncConfig.self,
+            configuration: .init(fileURL: URL(fileURLWithPath: syncedDbPath),
+                                 migration: engramMigrations)
+        )
+        syncedRef = synced?.sendableReference
+        sessionLog("initMemoryTools: synced lattice \(synced != nil ? "opened" : "FAILED to open") at \(syncedDbPath)", sessionId: sessionId)
+    }
+
     // Per-session Lattice debug logging
     if let sid = sessionId, !sid.isEmpty {
         let logPath = memoryLogsDir + "/lattice-\(sid).log"
@@ -58,7 +76,7 @@ func initMemoryTools(sessionId: String? = nil) async -> MemoryTools? {
     await embedder.load()
     sessionLog("initMemoryTools: embedder loaded", sessionId: sessionId)
 
-    let tools = MemoryTools(localRef: lattice.sendableReference, syncedRef: nil, embedder: embedder)
+    let tools = MemoryTools(localRef: lattice.sendableReference, syncedRef: syncedRef, embedder: embedder)
     // Every hook recall INJECTS its output into a tool-capable session, so
     // the hook path always fences foreign-authored content; the per-device
     // opt-out ("memory-hooks group-advise off" or the visualizer settings
