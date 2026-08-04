@@ -327,6 +327,69 @@ final class SyncManager {
     var groupLattices: [String: Lattice] = [:]
     var statusMessage: String?
 
+    /// One group's spoke, resolved into everything a galaxy needs.
+    struct GroupGalaxySpoke: Identifiable {
+        let groupId: UUID
+        let name: String
+        let parentId: UUID?
+        let ref: LatticeThreadSafeReference
+        /// Height above the deepest attached descendant: a leaf team is 1,
+        /// its org 2, and so on. Personal/synced sit at 0, so a team's nodes
+        /// float directly above the user's own graph.
+        let hierarchyLevel: Int
+        var id: UUID { groupId }
+        var galaxyId: String { "group:\(groupId.uuidString)" }
+    }
+
+    /// Open every group spoke on this machine and describe it as a galaxy.
+    ///
+    /// Spoke FILES are the source of truth for which groups may be rendered
+    /// (the daemon renames a spoke `.revoked` the moment a membership goes
+    /// away); groups.json supplies only the display name and the parent
+    /// chain, so a stale directory costs a nice label, never visibility.
+    /// Idempotent — reuses any lattice already open.
+    func discoverGroupGalaxies() -> [GroupGalaxySpoke] {
+        let claudeDir = NSHomeDirectory() + "/.claude"
+        let spokes = SyncService.discoverGroupSpokes(claudeDir: claudeDir)
+        guard !spokes.isEmpty else { return [] }
+
+        let directory = GroupDirectory.load()
+        let infoById = Dictionary(uniqueKeysWithValues:
+            (directory?.groups ?? []).map { ($0.id, $0) })
+        let present = Set(spokes.map(\.groupId))
+
+        let levels = GroupHierarchy.levels(
+            present: present,
+            parentOf: infoById.mapValues(\.parentId))
+
+        var result: [GroupGalaxySpoke] = []
+        for spoke in spokes {
+            let lattice: Lattice
+            if let existing = groupLattices[spoke.groupId.uuidString] {
+                lattice = existing
+            } else {
+                guard let opened = try? Lattice(
+                    Memory.self, Edge.self, GroupProjectMap.self,
+                    configuration: .init(fileURL: URL(fileURLWithPath: spoke.path),
+                                         migration: engramMigrations)
+                ) else {
+                    log("Group galaxy: could not open spoke at \(spoke.path)")
+                    continue
+                }
+                groupLattices[spoke.groupId.uuidString] = opened
+                lattice = opened
+            }
+            let info = infoById[spoke.groupId]
+            result.append(GroupGalaxySpoke(
+                groupId: spoke.groupId,
+                name: info?.name ?? "Group",
+                parentId: info?.parentId,
+                ref: lattice.sendableReference,
+                hierarchyLevel: levels[spoke.groupId] ?? 1))
+        }
+        return result
+    }
+
     /// Expose/un-expose a project to a group. See Actor.setGroupExposure.
     func setGroupExposure(project: String, groupId: UUID, exposed: Bool) {
         Task {

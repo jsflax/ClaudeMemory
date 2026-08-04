@@ -165,6 +165,26 @@ final class GalaxyRegistry {
 
     /// Rebuild merged data from all galaxies. Called each frame by renderTick.
     /// Only does real work when topology has changed.
+    /// Galaxies in dedup-precedence order: group > synced > personal, with
+    /// the most specific group first (leaf team before its org) and sorted id
+    /// as the final tiebreak. Matches the node-filter precedence, so the
+    /// merge backstop lands on the same galaxy the filters intended.
+    private func galaxiesInPrecedenceOrder() -> [Galaxy] {
+        func rank(_ id: String) -> Int {
+            if id.hasPrefix("group:") { return 0 }
+            if id == "synced" { return 1 }
+            return 2
+        }
+        return galaxies.values.sorted { lhs, rhs in
+            let (lr, rr) = (rank(lhs.id), rank(rhs.id))
+            if lr != rr { return lr < rr }
+            if lr == 0, lhs.hierarchyLevel != rhs.hierarchyLevel {
+                return lhs.hierarchyLevel < rhs.hierarchyLevel
+            }
+            return lhs.id < rhs.id
+        }
+    }
+
     func mergeRenderData() {
         // Check if any galaxy's topology changed
         var topologySum: UInt64 = 0
@@ -207,8 +227,17 @@ final class GalaxyRegistry {
             var nodeById: [UUID: NodeData] = [:]
             var newNodeToGalaxy: [UUID: String] = [:]
 
+            // Precedence order, NOT dictionary order. Every merge below is
+            // first-wins (`seenIds.insert`, `{ existing, _ in existing }`),
+            // so iterating `galaxies.values` made the winner for a duplicated
+            // node depend on hashing — the same memory would jump between
+            // galaxies from one launch to the next. The node filters should
+            // already prevent duplicates; this is the backstop, and a
+            // backstop that picks arbitrarily is how the flicker survives.
+            let ordered = galaxiesInPrecedenceOrder()
+
             var seenIds = Set<UUID>()
-            for galaxy in galaxies.values {
+            for galaxy in ordered {
                 let store = galaxy.renderStore
                 for node in store.nodes {
                     if seenIds.insert(node.id).inserted {
@@ -226,7 +255,7 @@ final class GalaxyRegistry {
             let mergedVisibleIds = Set(nodes.map(\.id))
             var seen = Set<UUID>()
             var crossEdges: [EdgeData] = []
-            for galaxy in galaxies.values {
+            for galaxy in ordered {
                 for (gid, edge) in galaxy.renderStore.allEdges {
                     guard seen.insert(gid).inserted else { continue }
                     guard mergedVisibleIds.contains(edge.sourceId),
@@ -486,55 +515,13 @@ final class GalaxyRegistry {
                         guard let self,
                               let personal = self.galaxies["personal"],
                               let syncConfig = personal.latticeRef.resolve()?.object(SyncConfig.self, primaryKey: capturedPk) else { return }
-                        let project = syncConfig.project
-                        let policy = syncConfig.policy
-
-#if ENGRAM_INSTRUMENTATION
-                        let migStart = CFAbsoluteTimeGetCurrent()
-#endif
-
-                        if policy == .sync {
-                            guard personal.renderStore.allNodes.values.contains(where: { $0.project == project }) else {
-#if ENGRAM_INSTRUMENTATION
-                                let ts = String(format: "%.3f", CFAbsoluteTimeGetCurrent())
-                                self.migrationLog("\(ts),skip_idempotent,\(project),personal→synced,personal,synced,0,0,0,0.00")
-#endif
-                                return
-                            }
-                            self.ensureSyncedGalaxyExists()
-                            let extracted = self.migrateProjectOut(project, from: "personal")
-                            self.migrateRenderStoreIn("synced", nodes: extracted.nodes, intraProjectEdges: extracted.intraEdges)
-                            // Reassign galaxy group in unified sim (no remove+re-add)
-                            let nodeIds = Set(extracted.nodes.map(\.id))
-                            self.unifiedSimulation.changeGalaxyGroup(for: nodeIds, to: "synced")
-                            self.unifiedSimulation.wake()
-
-#if ENGRAM_INSTRUMENTATION
-                            let migMs = (CFAbsoluteTimeGetCurrent() - migStart) * 1000.0
-                            let ts = String(format: "%.3f", CFAbsoluteTimeGetCurrent())
-                            self.migrationLog("\(ts),migrate,\(project),personal→synced,personal,synced,\(extracted.nodes.count),\(extracted.intraEdges.count),0,\(String(format: "%.2f", migMs))")
-#endif
-                        } else {
-                            guard self.galaxies["synced"]?.renderStore.allNodes.values.contains(where: { $0.project == project }) == true else {
-#if ENGRAM_INSTRUMENTATION
-                                let ts = String(format: "%.3f", CFAbsoluteTimeGetCurrent())
-                                self.migrationLog("\(ts),skip_idempotent,\(project),synced→personal,synced,personal,0,0,0,0.00")
-#endif
-                                return
-                            }
-                            let extracted = self.migrateProjectOut(project, from: "synced")
-                            self.migrateRenderStoreIn("personal", nodes: extracted.nodes, intraProjectEdges: extracted.intraEdges)
-                            // Reassign galaxy group in unified sim (no remove+re-add)
-                            let nodeIds = Set(extracted.nodes.map(\.id))
-                            self.unifiedSimulation.changeGalaxyGroup(for: nodeIds, to: "personal")
-                            self.unifiedSimulation.wake()
-
-#if ENGRAM_INSTRUMENTATION
-                            let migMs = (CFAbsoluteTimeGetCurrent() - migStart) * 1000.0
-                            let ts = String(format: "%.3f", CFAbsoluteTimeGetCurrent())
-                            self.migrationLog("\(ts),migrate,\(project),synced→personal,synced,personal,\(extracted.nodes.count),\(extracted.intraEdges.count),0,\(String(format: "%.2f", migMs))")
-#endif
-                        }
+                        // One row carries BOTH the personal policy and the
+                        // group exposure set, so this fires for either edit —
+                        // resolve where the project belongs now and move it
+                        // there, rather than branching on a personal↔synced
+                        // binary that a group destination doesn't fit.
+                        self.migrateProject(syncConfig.project,
+                                            to: self.destinationGalaxyId(for: syncConfig))
                         self.rebuildNodeFilters()
                     }
                 case .delete:
@@ -547,6 +534,69 @@ final class GalaxyRegistry {
             Task { @MainActor in
                 self.syncConfigObserver = syncConfigObserver
             }
+        }
+    }
+
+    /// Which galaxy owns a project's nodes, by precedence group > synced >
+    /// personal (a group-shared project renders with its group).
+    ///
+    /// Ties are broken DETERMINISTICALLY: among attached groups the project
+    /// is exposed to, the most specific one wins (lowest hierarchy level —
+    /// the leaf team rather than its org), then sorted galaxy id. "Whichever
+    /// we happened to see first" would move nodes between galaxies on every
+    /// relaunch.
+    func destinationGalaxyId(for config: SyncConfig) -> String {
+        if let owner = GroupHierarchy.owningGroup(
+            exposedGroupIds: config.exposedGroups,
+            attachedLevels: attachedGroupLevels()) {
+            return "group:\(owner.uuidString)"
+        }
+        return config.policy == .sync ? "synced" : "personal"
+    }
+
+    /// Attached group galaxies as (groupId → hierarchy level), the input the
+    /// placement rules take.
+    private func attachedGroupLevels() -> [UUID: Int] {
+        var levels: [UUID: Int] = [:]
+        for (id, galaxy) in galaxies where id.hasPrefix("group:") {
+            guard let uuid = UUID(uuidString: String(id.dropFirst("group:".count))) else { continue }
+            levels[uuid] = galaxy.hierarchyLevel
+        }
+        return levels
+    }
+
+    /// Move a project's rendered nodes into `destination`, wherever they are
+    /// now. Replaces the old personal→synced / synced→personal pair: with
+    /// group galaxies the source can be any galaxy, and a project can move
+    /// group→group when exposure changes.
+    func migrateProject(_ project: String, to destination: String) {
+        if destination == "synced" { ensureSyncedGalaxyExists() }
+        guard galaxies[destination] != nil else { return }
+
+        let sources = galaxies.keys.filter { id in
+            id != destination
+                && galaxies[id]?.renderStore.allNodes.values
+                    .contains(where: { $0.project == project }) == true
+        }.sorted()
+        guard !sources.isEmpty else { return }   // idempotent: already there
+
+        for source in sources {
+#if ENGRAM_INSTRUMENTATION
+            let migStart = CFAbsoluteTimeGetCurrent()
+#endif
+            let extracted = migrateProjectOut(project, from: source)
+            guard !extracted.nodes.isEmpty else { continue }
+            migrateRenderStoreIn(destination, nodes: extracted.nodes,
+                                 intraProjectEdges: extracted.intraEdges)
+            // Reassign galaxy group in unified sim (no remove+re-add)
+            let nodeIds = Set(extracted.nodes.map(\.id))
+            unifiedSimulation.changeGalaxyGroup(for: nodeIds, to: destination)
+            unifiedSimulation.wake()
+#if ENGRAM_INSTRUMENTATION
+            let migMs = (CFAbsoluteTimeGetCurrent() - migStart) * 1000.0
+            let ts = String(format: "%.3f", CFAbsoluteTimeGetCurrent())
+            migrationLog("\(ts),migrate,\(project),\(source)→\(destination),\(source),\(destination),\(extracted.nodes.count),\(extracted.intraEdges.count),0,\(String(format: "%.2f", migMs))")
+#endif
         }
     }
 
@@ -833,12 +883,16 @@ final class GalaxyRegistry {
         })
         var syncedProjects = Set<String>()
         var groupClaimedProjects = Set<String>()
+        // project → the ONE group galaxy that renders it, so a project
+        // exposed to two groups doesn't draw twice (mergeRenderData's seenIds
+        // would pick an arbitrary winner, which flips between launches).
+        var groupOwner: [String: String] = [:]
         for config in lattice.objects(SyncConfig.self) {
             if config.policy == .sync { syncedProjects.insert(config.project) }
-            if !attachedGroupIds.isEmpty,
-               !config.exposedGroups.isDisjoint(with: attachedGroupIds) {
-                groupClaimedProjects.insert(config.project)
-            }
+            guard !attachedGroupIds.isEmpty,
+                  !config.exposedGroups.isDisjoint(with: attachedGroupIds) else { continue }
+            groupClaimedProjects.insert(config.project)
+            groupOwner[config.project] = destinationGalaxyId(for: config)
         }
 
         let personalExcluded = syncedProjects.union(groupClaimedProjects)
@@ -861,6 +915,20 @@ final class GalaxyRegistry {
                 synced.setNodeFilter { @Sendable memory in
                     !captured.contains(memory.project)
                 }
+            }
+        }
+
+        // Each group galaxy drops rows for a project another group galaxy
+        // owns. A project this user never exposed (a teammate's, present only
+        // in that spoke) has no owner entry and stays visible — otherwise
+        // joining a team would show an empty galaxy.
+        for (galaxyId, galaxy) in galaxies where galaxyId.hasPrefix("group:") {
+            let owned = groupOwner
+            let me = galaxyId
+            galaxy.setNodeFilter { @Sendable memory in
+                guard memory.deletedAt == nil else { return false }
+                guard let owner = owned[memory.project] else { return true }
+                return owner == me
             }
         }
     }

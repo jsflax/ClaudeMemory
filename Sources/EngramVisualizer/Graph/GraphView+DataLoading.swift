@@ -73,6 +73,27 @@ extension GraphView {
             }
         }
 
+        // Group galaxies register in the SAME synchronous block, before any
+        // load starts: computeWorldLayout runs on register(), and if a group
+        // arrived later every galaxy's worldCenter would have been computed
+        // for the wrong count and the nodes would pile up at the origin.
+        // A group galaxy shows ONLY live rows — a tombstone is hidden for
+        // every member, including the person who wrote it.
+        let groupSpokes = syncManager.discoverGroupGalaxies()
+        let attachedGroupIds = Set(groupSpokes.map(\.groupId))
+        for spoke in groupSpokes where galaxyRegistry.galaxies[spoke.galaxyId] == nil {
+            // Only draw a hierarchy line to a parent that is itself attached;
+            // otherwise the line would point at a galaxy that isn't there.
+            let parentGalaxyId = spoke.parentId.flatMap {
+                attachedGroupIds.contains($0) ? "group:\($0.uuidString)" : nil
+            }
+            let galaxy = Galaxy(id: spoke.galaxyId, displayName: spoke.name,
+                                lattice: spoke.ref,
+                                hierarchyLevel: spoke.hierarchyLevel,
+                                parentGalaxyId: parentGalaxyId)
+            galaxyRegistry.register(galaxy)
+        }
+
         // NOW start loading — worldCenter is already correct for all galaxies.
         if let personal = galaxyRegistry.galaxies["personal"] {
             Task {
@@ -87,10 +108,27 @@ extension GraphView {
                 await synced.startObservers()
             }
         }
+        for spoke in groupSpokes {
+            guard let galaxy = galaxyRegistry.galaxies[spoke.galaxyId] else { continue }
+            Task {
+                galaxy.setNodeFilter(Self.groupGalaxyFilter)
+                await galaxy.loadData()
+                // Live animation comes free: the spoke is daemon-written, and
+                // startObservers watches its AuditLog cross-process — the same
+                // mechanism the synced galaxy already uses.
+                await galaxy.startObservers()
+            }
+        }
 
         galaxyRegistry.syncManager = syncManager
         galaxyRegistry.setupSyncConfigObserver()
+        // Group galaxies now exist, so personal/synced must stop claiming the
+        // projects they own (precedence group > synced > personal).
+        galaxyRegistry.rebuildNodeFilters()
     }
+
+    /// Tombstoned rows are hidden for everyone, author included (decision 9).
+    static let groupGalaxyFilter: @Sendable (Memory) -> Bool = { $0.deletedAt == nil }
 
     /// Handle late-arriving synced galaxy when daemon connects.
     func handleSyncConnect() {
@@ -98,6 +136,19 @@ extension GraphView {
             galaxyRegistry.onLatticeAvailable(
                 id: "synced", displayName: "Synced", latticeRef: ref
             )
+        }
+        // A group joined (or the daemon finished its first sync) after
+        // launch: same idempotent late-attach path the synced galaxy uses.
+        let groupSpokes = syncManager.discoverGroupGalaxies()
+        let attachedGroupIds = Set(groupSpokes.map(\.groupId))
+        for spoke in groupSpokes {
+            galaxyRegistry.onLatticeAvailable(
+                id: spoke.galaxyId, displayName: spoke.name, latticeRef: spoke.ref,
+                hierarchyLevel: spoke.hierarchyLevel,
+                parentGalaxyId: spoke.parentId.flatMap {
+                    attachedGroupIds.contains($0) ? "group:\($0.uuidString)" : nil
+                },
+                nodeFilter: Self.groupGalaxyFilter)
         }
         galaxyRegistry.rebuildNodeFilters()
     }
