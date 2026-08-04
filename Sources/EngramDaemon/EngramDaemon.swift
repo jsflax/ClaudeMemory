@@ -8,7 +8,8 @@ import Lattice
 struct EngramDaemon: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "memory-sync",
-        abstract: "Engram sync daemon — relays memory changes to the cloud via WSS."
+        abstract: "Engram sync daemon — relays memory changes to the cloud via WSS.",
+        subcommands: [ExposeCommand.self, GroupsCommand.self]
     )
 
     @Option(name: .long, help: "Lattice log level: off, error, warning, info, debug")
@@ -255,6 +256,21 @@ struct EngramDaemon: AsyncParsableCommand {
         //     threads that make the spoke a live mirror.
         var groupSpokes: [UUID: Lattice] = [:]
         for membership in memberships {
+            // Billing gate BEFORE connecting: a lapsed group subscription
+            // makes the relay answer 402 at the WebSocket upgrade, which
+            // reaches the client only as an untyped error string and would
+            // reconnect-loop forever. Ask the server instead, and publish
+            // `payment_required` — a first-class state the sidebar renders
+            // as a billing banner, never as a red failure.
+            let billing = await GroupDirectorySync.fetchGroupSubscriptionStatus(
+                endpoint: credentials.endpoint, token: credentials.token, groupId: membership.id)
+            guard GroupDirectorySync.groupSyncPermitted(status: billing) else {
+                log("Group spoke SKIPPED (billing \(billing ?? "unknown")): \(membership.name)")
+                DaemonStatus.writeSpoke(groupId: membership.id, name: membership.name,
+                                        state: "payment_required",
+                                        detail: "Team sync paused — subscription \(billing ?? "inactive")")
+                continue
+            }
             guard let spoke = SyncService.openGroupLattice(
                 claudeDir: claudeDir,
                 groupId: membership.id,
@@ -263,9 +279,16 @@ struct EngramDaemon: AsyncParsableCommand {
                 selfUserId: selfUserId
             ) else {
                 log("Group spoke FAILED to open: \(membership.name) (\(membership.id))")
+                DaemonStatus.writeSpoke(groupId: membership.id, name: membership.name,
+                                        state: "error", detail: "could not open spoke database")
                 continue
             }
             groupSpokes[membership.id] = spoke
+            DaemonStatus.writeSpoke(groupId: membership.id, name: membership.name,
+                                    state: billing == "past_due" ? "past_due" : "connected",
+                                    detail: billing == "past_due"
+                                        ? "Subscription past due — sync continues during the grace period"
+                                        : nil)
             log("Group spoke opened: \(membership.name) → group-\(membership.id.uuidString).sqlite")
         }
         // Retire spokes for groups we are no longer in: quarantine by rename
@@ -341,6 +364,7 @@ struct EngramDaemon: AsyncParsableCommand {
         startMembershipPoll(claudeDir: claudeDir,
                             credentials: credentials,
                             knownGroupIds: Set(memberships.map(\.id)),
+                            runningSpokeIds: Set(groupSpokes.keys),
                             lockFd: lockFd)
 
         // Handle graceful shutdown
@@ -419,6 +443,26 @@ enum DaemonStatus {
     nonisolated(unsafe) private static var lastSyncAt: String?
     private static let lock = NSLock()
 
+    /// Per-group spoke state, surfaced to the visualizer's sidebar.
+    /// `payment_required` is a first-class state, distinct from `error`:
+    /// the UI renders it as a billing banner (with a checkout link for
+    /// owners), never as a red failure.
+    nonisolated(unsafe) private static var spokes: [String: [String: Any]] = [:]
+
+    static func writeSpoke(groupId: UUID, name: String, state: String, detail: String? = nil) {
+        lock.lock()
+        var entry: [String: Any] = ["name": name, "state": state]
+        if let detail { entry["detail"] = detail }
+        spokes[groupId.uuidString] = entry
+        lock.unlock()
+        // Re-publish so the change lands in the file immediately; the
+        // top-level state is unchanged by a per-spoke update.
+        write(state: lastKnownState ?? "connected", detail: lastKnownDetail)
+    }
+
+    nonisolated(unsafe) private static var lastKnownState: String?
+    nonisolated(unsafe) private static var lastKnownDetail: String?
+
     static func write(state: String,
                       detail: String?,
                       pendingUpload: Int? = nil,
@@ -426,6 +470,8 @@ enum DaemonStatus {
         lock.lock(); defer { lock.unlock() }
         let now = ISO8601DateFormatter().string(from: Date())
         if didSync { lastSyncAt = now }
+        lastKnownState = state
+        lastKnownDetail = detail
         var obj: [String: Any] = [
             "state": state,
             "updatedAt": now,
@@ -434,6 +480,7 @@ enum DaemonStatus {
         if let detail { obj["detail"] = detail }
         if let pendingUpload { obj["pendingUpload"] = pendingUpload }
         if let lastSyncAt { obj["lastSyncAt"] = lastSyncAt }
+        if !spokes.isEmpty { obj["groups"] = spokes }
         guard let data = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted]) else { return }
         try? data.write(to: URL(fileURLWithPath: path), options: [.atomic])
     }
@@ -551,6 +598,7 @@ private func startMembershipPoll(
     claudeDir: String,
     credentials: SyncCredentials,
     knownGroupIds: Set<UUID>,
+    runningSpokeIds: Set<UUID>,
     lockFd: Int32
 ) {
     Task.detached {
@@ -571,6 +619,29 @@ private func startMembershipPoll(
                 let snapshot = try await GroupDirectorySync.fetch(
                     endpoint: credentials.endpoint, token: credentials.token)
                 try? GroupDirectorySync.write(snapshot, claudeDir: claudeDir)
+                // Billing can change without membership changing — a lapse
+                // must pause the spoke and a payment must resume it. Both
+                // require the restart path (spokes are opened at startup).
+                for membership in snapshot.groups {
+                    let billing = await GroupDirectorySync.fetchGroupSubscriptionStatus(
+                        endpoint: credentials.endpoint, token: credentials.token,
+                        groupId: membership.id)
+                    let permitted = GroupDirectorySync.groupSyncPermitted(status: billing)
+                    let wasRunning = runningSpokeIds.contains(membership.id)
+                    if permitted != wasRunning {
+                        log("Group billing changed for \(membership.name) (\(billing ?? "unknown")) — restarting")
+                        DaemonStatus.write(state: "restarting", detail: "group billing changed")
+                        flock(lockFd, LOCK_UN)
+                        close(lockFd)
+                        Darwin.exit(1)
+                    }
+                    if !permitted {
+                        DaemonStatus.writeSpoke(groupId: membership.id, name: membership.name,
+                                                state: "payment_required",
+                                                detail: "Team sync paused — subscription \(billing ?? "inactive")")
+                    }
+                }
+
                 let current = Set(snapshot.groups.map(\.id))
                 if current != knownGroupIds {
                     let added = current.subtracting(knownGroupIds).count

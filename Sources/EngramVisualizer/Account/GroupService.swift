@@ -339,6 +339,25 @@ final class GroupService {
 
     /// Create-or-match by name — the server is idempotent, so this is safe
     /// as the exposure flow's default mapping step.
+    /// Checkout URL for a root group's seat subscription, or nil on failure
+    /// (the caller surfaces `errorMessage`).
+    func checkoutURLString(groupId: UUID) async -> String? {
+        await mutate {
+            let data = try await self.send("POST", "/groups/\(groupId.uuidString)/subscription/checkout")
+            struct Response: Decodable { let url: String }
+            return try Self.decoder.decode(Response.self, from: data).url
+        }
+    }
+
+    /// Stripe billing-portal URL for an existing group subscription.
+    func portalURLString(groupId: UUID) async -> String? {
+        await mutate {
+            let data = try await self.send("POST", "/groups/\(groupId.uuidString)/subscription/portal")
+            struct Response: Decodable { let url: String }
+            return try Self.decoder.decode(Response.self, from: data).url
+        }
+    }
+
     @discardableResult
     func createGroupProject(groupId: UUID, name: String) async -> GroupProjectInfo? {
         await mutate {

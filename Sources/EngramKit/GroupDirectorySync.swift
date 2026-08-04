@@ -159,6 +159,35 @@ public enum GroupDirectorySync {
         return dto.status == "active" || dto.status == "trialing"
     }
 
+    /// Billing state of one group's BILLING ROOT, as the server reports it.
+    ///
+    /// Polled rather than inferred from transport errors: a lapsed
+    /// subscription surfaces at the relay as a 402 during the WebSocket
+    /// upgrade, which reaches the client only as an untyped error string.
+    /// The server already publishes the truth, so ask it.
+    ///
+    /// Returns nil when unreachable/undecidable — callers keep their
+    /// current state rather than reacting to a network blip.
+    public static func fetchGroupSubscriptionStatus(
+        endpoint: String, token: String, groupId: UUID
+    ) async -> String? {
+        guard let base = URL(string: endpoint) else { return nil }
+        let url = base.appendingPathComponent("groups")
+            .appendingPathComponent(groupId.uuidString)
+            .appendingPathComponent("subscription")
+        guard let data = try? await get(url, token: token) else { return nil }
+        struct StatusDTO: Decodable { let status: String }
+        return (try? decoder().decode(StatusDTO.self, from: data))?.status
+    }
+
+    /// Whether a reported group-subscription status permits sync.
+    /// `past_due` DOES permit it — the server grants a grace window and
+    /// sends a warning header rather than cutting members off mid-cycle.
+    public static func groupSyncPermitted(status: String?) -> Bool {
+        guard let status else { return true }   // unknown ⇒ don't tear down
+        return status == "active" || status == "trialing" || status == "past_due"
+    }
+
     /// Write `groups.json` atomically at 0600. Atomic because short-lived
     /// readers (hooks) can open it at any instant; a torn write would make
     /// every author render as "unknown" for that session.

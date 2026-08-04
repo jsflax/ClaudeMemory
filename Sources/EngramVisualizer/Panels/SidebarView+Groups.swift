@@ -27,6 +27,14 @@ extension SidebarView {
                     .padding(.vertical, 4)
                 }
 
+                // Billing banners come from the DAEMON's per-spoke state, not
+                // from a client-side guess: it is the daemon that knows a
+                // group's sync is actually paused. Distinct from the red
+                // error style — a lapse is a prompt, not a failure.
+                ForEach((syncManager.daemonHealth?.groups ?? []).filter(\.needsBilling)) { spoke in
+                    billingBanner(spoke)
+                }
+
                 let ordered = groupService.orderedGroups()
                 if ordered.isEmpty && groupService.lastRefreshError == nil {
                     Text(groupService.hasLoadedOnce ? "No groups yet" : "Loading…")
@@ -65,6 +73,60 @@ extension SidebarView {
         .task {
             await groupService.refresh()
         }
+    }
+
+    /// Billing state for one group's spoke. Amber, not red: sync is paused
+    /// pending payment, and an owner gets a direct route to fix it.
+    func billingBanner(_ spoke: SyncManager.GroupSpokeHealth) -> some View {
+        let group = groupService.groups.first { $0.id.uuidString == spoke.id }
+        let isOwner = group?.myRole == "owner"
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: "creditcard")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.orange.opacity(0.8))
+                Text(spoke.name)
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.8))
+                    .lineLimit(1)
+                Spacer()
+            }
+            Text(spoke.detail ?? (spoke.state == "past_due"
+                 ? "Subscription past due — sync continues during the grace period"
+                 : "Team sync paused — the organization's subscription is inactive"))
+                .font(.system(size: 9, design: .monospaced))
+                .foregroundStyle(.white.opacity(0.5))
+                .fixedSize(horizontal: false, vertical: true)
+            if isOwner, let group {
+                Button {
+                    Task {
+                        // Owners get the checkout/portal link directly; the
+                        // server decides which is appropriate.
+                        let live = spoke.state == "past_due"
+                        if let url = live
+                            ? await groupService.portalURLString(groupId: group.id)
+                            : await groupService.checkoutURLString(groupId: group.id),
+                           let target = URL(string: url) {
+                            NSWorkspace.shared.open(target)
+                        }
+                    }
+                } label: {
+                    Text(spoke.state == "past_due" ? "Manage billing" : "Reactivate…")
+                        .font(.system(size: 10, weight: .medium, design: .monospaced))
+                        .foregroundStyle(.black.opacity(0.85))
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 3)
+                        .background(Capsule().fill(.orange.opacity(0.85)))
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.vertical, 6)
+        .padding(.horizontal, 8)
+        .background(
+            RoundedRectangle(cornerRadius: 5)
+                .fill(.orange.opacity(0.08))
+        )
     }
 
     func groupRow(_ group: GroupService.GroupSummary, depth: Int) -> some View {

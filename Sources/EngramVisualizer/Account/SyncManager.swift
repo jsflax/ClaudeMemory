@@ -352,15 +352,29 @@ final class SyncManager {
     /// connection failures: "nothing pending" looks identical to "the WSS has
     /// been rejected with 401 for three months" — which happened.
     struct DaemonHealth {
-        let state: String        // connected/disconnected/error/waiting_for_auth/...
+        let state: String        // connected/disconnected/error/waiting_for_auth/idle/...
         let detail: String?
         let lastSyncAt: String?
         let updatedAt: Date?
+        /// Per-group spoke states written by the daemon.
+        let groups: [GroupSpokeHealth]
         var isHealthy: Bool { state == "connected" || state == "starting" }
         var isStale: Bool {
             guard let updatedAt else { return true }
             return Date().timeIntervalSince(updatedAt) > 180
         }
+    }
+
+    /// One group spoke's state. `payment_required` is deliberately NOT an
+    /// error: the group's subscription lapsed, which is a billing prompt
+    /// (with a checkout path for owners), not a failure the user can fix by
+    /// retrying.
+    struct GroupSpokeHealth: Identifiable {
+        let id: String          // group UUID string
+        let name: String
+        let state: String       // connected / past_due / payment_required / error
+        let detail: String?
+        var needsBilling: Bool { state == "payment_required" || state == "past_due" }
     }
     var daemonHealth: DaemonHealth?
 
@@ -373,11 +387,23 @@ final class SyncManager {
             return
         }
         let iso = ISO8601DateFormatter()
+        var spokes: [GroupSpokeHealth] = []
+        if let groups = obj["groups"] as? [String: [String: Any]] {
+            for (groupId, entry) in groups {
+                spokes.append(GroupSpokeHealth(
+                    id: groupId,
+                    name: entry["name"] as? String ?? "group",
+                    state: entry["state"] as? String ?? "unknown",
+                    detail: entry["detail"] as? String))
+            }
+            spokes.sort { $0.name < $1.name }
+        }
         daemonHealth = DaemonHealth(
             state: state,
             detail: obj["detail"] as? String,
             lastSyncAt: obj["lastSyncAt"] as? String,
-            updatedAt: (obj["updatedAt"] as? String).flatMap { iso.date(from: $0) }
+            updatedAt: (obj["updatedAt"] as? String).flatMap { iso.date(from: $0) },
+            groups: spokes
         )
     }
 
