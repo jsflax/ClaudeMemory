@@ -78,11 +78,34 @@ if FileManager.default.fileExists(atPath: syncedDbPath) {
     syncedLattice = nil
 }
 
+// MARK: - Init Group Spokes (optional)
+
+// Reads are MEMBERSHIP-scoped: every group spoke on this machine joins the
+// recall union, regardless of what this member has exposed (exposure gates
+// only what LEAVES the machine). Spoke files are daemon-owned — their
+// presence IS the feature flag, and a revoked membership is a rename the
+// per-read stat() guard picks up. Plain opens: no WSS, no IPC.
+var groupRefs: [MemoryTools.GroupSpokeRef] = []
+for spoke in SyncService.discoverGroupSpokes(claudeDir: claudeDir) {
+    guard let lattice = try? Lattice(
+        Memory.self, Edge.self, GroupProjectMap.self,
+        configuration: .init(fileURL: URL(fileURLWithPath: spoke.path),
+                             migration: engramMigrations)
+    ) else {
+        log("Failed to open group spoke at \(spoke.path)")
+        continue
+    }
+    groupRefs.append(.init(groupId: spoke.groupId, path: spoke.path,
+                           ref: lattice.sendableReference))
+    log("Group spoke \(spoke.groupId.uuidString) at \(spoke.path)")
+}
+
 // MARK: - MCP Server
 
 let tools = MemoryTools(
     localRef: localLattice.sendableReference,
     syncedRef: syncedLattice?.sendableReference,
+    groupRefs: groupRefs,
     embedder: embedder
 )
 

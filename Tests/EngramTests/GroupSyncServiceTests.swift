@@ -122,8 +122,12 @@ private func waitUntil(_ timeout: TimeInterval = 15, _ condition: () -> Bool) as
         channel: SyncService.groupChannel(groupId),
         syncFilter: SyncService.buildGroupSyncFilter(from: hub, groupId: groupId),
         narrowingEmitsRemovals: false)]
-    _ = try Lattice(Memory.self, Edge.self, Checkpoint.self, HookState.self,
-                    SessionState.self, SyncConfig.self, configuration: hubConfig)
+    // RETAINED. This was `_ = try Lattice(...)`, which released the hub's
+    // IPC handle immediately: nothing ever relayed, so the assertion below
+    // passed no matter what the filter said. An "empty means unfiltered"
+    // regression sailed straight through it.
+    let hubWithIPC = try Lattice(Memory.self, Edge.self, Checkpoint.self, HookState.self,
+                                 SessionState.self, SyncConfig.self, configuration: hubConfig)
 
     var spokeConfig = Lattice.Configuration(
         fileURL: URL(fileURLWithPath: SyncService.groupDbPath(claudeDir: claudeDir, groupId: groupId)),
@@ -135,6 +139,20 @@ private func waitUntil(_ timeout: TimeInterval = 15, _ condition: () -> Bool) as
     // The empty-exposure filter must match NOTHING — an "empty means
     // unfiltered" bug here would ship the user's entire database.
     #expect(spoke.objects(Memory.self).isEmpty)
+
+    // POSITIVE CONTROL. Expose the project and push the rebuilt filter down
+    // the SAME channel: the row must now arrive. Without this, an empty
+    // spoke is indistinguishable from a relay that never started, which is
+    // exactly how this test used to fail open.
+    if let config = hub.objects(SyncConfig.self).where({ $0.project == "p" }).first {
+        config.exposedGroups = [groupId.uuidString]
+    }
+    hubWithIPC.updateSyncFilter(
+        SyncService.buildGroupSyncFilter(from: hub, groupId: groupId),
+        forChannel: SyncService.groupChannel(groupId))
+    #expect(await waitUntil {
+        spoke.objects(Memory.self).contains { $0.content == "should stay home" }
+    }, "positive control failed: the relay was never live, so the emptiness asserted above proves nothing")
 }
 
 // MARK: - Spoke → hub: the cross-group firewall

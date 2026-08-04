@@ -65,6 +65,39 @@ public enum SyncService {
         groupDbPath(claudeDir: claudeDir, groupId: groupId) + ".revoked"
     }
 
+    /// Group spokes present on this machine, newest-synced first.
+    ///
+    /// The FILE is the feature flag: the daemon is the only writer, it
+    /// renames a spoke to `.revoked` the moment a membership disappears, and
+    /// reads are membership-scoped (plan decision 3), so "what spokes exist"
+    /// is exactly "what groups may be read". Deliberately NOT intersected
+    /// with groups.json — a stale or missing directory would silently
+    /// blind every group recall, which is the failure this ordering avoids.
+    ///
+    /// Ordered by modification time descending so that when the attach cap
+    /// bites (SQLITE_MAX_ATTACHED, risk 6) the groups that are actually
+    /// moving are the ones that stay attached.
+    public static func discoverGroupSpokes(claudeDir: String) -> [(groupId: UUID, path: String)] {
+        let syncDir = (syncedDbPath(claudeDir: claudeDir) as NSString).deletingLastPathComponent
+        let fm = FileManager.default
+        guard let names = try? fm.contentsOfDirectory(atPath: syncDir) else { return [] }
+        var found: [(groupId: UUID, path: String, mtime: Date)] = []
+        for name in names {
+            // `.revoked` (and any other suffix) must not match: hasPrefix
+            // alone would happily re-attach a quarantined spoke.
+            guard name.hasPrefix("group-"), name.hasSuffix(".sqlite") else { continue }
+            let idPart = String(name.dropFirst("group-".count).dropLast(".sqlite".count))
+            guard let groupId = UUID(uuidString: idPart) else { continue }
+            let path = syncDir + "/" + name
+            let mtime = (try? fm.attributesOfItem(atPath: path)[.modificationDate] as? Date)
+                .flatMap { $0 } ?? .distantPast
+            found.append((groupId, path, mtime))
+        }
+        return found
+            .sorted { $0.mtime > $1.mtime }
+            .map { (groupId: $0.groupId, path: $0.path) }
+    }
+
     /// HUB→SPOKE filter for one group channel: non-private memories of the
     /// projects this member exposed to THAT group, plus edges whose
     /// endpoints both qualify.

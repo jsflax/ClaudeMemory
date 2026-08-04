@@ -41,13 +41,42 @@ public actor MemoryTools {
         return f
     }()
 
+    /// One membership's group spoke, as handed in by the process that opened
+    /// it (`main.swift` for the MCP server, `LatticeHelpers` for hooks).
+    /// The path travels with the handle because revocation is a RENAME —
+    /// re-`stat`ing it per read is how a kicked member stops seeing group
+    /// data at the next recall instead of at process exit.
+    public struct GroupSpokeRef: Sendable {
+        public let groupId: UUID
+        public let path: String
+        public let ref: LatticeThreadSafeReference
+
+        public init(groupId: UUID, path: String, ref: LatticeThreadSafeReference) {
+            self.groupId = groupId
+            self.path = path
+            self.ref = ref
+        }
+    }
+
+    /// Group spokes attached on reads. Reads are MEMBERSHIP-scoped (decision
+    /// 3) — exposure gates only what LEAVES this machine — so every spoke
+    /// participates in every recall, including project-less ones.
+    package let groupSpokes: [(groupId: UUID, path: String, lattice: Lattice)]
+
     /// Resolves sendable references inside the actor's isolation domain.
-    public init(localRef: LatticeThreadSafeReference, syncedRef: LatticeThreadSafeReference?, embedder: EmbeddingService) {
+    public init(localRef: LatticeThreadSafeReference,
+                syncedRef: LatticeThreadSafeReference?,
+                groupRefs: [GroupSpokeRef] = [],
+                embedder: EmbeddingService) {
         guard let local = localRef.resolve() else {
             fatalError("Failed to resolve local lattice reference")
         }
         self.localLattice = local
         self.syncedLattice = syncedRef?.resolve()
+        self.groupSpokes = groupRefs.compactMap { spoke in
+            guard let lattice = spoke.ref.resolve() else { return nil }
+            return (groupId: spoke.groupId, path: spoke.path, lattice: lattice)
+        }
         self.embedder = embedder
         // Hard default, not opt-in: any MemoryTools living inside the
         // maintenance subprocess tree excludes foreign content everywhere.
@@ -58,51 +87,76 @@ public actor MemoryTools {
     /// For synced projects, returns a UNION ALL view spanning both local and synced DBs
     /// so we get local memories + cross-device data in one query.
     /// For local projects, returns localLattice directly.
-    /// Cached attached Lattice — created once, reused across recalls.
-    private var _attachedLattice: Lattice?
+    /// Attach-set-keyed cache of union handles. Keyed rather than single
+    /// because the set genuinely varies within one process: a synced project
+    /// and a local-only project differ, and spokes appear/disappear under
+    /// the daemon. Bounded — every entry is a live SQLite connection.
+    private var attachCache: [String: Lattice] = [:]
+    private static let attachCacheLimit = 6
+
+    /// SQLite's compile-time attach ceiling is 10; leave headroom for
+    /// temp/internal databases. When more spokes exist than fit, the
+    /// newest-synced win (`discoverGroupSpokes` orders by mtime) and the
+    /// drop is LOGGED — a silently truncated union reads as "that memory
+    /// doesn't exist" (risk 6).
+    package static let maxAttachments = 8
+
+    /// Live spokes for this read: `stat()` per call, so a revoked spoke
+    /// (renamed `.revoked` by the daemon) drops out of the union at the next
+    /// recall rather than at process exit.
+    private func liveGroupSpokes() -> [(groupId: UUID, path: String, lattice: Lattice)] {
+        groupSpokes.filter { FileManager.default.fileExists(atPath: $0.path) }
+    }
 
     package func readLattice(for project: String?) -> Lattice {
-        log("[readLattice] enter, project=\(project ?? "nil"), syncedLattice=\(syncedLattice != nil)")
-        guard let syncedLattice, let project else {
-            log("[readLattice] returning localLattice (no sync or no project)")
+        // Personal synced DB: still gated on the project's sync policy —
+        // a local-only project has no business reading the cloud mirror.
+        var includeSynced = false
+        if syncedLattice != nil, let project {
+            if let config = localLattice.objects(SyncConfig.self)
+                .where({ $0.project == project }).first {
+                includeSynced = config.policy == .sync
+            } else if let fallback = localLattice.objects(SyncConfig.self)
+                .where({ $0.project == "_default" }).first {
+                includeSynced = fallback.policy == .sync
+            }
+        }
+
+        // Group spokes attach unconditionally — membership-scoped reads.
+        var spokes = liveGroupSpokes()
+        let budget = Self.maxAttachments - (includeSynced ? 1 : 0)
+        if spokes.count > budget {
+            let dropped = spokes.dropFirst(budget).map { $0.groupId.uuidString }
+            log("[readLattice] ATTACH CAP: \(spokes.count) group spokes exceed the \(budget)-database budget — omitting \(dropped.joined(separator: ", ")) from this read")
+            spokes = Array(spokes.prefix(budget))
+        }
+
+        let attachments: [Lattice] =
+            (includeSynced ? [syncedLattice!] : []) + spokes.map(\.lattice)
+        guard !attachments.isEmpty else { return localLattice }
+
+        let signature = (includeSynced ? "synced|" : "|")
+            + spokes.map(\.path).sorted().joined(separator: "|")
+        if let cached = attachCache[signature] { return cached }
+
+        // `attaching` throws as of Lattice 1.x. A failed ATTACH must not take
+        // down every read path — fall back to local-only and say so LOUDLY:
+        // silent degradation here means recall quietly stops seeing synced
+        // and teammates' memories, the exact failure class this wiring exists
+        // to close.
+        do {
+            var union = try localLattice.attaching(lattice: attachments[0])
+            for extra in attachments.dropFirst() {
+                try union.attach(lattice: extra)
+            }
+            if attachCache.count >= Self.attachCacheLimit { attachCache.removeAll() }
+            attachCache[signature] = union
+            log("[readLattice] union built: local + \(attachments.count) attached (\(signature))")
+            return union
+        } catch {
+            log("[readLattice] ATTACH FAILED (\(error)) — serving LOCAL-ONLY reads for '\(project ?? "nil")'; synced and group memories are invisible until this is resolved")
             return localLattice
         }
-        let isSynced: Bool
-        log("[readLattice] querying SyncConfig for project=\(project)")
-        if let config = localLattice.objects(SyncConfig.self)
-            .where({ $0.project == project }).first {
-            isSynced = config.policy == .sync
-            log("[readLattice] found config, isSynced=\(isSynced)")
-        } else if let fallback = localLattice.objects(SyncConfig.self)
-            .where({ $0.project == "_default" }).first {
-            isSynced = fallback.policy == .sync
-            log("[readLattice] using default config, isSynced=\(isSynced)")
-        } else {
-            isSynced = false
-            log("[readLattice] no config, isSynced=false")
-        }
-        log("[readLattice] about to return, isSynced=\(isSynced)")
-        if isSynced {
-            if _attachedLattice == nil {
-                // `attaching` throws as of Lattice 1.x. A failed ATTACH must
-                // not take down every read path — fall back to local-only
-                // and say so LOUDLY: silent degradation here means recall
-                // quietly stops seeing cross-device memories, which is the
-                // exact failure class the synced-DB wiring exists to close.
-                do {
-                    _attachedLattice = try localLattice.attaching(lattice: syncedLattice)
-                } catch {
-                    log("[readLattice] ATTACH FAILED (\(error)) — serving LOCAL-ONLY reads for '\(project)'; synced memories are invisible until this is resolved")
-                }
-            }
-            if let attached = _attachedLattice {
-                log("[readLattice] returning cached attached lattice")
-                return attached
-            }
-            return localLattice
-        }
-        log("[readLattice] returning localLattice")
-        return localLattice
     }
 
     /// The signed-in user's id for authorUserId stamping — from the
@@ -142,15 +196,41 @@ public actor MemoryTools {
         excludeForeignAuthored = Self.maintenanceEnvironmentDetected || exclude
     }
 
-    /// Foreign = authored by a known other user. Nil-author rows here are
-    /// the user's own legacy rows (hub/synced DBs hold only self-authored
-    /// data — teammate rows never transit the hub). When group spokes
-    /// attach, spoke-RESIDENT nil-author rows must ALSO count as foreign
-    /// (nil never masquerades as self) — revisit at the readLattice
-    /// multi-attach.
+    /// Foreign = authored by a known other user, OR nil-authored and
+    /// resident only in a group spoke.
+    ///
+    /// The second arm is load-bearing. Nil-author rows in the hub/synced
+    /// pair are the user's OWN legacy rows (teammate rows never transit the
+    /// hub — the spoke→hub firewall admits `authorUserId == me` only), so
+    /// treating nil as self is right there. In a spoke, nil means "a
+    /// teammate wrote this before their client stamped authorship" — and nil
+    /// must never masquerade as self, or unattributed teammate content would
+    /// render unlabelled and unfenced straight into an advise injection.
     func isForeignAuthored(_ mem: Memory) -> Bool {
-        guard let author = mem.authorUserId else { return false }
-        return author != currentUserId
+        if let author = mem.authorUserId { return author != currentUserId }
+        guard !groupSpokes.isEmpty, let globalId = mem.globalId else { return false }
+        return !isHubResident(globalId)
+    }
+
+    /// Residency memo. A nil-author spoke row can never LATER become
+    /// hub-resident (the firewall would have to admit it, and it admits only
+    /// `authorUserId == me`), so a cached "no" cannot go stale in the
+    /// dangerous direction.
+    private var hubResidency: [UUID: Bool] = [:]
+
+    /// Whether a row lives in the hub or the personal synced mirror, as
+    /// opposed to only in a group spoke. One indexed point lookup, memoized.
+    func isHubResident(_ globalId: UUID) -> Bool {
+        if let cached = hubResidency[globalId] { return cached }
+        var resident = localLattice.objects(Memory.self)
+            .where { $0.globalId == globalId }.first != nil
+        if !resident, let syncedLattice {
+            resident = syncedLattice.objects(Memory.self)
+                .where { $0.globalId == globalId }.first != nil
+        }
+        if hubResidency.count > 4096 { hubResidency.removeAll() }
+        hubResidency[globalId] = resident
+        return resident
     }
 
     /// Per-memory content cap inside the advise fence.
@@ -210,8 +290,11 @@ public actor MemoryTools {
         }
     }
 
-    /// Finds a memory by globalId, trying localLattice first then syncedLattice.
-    /// Returns the memory and which lattice it was found in.
+    /// Finds a memory by globalId: local, then synced, then group spokes.
+    /// Returns the memory and the lattice that OWNS it — writes must go to
+    /// the owning store so the daemon's synchronizer relays them (a write
+    /// through the union handle lands in whichever store holds the row, but
+    /// callers also branch on which one it is).
     func findMemory(id: UUID) -> (memory: Memory, lattice: Lattice)? {
         if let mem = localLattice.objects(Memory.self)
             .where({ $0.globalId == id }).first {
@@ -222,10 +305,18 @@ public actor MemoryTools {
             .where({ $0.globalId == id }).first {
             return (mem, syncedLattice)
         }
+        for spoke in liveGroupSpokes() {
+            if let mem = spoke.lattice.objects(Memory.self)
+                .where({ $0.globalId == id }).first {
+                return (mem, spoke.lattice)
+            }
+        }
         return nil
     }
 
-    /// Finds an edge by globalId, trying localLattice first then syncedLattice.
+    /// Finds an edge by globalId: local, then synced, then group spokes.
+    /// Group-only edges (both endpoints group-resident) live exclusively in
+    /// a spoke — they never transit the hub, where they would dangle.
     func findEdge(id: UUID) -> (edge: Edge, lattice: Lattice)? {
         if let edge = localLattice.objects(Edge.self)
             .where({ $0.globalId == id }).first {
@@ -236,7 +327,54 @@ public actor MemoryTools {
             .where({ $0.globalId == id }).first {
             return (edge, syncedLattice)
         }
+        for spoke in liveGroupSpokes() {
+            if let edge = spoke.lattice.objects(Edge.self)
+                .where({ $0.globalId == id }).first {
+                return (edge, spoke.lattice)
+            }
+        }
         return nil
+    }
+
+    // MARK: - Group project registry (decision 13)
+
+    private var queryProjectCache: [String: Set<String>] = [:]
+
+    /// Every local project name that means "this project" across the
+    /// attached union.
+    ///
+    /// Members derive `project` from their own folder name, so the same repo
+    /// arrives from a teammate as a DIFFERENT string, and two unrelated repos
+    /// can arrive as the SAME one. `GroupProjectMap` is the reader-side
+    /// resolution: my local name → the group's canonical name → every other
+    /// member's local name for it. Used as an IN-list in the SQL rollups and
+    /// as set membership in recall's project boost, so a teammate's memory
+    /// about the same codebase ranks like my own.
+    ///
+    /// Returns `[localProject]` alone when nothing maps it — the honest
+    /// answer when a project isn't shared, and the safe one when the map
+    /// hasn't synced yet.
+    package func resolveQueryProjects(_ localProject: String) -> Set<String> {
+        if let cached = queryProjectCache[localProject] { return cached }
+        var names: Set<String> = [localProject]
+        let me = currentUserId
+        for spoke in liveGroupSpokes() {
+            // My canonical name(s) for this local project in THIS group.
+            let canonical = Set(spoke.lattice.objects(GroupProjectMap.self)
+                .where { $0.localProject == localProject }
+                .snapshot()
+                .filter { me == nil || $0.memberUserId == me }
+                .map(\.groupProject))
+            guard !canonical.isEmpty else { continue }
+            // Everyone's local name for those canonical names.
+            for row in spoke.lattice.objects(GroupProjectMap.self).snapshot()
+            where canonical.contains(row.groupProject) {
+                names.insert(row.localProject)
+            }
+        }
+        if queryProjectCache.count > 64 { queryProjectCache.removeAll() }
+        queryProjectCache[localProject] = names
+        return names
     }
 
     #if DEBUG

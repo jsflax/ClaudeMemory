@@ -471,14 +471,20 @@ extension MemoryTools {
             // Apply soft project boosting and reinforcement scoring on distances
             sessionLog("[recall] Starting boosting loop (\(nearest.count) items)")
             let now = Date()
+            // Teammates derive `project` from their own folder names, so the
+            // same codebase arrives under a different string. Boost every
+            // local name that maps to the same group project (decision 13),
+            // or the teammate's memory about this very repo ranks as if it
+            // were from an unrelated one.
+            let queryProjects = projectFilter.map { resolveQueryProjects($0) }
             let boosted: [(object: Memory, distance: Double)] = nearest.map { match in
                 let m = match.object
                 let l2Dist = match.distances["embedding"] ?? match.distance
 
                 // Project boost
                 let projectBoost: Double
-                if let projectFilter {
-                    if m.project == projectFilter {
+                if let queryProjects {
+                    if queryProjects.contains(m.project) {
                         projectBoost = 0.7   // same-project: strong boost
                     } else if m.project == "global" {
                         projectBoost = 0.85  // global: moderate boost
@@ -541,9 +547,19 @@ extension MemoryTools {
             // projects: the recalled objects live on the attaching lattice's
             // connection, so the txn wrapped nothing and every bump
             // autocommitted individually.
-            var bumpTargets: [Memory] = filtered.map(\.object)
+            //
+            // Spoke-resident rows are EXCLUDED: bumping one writes into the
+            // group DB, which the daemon relays over WSS to every member —
+            // an O(members) write fan-out per recall, and those remote
+            // entries would perpetually re-trip the reconciliation trigger.
+            // Access stats are personal ranking metadata, so only the copies
+            // that live in the hub or the personal mirror get bumped.
+            var bumpTargets: [Memory] = filtered.map(\.object).filter { m in
+                guard !groupSpokes.isEmpty else { return true }
+                guard let gid = m.globalId else { return false }
+                return isHubResident(gid)
+            }
 
-            let selfId = currentUserId
             let lines = filtered.compactMap { match -> String? in
                 let m = match.object
                 guard let mGid = m.globalId else { return nil }
@@ -555,7 +571,10 @@ extension MemoryTools {
                 // own + legacy rows stay clean. Placement after
                 // [project/topic] is load-bearing: logRecalledMemories
                 // anchors on [id: and the FIRST bracket pair after it.
-                let isForeign = m.authorUserId != nil && m.authorUserId != selfId
+                // Goes through isForeignAuthored so a nil-author row that
+                // exists only in a spoke is caught: an unstamped teammate
+                // memory must not render unlabelled and unfenced.
+                let isForeign = isForeignAuthored(m)
                 let badge = isForeign
                     ? " [by:\(GroupDirectory.badgeName(for: m.authorUserId))]" : ""
                 // Advise-injection path: foreign content renders inside the
@@ -589,8 +608,8 @@ extension MemoryTools {
                 // Value-captured so the filter closure doesn't reference
                 // actor state.
                 let dropForeign = excludeForeignAuthored
-                let traversalSelfId = selfId
-                let connected = traverseGraph(
+                let traversalSelfId = currentUserId
+                let traversed = traverseGraph(
                     from: recalledGlobalIds,
                     depth: depth,
                     excludeGlobalIds: recalledGlobalIds,
@@ -611,11 +630,24 @@ extension MemoryTools {
                         return Double(emb.cosineDistance(to: queryVec)) <= 0.15
                     }
                 )
+                // The in-traversal filter is @Sendable and can't consult
+                // residency, so nil-author spoke rows slip through it. Re-run
+                // the exclusion here, back inside the actor, where
+                // isForeignAuthored sees the whole picture.
+                let connected = dropForeign
+                    ? traversed.filter { !isForeignAuthored($0.memory) }
+                    : traversed
                 log("[recall] Graph traversal returned \(connected.count) connected memories")
                 sessionLog("[recall] Graph traversal returned \(connected.count) connected")
                 if !connected.isEmpty {
                     output += "\n\n--- Connected (graph traversal, depth: \(depth)) ---"
-                    bumpTargets.append(contentsOf: connected.map(\.memory))
+                    // Same spoke-resident exclusion as the direct results:
+                    // a bump on a group row is a write to every member.
+                    bumpTargets.append(contentsOf: connected.map(\.memory).filter { m in
+                        guard !groupSpokes.isEmpty else { return true }
+                        guard let gid = m.globalId else { return false }
+                        return isHubResident(gid)
+                    })
                     for mem in connected {
                         let m = mem.memory
                         guard let memGlobalId = m.globalId else { continue }
@@ -681,7 +713,11 @@ extension MemoryTools {
             let ftsTerms = contentWords.isEmpty ? query.split(separator: " ").map(String.init) : contentWords
             let ftsQuery: TextQuery = ._anyOf(ftsTerms)
             if let projectFilter {
-                results = results.where { $0.project == projectFilter || $0.project == "global" }
+                // IN-list over every local name that maps to the same group
+                // project, so the degraded path scopes the same way the
+                // vector path boosts.
+                let names = Array(resolveQueryProjects(projectFilter)) + ["global"]
+                results = results.where { $0.project.in(names) }
             }
             // Exclusion BEFORE the limit (verification finding): otherwise
             // foreign rows consume limit slots and then get dropped in the

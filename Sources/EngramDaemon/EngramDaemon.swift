@@ -117,15 +117,36 @@ struct EngramDaemon: AsyncParsableCommand {
         // finally to personal-only — corrected at the next membership poll.
         var memberships: [GroupDirectorySync.Membership] = []
         var selfUserId: UUID?
+        // "I asked the server and it told me" vs "I could not ask". ONLY the
+        // former may drive spoke retirement: retireDepartedSpokes reads an
+        // empty set as "this user is in no groups" and quarantines every
+        // spoke + wipes its hub channel state. A 401 on an expired token
+        // would otherwise destroy every group's local mirror (and the
+        // GroupProjectMap rows that live nowhere else) and force a full
+        // re-download once the token refreshes.
+        var membershipsAuthoritative = false
         do {
             let snapshot = try await GroupDirectorySync.fetch(
                 endpoint: credentials.endpoint, token: credentials.token)
             try? GroupDirectorySync.write(snapshot, claudeDir: claudeDir)
             memberships = snapshot.groups
             selfUserId = snapshot.selfUserId
+            membershipsAuthoritative = true
             log("Groups: \(memberships.count) membership(s) fetched")
         } catch GroupDirectorySync.FetchError.unauthorized {
-            log("Groups: unauthorized — running personal-only")
+            // Same treatment as any other failure: a rejected token says
+            // nothing about membership. Fall back to the cached directory so
+            // an expired token degrades to "stale groups" rather than "no
+            // groups" — the poll corrects it once auth recovers.
+            let cached = GroupDirectory.load(from: URL(fileURLWithPath:
+                (SyncService.syncedDbPath(claudeDir: claudeDir) as NSString)
+                    .deletingLastPathComponent + "/groups.json"))
+            memberships = (cached?.groups ?? []).map {
+                GroupDirectorySync.Membership(id: $0.id, name: $0.name, parentId: $0.parentId,
+                                              myRole: $0.myRole, root: $0.root ?? false)
+            }
+            selfUserId = cached?.selfUserId
+            log("Groups: unauthorized — keeping cached directory (\(memberships.count) group(s)); NOT retiring spokes")
         } catch {
             let cached = GroupDirectory.load(from: URL(fileURLWithPath:
                 (SyncService.syncedDbPath(claudeDir: claudeDir) as NSString)
@@ -255,6 +276,13 @@ struct EngramDaemon: AsyncParsableCommand {
         //     lifetime; a dropped reference would tear down the sync
         //     threads that make the spoke a live mirror.
         var groupSpokes: [UUID: Lattice] = [:]
+        // What the BILLING gate decided at startup, per group. The poll
+        // compares against this rather than against "is a spoke running",
+        // because a spoke can be absent for reasons that have nothing to do
+        // with billing (a corrupt or locked spoke file, a failed migration)
+        // — and conflating the two turns one unopenable spoke into a
+        // permanent 5-minute restart loop that also tears down personal sync.
+        var startupPermitted: [UUID: Bool] = [:]
         for membership in memberships {
             // Billing gate BEFORE connecting: a lapsed group subscription
             // makes the relay answer 402 at the WebSocket upgrade, which
@@ -264,6 +292,7 @@ struct EngramDaemon: AsyncParsableCommand {
             // as a billing banner, never as a red failure.
             let billing = await GroupDirectorySync.fetchGroupSubscriptionStatus(
                 endpoint: credentials.endpoint, token: credentials.token, groupId: membership.id)
+            startupPermitted[membership.id] = GroupDirectorySync.groupSyncPermitted(status: billing)
             guard GroupDirectorySync.groupSyncPermitted(status: billing) else {
                 log("Group spoke SKIPPED (billing \(billing ?? "unknown")): \(membership.name)")
                 DaemonStatus.writeSpoke(groupId: membership.id, name: membership.name,
@@ -296,9 +325,16 @@ struct EngramDaemon: AsyncParsableCommand {
         // for forensics), and drop the channel's sync bookkeeping so its
         // stale confirmations can't collapse entries the live channels still
         // need (Stage A6).
-        retireDepartedSpokes(claudeDir: claudeDir,
-                             activeGroupIds: Set(memberships.map(\.id)),
-                             hub: localLattice)
+        //
+        // Gated on an AUTHORITATIVE membership list. Retiring on a cached or
+        // failed fetch would let one bad token wipe every group mirror.
+        if membershipsAuthoritative {
+            retireDepartedSpokes(claudeDir: claudeDir,
+                                 activeGroupIds: Set(memberships.map(\.id)),
+                                 hub: localLattice)
+        } else {
+            log("Skipping spoke retirement — membership list is cached, not authoritative")
+        }
 
         // 7. Observe SyncConfig changes — rebuild filter dynamically
         // A SyncConfig write can change the personal policy OR a project's
@@ -364,7 +400,7 @@ struct EngramDaemon: AsyncParsableCommand {
         startMembershipPoll(claudeDir: claudeDir,
                             credentials: credentials,
                             knownGroupIds: Set(memberships.map(\.id)),
-                            runningSpokeIds: Set(groupSpokes.keys),
+                            startupPermitted: startupPermitted,
                             lockFd: lockFd)
 
         // Handle graceful shutdown
@@ -422,10 +458,23 @@ struct EngramDaemon: AsyncParsableCommand {
                            detail: "PID \(ProcessInfo.processInfo.processIdentifier)")
 
         // 10. Sit forever — launchd manages lifecycle.
-        // withExtendedLifetime keeps the observer token (and other locals)
-        // alive across the never-returning dispatchMain().
-        withExtendedLifetime(syncConfigObserver) {
-            dispatchMain()
+        //
+        // Parked ASYNCHRONOUSLY, not with dispatchMain(). `run()` on an
+        // @main AsyncParsableCommand executes on a cooperative-pool thread,
+        // and dispatch_main() from a non-main thread is a hard client crash
+        // (DISPATCH_CLIENT_CRASH "dispatch_main() must be called on the main
+        // thread") — measured here as SIGTRAP/exit 133, which under launchd's
+        // KeepAlive(SuccessfulExit: false) is a permanent restart loop that
+        // kills the SyncConfig observer microseconds after registering it
+        // (so `memory-sync expose` would silently never take effect).
+        //
+        // The Swift async-main runtime already drains the dispatch main queue
+        // on the real main thread, so the `.main`-queue DispatchSources above
+        // (SIGTERM handler, synced-DB watchdog) keep firing — verified with a
+        // standalone repro before this change.
+        while true {
+            try await Task.sleep(for: .seconds(3600))
+            withExtendedLifetime(syncConfigObserver) {}
         }
     }
 }
@@ -598,7 +647,7 @@ private func startMembershipPoll(
     claudeDir: String,
     credentials: SyncCredentials,
     knownGroupIds: Set<UUID>,
-    runningSpokeIds: Set<UUID>,
+    startupPermitted: [UUID: Bool],
     lockFd: Int32
 ) {
     Task.detached {
@@ -627,8 +676,15 @@ private func startMembershipPoll(
                         endpoint: credentials.endpoint, token: credentials.token,
                         groupId: membership.id)
                     let permitted = GroupDirectorySync.groupSyncPermitted(status: billing)
-                    let wasRunning = runningSpokeIds.contains(membership.id)
-                    if permitted != wasRunning {
+                    // Compare against the DECISION made at startup, not
+                    // against whether a spoke happens to be running: a group
+                    // whose spoke failed to open for a non-billing reason
+                    // would otherwise look like a billing transition on every
+                    // single poll and restart the daemon forever. A group
+                    // this poll has never seen (just joined) has no startup
+                    // decision — the membership check below handles it.
+                    guard let wasPermitted = startupPermitted[membership.id] else { continue }
+                    if permitted != wasPermitted {
                         log("Group billing changed for \(membership.name) (\(billing ?? "unknown")) — restarting")
                         DaemonStatus.write(state: "restarting", detail: "group billing changed")
                         flock(lockFd, LOCK_UN)

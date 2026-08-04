@@ -70,13 +70,33 @@ func initMemoryTools(sessionId: String? = nil) async -> MemoryTools? {
         sessionLog("initMemoryTools: lattice debug logging → \(logPath)", sessionId: sessionId)
     }
 
+    // Group spokes — the same membership-scoped union the MCP server reads.
+    // Without these the advise hook injects only personal memories, which is
+    // the whole point of group sync missing from the surface where teammates'
+    // knowledge is supposed to show up unprompted.
+    var groupRefs: [MemoryTools.GroupSpokeRef] = []
+    for spoke in SyncService.discoverGroupSpokes(claudeDir: claudeDir) {
+        guard let lattice = try? Lattice(
+            Memory.self, Edge.self, GroupProjectMap.self,
+            configuration: .init(fileURL: URL(fileURLWithPath: spoke.path),
+                                 migration: engramMigrations)
+        ) else {
+            sessionLog("initMemoryTools: FAILED to open group spoke at \(spoke.path)", sessionId: sessionId)
+            continue
+        }
+        groupRefs.append(.init(groupId: spoke.groupId, path: spoke.path,
+                               ref: lattice.sendableReference))
+    }
+    sessionLog("initMemoryTools: \(groupRefs.count) group spoke(s) attached", sessionId: sessionId)
+
     let modelPath = ProcessInfo.processInfo.environment["CLAUDE_MEMORY_MODEL"]
     sessionLog("initMemoryTools: loading embedder (modelPath=\(modelPath ?? "bundled"))", sessionId: sessionId)
     let embedder = EmbeddingService(modelPath: modelPath)
     await embedder.load()
     sessionLog("initMemoryTools: embedder loaded", sessionId: sessionId)
 
-    let tools = MemoryTools(localRef: lattice.sendableReference, syncedRef: syncedRef, embedder: embedder)
+    let tools = MemoryTools(localRef: lattice.sendableReference, syncedRef: syncedRef,
+                            groupRefs: groupRefs, embedder: embedder)
     // Every hook recall INJECTS its output into a tool-capable session, so
     // the hook path always fences foreign-authored content; the per-device
     // opt-out ("memory-hooks group-advise off" or the visualizer settings
