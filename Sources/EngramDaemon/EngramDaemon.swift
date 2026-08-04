@@ -5,7 +5,7 @@ import Foundation
 import Lattice
 
 @main
-struct EngramDaemon: ParsableCommand {
+struct EngramDaemon: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "memory-sync",
         abstract: "Engram sync daemon — relays memory changes to the cloud via WSS."
@@ -20,7 +20,7 @@ struct EngramDaemon: ParsableCommand {
     @Flag(name: .long, help: "Nuclear compaction: wipe all sync state and re-sync from scratch")
     var nuclearCompact: Bool = false
 
-    func run() throws {
+    func run() async throws {
         if let logLevel {
             switch logLevel.lowercased() {
             case "debug": Lattice.setLogLevel(.debug)
@@ -110,12 +110,56 @@ struct EngramDaemon: ParsableCommand {
             }
         }
 
+        // Group memberships FIRST: `ipcTargets` is configuration-time only,
+        // so the hub must know every channel before it opens. A fetch
+        // failure falls back to the last-written groups.json (offline) and
+        // finally to personal-only — corrected at the next membership poll.
+        var memberships: [GroupDirectorySync.Membership] = []
+        var selfUserId: UUID?
+        do {
+            let snapshot = try await GroupDirectorySync.fetch(
+                endpoint: credentials.endpoint, token: credentials.token)
+            try? GroupDirectorySync.write(snapshot, claudeDir: claudeDir)
+            memberships = snapshot.groups
+            selfUserId = snapshot.selfUserId
+            log("Groups: \(memberships.count) membership(s) fetched")
+        } catch GroupDirectorySync.FetchError.unauthorized {
+            log("Groups: unauthorized — running personal-only")
+        } catch {
+            let cached = GroupDirectory.load(from: URL(fileURLWithPath:
+                (SyncService.syncedDbPath(claudeDir: claudeDir) as NSString)
+                    .deletingLastPathComponent + "/groups.json"))
+            memberships = (cached?.groups ?? []).map {
+                GroupDirectorySync.Membership(id: $0.id, name: $0.name, parentId: $0.parentId,
+                                              myRole: $0.myRole, root: $0.root ?? false)
+            }
+            selfUserId = cached?.selfUserId
+            log("Groups: fetch failed (\(error)) — using cached directory (\(memberships.count) group(s))")
+        }
+
         // Now open with IPC — replication slot cursor will be 0 after nuclear compact
         var localConfig = Lattice.Configuration(
             fileURL: URL(fileURLWithPath: dbPath),
             migration: engramMigrations
         )
-        localConfig.ipcTargets = [.init(channel: channel)]
+        // One IPC target per sync destination: the personal spoke plus one
+        // per group. Every filter is set HERE, at configuration time — a
+        // spoke that connects before its filter arrives would run
+        // unfiltered, which on a group channel is a cross-group leak
+        // (Stage A2). Independent filters on one database is exactly what
+        // Stage A1's per-sync_id sync set made correct.
+        var hubTargets: [Lattice.IPCSyncTarget] = [
+            .init(channel: channel, syncFilter: SyncService.buildSyncFilter(from: hubFilterSource(dbPath)))
+        ]
+        for membership in memberships {
+            hubTargets.append(.init(
+                channel: SyncService.groupChannel(membership.id),
+                syncFilter: SyncService.buildGroupSyncFilter(
+                    from: hubFilterSource(dbPath), groupId: membership.id),
+                // Stage A4: un-exposing must not delete what the group has.
+                narrowingEmitsRemovals: false))
+        }
+        localConfig.ipcTargets = hubTargets
 
         let localLattice: Lattice
         do {
@@ -137,10 +181,18 @@ struct EngramDaemon: ParsableCommand {
             SyncService.compactBeforeSync(localLattice)
         }
 
-        // 5. Build and push sync filter
-        let filter = SyncService.buildSyncFilter(from: localLattice)
-        localLattice.updateSyncFilter(filter)
-        log("Sync filter applied")
+        // 5. Filters were applied at configuration time (above). Refresh
+        //    them per channel now that the hub is open with real data —
+        //    per-channel, never the fan-to-all overload, which would
+        //    overwrite every group's filter with one of them (Stage A2).
+        localLattice.updateSyncFilter(SyncService.buildSyncFilter(from: localLattice),
+                                      forChannel: channel)
+        for membership in memberships {
+            localLattice.updateSyncFilter(
+                SyncService.buildGroupSyncFilter(from: localLattice, groupId: membership.id),
+                forChannel: SyncService.groupChannel(membership.id))
+        }
+        log("Sync filters applied (personal + \(memberships.count) group channel(s))")
 
         // 6. Open syncedLattice with WSS + IPC (in daemon-owned sync/ directory)
         let syncedDbPath = SyncService.syncedDbPath(claudeDir: claudeDir)
@@ -157,11 +209,47 @@ struct EngramDaemon: ParsableCommand {
         }
         log("Synced lattice opened (WSS: \(credentials.wssEndpoint), db: \(syncedDbPath))")
 
+        // 6b. Group spokes — one per membership. Held for the daemon's
+        //     lifetime; a dropped reference would tear down the sync
+        //     threads that make the spoke a live mirror.
+        var groupSpokes: [UUID: Lattice] = [:]
+        for membership in memberships {
+            guard let spoke = SyncService.openGroupLattice(
+                claudeDir: claudeDir,
+                groupId: membership.id,
+                authToken: credentials.token,
+                wssBase: credentials.httpBase,
+                selfUserId: selfUserId
+            ) else {
+                log("Group spoke FAILED to open: \(membership.name) (\(membership.id))")
+                continue
+            }
+            groupSpokes[membership.id] = spoke
+            log("Group spoke opened: \(membership.name) → group-\(membership.id.uuidString).sqlite")
+        }
+        // Retire spokes for groups we are no longer in: quarantine by rename
+        // so MCP discovery stops attaching them immediately (the file stays
+        // for forensics), and drop the channel's sync bookkeeping so its
+        // stale confirmations can't collapse entries the live channels still
+        // need (Stage A6).
+        retireDepartedSpokes(claudeDir: claudeDir,
+                             activeGroupIds: Set(memberships.map(\.id)),
+                             hub: localLattice)
+
         // 7. Observe SyncConfig changes — rebuild filter dynamically
+        // A SyncConfig write can change the personal policy OR a project's
+        // group exposure — both live in the same row, so every channel is
+        // rebuilt, each against its own filter.
+        let observedGroupIds = memberships.map(\.id)
         let syncConfigObserver = localLattice.observe(SyncConfig.self) { _ in
-            let newFilter = SyncService.buildSyncFilter(from: localLattice)
-            localLattice.updateSyncFilter(newFilter)
-            log("Sync filter rebuilt (SyncConfig changed)")
+            localLattice.updateSyncFilter(SyncService.buildSyncFilter(from: localLattice),
+                                          forChannel: channel)
+            for groupId in observedGroupIds {
+                localLattice.updateSyncFilter(
+                    SyncService.buildGroupSyncFilter(from: localLattice, groupId: groupId),
+                    forChannel: SyncService.groupChannel(groupId))
+            }
+            log("Sync filters rebuilt (SyncConfig changed)")
         }
 
         // 8. Wire sync error, state, and progress logging
@@ -198,6 +286,13 @@ struct EngramDaemon: ParsableCommand {
                                    didSync: progress.acked > 0 && progress.pendingUpload == 0)
             }
         }
+
+        // 8b. Membership poll — group changes rebuild the channel set via
+        //     a launchd-backed restart (ipcTargets are config-time only).
+        startMembershipPoll(claudeDir: claudeDir,
+                            credentials: credentials,
+                            knownGroupIds: Set(memberships.map(\.id)),
+                            lockFd: lockFd)
 
         // Handle graceful shutdown
         signal(SIGTERM, SIG_IGN)
@@ -300,6 +395,13 @@ enum DaemonStatus {
 private struct SyncCredentials {
     let token: String
     let endpoint: String
+    /// ws(s):// base — group channels append /sync/group/<id>.
+    var httpBase: URL {
+        let ws = endpoint
+            .replacingOccurrences(of: "https://", with: "wss://")
+            .replacingOccurrences(of: "http://", with: "ws://")
+        return URL(string: ws)!
+    }
     var wssEndpoint: URL {
         let ws = endpoint
             .replacingOccurrences(of: "https://", with: "wss://")
@@ -329,6 +431,116 @@ private func keychainLoad(service: String, account: String) -> String? {
     let status = SecItemCopyMatching(query as CFDictionary, &result)
     guard status == errSecSuccess, let data = result as? Data else { return nil }
     return String(data: data, encoding: .utf8)
+}
+
+// MARK: - Group spoke lifecycle
+
+/// Opens the hub read-only-ish for filter construction BEFORE the real
+/// (IPC-carrying) open. Filters must exist at configuration time, but the
+/// SyncConfig rows that define them live in the very database being opened —
+/// so read them through a separate plain handle first.
+private func hubFilterSource(_ dbPath: String) -> Lattice {
+    // Plain open: no IPC, no WSS. Same file, so the row set is identical.
+    (try? Lattice(
+        Memory.self, Edge.self, Checkpoint.self,
+        HookState.self, SessionState.self, SyncConfig.self,
+        configuration: .init(fileURL: URL(fileURLWithPath: dbPath),
+                             migration: engramMigrations)
+    )) ?? {
+        // Unreachable in practice (the caller opens the same file moments
+        // later and exits on failure); an in-memory stand-in keeps filter
+        // construction total rather than crashing the daemon.
+        try! Lattice(Memory.self, Edge.self, SyncConfig.self,
+                     configuration: .init(storage: .memory()))
+    }()
+}
+
+/// Quarantine spokes for groups this user is no longer in, and retire their
+/// hub channel state.
+///
+/// Rename rather than delete: MCP discovery globs `group-*.sqlite`, so the
+/// rename stops attachment at once (combined with readLattice's per-call
+/// liveness check, a kicked member's live sessions stop serving group data
+/// at the next recall) while the file survives for forensics.
+private func retireDepartedSpokes(claudeDir: String, activeGroupIds: Set<UUID>, hub: Lattice) {
+    let syncDir = (SyncService.syncedDbPath(claudeDir: claudeDir) as NSString)
+        .deletingLastPathComponent
+    guard let entries = try? FileManager.default.contentsOfDirectory(atPath: syncDir) else { return }
+    for entry in entries where entry.hasPrefix("group-") && entry.hasSuffix(".sqlite") {
+        let idString = String(entry.dropFirst("group-".count).dropLast(".sqlite".count))
+        guard let groupId = UUID(uuidString: idString), !activeGroupIds.contains(groupId) else {
+            continue
+        }
+        // Stage A6: a dead channel's stale sync_state/sync_set rows can let
+        // an audit entry collapse before a LIVE channel relayed it (silent
+        // relay loss), and its stale pending rows pin entries forever.
+        hub.removeSyncChannelState(ipcChannel: SyncService.groupChannel(groupId))
+        let from = syncDir + "/" + entry
+        let to = SyncService.revokedGroupDbPath(claudeDir: claudeDir, groupId: groupId)
+        try? FileManager.default.removeItem(atPath: to)
+        do {
+            try FileManager.default.moveItem(atPath: from, toPath: to)
+            // WAL/SHM siblings follow the database.
+            for suffix in ["-wal", "-shm"] {
+                try? FileManager.default.moveItem(atPath: from + suffix, toPath: to + suffix)
+            }
+            log("Group spoke retired (membership ended): \(entry) → \(to as NSString).lastPathComponent")
+        } catch {
+            log("Group spoke retire FAILED for \(entry): \(error)")
+        }
+    }
+}
+
+/// Poll memberships; relaunch when the set changes.
+///
+/// `ipcTargets` are configuration-time only in the core, so a membership
+/// change cannot be applied in place — the daemon writes the refreshed
+/// directory, then exits NON-zero so launchd restarts it with the new
+/// channel set. Exiting is safe: the hub is a durable queue, and the
+/// restart re-reads every filter from SyncConfig.
+private func startMembershipPoll(
+    claudeDir: String,
+    credentials: SyncCredentials,
+    knownGroupIds: Set<UUID>,
+    lockFd: Int32
+) {
+    Task.detached {
+        while true {
+            // Wake early when the visualizer requests a refresh after an
+            // interactive membership change.
+            var slept = 0
+            while slept < 300 {
+                try? await Task.sleep(for: .seconds(5))
+                slept += 5
+                if GroupDirectorySync.consumeRefreshRequest(claudeDir: claudeDir) {
+                    log("Groups: refresh requested by the app")
+                    break
+                }
+            }
+
+            do {
+                let snapshot = try await GroupDirectorySync.fetch(
+                    endpoint: credentials.endpoint, token: credentials.token)
+                try? GroupDirectorySync.write(snapshot, claudeDir: claudeDir)
+                let current = Set(snapshot.groups.map(\.id))
+                if current != knownGroupIds {
+                    let added = current.subtracting(knownGroupIds).count
+                    let removed = knownGroupIds.subtracting(current).count
+                    log("Groups changed (+\(added)/-\(removed)) — restarting to rebuild IPC targets")
+                    DaemonStatus.write(state: "restarting", detail: "group membership changed")
+                    flock(lockFd, LOCK_UN)
+                    close(lockFd)
+                    // Non-zero: launchd's KeepAlive(SuccessfulExit:false)
+                    // restarts us; a clean exit would NOT come back.
+                    Darwin.exit(1)
+                }
+            } catch GroupDirectorySync.FetchError.unauthorized {
+                log("Groups: poll unauthorized — leaving membership set unchanged")
+            } catch {
+                log("Groups: poll failed (\(error)) — retrying next cycle")
+            }
+        }
+    }
 }
 
 // MARK: - Logging
