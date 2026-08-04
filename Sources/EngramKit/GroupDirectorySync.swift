@@ -137,6 +137,28 @@ public enum GroupDirectorySync {
             members: members)
     }
 
+    /// Whether the PERSONAL subscription entitles personal cloud sync.
+    ///
+    /// Lives here because it shares the authenticated-GET plumbing, and
+    /// because the daemon needs both answers — personal entitlement and
+    /// group memberships — to decide what it is allowed to run. A user with
+    /// no personal subscription but a paid group seat is a first-class
+    /// persona: group sync must work while the personal WSS stays closed
+    /// (the server gates `/sync` behind the personal subscription, so
+    /// opening it would loop on 402 and paint a false error state).
+    ///
+    /// Unreachable server ⇒ nil: "unknown", which callers treat as
+    /// "keep whatever you were doing" rather than tearing sync down on a
+    /// transient network failure.
+    public static func fetchPersonalSyncEnabled(endpoint: String, token: String) async -> Bool? {
+        guard let base = URL(string: endpoint) else { return nil }
+        let url = base.appendingPathComponent("subscriptions").appendingPathComponent("status")
+        guard let data = try? await get(url, token: token) else { return nil }
+        struct StatusDTO: Decodable { let status: String }
+        guard let dto = try? decoder().decode(StatusDTO.self, from: data) else { return nil }
+        return dto.status == "active" || dto.status == "trialing"
+    }
+
     /// Write `groups.json` atomically at 0600. Atomic because short-lived
     /// readers (hooks) can open it at any instant; a torn write would make
     /// every author render as "unknown" for that session.

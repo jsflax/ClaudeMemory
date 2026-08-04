@@ -150,7 +150,15 @@ struct EngramApp: App {
                 .ignoresSafeArea()
                 .onAppear {
                     syncManager.initialize(lattice: localLattice)
+                    // Signed in is enough to run the daemon: a group seat is
+                    // billed on the group, so waiting for a PERSONAL
+                    // subscription would leave group-only members with no
+                    // sync. The daemon decides what it may actually open.
+                    if accountService.isSignedIn { syncManager.startDaemonIfSignedIn() }
                     autoConnectSync()
+                }
+                .onChange(of: accountService.isSignedIn) { _, signedIn in
+                    if signedIn { syncManager.startDaemonIfSignedIn() }
                 }
                 .onChange(of: accountService.subscription?.isActive) { _, active in
                     if active == true {

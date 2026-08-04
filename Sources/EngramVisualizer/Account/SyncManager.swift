@@ -302,6 +302,20 @@ final class SyncManager {
             await actor.connectSync(wssEndpoint: wssEndpoint, authToken: authToken)
         }
     }
+
+    /// Start the sync daemon for a signed-in user REGARDLESS of personal
+    /// subscription state.
+    ///
+    /// The daemon is the only thing that opens group spokes, and group seats
+    /// are billed on the group's own subscription — so gating its launch on
+    /// a personal subscription (which is what `connectSync` does, since it
+    /// is reachable only via `syncWebSocketURL`) left a paid group member
+    /// with no sync at all. The daemon itself decides what it may run:
+    /// personal spoke only when entitled, group spokes per membership, and
+    /// idle when neither applies.
+    func startDaemonIfSignedIn() {
+        CLIInstaller.startDaemon()
+    }
     func disconnectSync() {
         Task {
             await actor.disconnectSync()

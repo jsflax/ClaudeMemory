@@ -137,6 +137,42 @@ struct EngramDaemon: AsyncParsableCommand {
             log("Groups: fetch failed (\(error)) — using cached directory (\(memberships.count) group(s))")
         }
 
+        // Personal entitlement decides whether the PERSONAL spoke may open.
+        // Group seats are billed separately, so a user with no personal
+        // subscription but a paid group seat is a first-class persona:
+        // their group sync must work while /sync (personal) stays closed —
+        // opening it would loop on 402 and paint a false error state.
+        // Unknown (server unreachable) is treated as ENABLED so a transient
+        // outage never silently downgrades a paying user to group-only.
+        let personalSyncEnabled = await GroupDirectorySync.fetchPersonalSyncEnabled(
+            endpoint: credentials.endpoint, token: credentials.token) ?? true
+
+        if !personalSyncEnabled && memberships.isEmpty {
+            // Nothing to sync — but do NOT exit: launchd will not restart a
+            // clean exit, and the user may subscribe or accept an invite at
+            // any moment. Idle and re-check on the same cadence as the
+            // membership poll.
+            log("No personal subscription and no group memberships — idling until entitlements change")
+            DaemonStatus.write(state: "idle",
+                               detail: "No active subscription or group membership.")
+            while true {
+                sleep(300)
+                let groupsNow = (try? await GroupDirectorySync.fetch(
+                    endpoint: credentials.endpoint, token: credentials.token))?.groups ?? []
+                let personalNow = await GroupDirectorySync.fetchPersonalSyncEnabled(
+                    endpoint: credentials.endpoint, token: credentials.token) ?? false
+                if personalNow || !groupsNow.isEmpty {
+                    log("Entitlements changed (personal: \(personalNow), groups: \(groupsNow.count)) — restarting")
+                    flock(lockFd, LOCK_UN)
+                    close(lockFd)
+                    Darwin.exit(1)   // launchd restarts on non-zero
+                }
+            }
+        }
+        if !personalSyncEnabled {
+            log("Personal sync disabled (no active personal subscription) — running GROUP-ONLY with \(memberships.count) spoke(s)")
+        }
+
         // Now open with IPC — replication slot cursor will be 0 after nuclear compact
         var localConfig = Lattice.Configuration(
             fileURL: URL(fileURLWithPath: dbPath),
@@ -194,20 +230,25 @@ struct EngramDaemon: AsyncParsableCommand {
         }
         log("Sync filters applied (personal + \(memberships.count) group channel(s))")
 
-        // 6. Open syncedLattice with WSS + IPC (in daemon-owned sync/ directory)
+        // 6. Open syncedLattice with WSS + IPC (in daemon-owned sync/ directory).
+        //    Skipped entirely for the group-only persona — see above.
         let syncedDbPath = SyncService.syncedDbPath(claudeDir: claudeDir)
-        guard let syncedLattice = SyncService.openSyncedLattice(
-            claudeDir: claudeDir,
-            authToken: credentials.token,
-            wssEndpoint: credentials.wssEndpoint,
-            channel: channel
-        ) else {
-            log("Failed to open synced database")
-            flock(lockFd, LOCK_UN)
-            close(lockFd)
-            throw ExitCode.failure
+        var syncedLattice: Lattice?
+        if personalSyncEnabled {
+            guard let opened = SyncService.openSyncedLattice(
+                claudeDir: claudeDir,
+                authToken: credentials.token,
+                wssEndpoint: credentials.wssEndpoint,
+                channel: channel
+            ) else {
+                log("Failed to open synced database")
+                flock(lockFd, LOCK_UN)
+                close(lockFd)
+                throw ExitCode.failure
+            }
+            syncedLattice = opened
+            log("Synced lattice opened (WSS: \(credentials.wssEndpoint), db: \(syncedDbPath))")
         }
-        log("Synced lattice opened (WSS: \(credentials.wssEndpoint), db: \(syncedDbPath))")
 
         // 6b. Group spokes — one per membership. Held for the daemon's
         //     lifetime; a dropped reference would tear down the sync
@@ -262,6 +303,7 @@ struct EngramDaemon: AsyncParsableCommand {
             }
         }
 
+        if let syncedLattice {
         syncedLattice.onSyncError { error in
             log("WSS error: \(error)")
             DaemonStatus.write(state: "error", detail: "\(error)")
@@ -285,6 +327,13 @@ struct EngramDaemon: AsyncParsableCommand {
                                    pendingUpload: progress.pendingUpload,
                                    didSync: progress.acked > 0 && progress.pendingUpload == 0)
             }
+        }
+        } else {
+            // Group-only: there is no personal WSS to report on, so publish
+            // a state the UI can render as healthy rather than leaving the
+            // health file stuck on "starting" forever.
+            DaemonStatus.write(state: "connected",
+                               detail: "Group sync only (no personal subscription)")
         }
 
         // 8b. Membership poll — group changes rebuild the channel set via
