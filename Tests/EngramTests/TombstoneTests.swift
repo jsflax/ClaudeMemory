@@ -28,8 +28,8 @@ private func makeToolsWithLattice() async throws -> ToolsContext {
 }
 
 /// Marks a project as exposed to a group (what setGroupExposure will do).
-private func expose(_ project: String, in lattice: Lattice) {
-    lattice.add(SyncConfig(project: project, policy: .sync, exposedTeams: ["group-1"]))
+private func expose(_ project: String, in lattice: Lattice) throws {
+    try lattice.add(SyncConfig(project: project, policy: .sync, exposedTeams: ["group-1"]))
 }
 
 private func remember(_ tools: MemoryTools, _ content: String, project: String) async throws -> UUID {
@@ -46,7 +46,7 @@ private func remember(_ tools: MemoryTools, _ content: String, project: String) 
 
 @Test func forget_groupShared_tombstonesAndRestores() async throws {
     let ctx = try await makeToolsWithLattice()
-    expose("shared-proj", in: ctx.lattice)
+    try expose("shared-proj", in: ctx.lattice)
     let gid = try await remember(ctx.tools, "Deploy uses blue-green with 5m soak", project: "shared-proj")
 
     let forgetOut = text(from: try await ctx.tools.handle(CallTool.Parameters(
@@ -55,7 +55,7 @@ private func remember(_ tools: MemoryTools, _ content: String, project: String) 
     #expect(forgetOut.contains("undelete"))
 
     // Row survives with a tombstone — NOT hard-deleted.
-    let row = ctx.lattice.objects(Memory.self).where { $0.__globalId == gid }.first
+    let row = ctx.lattice.objects(Memory.self).where { $0.globalId == gid }.first
     #expect(row != nil)
     #expect(row?.deletedAt != nil)
 
@@ -74,7 +74,7 @@ private func remember(_ tools: MemoryTools, _ content: String, project: String) 
     let undeleteOut = text(from: try await ctx.tools.handle(CallTool.Parameters(
         name: "update", arguments: ["id": .string(gid.uuidString), "undelete": .bool(true)])))
     #expect(undeleteOut.contains("undeleted"))
-    let restored = ctx.lattice.objects(Memory.self).where { $0.__globalId == gid }.first
+    let restored = ctx.lattice.objects(Memory.self).where { $0.globalId == gid }.first
     #expect(restored?.deletedAt == nil)
     let recallAfter = text(from: try await ctx.tools.handle(CallTool.Parameters(
         name: "recall", arguments: ["query": .string("blue-green deploy soak"), "project": .string("shared-proj")])))
@@ -89,12 +89,12 @@ private func remember(_ tools: MemoryTools, _ content: String, project: String) 
         name: "forget", arguments: ["id": .string(gid.uuidString)])))
     #expect(out.contains("Deleted memory"))
     #expect(!out.contains("tombstoned"))
-    #expect(ctx.lattice.objects(Memory.self).where { $0.__globalId == gid }.first == nil)
+    #expect(ctx.lattice.objects(Memory.self).where { $0.globalId == gid }.first == nil)
 }
 
 @Test func forget_bulk_partitionsSharedFromPrivate() async throws {
     let ctx = try await makeToolsWithLattice()
-    expose("mixed-proj", in: ctx.lattice)
+    try expose("mixed-proj", in: ctx.lattice)
     let sharedGid = try await remember(ctx.tools, "Shared team knowledge about the API gateway", project: "mixed-proj")
     // A PRIVATE row in the same exposed project never leaves the machine —
     // it keeps the hard delete.
@@ -110,14 +110,14 @@ private func remember(_ tools: MemoryTools, _ content: String, project: String) 
     #expect(out.contains("1 deleted"))
     #expect(out.contains("1 group-shared → tombstoned"))
 
-    #expect(ctx.lattice.objects(Memory.self).where { $0.__globalId == privGid }.first == nil)
-    let sharedRow = ctx.lattice.objects(Memory.self).where { $0.__globalId == sharedGid }.first
+    #expect(ctx.lattice.objects(Memory.self).where { $0.globalId == privGid }.first == nil)
+    let sharedRow = ctx.lattice.objects(Memory.self).where { $0.globalId == sharedGid }.first
     #expect(sharedRow?.deletedAt != nil)
 }
 
 @Test func tombstonedNeighbor_excludedFromGraphTraversal() async throws {
     let ctx = try await makeToolsWithLattice()
-    expose("graph-proj", in: ctx.lattice)
+    try expose("graph-proj", in: ctx.lattice)
     let a = try await remember(ctx.tools, "Root concept: retry budgets", project: "graph-proj")
     let b = try await remember(ctx.tools, "Detail: exponential backoff caps at 60s", project: "graph-proj")
     _ = try await ctx.tools.handle(CallTool.Parameters(
@@ -147,7 +147,7 @@ private func remember(_ tools: MemoryTools, _ content: String, project: String) 
         topic: "debugging", project: "badge-proj",
         embedding: Vector<Float>(try await sharedEmbedder.embed(text: "Teammate insight: the flaky test is timezone-dependent")!),
         authorUserId: foreignAuthor)
-    ctx.lattice.add(mem)
+    try ctx.lattice.add(mem)
     _ = try await remember(ctx.tools, "My own note about test flakiness", project: "badge-proj")
 
     let out = text(from: try await ctx.tools.handle(CallTool.Parameters(
@@ -178,14 +178,14 @@ private func remember(_ tools: MemoryTools, _ content: String, project: String) 
         topic: "ci", project: "authz-proj",
         embedding: Vector<Float>(try await sharedEmbedder.embed(text: "Foreign-authored group memory about CI caching")!),
         authorUserId: foreignAuthor)
-    ctx.lattice.add(mem)
-    let gid = mem.__globalId!
+    try ctx.lattice.add(mem)
+    let gid = mem.globalId!
 
     // Privacy flip on a teammate's row is refused…
     let flipOut = text(from: try await ctx.tools.handle(CallTool.Parameters(
         name: "update", arguments: ["id": .string(gid.uuidString), "is_private": .bool(true)])))
     #expect(flipOut.contains("author-only"))
-    #expect(ctx.lattice.objects(Memory.self).where { $0.__globalId == gid }.first?.isPrivate == false)
+    #expect(ctx.lattice.objects(Memory.self).where { $0.globalId == gid }.first?.isPrivate == false)
 
     // …but ordinary edits are flat-trust, with a group-share note.
     let editOut = text(from: try await ctx.tools.handle(CallTool.Parameters(
@@ -202,8 +202,8 @@ private func remember(_ tools: MemoryTools, _ content: String, project: String) 
         topic: "general", project: "cons-proj",
         embedding: Vector<Float>(try await sharedEmbedder.embed(text: "Teammate memory about connection pooling limits")!),
         authorUserId: UUID())
-    ctx.lattice.add(foreign)
-    let foreignGid = foreign.__globalId!
+    try ctx.lattice.add(foreign)
+    let foreignGid = foreign.globalId!
 
     let refuseOut = text(from: try await ctx.tools.handle(CallTool.Parameters(
         name: "consolidate",
@@ -212,8 +212,8 @@ private func remember(_ tools: MemoryTools, _ content: String, project: String) 
     #expect(refuseOut.contains("teammates"))
     #expect(refuseOut.contains("force"))
     // Foreign member untouched.
-    #expect(ctx.lattice.objects(Memory.self).where { $0.__globalId == foreignGid }.first?.importance != 0 ||
-            ctx.lattice.objects(Memory.self).where { $0.__globalId == foreignGid }.first != nil)
+    #expect(ctx.lattice.objects(Memory.self).where { $0.globalId == foreignGid }.first?.importance != 0 ||
+            ctx.lattice.objects(Memory.self).where { $0.globalId == foreignGid }.first != nil)
 
     let forcedOut = text(from: try await ctx.tools.handle(CallTool.Parameters(
         name: "consolidate",
@@ -227,7 +227,7 @@ private func remember(_ tools: MemoryTools, _ content: String, project: String) 
 
 @Test func timeline_excludesTombstoned() async throws {
     let ctx = try await makeToolsWithLattice()
-    expose("tl-proj", in: ctx.lattice)
+    try expose("tl-proj", in: ctx.lattice)
     let gid = try await remember(ctx.tools, "Timeline-visible memory about migrations", project: "tl-proj")
     _ = try await ctx.tools.handle(CallTool.Parameters(
         name: "forget", arguments: ["id": .string(gid.uuidString)]))
@@ -239,7 +239,7 @@ private func remember(_ tools: MemoryTools, _ content: String, project: String) 
 
 @Test func undelete_revivesEdgesAndConnectRevivesTombstonedEdge() async throws {
     let ctx = try await makeToolsWithLattice()
-    expose("edge-proj", in: ctx.lattice)
+    try expose("edge-proj", in: ctx.lattice)
     let a = try await remember(ctx.tools, "Hub note on cache invalidation strategies", project: "edge-proj")
     let b = try await remember(ctx.tools, "Detail on TTL-based cache invalidation", project: "edge-proj")
     _ = try await ctx.tools.handle(CallTool.Parameters(
@@ -274,11 +274,11 @@ private func remember(_ tools: MemoryTools, _ content: String, project: String) 
 
 @Test func merge_refusesTombstonedSources() async throws {
     let ctx = try await makeToolsWithLattice()
-    expose("merge-proj", in: ctx.lattice)
+    try expose("merge-proj", in: ctx.lattice)
     let live = try await remember(ctx.tools, "Live memory about rate limiting", project: "merge-proj")
     let dead = try await remember(ctx.tools, "Soon-tombstoned memory about rate limiting", project: "merge-proj")
     _ = try await ctx.tools.handle(CallTool.Parameters(name: "forget", arguments: ["id": .string(dead.uuidString)]))
-    let deadRow = ctx.lattice.objects(Memory.self).where { $0.__globalId == dead }.first
+    let deadRow = ctx.lattice.objects(Memory.self).where { $0.globalId == dead }.first
     let originalDeletedAt = deadRow?.deletedAt
 
     let out = text(from: try await ctx.tools.handle(CallTool.Parameters(
@@ -288,12 +288,12 @@ private func remember(_ tools: MemoryTools, _ content: String, project: String) 
     #expect(out.contains("tombstoned"))
     #expect(out.contains("undelete"))
     // Tombstone attribution untouched (no deletedBy/At clobber).
-    #expect(ctx.lattice.objects(Memory.self).where { $0.__globalId == dead }.first?.deletedAt == originalDeletedAt)
+    #expect(ctx.lattice.objects(Memory.self).where { $0.globalId == dead }.first?.deletedAt == originalDeletedAt)
 }
 
 @Test func graph_onTombstonedRoot_returnsNotice() async throws {
     let ctx = try await makeToolsWithLattice()
-    expose("root-proj", in: ctx.lattice)
+    try expose("root-proj", in: ctx.lattice)
     let gid = try await remember(ctx.tools, "Root memory soon to be tombstoned", project: "root-proj")
     _ = try await ctx.tools.handle(CallTool.Parameters(name: "forget", arguments: ["id": .string(gid.uuidString)]))
 

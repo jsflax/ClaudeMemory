@@ -463,7 +463,7 @@ final class MockGraphProvider: SceneDataProvider {
 
             var dbNodeIds: Set<UUID> = []
             for memory in lattice.objects(Memory.self) {
-                guard let globalId = memory.__globalId else { continue }
+                guard let globalId = memory.globalId else { continue }
                 let project = memory.project
                 let topic = memory.topic
 
@@ -487,7 +487,7 @@ final class MockGraphProvider: SceneDataProvider {
             }
 
             for edge in lattice.objects(Edge.self) {
-                guard let globalId = edge.__globalId else { continue }
+                guard let globalId = edge.globalId else { continue }
                 newEdges.append(RKEdgeSnapshot(
                     id: globalId,
                     sourceId: edge.sourceGlobalId,

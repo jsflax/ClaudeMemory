@@ -23,9 +23,9 @@ extension MemoryTools {
         let floats = try await embedder.embed(text: title)
         let embeddingVec = floats.map { Vector<Float>($0) } ?? Vector<Float>([])
         let episode = Memory(content: title, topic: "episode", project: project, embedding: embeddingVec)
-        localLattice.add(episode)
+        try localLattice.add(episode)
 
-        guard let episodeGid = episode.__globalId else {
+        guard let episodeGid = episode.globalId else {
             throw MCPError.internalError("Failed to persist episode memory — globalId is nil after add()")
         }
         activeEpisodeId = episodeGid
@@ -111,7 +111,7 @@ extension MemoryTools {
         let me = currentUserId
         var members: [Memory] = []
         for edge in edges {
-            if let mem = episodeLattice.objects(Memory.self).where({ $0.__globalId == edge.sourceGlobalId && $0.topic != "episode" && $0.deletedAt == nil }).first {
+            if let mem = episodeLattice.objects(Memory.self).where({ $0.globalId == edge.sourceGlobalId && $0.topic != "episode" && $0.deletedAt == nil }).first {
                 if dropForeign, let author = mem.authorUserId, author != me { continue }
                 members.append(mem)
             }
@@ -149,7 +149,7 @@ extension MemoryTools {
 
             for mem in limited {
                 let time = timeFormatter.string(from: mem.createdAt)
-                let memGid = mem.__globalId?.uuidString ?? "?"
+                let memGid = mem.globalId?.uuidString ?? "?"
                 output += "\n[id:\(memGid)] [\(time)] \(mem.content)"
             }
 
@@ -168,7 +168,7 @@ extension MemoryTools {
         let limit = a.limit?.value ?? 20
 
         let db = readLattice(for: a.project)
-        var results = db.objects(Memory.self).distinct(by: \.__globalId).where { $0.topic == "episode" && $0.deletedAt == nil }
+        var results = db.objects(Memory.self).distinct(by: \.globalId).where { $0.topic == "episode" && $0.deletedAt == nil }
 
         if excludeForeignAuthored {
             let me = currentUserId
@@ -186,7 +186,7 @@ extension MemoryTools {
         }
 
         let lines = limited.compactMap { ep -> String? in
-            guard let epGid = ep.__globalId else { return nil }
+            guard let epGid = ep.globalId else { return nil }
             let memCount = countEpisodeMembers(epGid)
             let isActive = activeEpisodeId == epGid
             let startDate = Self.dateFormatter.string(from: ep.createdAt)
@@ -232,7 +232,7 @@ extension MemoryTools {
         let edges = episodeLattice.objects(Edge.self).where { $0.targetGlobalId == episodeGid && $0.relation == .partOf }
         var latest = startedAt
         for edge in edges {
-            if let mem = episodeLattice.objects(Memory.self).where({ $0.__globalId == edge.sourceGlobalId && $0.deletedAt == nil }).first {
+            if let mem = episodeLattice.objects(Memory.self).where({ $0.globalId == edge.sourceGlobalId && $0.deletedAt == nil }).first {
                 if mem.createdAt > latest { latest = mem.createdAt }
             }
         }

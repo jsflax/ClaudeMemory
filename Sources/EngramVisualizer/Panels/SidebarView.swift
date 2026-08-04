@@ -363,8 +363,12 @@ struct SidebarView: View {
             row.value = include ? "true" : "false"
             row.updatedAt = Date()
         } else {
-            lattice.add(HookState(key: .adviseIncludeGroupMemories,
-                                  value: include ? "true" : "false"))
+            do {
+                try lattice.add(HookState(key: .adviseIncludeGroupMemories,
+                                          value: include ? "true" : "false"))
+            } catch {
+                print("[Sidebar] advise opt-out write failed: \(error)")
+            }
         }
     }
 

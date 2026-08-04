@@ -17,7 +17,7 @@ extension MemoryTools {
         // Fetch all non-expired, non-episode memories for the project
         let db = readLattice(for: project)
         var query = db.objects(Memory.self).where { $0.deletedAt == nil }
-            .distinct(by: \.__globalId)
+            .distinct(by: \.globalId)
             .where { $0.project == project && $0.expiresAt > Date() && $0.topic != "episode" }
         if excludeForeignAuthored {
             // Maintenance guard: community detection is part of the
@@ -35,10 +35,10 @@ extension MemoryTools {
         }
 
         // Build memory globalId set and lookup
-        let memoryGlobalIds = Set(allMemories.compactMap(\.__globalId))
+        let memoryGlobalIds = Set(allMemories.compactMap(\.globalId))
         let memoryMapByGlobalId: [UUID: Memory] = Dictionary(
             uniqueKeysWithValues: allMemories.compactMap { m in
-                guard let gid = m.__globalId else { return nil }
+                guard let gid = m.globalId else { return nil }
                 return (gid, m)
             }
         )
@@ -47,7 +47,7 @@ extension MemoryTools {
         var adjacency: [UUID: Set<UUID>] = [:]
         for gid in memoryGlobalIds { adjacency[gid] = [] }
 
-        let edges = db.objects(Edge.self).distinct(by: \.__globalId).snapshot()
+        let edges = db.objects(Edge.self).distinct(by: \.globalId).snapshot()
         for edge in edges {
             guard memoryGlobalIds.contains(edge.sourceGlobalId) && memoryGlobalIds.contains(edge.targetGlobalId) else { continue }
             adjacency[edge.sourceGlobalId, default: []].insert(edge.targetGlobalId)
@@ -132,9 +132,9 @@ extension MemoryTools {
             source: "organize",
             embedding: hubEmbedding
         )
-        localLattice.add(hub)
+        try localLattice.add(hub)
 
-        guard let hubGlobalId = hub.__globalId else {
+        guard let hubGlobalId = hub.globalId else {
             return CallTool.Result(content: [.text("Failed to get hub globalId.")], isError: true)
         }
 
@@ -143,7 +143,7 @@ extension MemoryTools {
             for gid in ids {
                 if let mem = memories[gid] {
                     let edge = Edge(sourceGlobalId: gid, targetGlobalId: hubGlobalId, relation: .partOf, authorUserId: currentUserId)
-                    localLattice.add(edge)
+                    try localLattice.add(edge)
                     mem.topic = label
                 }
             }

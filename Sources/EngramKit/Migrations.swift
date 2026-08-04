@@ -55,7 +55,7 @@ nonisolated(unsafe) public let engramMigrations: [Int: Migration] = [
         blocks: { (old: V1.Edge, new: EngramModels.Edge) in
             // Look up source memory by old Int64 primary key
             if let sourceMem = Migration.lookup(Memory.self, id: old.sourceId),
-               let sourceGlobalId = sourceMem.__globalId {
+               let sourceGlobalId = sourceMem.globalId {
                 new.sourceGlobalId = sourceGlobalId
             } else {
                 // Orphan edge — source memory was deleted
@@ -64,7 +64,7 @@ nonisolated(unsafe) public let engramMigrations: [Int: Migration] = [
 
             // Look up target memory by old Int64 primary key
             if let targetMem = Migration.lookup(Memory.self, id: old.targetId),
-               let targetGlobalId = targetMem.__globalId {
+               let targetGlobalId = targetMem.globalId {
                 new.targetGlobalId = targetGlobalId
             } else {
                 // Orphan edge — target memory was deleted

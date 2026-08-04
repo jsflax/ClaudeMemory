@@ -288,7 +288,7 @@ func recallDoesNotHangOnAttachedLattice() async throws {
 
     // Create the attached view AFTER vacuum — attaching() opens a new connection,
     // which must see the clean vec0 state, not the pre-vacuum bloated one.
-    let combined = local.attaching(lattice: synced)
+    let combined = try local.attaching(lattice: synced)
     let combinedCount = combined.objects(Memory.self).count
     print("Combined (UNION ALL): \(combinedCount) memories")
 
@@ -369,7 +369,7 @@ private func cosineSimilarity(_ a: [Float], _ b: [Float]) -> Float {
     for (i, match) in l2Memories.prefix(10).enumerated() {
         let m = match.object
         let dist = match.distance
-        print("  \(i + 1). [id:\(m.__globalId)] d=\(String(format: "%.4f", dist)) [\(m.project ?? "?")/\(m.topic ?? "?")] \(String(m.content.prefix(80)))")
+        print("  \(i + 1). [id:\(m.globalId)] d=\(String(format: "%.4f", dist)) [\(m.project ?? "?")/\(m.topic ?? "?")] \(String(m.content.prefix(80)))")
     }
 
     // Step 3: Vector-only cosine for comparison (brute-force, no index)
@@ -382,7 +382,7 @@ private func cosineSimilarity(_ a: [Float], _ b: [Float]) -> Float {
     for (i, match) in cosMemories.prefix(10).enumerated() {
         let m = match.object
         let dist = match.distance
-        print("  \(i + 1). [id:\(m.__globalId)] d=\(String(format: "%.4f", dist)) [\(m.project ?? "?")/\(m.topic ?? "?")] \(String(m.content.prefix(80)))")
+        print("  \(i + 1). [id:\(m.globalId)] d=\(String(format: "%.4f", dist)) [\(m.project ?? "?")/\(m.topic ?? "?")] \(String(m.content.prefix(80)))")
     }
 
     // Step 4: FTS5 re-rank on L2 candidates (application-side term overlap scoring)
@@ -402,7 +402,7 @@ private func cosineSimilarity(_ a: [Float], _ b: [Float]) -> Float {
     print("\nL2 + FTS re-ranked (top 5):")
     for (i, item) in reranked.prefix(5).enumerated() {
         let m = item.match.object
-        print("  \(i + 1). [id:\(m.__globalId)] d=\(String(format: "%.4f", item.match.distance)) fts=\(String(format: "%.2f", item.ftsScore)) [\(m.project ?? "?")/\(m.topic ?? "?")] \(String(m.content.prefix(80)))")
+        print("  \(i + 1). [id:\(m.globalId)] d=\(String(format: "%.4f", item.match.distance)) fts=\(String(format: "%.2f", item.ftsScore)) [\(m.project ?? "?")/\(m.topic ?? "?")] \(String(m.content.prefix(80)))")
     }
 
     // Step 5: Compare with current approach (FTS5 + cosine, slow)
@@ -413,8 +413,8 @@ private func cosineSimilarity(_ a: [Float], _ b: [Float]) -> Float {
     print("\nCurrent FTS5+cosine depth=0: \(oldMs)ms (\(resultOld?.count ?? 0) chars)")
 
     // Do the L2 and cosine results overlap?
-    let l2Ids = Set(l2Memories.prefix(10).map { $0.object.__globalId })
-    let cosIds = Set(cosMemories.prefix(10).map { $0.object.__globalId })
+    let l2Ids = Set(l2Memories.prefix(10).map { $0.object.globalId })
+    let cosIds = Set(cosMemories.prefix(10).map { $0.object.globalId })
     let overlap = l2Ids.intersection(cosIds)
     print("\nTop-10 overlap (L2 vs cosine): \(overlap.count)/10 shared IDs")
 

@@ -165,8 +165,13 @@ struct EngramDaemon: ParsableCommand {
         }
 
         // 8. Wire sync error, state, and progress logging
-        localLattice.onSyncProgress { progress in
-            log("IPC relay: acked=\(progress.acked) total=\(progress.totalUpload) pending=\(progress.pendingUpload) uploading=\(progress.isUploading)")
+        // Lattice 1.x: the callback registrations became AsyncStreams.
+        // Consume them in detached tasks that live as long as the daemon.
+        let ipcProgressStream = localLattice.syncProgressStream
+        Task.detached {
+            for await progress in ipcProgressStream {
+                log("IPC relay: acked=\(progress.acked) total=\(progress.totalUpload) pending=\(progress.pendingUpload) uploading=\(progress.isUploading)")
+            }
         }
 
         syncedLattice.onSyncError { error in
@@ -179,16 +184,19 @@ struct EngramDaemon: ParsableCommand {
             DaemonStatus.write(state: connected ? "connected" : "disconnected", detail: nil)
         }
 
-        syncedLattice.onSyncProgress { progress in
-            if progress.isUploading {
-                log("WSS upload: \(progress.acked)/\(progress.totalUpload) (\(progress.pendingUpload) pending)")
+        let wssProgressStream = syncedLattice.syncProgressStream
+        Task.detached {
+            for await progress in wssProgressStream {
+                if progress.isUploading {
+                    log("WSS upload: \(progress.acked)/\(progress.totalUpload) (\(progress.pendingUpload) pending)")
+                }
+                // Record last activity + pending depth for the health file. A
+                // fully-acked idle progress event is the "caught up" signal.
+                DaemonStatus.write(state: "connected",
+                                   detail: nil,
+                                   pendingUpload: progress.pendingUpload,
+                                   didSync: progress.acked > 0 && progress.pendingUpload == 0)
             }
-            // Record last activity + pending depth for the health file. A
-            // fully-acked idle progress event is the "caught up" signal.
-            DaemonStatus.write(state: "connected",
-                               detail: nil,
-                               pendingUpload: progress.pendingUpload,
-                               didSync: progress.acked > 0 && progress.pendingUpload == 0)
         }
 
         // Handle graceful shutdown

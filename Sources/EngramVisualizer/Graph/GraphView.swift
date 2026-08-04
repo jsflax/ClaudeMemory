@@ -366,7 +366,7 @@ struct GraphView: View {
                 onClose: { selectedMemoryId = nil },
                 colorMap: colorMap
             )
-            .id(memory.__globalId)
+            .id(memory.globalId)
             .frame(maxWidth: min(400, size.width * 0.35), maxHeight: min(500, size.height * 0.7))
             .frame(maxWidth: .infinity, alignment: .trailing)
             .padding(24)
@@ -382,7 +382,7 @@ struct GraphView: View {
         guard let id = selectedMemoryId else { return nil }
         // Route to the galaxy that owns this node, fall back to primary lattice
         let targetLattice = galaxyRegistry.galaxyForNode(id)?.latticeRef.resolve() ?? lattice
-        return targetLattice.objects(Memory.self).where { $0.__globalId == id }.first
+        return targetLattice.objects(Memory.self).where { $0.globalId == id }.first
     }
 
     // MARK: - Helpers

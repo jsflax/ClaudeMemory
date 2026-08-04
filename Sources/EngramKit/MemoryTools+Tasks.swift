@@ -80,7 +80,7 @@ extension MemoryTools {
             progress: a.progress ?? "",
             context: a.context ?? ""
         )
-        localLattice.add(task)
+        try localLattice.add(task)
 
         guard let taskId = task.primaryKey else {
             throw MCPError.internalError("Failed to persist task — primaryKey is nil after add()")

@@ -84,10 +84,22 @@ public actor MemoryTools {
         log("[readLattice] about to return, isSynced=\(isSynced)")
         if isSynced {
             if _attachedLattice == nil {
-                _attachedLattice = localLattice.attaching(lattice: syncedLattice)
+                // `attaching` throws as of Lattice 1.x. A failed ATTACH must
+                // not take down every read path — fall back to local-only
+                // and say so LOUDLY: silent degradation here means recall
+                // quietly stops seeing cross-device memories, which is the
+                // exact failure class the synced-DB wiring exists to close.
+                do {
+                    _attachedLattice = try localLattice.attaching(lattice: syncedLattice)
+                } catch {
+                    log("[readLattice] ATTACH FAILED (\(error)) — serving LOCAL-ONLY reads for '\(project)'; synced memories are invisible until this is resolved")
+                }
             }
-            log("[readLattice] returning cached attached lattice")
-            return _attachedLattice!
+            if let attached = _attachedLattice {
+                log("[readLattice] returning cached attached lattice")
+                return attached
+            }
+            return localLattice
         }
         log("[readLattice] returning localLattice")
         return localLattice
@@ -202,12 +214,12 @@ public actor MemoryTools {
     /// Returns the memory and which lattice it was found in.
     func findMemory(id: UUID) -> (memory: Memory, lattice: Lattice)? {
         if let mem = localLattice.objects(Memory.self)
-            .where({ $0.__globalId == id }).first {
+            .where({ $0.globalId == id }).first {
             return (mem, localLattice)
         }
         if let syncedLattice,
            let mem = syncedLattice.objects(Memory.self)
-            .where({ $0.__globalId == id }).first {
+            .where({ $0.globalId == id }).first {
             return (mem, syncedLattice)
         }
         return nil
@@ -216,12 +228,12 @@ public actor MemoryTools {
     /// Finds an edge by globalId, trying localLattice first then syncedLattice.
     func findEdge(id: UUID) -> (edge: Edge, lattice: Lattice)? {
         if let edge = localLattice.objects(Edge.self)
-            .where({ $0.__globalId == id }).first {
+            .where({ $0.globalId == id }).first {
             return (edge, localLattice)
         }
         if let syncedLattice,
            let edge = syncedLattice.objects(Edge.self)
-            .where({ $0.__globalId == id }).first {
+            .where({ $0.globalId == id }).first {
             return (edge, syncedLattice)
         }
         return nil

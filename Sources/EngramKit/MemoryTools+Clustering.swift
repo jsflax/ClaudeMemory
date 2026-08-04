@@ -20,7 +20,7 @@ public func findMemoryClusters(
     selfUserId: UUID? = nil
 ) -> (clusters: [[UUID]], distances: [UUID: [UUID: Double]]) {
     let now = Date()
-    var baseQuery = lattice.objects(Memory.self).distinct(by: \.__globalId).where { $0.expiresAt > now && $0.deletedAt == nil }
+    var baseQuery = lattice.objects(Memory.self).distinct(by: \.globalId).where { $0.expiresAt > now && $0.deletedAt == nil }
     if let project { baseQuery = baseQuery.where { $0.project == project } }
     if let topic { baseQuery = baseQuery.where { $0.topic == topic } }
     var memories = baseQuery.snapshot()
@@ -36,7 +36,7 @@ public func findMemoryClusters(
 
     let memoryMap: [UUID: Memory] = Dictionary(
         uniqueKeysWithValues: memories.compactMap { m in
-            guard let gid = m.__globalId, !m.embedding.isEmpty else { return nil }
+            guard let gid = m.globalId, !m.embedding.isEmpty else { return nil }
             return (gid, m)
         }
     )
@@ -57,7 +57,7 @@ public func findMemoryClusters(
         var neighbors: [UUID] = []
         var dists: [UUID: Double] = [:]
         for match in matches {
-            guard let nId = match.object.__globalId else { continue }
+            guard let nId = match.object.globalId else { continue }
             guard nId != memId, validIds.contains(nId) else { continue }
             let dist = match.distances["embedding"] ?? 1.0
             if dist <= distanceThreshold {
@@ -145,7 +145,7 @@ extension MemoryTools {
         // Fetch memory data for formatting
         var memoryMap: [UUID: Memory] = [:]
         for gid in Set(result.clusters.flatMap({ $0 })) {
-            if let mem = db.objects(Memory.self).where({ $0.__globalId == gid }).first {
+            if let mem = db.objects(Memory.self).where({ $0.globalId == gid }).first {
                 memoryMap[gid] = mem
             }
         }
@@ -276,22 +276,22 @@ extension MemoryTools {
             authorUserId: currentUserId,
             modifiedAt: Date()
         )
-        localLattice.add(summary)
+        try localLattice.add(summary)
 
-        guard let summaryGlobalId = summary.__globalId else {
+        guard let summaryGlobalId = summary.globalId else {
             throw MCPError.internalError("Failed to get summary globalId after persist")
         }
 
         // Deprioritize originals (importance → 0) and create summarized_by edges
         nonisolated(unsafe) let sourceMemories = sources.map(\.memory)
-        let sourceGlobalIds = sourceMemories.compactMap(\.__globalId)
+        let sourceGlobalIds = sourceMemories.compactMap(\.globalId)
         try localLattice.transaction {
             for mem in sourceMemories {
                 mem.importance = 0
             }
             for sourceGlobalId in sourceGlobalIds {
                 let edge = Edge(sourceGlobalId: sourceGlobalId, targetGlobalId: summaryGlobalId, relation: .summarizedBy, authorUserId: currentUserId)
-                localLattice.add(edge)
+                try localLattice.add(edge)
             }
         }
 

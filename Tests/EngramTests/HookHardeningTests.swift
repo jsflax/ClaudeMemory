@@ -34,8 +34,8 @@ private func addForeign(_ content: String, project: String, in lattice: Lattice)
         topic: "general", project: project,
         embedding: Vector<Float>(try await sharedEmbedder.embed(text: content)!),
         authorUserId: UUID())
-    lattice.add(mem)
-    return mem.__globalId!
+    try lattice.add(mem)
+    return mem.globalId!
 }
 
 // MARK: - Fence unit behavior
@@ -86,7 +86,7 @@ private func addForeign(_ content: String, project: String, in lattice: Lattice)
         content: "My own deploy note about canary rollouts",
         topic: "general", project: "fence-proj",
         embedding: Vector<Float>(try await sharedEmbedder.embed(text: "My own deploy note about canary rollouts")!))
-    ctx.lattice.add(own)
+    try ctx.lattice.add(own)
 
     await ctx.tools.setForeignContentPolicy(fence: true, exclude: false)
     let out = text(from: try await ctx.tools.handle(CallTool.Parameters(
@@ -175,7 +175,7 @@ private func addForeign(_ content: String, project: String, in lattice: Lattice)
         content: "Teammate debugging session", topic: "episode", project: "guard-proj",
         embedding: Vector<Float>(try await sharedEmbedder.embed(text: "Teammate debugging session")!),
         authorUserId: UUID())
-    ctx.lattice.add(foreignEpisode)
+    try ctx.lattice.add(foreignEpisode)
 
     await ctx.tools.setForeignContentPolicy(fence: false, exclude: true)
 
@@ -213,7 +213,7 @@ private func addForeign(_ content: String, project: String, in lattice: Lattice)
         name: "list_episodes", arguments: ["project": .string("guard-proj")])))
     #expect(!episodes.contains("Teammate debugging session"))
     let epRecall = text(from: try await ctx.tools.handle(CallTool.Parameters(
-        name: "recall_episode", arguments: ["episode_id": .string(foreignEpisode.__globalId!.uuidString)])))
+        name: "recall_episode", arguments: ["episode_id": .string(foreignEpisode.globalId!.uuidString)])))
     #expect(epRecall.contains("not found"))
 }
 

@@ -132,7 +132,7 @@ struct RecallPerfRegressionTests {
 
         let all = lattice.objects(Memory.self).snapshot()
         let byId = Dictionary(uniqueKeysWithValues: all.compactMap { m -> (String, Memory)? in
-            guard let gid = m.__globalId else { return nil }
+            guard let gid = m.globalId else { return nil }
             return (gid.uuidString, m)
         })
         for (label, id) in [("hub", hub), ("child1", child1), ("child2", child2)] {

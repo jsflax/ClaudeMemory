@@ -42,14 +42,14 @@ struct EdgeMigrationTests {
 
             let m1 = Memory(content: "Networking layer", project: "Test", embedding: Vector<Float>(Array(repeating: 0, count: 384)))
             let m2 = Memory(content: "Database schema", project: "Test", embedding: Vector<Float>(Array(repeating: 0, count: 384)))
-            lattice.add(m1)
-            lattice.add(m2)
+            try lattice.add(m1)
+            try lattice.add(m2)
 
-            globalIds[m1.primaryKey!] = m1.__globalId!
-            globalIds[m2.primaryKey!] = m2.__globalId!
+            globalIds[m1.primaryKey!] = m1.globalId!
+            globalIds[m2.primaryKey!] = m2.globalId!
 
             let edge = V1.Edge(sourceId: m1.primaryKey!, targetId: m2.primaryKey!, relation: "relates_to")
-            lattice.add(edge)
+            try lattice.add(edge)
         }
 
         try autoreleasepool {
@@ -67,8 +67,8 @@ struct EdgeMigrationTests {
             let memories = lattice.objects(Memory.self)
             let m1 = memories.where { $0.content == "Networking layer" }.first!
             let m2 = memories.where { $0.content == "Database schema" }.first!
-            #expect(edge.sourceGlobalId == m1.__globalId)
-            #expect(edge.targetGlobalId == m2.__globalId)
+            #expect(edge.sourceGlobalId == m1.globalId)
+            #expect(edge.targetGlobalId == m2.globalId)
         }
     }
 
@@ -86,9 +86,9 @@ struct EdgeMigrationTests {
             for (i, rel) in relations.enumerated() {
                 let src = Memory(content: "Source \(i)", project: "RelTest", embedding: Vector<Float>(Array(repeating: 0, count: 384)))
                 let tgt = Memory(content: "Target \(i)", project: "RelTest", embedding: Vector<Float>(Array(repeating: 0, count: 384)))
-                lattice.add(src)
-                lattice.add(tgt)
-                lattice.add(V1.Edge(sourceId: src.primaryKey!, targetId: tgt.primaryKey!, relation: rel))
+                try lattice.add(src)
+                try lattice.add(tgt)
+                try lattice.add(V1.Edge(sourceId: src.primaryKey!, targetId: tgt.primaryKey!, relation: rel))
             }
         }
 
@@ -117,10 +117,10 @@ struct EdgeMigrationTests {
             let lattice = try migrationLattice(path: dbPath, v1: Memory.self, V1.Edge.self, Checkpoint.self, HookState.self)
 
             let mem = Memory(content: "Real memory", project: "OrphanTest", embedding: Vector<Float>(Array(repeating: 0, count: 384)))
-            lattice.add(mem)
+            try lattice.add(mem)
 
             // Edge referencing non-existent memory (PK 99999)
-            lattice.add(V1.Edge(sourceId: mem.primaryKey!, targetId: 99999, relation: "relates_to"))
+            try lattice.add(V1.Edge(sourceId: mem.primaryKey!, targetId: 99999, relation: "relates_to"))
         }
 
         try autoreleasepool {
@@ -142,7 +142,7 @@ struct EdgeMigrationTests {
 
         try autoreleasepool {
             let lattice = try migrationLattice(path: dbPath, v1: Memory.self, V1.Edge.self, Checkpoint.self, HookState.self)
-            lattice.add(Memory(content: "Lonely", project: "EmptyTest", embedding: Vector<Float>(Array(repeating: 0, count: 384))))
+            try lattice.add(Memory(content: "Lonely", project: "EmptyTest", embedding: Vector<Float>(Array(repeating: 0, count: 384))))
         }
 
         try autoreleasepool {
@@ -164,10 +164,10 @@ struct EdgeMigrationTests {
 
             let m1 = Memory(content: "A", project: "DateTest", embedding: Vector<Float>(Array(repeating: 0, count: 384)))
             let m2 = Memory(content: "B", project: "DateTest", embedding: Vector<Float>(Array(repeating: 0, count: 384)))
-            lattice.add(m1)
-            lattice.add(m2)
+            try lattice.add(m1)
+            try lattice.add(m2)
 
-            lattice.add(V1.Edge(sourceId: m1.primaryKey!, targetId: m2.primaryKey!, relation: "supersedes", createdAt: specificDate))
+            try lattice.add(V1.Edge(sourceId: m1.primaryKey!, targetId: m2.primaryKey!, relation: "supersedes", createdAt: specificDate))
         }
 
         try autoreleasepool {
@@ -189,10 +189,10 @@ struct EdgeMigrationTests {
 
             let m1 = Memory(content: "Existing A", project: "PostTest", embedding: Vector<Float>(Array(repeating: 0, count: 384)))
             let m2 = Memory(content: "Existing B", project: "PostTest", embedding: Vector<Float>(Array(repeating: 0, count: 384)))
-            lattice.add(m1)
-            lattice.add(m2)
+            try lattice.add(m1)
+            try lattice.add(m2)
 
-            lattice.add(V1.Edge(sourceId: m1.primaryKey!, targetId: m2.primaryKey!, relation: "relates_to"))
+            try lattice.add(V1.Edge(sourceId: m1.primaryKey!, targetId: m2.primaryKey!, relation: "relates_to"))
         }
 
         try autoreleasepool {
@@ -200,17 +200,17 @@ struct EdgeMigrationTests {
 
             // Add a new memory and edge post-migration
             let m3 = Memory(content: "New memory", project: "PostTest", embedding: Vector<Float>(Array(repeating: 0, count: 384)))
-            lattice.add(m3)
+            try lattice.add(m3)
 
             let m1 = lattice.objects(Memory.self).where { $0.content == "Existing A" }.first!
-            let newEdge = Edge(sourceGlobalId: m1.__globalId!, targetGlobalId: m3.__globalId!, relation: .derivedFrom)
-            lattice.add(newEdge)
+            let newEdge = Edge(sourceGlobalId: m1.globalId!, targetGlobalId: m3.globalId!, relation: .derivedFrom)
+            try lattice.add(newEdge)
 
             #expect(lattice.objects(Edge.self).count == 2)
 
             let derived = lattice.objects(Edge.self).where { $0.relation == .derivedFrom }
             #expect(derived.count == 1)
-            #expect(derived.first?.targetGlobalId == m3.__globalId)
+            #expect(derived.first?.targetGlobalId == m3.globalId)
         }
     }
 
@@ -224,10 +224,10 @@ struct EdgeMigrationTests {
 
             let m1 = Memory(content: "A", project: "UnkTest", embedding: Vector<Float>(Array(repeating: 0, count: 384)))
             let m2 = Memory(content: "B", project: "UnkTest", embedding: Vector<Float>(Array(repeating: 0, count: 384)))
-            lattice.add(m1)
-            lattice.add(m2)
+            try lattice.add(m1)
+            try lattice.add(m2)
 
-            lattice.add(V1.Edge(sourceId: m1.primaryKey!, targetId: m2.primaryKey!, relation: "some_future_relation"))
+            try lattice.add(V1.Edge(sourceId: m1.primaryKey!, targetId: m2.primaryKey!, relation: "some_future_relation"))
         }
 
         try autoreleasepool {
@@ -247,14 +247,14 @@ struct EdgeMigrationTests {
             var pks: [Int64] = []
             for i in 0..<10 {
                 let m = Memory(content: "Node \(i)", project: "StressTest", embedding: Vector<Float>(Array(repeating: 0, count: 384)))
-                lattice.add(m)
+                try lattice.add(m)
                 pks.append(m.primaryKey!)
             }
 
             // Fully connected: 10 choose 2 = 45 edges
             for i in 0..<10 {
                 for j in (i+1)..<10 {
-                    lattice.add(V1.Edge(sourceId: pks[i], targetId: pks[j], relation: "relates_to"))
+                    try lattice.add(V1.Edge(sourceId: pks[i], targetId: pks[j], relation: "relates_to"))
                 }
             }
             #expect(lattice.objects(V1.Edge.self).count == 45)

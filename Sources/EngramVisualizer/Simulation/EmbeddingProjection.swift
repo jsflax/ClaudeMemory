@@ -49,7 +49,7 @@ final class EmbeddingProjection {
         var loaded = 0
         for id in nodeIds {
             if embeddings[id] != nil { loaded += 1; continue }
-            guard let memory = lattice.objects(Memory.self).where({ $0.__globalId == id }).first else { continue }
+            guard let memory = lattice.objects(Memory.self).where({ $0.globalId == id }).first else { continue }
             let elements = memory.embedding.elements
             guard !elements.isEmpty else { continue }
             embeddings[id] = elements

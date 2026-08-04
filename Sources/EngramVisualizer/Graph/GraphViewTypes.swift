@@ -196,7 +196,7 @@ struct SearchBarView: View {
             let ftsQuery: TextQuery = .search(query)
             var ids = Set<UUID>()
             for match in lattice.objects(Memory.self).matching(ftsQuery, on: \.content, limit: 500) {
-                if let gid = match.object.__globalId { ids.insert(gid) }
+                if let gid = match.object.globalId { ids.insert(gid) }
             }
             matchIds = ids
         }

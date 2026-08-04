@@ -26,8 +26,8 @@ public enum SyncService {
 
             // Edges: only sync edges where both endpoints are synced memories
             filter.include(Edge.self) { edge in
-                edge.sourceGlobalId.in(\Memory.__globalId, where: memoryPredicate)
-                    && edge.targetGlobalId.in(\Memory.__globalId, where: memoryPredicate)
+                edge.sourceGlobalId.in(\Memory.globalId, where: memoryPredicate)
+                    && edge.targetGlobalId.in(\Memory.globalId, where: memoryPredicate)
             }
         }
         // SyncConfig: replicate sync preferences across devices

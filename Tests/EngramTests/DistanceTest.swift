@@ -33,7 +33,7 @@ import Foundation
     // Attached nearest (local + synced UNION ALL)
     let syncedLattice = try Lattice(Memory.self, Edge.self, SyncConfig.self,
                                     configuration: .init(fileURL: syncedPath, migration: engramMigrations))
-    let combined = localLattice.attaching(lattice: syncedLattice)
+    let combined = try localLattice.attaching(lattice: syncedLattice)
     let attachedNearest = combined.objects(Memory.self)
         .nearest(to: query, on: \.embedding, limit: 5)
     let attachedSnapshot = attachedNearest.snapshot()

@@ -228,13 +228,13 @@ private let allowProdDBTests = ProcessInfo.processInfo.environment["ENGRAM_ALLOW
     for i in 0..<20 {
         let mem = Memory(content: "Local memory \(i)")
         mem.embedding = Vector<Float>((0..<dims).map { _ in Float.random(in: -1...1) })
-        localLattice.add(mem)
+        try localLattice.add(mem)
     }
     // Insert into synced
     for i in 0..<20 {
         let mem = Memory(content: "Synced memory \(i)")
         mem.embedding = Vector<Float>((0..<dims).map { _ in Float.random(in: -1...1) })
-        syncedLattice.add(mem)
+        try syncedLattice.add(mem)
     }
 
     // Train both

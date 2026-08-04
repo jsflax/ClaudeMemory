@@ -43,7 +43,7 @@ struct IPCRelaySyncTests {
                 let stream = db.changeStream
                 continuation.resume(returning: ())
                 var seenRowIds = Set<Int64>()
-                for await changes in stream {
+                for try await changes in stream {
                     let resolved = changes.compactMap { $0.resolve(on: db) }
                     for r in resolved where r.tableName == table && r.operation == operation {
                         seenRowIds.insert(r.rowId)
@@ -90,7 +90,7 @@ struct IPCRelaySyncTests {
         let task = await waitForChange(on: syncedConfig, table: "Memory", operation: .insert)
 
         // Write a memory on the hub side (simulates MCP server write)
-        hub.add(Memory(
+        try hub.add(Memory(
             content: "Test memory for IPC relay",
             topic: "testing",
             project: "Engram",
@@ -137,7 +137,7 @@ struct IPCRelaySyncTests {
 
         let deliveryTask = await waitForChange(on: syncedConfig, table: "Memory", operation: .insert)
 
-        hub.add(Memory(
+        try hub.add(Memory(
             content: "Collapse regression memory",
             topic: "testing",
             project: "Engram",
@@ -201,7 +201,7 @@ struct IPCRelaySyncTests {
         let task = await waitForChange(on: syncedConfig, table: "Memory", operation: .insert)
 
         // Write a synced-project memory (should replicate)
-        hub.add(Memory(
+        try hub.add(Memory(
             content: "This should sync",
             topic: "testing",
             project: "SyncedProject",
@@ -209,7 +209,7 @@ struct IPCRelaySyncTests {
         ))
 
         // Write a local-only memory (should NOT replicate)
-        hub.add(Memory(
+        try hub.add(Memory(
             content: "This stays local",
             topic: "testing",
             project: "LocalProject",
@@ -264,7 +264,7 @@ struct IPCRelaySyncTests {
         let task = await waitForChange(on: syncedConfig, table: "Memory", operation: .insert)
 
         // Public memory — should sync
-        hub.add(Memory(
+        try hub.add(Memory(
             content: "Public knowledge",
             topic: "testing",
             project: "MyProject",
@@ -273,7 +273,7 @@ struct IPCRelaySyncTests {
         ))
 
         // Private memory — should NOT sync
-        hub.add(Memory(
+        try hub.add(Memory(
             content: "Secret stuff",
             topic: "testing",
             project: "MyProject",
@@ -319,7 +319,7 @@ struct IPCRelaySyncTests {
 
         // Phase 1: Hub → Synced
         let task1 = await waitForChange(on: syncedConfig, table: "Memory", operation: .insert)
-        hub.add(Memory(
+        try hub.add(Memory(
             content: "From MCP server",
             project: "Engram",
             embedding: Vector<Float>([Float](repeating: 0.1, count: 384))
@@ -331,7 +331,7 @@ struct IPCRelaySyncTests {
         print("[test4] Phase 2: setting up waitForChange on hub")
         let task2 = await waitForChange(on: hubConfig, table: "Memory", operation: .insert)
         print("[test4] Phase 2: adding memory on synced")
-        synced.add(Memory(
+        try synced.add(Memory(
             content: "From cloud",
             project: "Engram",
             embedding: Vector<Float>([Float](repeating: 0.2, count: 384))
@@ -390,16 +390,16 @@ struct IPCRelaySyncTests {
             project: "Engram",
             embedding: Vector<Float>([Float](repeating: 0.2, count: 384))
         )
-        hub.add(m1)
-        hub.add(m2)
+        try hub.add(m1)
+        try hub.add(m2)
 
         try await memTask.value
         #expect(synced.objects(Memory.self).count == 2)
 
         // Add an edge connecting them
         let edgeTask = await waitForChange(on: syncedConfig, table: "Edge", operation: .insert)
-        let edge = Edge(sourceGlobalId: m1.__globalId!, targetGlobalId: m2.__globalId!, relation: .partOf)
-        hub.add(edge)
+        let edge = Edge(sourceGlobalId: m1.globalId!, targetGlobalId: m2.globalId!, relation: .partOf)
+        try hub.add(edge)
 
         try await edgeTask.value
 
@@ -408,8 +408,8 @@ struct IPCRelaySyncTests {
 
         let syncedEdge = synced.objects(Edge.self).first!
         #expect(syncedEdge.relation == .partOf)
-        #expect(syncedEdge.sourceGlobalId == m1.__globalId)
-        #expect(syncedEdge.targetGlobalId == m2.__globalId)
+        #expect(syncedEdge.sourceGlobalId == m1.globalId)
+        #expect(syncedEdge.targetGlobalId == m2.globalId)
     }
 
     // MARK: - Test 6: Dynamic filter update via updateSyncFilter
@@ -450,12 +450,12 @@ struct IPCRelaySyncTests {
         let task1 = await waitForChange(on: syncedConfig, table: "Memory", operation: .insert)
 
         // Add memories for both projects
-        hub.add(Memory(
+        try hub.add(Memory(
             content: "ProjectA memory",
             project: "ProjectA",
             embedding: Vector<Float>([Float](repeating: 0.1, count: 384))
         ))
-        hub.add(Memory(
+        try hub.add(Memory(
             content: "ProjectB memory",
             project: "ProjectB",
             embedding: Vector<Float>([Float](repeating: 0.2, count: 384))
@@ -531,27 +531,27 @@ struct IPCRelaySyncTests {
         // Add memories across all 3 projects, wait for all 5 to arrive on synced
         let insertTask = await waitForChange(on: syncedConfig, table: "Memory", operation: .insert, count: 5)
 
-        hub.add(Memory(
+        try hub.add(Memory(
             content: "Lattice arch decision",
             project: "Lattice",
             embedding: Vector<Float>([Float](repeating: 0.1, count: 384))
         ))
-        hub.add(Memory(
+        try hub.add(Memory(
             content: "engram-server deploy note",
             project: "engram-server",
             embedding: Vector<Float>([Float](repeating: 0.2, count: 384))
         ))
-        hub.add(Memory(
+        try hub.add(Memory(
             content: "ComoHotels drag fix",
             project: "ComoHotels",
             embedding: Vector<Float>([Float](repeating: 0.3, count: 384))
         ))
-        hub.add(Memory(
+        try hub.add(Memory(
             content: "ComoHotels chat jitter",
             project: "ComoHotels",
             embedding: Vector<Float>([Float](repeating: 0.4, count: 384))
         ))
-        hub.add(Memory(
+        try hub.add(Memory(
             content: "ComoHotels payment flow",
             project: "ComoHotels",
             embedding: Vector<Float>([Float](repeating: 0.5, count: 384))
@@ -634,15 +634,15 @@ struct IPCRelaySyncTests {
         // Add memories across all 3 projects to localLattice
         let insertTask = await waitForChange(on: syncedConfig, table: "Memory", operation: .insert, count: 5)
 
-        local.add(Memory(content: "A knowledge", project: "ProjectA",
+        try local.add(Memory(content: "A knowledge", project: "ProjectA",
             embedding: Vector<Float>([Float](repeating: 0.1, count: 384))))
-        local.add(Memory(content: "B knowledge", project: "ProjectB",
+        try local.add(Memory(content: "B knowledge", project: "ProjectB",
             embedding: Vector<Float>([Float](repeating: 0.2, count: 384))))
-        local.add(Memory(content: "C item 1", project: "ProjectC",
+        try local.add(Memory(content: "C item 1", project: "ProjectC",
             embedding: Vector<Float>([Float](repeating: 0.3, count: 384))))
-        local.add(Memory(content: "C item 2", project: "ProjectC",
+        try local.add(Memory(content: "C item 2", project: "ProjectC",
             embedding: Vector<Float>([Float](repeating: 0.4, count: 384))))
-        local.add(Memory(content: "C item 3", project: "ProjectC",
+        try local.add(Memory(content: "C item 3", project: "ProjectC",
             embedding: Vector<Float>([Float](repeating: 0.5, count: 384))))
 
         try await insertTask.value
@@ -754,15 +754,15 @@ struct IPCRelaySyncTests {
         let syncedInsertTask = await waitForChange(on: syncedConfig, table: "Memory", operation: .insert, count: 5)
         let cloudInsertTask = await waitForChange(on: cloudConfig, table: "Memory", operation: .insert, count: 5)
 
-        local.add(Memory(content: "A knowledge", project: "ProjectA",
+        try local.add(Memory(content: "A knowledge", project: "ProjectA",
             embedding: Vector<Float>([Float](repeating: 0.1, count: 384))))
-        local.add(Memory(content: "B knowledge", project: "ProjectB",
+        try local.add(Memory(content: "B knowledge", project: "ProjectB",
             embedding: Vector<Float>([Float](repeating: 0.2, count: 384))))
-        local.add(Memory(content: "C item 1", project: "ProjectC",
+        try local.add(Memory(content: "C item 1", project: "ProjectC",
             embedding: Vector<Float>([Float](repeating: 0.3, count: 384))))
-        local.add(Memory(content: "C item 2", project: "ProjectC",
+        try local.add(Memory(content: "C item 2", project: "ProjectC",
             embedding: Vector<Float>([Float](repeating: 0.4, count: 384))))
-        local.add(Memory(content: "C item 3", project: "ProjectC",
+        try local.add(Memory(content: "C item 3", project: "ProjectC",
             embedding: Vector<Float>([Float](repeating: 0.5, count: 384))))
 
         try await syncedInsertTask.value
@@ -849,8 +849,8 @@ struct IPCRelaySyncTests {
         var filter = Lattice.SyncFilter()
         filter.include(Memory.self, where: memoryPredicate)
         filter.include(Edge.self) { edge in
-            edge.sourceGlobalId.in(\Memory.__globalId, where: memoryPredicate)
-                && edge.targetGlobalId.in(\Memory.__globalId, where: memoryPredicate)
+            edge.sourceGlobalId.in(\Memory.globalId, where: memoryPredicate)
+                && edge.targetGlobalId.in(\Memory.globalId, where: memoryPredicate)
         }
         filter.include(SyncConfig.self)
 
@@ -870,20 +870,20 @@ struct IPCRelaySyncTests {
         let insertTask = await waitForChange(on: syncedConfig, table: "Memory", operation: .insert, count: 3)
 
         // Filtered (should sync)
-        local.add(Memory(content: "Lattice arch", project: "Lattice",
+        try local.add(Memory(content: "Lattice arch", project: "Lattice",
             embedding: Vector<Float>([Float](repeating: 0.1, count: 384))))
-        local.add(Memory(content: "engram-server deploy", project: "engram-server",
+        try local.add(Memory(content: "engram-server deploy", project: "engram-server",
             embedding: Vector<Float>([Float](repeating: 0.2, count: 384))))
-        local.add(Memory(content: "Lattice bugfix", project: "Lattice",
+        try local.add(Memory(content: "Lattice bugfix", project: "Lattice",
             embedding: Vector<Float>([Float](repeating: 0.3, count: 384))))
         await Task.yield()
 
         // NOT filtered (should NOT sync)
-        local.add(Memory(content: "ComoHotels drag fix", project: "ComoHotels",
+        try local.add(Memory(content: "ComoHotels drag fix", project: "ComoHotels",
             embedding: Vector<Float>([Float](repeating: 0.4, count: 384))))
-        local.add(Memory(content: "ComoHotels payment", project: "ComoHotels",
+        try local.add(Memory(content: "ComoHotels payment", project: "ComoHotels",
             embedding: Vector<Float>([Float](repeating: 0.5, count: 384))))
-        local.add(Memory(content: "LocalOnly secret", project: "LocalOnly",
+        try local.add(Memory(content: "LocalOnly secret", project: "LocalOnly",
             embedding: Vector<Float>([Float](repeating: 0.6, count: 384)),
             isPrivate: true))
 
@@ -932,8 +932,13 @@ struct IPCRelaySyncTests {
         try await Task.sleep(for: .milliseconds(100))
 
         // Track sync progress from the hub
+        // Lattice 1.x: progress is an AsyncStream, not a callback.
         nonisolated(unsafe) var lastProgress: Lattice.SyncProgress?
-        local2.onSyncProgress { p in lastProgress = p }
+        let progressStream = local2.syncProgressStream
+        let progressTask = Task.detached {
+            for await p in progressStream { lastProgress = p }
+        }
+        defer { progressTask.cancel() }
 
         // Create fresh synced DB — triggers IPC connection
         var syncedConfig2 = Lattice.Configuration(fileURL: syncedURL)
@@ -1028,15 +1033,15 @@ struct IPCRelaySyncTests {
         // Sync 5 memories
         let insertTask = await waitForChange(on: syncedConfig, table: "Memory", operation: .insert, count: 5)
 
-        local.add(Memory(content: "A knowledge", project: "ProjectA",
+        try local.add(Memory(content: "A knowledge", project: "ProjectA",
             embedding: Vector<Float>([Float](repeating: 0.1, count: 384))))
-        local.add(Memory(content: "B knowledge", project: "ProjectB",
+        try local.add(Memory(content: "B knowledge", project: "ProjectB",
             embedding: Vector<Float>([Float](repeating: 0.2, count: 384))))
-        local.add(Memory(content: "Como item 1", project: "ComoHotels",
+        try local.add(Memory(content: "Como item 1", project: "ComoHotels",
             embedding: Vector<Float>([Float](repeating: 0.3, count: 384))))
-        local.add(Memory(content: "Como item 2", project: "ComoHotels",
+        try local.add(Memory(content: "Como item 2", project: "ComoHotels",
             embedding: Vector<Float>([Float](repeating: 0.4, count: 384))))
-        local.add(Memory(content: "Como item 3", project: "ComoHotels",
+        try local.add(Memory(content: "Como item 3", project: "ComoHotels",
             embedding: Vector<Float>([Float](repeating: 0.5, count: 384))))
 
         try await insertTask.value
@@ -1137,7 +1142,7 @@ struct IPCRelaySyncTests {
             let m = Memory()
             m.content = "pre-compact-\(i)"
             m.project = "test"
-            local.add(m)
+            try local.add(m)
         }
         try await task1.value
 
@@ -1157,7 +1162,7 @@ struct IPCRelaySyncTests {
             let m = Memory()
             m.content = "post-compact-\(i)"
             m.project = "test"
-            local.add(m)
+            try local.add(m)
         }
         try await task2.value
 

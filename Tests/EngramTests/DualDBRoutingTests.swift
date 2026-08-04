@@ -34,7 +34,7 @@ import Foundation
     let ctx = try await makeDualDBTools()
 
     // Configure "SyncedProj" as synced
-    ctx.localLattice.add(SyncConfig(project: "SyncedProj", policy: .sync))
+    try ctx.localLattice.add(SyncConfig(project: "SyncedProj", policy: .sync))
 
     // Manually insert a memory into the synced database (simulating cross-device data)
     let embedder = sharedEmbedder
@@ -46,7 +46,7 @@ import Foundation
         embedding: try await Vector(embedder.embed(text: "Cross-device memory about deployment pipeline")!),
         importance: 3
     )
-    ctx.syncedLattice.add(crossDeviceMemory)
+    try ctx.syncedLattice.add(crossDeviceMemory)
 
     // Recall should route to syncedLattice and find the cross-device memory
     let recall = try await ctx.tools.handle(CallTool.Parameters(
@@ -61,7 +61,7 @@ import Foundation
     let ctx = try await makeDualDBTools()
 
     // Set _default policy to sync (no per-project override)
-    ctx.localLattice.add(SyncConfig(project: "_default", policy: .sync))
+    try ctx.localLattice.add(SyncConfig(project: "_default", policy: .sync))
 
     // Insert a memory directly into synced DB
     let embedder = sharedEmbedder
@@ -73,7 +73,7 @@ import Foundation
         embedding: try await Vector(embedder.embed(text: "Default-synced memory about caching strategy")!),
         importance: 3
     )
-    ctx.syncedLattice.add(mem)
+    try ctx.syncedLattice.add(mem)
 
     // Recall for "AnyProject" should route to syncedLattice via _default fallback
     let recall = try await ctx.tools.handle(CallTool.Parameters(
@@ -87,8 +87,8 @@ import Foundation
     let ctx = try await makeDualDBTools()
 
     // Default is sync, but "LocalProj" is explicitly local
-    ctx.localLattice.add(SyncConfig(project: "_default", policy: .sync))
-    ctx.localLattice.add(SyncConfig(project: "LocalProj", policy: .local))
+    try ctx.localLattice.add(SyncConfig(project: "_default", policy: .sync))
+    try ctx.localLattice.add(SyncConfig(project: "LocalProj", policy: .local))
 
     // Store via tools → goes to localLattice
     _ = try await ctx.tools.handle(CallTool.Parameters(
@@ -113,7 +113,7 @@ import Foundation
     let ctx = try await makeDualDBTools()
 
     // Configure project as synced
-    ctx.localLattice.add(SyncConfig(project: "SyncedProj", policy: .sync))
+    try ctx.localLattice.add(SyncConfig(project: "SyncedProj", policy: .sync))
 
     // Store a memory — should go to localLattice even though project is synced
     _ = try await ctx.tools.handle(CallTool.Parameters(
@@ -167,8 +167,8 @@ import Foundation
         project: "SyncedProj",
         embedding: try await Vector(embedder.embed(text: "Cross-device memory only in synced DB")!)
     )
-    ctx.syncedLattice.add(mem)
-    let globalId = mem.__globalId!.uuidString
+    try ctx.syncedLattice.add(mem)
+    let globalId = mem.globalId!.uuidString
 
     // Graph lookup should find it in syncedLattice via fallback
     let graph = try await ctx.tools.handle(CallTool.Parameters(
@@ -184,7 +184,7 @@ import Foundation
 @Test func dualDB_stats_routesByProject() async throws {
     let ctx = try await makeDualDBTools()
 
-    ctx.localLattice.add(SyncConfig(project: "SyncedProj", policy: .sync))
+    try ctx.localLattice.add(SyncConfig(project: "SyncedProj", policy: .sync))
 
     // Add 2 memories to syncedLattice
     let embedder = sharedEmbedder
@@ -197,7 +197,7 @@ import Foundation
             project: "SyncedProj",
             embedding: try await Vector(embedder.embed(text: "Synced stat memory \(i)")!)
         )
-        ctx.syncedLattice.add(m)
+        try ctx.syncedLattice.add(m)
     }
 
     // Add 1 memory to localLattice in a different project
@@ -227,7 +227,7 @@ import Foundation
 @Test func dualDB_listTopics_routesByProject() async throws {
     let ctx = try await makeDualDBTools()
 
-    ctx.localLattice.add(SyncConfig(project: "SyncedProj", policy: .sync))
+    try ctx.localLattice.add(SyncConfig(project: "SyncedProj", policy: .sync))
 
     // Add a memory with topic "cross-device-arch" to syncedLattice
     let embedder = sharedEmbedder
@@ -239,7 +239,7 @@ import Foundation
         project: "SyncedProj",
         embedding: try await Vector(embedder.embed(text: "Architecture decision from another device")!)
     )
-    ctx.syncedLattice.add(m)
+    try ctx.syncedLattice.add(m)
 
     // list_topics for SyncedProj should find the topic from syncedLattice
     let topics = try await ctx.tools.handle(CallTool.Parameters(
@@ -276,7 +276,7 @@ import Foundation
     let ctx = try await makeDualDBTools()
 
     // Even with _default sync, nil project → localLattice
-    ctx.localLattice.add(SyncConfig(project: "_default", policy: .sync))
+    try ctx.localLattice.add(SyncConfig(project: "_default", policy: .sync))
 
     _ = try await ctx.tools.handle(CallTool.Parameters(
         name: "remember",
@@ -341,8 +341,8 @@ import Foundation
         project: "SyncedProj",
         embedding: try await Vector(embedder.embed(text: "Cross-device memory to forget")!)
     )
-    ctx.syncedLattice.add(mem)
-    let globalId = mem.__globalId!.uuidString
+    try ctx.syncedLattice.add(mem)
+    let globalId = mem.globalId!.uuidString
 
     // Forget should find and delete it from syncedLattice
     let forget = try await ctx.tools.handle(CallTool.Parameters(
@@ -353,7 +353,7 @@ import Foundation
 
     // Verify it's gone from syncedLattice
     let remaining = ctx.syncedLattice.objects(Memory.self)
-        .where({ $0.__globalId == mem.__globalId })
+        .where({ $0.globalId == mem.globalId })
     #expect(remaining.count == 0)
 }
 
@@ -366,7 +366,7 @@ import Foundation
 /// Recall on a synced project should return all 4 unique memories, deduplicating the 2 shared ones.
 @Test func dualDB_overlappingSubset_deduplicatesOnRecall() async throws {
     let ctx = try await makeDualDBTools()
-    ctx.localLattice.add(SyncConfig(project: "SharedProj", policy: .sync))
+    try ctx.localLattice.add(SyncConfig(project: "SharedProj", policy: .sync))
 
     let embedder = sharedEmbedder
     if await !embedder.isLoaded { await embedder.load() }
@@ -379,8 +379,8 @@ import Foundation
         embedding: try await Vector(embedder.embed(text: "Shared memory alpha about API design patterns")!),
         importance: 3
     )
-    ctx.localLattice.add(shared1)
-    let gid1 = shared1.__globalId!
+    try ctx.localLattice.add(shared1)
+    let gid1 = shared1.globalId!
     let syncedCopy1 = Memory(
         content: "Shared memory alpha about API design patterns",
         topic: "architecture",
@@ -388,7 +388,7 @@ import Foundation
         embedding: try await Vector(embedder.embed(text: "Shared memory alpha about API design patterns")!),
         importance: 3
     )
-    ctx.syncedLattice.add(syncedCopy1, preservingGlobalId: gid1)
+    try ctx.syncedLattice.add(syncedCopy1, preservingGlobalId: gid1)
 
     // --- Shared memory 2: exists in BOTH DBs with same globalId ---
     let shared2 = Memory(
@@ -398,8 +398,8 @@ import Foundation
         embedding: try await Vector(embedder.embed(text: "Shared memory beta about database indexing strategies")!),
         importance: 3
     )
-    ctx.localLattice.add(shared2)
-    let gid2 = shared2.__globalId!
+    try ctx.localLattice.add(shared2)
+    let gid2 = shared2.globalId!
     let syncedCopy2 = Memory(
         content: "Shared memory beta about database indexing strategies",
         topic: "architecture",
@@ -407,7 +407,7 @@ import Foundation
         embedding: try await Vector(embedder.embed(text: "Shared memory beta about database indexing strategies")!),
         importance: 3
     )
-    ctx.syncedLattice.add(syncedCopy2, preservingGlobalId: gid2)
+    try ctx.syncedLattice.add(syncedCopy2, preservingGlobalId: gid2)
 
     // --- Local-only memory: just written, not yet relayed to synced DB ---
     let localOnly = Memory(
@@ -417,8 +417,8 @@ import Foundation
         embedding: try await Vector(embedder.embed(text: "Local only memory about pending refactoring work")!),
         importance: 3
     )
-    ctx.localLattice.add(localOnly)
-    let gidLocal = localOnly.__globalId!
+    try ctx.localLattice.add(localOnly)
+    let gidLocal = localOnly.globalId!
 
     // --- Synced-only memory: from another device, not in local DB ---
     let syncedOnly = Memory(
@@ -428,8 +428,8 @@ import Foundation
         embedding: try await Vector(embedder.embed(text: "Synced only memory about deployment automation from laptop")!),
         importance: 3
     )
-    ctx.syncedLattice.add(syncedOnly)
-    let gidSynced = syncedOnly.__globalId!
+    try ctx.syncedLattice.add(syncedOnly)
+    let gidSynced = syncedOnly.globalId!
 
     // Raw counts: local has 3, synced has 3, but 2 are shared → 4 unique
     #expect(ctx.localLattice.objects(Memory.self).count == 3)
@@ -462,7 +462,7 @@ import Foundation
 /// Tests that stats correctly count deduplicated memories across overlapping DBs.
 @Test func dualDB_overlappingSubset_statsCountCorrectly() async throws {
     let ctx = try await makeDualDBTools()
-    ctx.localLattice.add(SyncConfig(project: "SharedProj", policy: .sync))
+    try ctx.localLattice.add(SyncConfig(project: "SharedProj", policy: .sync))
 
     let embedder = sharedEmbedder
     if await !embedder.isLoaded { await embedder.load() }
@@ -475,8 +475,8 @@ import Foundation
         embedding: try await Vector(embedder.embed(text: "Shared stats memory")!),
         importance: 3
     )
-    ctx.localLattice.add(shared)
-    let gid = shared.__globalId!
+    try ctx.localLattice.add(shared)
+    let gid = shared.globalId!
     let syncedCopy = Memory(
         content: "Shared stats memory",
         topic: "testing",
@@ -484,7 +484,7 @@ import Foundation
         embedding: try await Vector(embedder.embed(text: "Shared stats memory")!),
         importance: 3
     )
-    ctx.syncedLattice.add(syncedCopy, preservingGlobalId: gid)
+    try ctx.syncedLattice.add(syncedCopy, preservingGlobalId: gid)
 
     // 1 local-only
     let localOnly = Memory(
@@ -494,7 +494,7 @@ import Foundation
         embedding: try await Vector(embedder.embed(text: "Local only stats memory")!),
         importance: 3
     )
-    ctx.localLattice.add(localOnly)
+    try ctx.localLattice.add(localOnly)
 
     // 1 synced-only
     let syncedOnly = Memory(
@@ -504,7 +504,7 @@ import Foundation
         embedding: try await Vector(embedder.embed(text: "Synced only stats memory")!),
         importance: 3
     )
-    ctx.syncedLattice.add(syncedOnly)
+    try ctx.syncedLattice.add(syncedOnly)
 
     // Raw: local=2, synced=2, unique=3
     // Stats should report 3, not 4
@@ -520,7 +520,7 @@ import Foundation
 /// appears in both DBs under the same topic.
 @Test func dualDB_overlappingSubset_listTopicsDeduplicates() async throws {
     let ctx = try await makeDualDBTools()
-    ctx.localLattice.add(SyncConfig(project: "SharedProj", policy: .sync))
+    try ctx.localLattice.add(SyncConfig(project: "SharedProj", policy: .sync))
 
     let embedder = sharedEmbedder
     if await !embedder.isLoaded { await embedder.load() }
@@ -533,9 +533,9 @@ import Foundation
         embedding: try await Vector(embedder.embed(text: "Debug shared memory")!),
         importance: 3
     )
-    ctx.localLattice.add(shared)
-    let gid = shared.__globalId!
-    ctx.syncedLattice.add(Memory(
+    try ctx.localLattice.add(shared)
+    let gid = shared.globalId!
+    try ctx.syncedLattice.add(Memory(
         content: "Debug shared memory",
         topic: "debugging",
         project: "SharedProj",
@@ -550,7 +550,7 @@ import Foundation
         embedding: try await Vector(embedder.embed(text: "Debug synced-only memory")!),
         importance: 3
     )
-    ctx.syncedLattice.add(syncedOnly)
+    try ctx.syncedLattice.add(syncedOnly)
 
     // list_topics should show debugging: 2 (not 3)
     let topics = try await ctx.tools.handle(CallTool.Parameters(

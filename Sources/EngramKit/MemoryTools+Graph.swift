@@ -39,7 +39,7 @@ extension MemoryTools {
         let existing = localLattice.objects(Edge.self)
             .where { $0.sourceGlobalId == fromGid && $0.targetGlobalId == toGid && $0.relation == relationEnum }
         if let edge = existing.first {
-            let edgeGid = edge.__globalId?.uuidString ?? "?"
+            let edgeGid = edge.globalId?.uuidString ?? "?"
             if edge.deletedAt != nil {
                 edge.deletedAt = nil
                 log("Revived tombstoned edge [id:\(edgeGid)]")
@@ -56,9 +56,9 @@ extension MemoryTools {
 
         // Create edge (always in localLattice), attributed to the writer
         let edge = Edge(sourceGlobalId: fromGid, targetGlobalId: toGid, relation: relationEnum, authorUserId: currentUserId)
-        localLattice.add(edge)
+        try localLattice.add(edge)
 
-        guard let edgeGid = edge.__globalId else {
+        guard let edgeGid = edge.globalId else {
             throw MCPError.internalError("Failed to persist edge — globalId is nil after add()")
         }
 
@@ -89,7 +89,7 @@ extension MemoryTools {
                     isError: false
                 )
             }
-            foundLattice.delete(Edge.self, where: { $0.__globalId == edgeGid })
+            foundLattice.delete(Edge.self, where: { $0.globalId == edgeGid })
             log("Disconnected edge [id:\(edgeGid.uuidString)]")
             return CallTool.Result(
                 content: [.text("Deleted edge (id: \(edgeGid.uuidString)).")],
@@ -127,8 +127,8 @@ extension MemoryTools {
             if edgeTouchesGroupSharedMemory(edge) {
                 if edge.deletedAt == nil { edge.deletedAt = Date() }
                 tombstoned += 1
-            } else if let egid = edge.__globalId {
-                localLattice.delete(Edge.self, where: { $0.__globalId == egid })
+            } else if let egid = edge.globalId {
+                localLattice.delete(Edge.self, where: { $0.globalId == egid })
                 deleted += 1
             }
         }
@@ -215,7 +215,7 @@ extension MemoryTools {
         var seenEdgeGids = Set<UUID>()
         var uniqueEdges: [Edge] = []
         for (edge, _) in allEdges {
-            guard let edgeGid = edge.__globalId else { continue }
+            guard let edgeGid = edge.globalId else { continue }
             if !seenEdgeGids.contains(edgeGid) {
                 seenEdgeGids.insert(edgeGid)
                 uniqueEdges.append(edge)
@@ -244,20 +244,20 @@ extension MemoryTools {
             for edge in uniqueEdges {
                 if edge.sourceGlobalId == memGid {
                     // Outgoing
-                    let targetMem = rootLattice.objects(Memory.self).where { $0.__globalId == edge.targetGlobalId }.first
+                    let targetMem = rootLattice.objects(Memory.self).where { $0.globalId == edge.targetGlobalId }.first
                     if excluded(targetMem) { continue }
                     let targetContent = targetMem?.content ?? "(deleted)"
                     output += "\n  --[\(edge.relation.rawValue)]--> [id:\(edge.targetGlobalId.uuidString)]\(badge(targetMem)) \(targetContent.prefix(80))"
                 } else if edge.targetGlobalId == memGid {
                     // Incoming
-                    let sourceMem = rootLattice.objects(Memory.self).where { $0.__globalId == edge.sourceGlobalId }.first
+                    let sourceMem = rootLattice.objects(Memory.self).where { $0.globalId == edge.sourceGlobalId }.first
                     if excluded(sourceMem) { continue }
                     let sourceContent = sourceMem?.content ?? "(deleted)"
                     output += "\n  <--[\(edge.relation.rawValue)]-- [id:\(edge.sourceGlobalId.uuidString)]\(badge(sourceMem)) \(sourceContent.prefix(80))"
                 } else {
                     // Edge between two non-root nodes (deeper traversal)
-                    let sourceMem = rootLattice.objects(Memory.self).where { $0.__globalId == edge.sourceGlobalId }.first
-                    let targetMem = rootLattice.objects(Memory.self).where { $0.__globalId == edge.targetGlobalId }.first
+                    let sourceMem = rootLattice.objects(Memory.self).where { $0.globalId == edge.sourceGlobalId }.first
+                    let targetMem = rootLattice.objects(Memory.self).where { $0.globalId == edge.targetGlobalId }.first
                     if excluded(sourceMem) || excluded(targetMem) { continue }
                     let sourceContent = sourceMem?.content ?? "(deleted)"
                     let targetContent = targetMem?.content ?? "(deleted)"
@@ -389,7 +389,7 @@ extension MemoryTools {
                 // Tombstone filter INSIDE the BFS hydration — a handler-level
                 // filter alone would leak tombstoned memories into recall's
                 // Connected section via traversal.
-                if let mem = db.objects(Memory.self).where({ $0.__globalId == gid && $0.expiresAt > now && $0.deletedAt == nil }).first,
+                if let mem = db.objects(Memory.self).where({ $0.globalId == gid && $0.expiresAt > now && $0.deletedAt == nil }).first,
                    let edge = connectingEdges[gid] {
                     // Hydrated by the fetch — the filter's embedding read and
                     // the caller's formatting reads (content up to 4x per

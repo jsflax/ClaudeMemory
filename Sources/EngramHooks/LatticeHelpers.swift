@@ -110,7 +110,10 @@ func setHookState(key: HookState.Key, value: String) {
         existing.value = value
         existing.updatedAt = Date()
     } else {
-        lattice.add(HookState(key: key, value: value))
+        // Non-throwing helper by design (hook call sites treat state writes
+        // as best-effort); a failed upsert logs rather than propagating.
+        do { try lattice.add(HookState(key: key, value: value)) }
+        catch { hookLog("setHookState(\(key)) failed: \(error)") }
     }
 }
 
@@ -130,7 +133,11 @@ func withSessionState<T>(sessionId: String?, _ body: (SessionState) -> T) -> T? 
         state = existing
     } else {
         state = SessionState(sessionId: sessionId)
-        lattice.add(state)
+        do { try lattice.add(state) }
+        catch {
+            hookLog("withSessionState: could not create SessionState: \(error)")
+            return nil
+        }
     }
     return withExtendedLifetime(lattice) { body(state) }
 }

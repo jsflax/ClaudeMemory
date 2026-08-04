@@ -134,16 +134,23 @@ final class SyncManager {
         // MARK: - Sync Progress
 
         private func wireSyncProgress() {
+            // Lattice 1.x: progress is an AsyncStream, not a callback
+            // registration. Consume each in a detached task; the streams end
+            // when their lattice goes away, ending the task with them.
             // IPC progress: cross-process observation of memory.db's IPC relay
-            localLattice?.onSyncProgress { [weak self] progress in
-                Task { @MainActor [weak self] in
-                    self?.parent?.ipcProgress = progress
+            if let ipcStream = localLattice?.syncProgressStream {
+                Task.detached { [weak self] in
+                    for await progress in ipcStream {
+                        await MainActor.run { self?.parent?.ipcProgress = progress }
+                    }
                 }
             }
             // WSS progress: cross-process observation of synced.db's WSS upload
-            syncedLattice?.onSyncProgress { [weak self] progress in
-                Task { @MainActor [weak self] in
-                    self?.parent?.wssProgress = progress
+            if let wssStream = syncedLattice?.syncProgressStream {
+                Task.detached { [weak self] in
+                    for await progress in wssStream {
+                        await MainActor.run { self?.parent?.wssProgress = progress }
+                    }
                 }
             }
         }
@@ -171,7 +178,8 @@ final class SyncManager {
                 existing.policy = newPolicy
                 existing.updatedAt = Date()
             } else {
-                localLattice.add(SyncConfig(project: project, policy: newPolicy))
+                do { try localLattice.add(SyncConfig(project: project, policy: newPolicy)) }
+                catch { print("[SyncManager] toggleProject: SyncConfig insert failed: \(error)"); return }
             }
 
             // Rebuild filter and push to localLattice — Lattice's reconcile_sync_filter handles catch-up
@@ -211,8 +219,13 @@ final class SyncManager {
                 existing.exposedGroups = groups
                 existing.updatedAt = Date()
             } else if exposed {
-                localLattice.add(SyncConfig(project: project, policy: .local,
-                                            exposedTeams: [gid]))
+                do {
+                    try localLattice.add(SyncConfig(project: project, policy: .local,
+                                                    exposedTeams: [gid]))
+                } catch {
+                    print("[SyncManager] setGroupExposure: SyncConfig insert failed: \(error)")
+                    return
+                }
             }
 
             guard exposed else { return }
@@ -261,9 +274,13 @@ final class SyncManager {
                     existing.updatedAt = Date()
                 }
             } else {
-                spoke.add(GroupProjectMap(memberUserId: me,
-                                          localProject: localProject,
-                                          groupProject: localProject))
+                do {
+                    try spoke.add(GroupProjectMap(memberUserId: me,
+                                                  localProject: localProject,
+                                                  groupProject: localProject))
+                } catch {
+                    print("[SyncManager] writeGroupProjectMap: insert failed: \(error)")
+                }
             }
         }
     }

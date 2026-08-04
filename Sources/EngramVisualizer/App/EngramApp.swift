@@ -90,7 +90,9 @@ struct EngramApp: App {
 
         config = local.objects(VisualizerConfig.self).first ?? {
             let c = VisualizerConfig()
-            local.add(c)
+            // Same posture as the `try! Lattice(...)` above: without a
+            // config row the app has nothing to render.
+            try! local.add(c)
             return c
         }()
         // Allow tests to force sound on via environment
@@ -122,9 +124,9 @@ struct EngramApp: App {
                 m.embedding = Vector<Float>([Float](repeating: 0.01, count: 384))
                 m.createdAt = Date()
                 m.lastAccessedAt = Date()
-                bg.add(m)
+                try? bg.add(m)
                 try? await Task.sleep(for: .seconds(3))
-                bg.delete(m)
+                try? bg.delete(m)
             }
         }
     }

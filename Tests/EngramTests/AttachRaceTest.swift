@@ -26,7 +26,7 @@ private let allowProdDBTests = ProcessInfo.processInfo.environment["ENGRAM_ALLOW
     let syncedLattice = try Lattice(Memory.self, Edge.self, SyncConfig.self,
                                     configuration: .init(fileURL: syncedPath, migration: engramMigrations))
 
-    let combined = localLattice.attaching(lattice: syncedLattice)
+    let combined = try localLattice.attaching(lattice: syncedLattice)
 
     // This is exactly what handleRecall does — nearest then read properties
     let embedder = sharedEmbedder
@@ -52,7 +52,7 @@ private let allowProdDBTests = ProcessInfo.processInfo.environment["ENGRAM_ALLOW
         let qEmbed = try await embedder.embed(text: q)!
         let embedding = Vector<Float>(qEmbed)
         let nearest = combined.objects(Memory.self)
-            .distinct(by: \.__globalId)
+            .distinct(by: \.globalId)
             .where { $0.expiresAt > Date() }
             .nearest(to: embedding, on: \.embedding, limit: 15, distance: .l2)
 
@@ -116,14 +116,14 @@ func hooks_rapidOpenAndWrite() async throws {
         // Exactly what throttledLearningNudge does
         let sessionId = "test-\(UUID().uuidString)"
         let state = SessionState(sessionId: sessionId)
-        lattice.add(state)
+        try lattice.add(state)
         state.toolCallCount += 1
         state.updatedAt = Date()
         print("SessionState write \(i) OK: toolCallCount=\(state.toolCallCount)")
 
         // Exactly what setHookState does
         let hook = HookState(key: .maintenanceActive, value: "test-\(i)")
-        lattice.add(hook)
+        try lattice.add(hook)
         hook.updatedAt = Date()
         hook.value = "updated-\(i)"
         print("HookState write \(i) OK: value=\(hook.value)")
@@ -153,7 +153,7 @@ func hooks_rapidOpenAndWrite() async throws {
             state = existing
         } else {
             state = SessionState(sessionId: sessionId)
-            lattice.add(state)
+            try lattice.add(state)
         }
 
         // Exactly what throttledLearningNudge() does — THIS is the crash site

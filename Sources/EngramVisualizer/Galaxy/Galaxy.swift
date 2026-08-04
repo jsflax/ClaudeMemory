@@ -129,14 +129,14 @@ actor Galaxy: Identifiable {
             switch change {
             case .insert(let pk):
                 guard let edge = bg.object(MemoryEdge.self, primaryKey: pk),
-                      let gid = edge.__globalId else { return }
+                      let gid = edge.globalId else { return }
                 let data = EdgeData(id: gid, sourceId: edge.sourceGlobalId,
                                     targetId: edge.targetGlobalId, relation: edge.relation.rawValue)
                 edgePkToGidLock.withLock { $0[pk] = gid }
                 pendingUpdate.withLock { $0.insertedEdges.append((pk, data)) }
             case .update(let pk):
                 guard let edge = bg.object(MemoryEdge.self, primaryKey: pk),
-                      let gid = edge.__globalId else { return }
+                      let gid = edge.globalId else { return }
                 let data = EdgeData(id: gid, sourceId: edge.sourceGlobalId,
                                     targetId: edge.targetGlobalId, relation: edge.relation.rawValue)
                 pendingUpdate.withLock { $0.updatedEdges.append(data) }
@@ -155,7 +155,7 @@ actor Galaxy: Identifiable {
             switch change {
             case .insert(let pk):
                 guard let memory = bg.object(Memory.self, primaryKey: pk),
-                      let gid = memory.__globalId else { return }
+                      let gid = memory.globalId else { return }
                 // Same structural partition loadData applies — without it a
                 // post-load memory lands in every galaxy whose DB has it.
                 if let filter = self.nodeFilter, !filter(memory) { return }
@@ -168,7 +168,7 @@ actor Galaxy: Identifiable {
                 pendingUpdate.withLock { $0.insertedNodes.append((pk, node)) }
             case .update(let pk):
                 guard let memory = bg.object(Memory.self, primaryKey: pk),
-                      let gid = memory.__globalId else { return }
+                      let gid = memory.globalId else { return }
                 if let filter = self.nodeFilter, !filter(memory) {
                     // Fell out of this galaxy's partition (e.g. project
                     // toggled to sync) — remove; no-op if never present.
@@ -206,7 +206,7 @@ actor Galaxy: Identifiable {
         var edgePkToGlobalId: [Int64: UUID] = [:]
         var edgesByNode: [UUID: [EdgeData]] = [:]
         for e in bgLattice.objects(MemoryEdge.self) {
-            guard let pk = e.primaryKey, let gid = e.__globalId else { continue }
+            guard let pk = e.primaryKey, let gid = e.globalId else { continue }
             let ed = EdgeData(id: gid, sourceId: e.sourceGlobalId,
                               targetId: e.targetGlobalId, relation: e.relation.rawValue)
             allEdges[gid] = ed
@@ -227,7 +227,7 @@ actor Galaxy: Identifiable {
         // 2. Read nodes in batches — all off MainActor
         var nodeBatch: [(pk: Int64, node: NodeData)] = []
         for m in bgLattice.objects(Memory.self) {
-            guard let gid = m.__globalId, let pk = m.primaryKey else { continue }
+            guard let gid = m.globalId, let pk = m.primaryKey else { continue }
             if let filter = nodeFilter, !filter(m) { continue }
             nodeBatch.append((pk, NodeData(
                 id: gid, project: m.project, topic: m.topic,

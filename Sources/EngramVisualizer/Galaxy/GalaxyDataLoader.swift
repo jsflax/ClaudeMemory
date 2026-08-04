@@ -93,7 +93,7 @@ final class ObserverAccumulator {
 //            var edgePkToGlobalId: [Int64: UUID] = [:]
 //            var edgesByNode: [UUID: [EdgeData]] = [:]
 //            for e in bgLattice.objects(MemoryEdge.self) {
-//                guard let pk = e.primaryKey, let gid = e.__globalId else { continue }
+//                guard let pk = e.primaryKey, let gid = e.globalId else { continue }
 //                let ed = EdgeData(id: gid, sourceId: e.sourceGlobalId,
 //                                  targetId: e.targetGlobalId, relation: e.relation.rawValue)
 //                allEdges[gid] = ed
@@ -113,7 +113,7 @@ final class ObserverAccumulator {
 //            var nodeBatch: [NodeData] = []
 //            var pkBatch: [Int64: UUID] = [:]
 //            for m in bgLattice.objects(Memory.self) {
-//                guard let gid = m.__globalId, let pk = m.primaryKey else { continue }
+//                guard let gid = m.globalId, let pk = m.primaryKey else { continue }
 //                // Apply per-galaxy node filter (for data partitioning)
 //                if let filter = nodeFilter, !filter(m) { continue }
 //
