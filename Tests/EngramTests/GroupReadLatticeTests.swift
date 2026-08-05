@@ -223,7 +223,11 @@ private func addMemory(_ content: String, project: String, author: UUID?,
 
 @Test func resolveQueryProjectsMapsAcrossMembersLocalNames() async throws {
     let ctx = try await makeGroupTools()
-    let me = UUID(), teammate = UUID()
+    // The REAL signed-in id when ~/.claude/sync/groups.json exists on this
+    // machine (the daemon writes it): resolveQueryProjects filters map rows
+    // by currentUserId, so a fabricated id would be correctly REJECTED by
+    // the code under test. Random only when no directory exists.
+    let me = GroupDirectory.currentUserId() ?? UUID(), teammate = UUID()
     // I call it "engram"; the group calls it "Engram"; my teammate's folder
     // is "engram-fork".
     try ctx.spokes[0].lattice.add(GroupProjectMap(memberUserId: me,
@@ -253,7 +257,11 @@ private func addMemory(_ content: String, project: String, author: UUID?,
 
 @Test func recallBoostsATeammatesDifferentlyNamedCopyOfTheSameProject() async throws {
     let ctx = try await makeGroupTools()
-    let me = UUID(), teammate = UUID()
+    // The REAL signed-in id when ~/.claude/sync/groups.json exists on this
+    // machine (the daemon writes it): resolveQueryProjects filters map rows
+    // by currentUserId, so a fabricated id would be correctly REJECTED by
+    // the code under test. Random only when no directory exists.
+    let me = GroupDirectory.currentUserId() ?? UUID(), teammate = UUID()
     try ctx.spokes[0].lattice.add(GroupProjectMap(memberUserId: me,
                                                   localProject: "engram",
                                                   groupProject: "Engram"))

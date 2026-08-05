@@ -355,8 +355,14 @@ extension MemoryTools {
         var visited = excludeGlobalIds
         var frontier = startGlobalIds
         var result: [(memory: Memory, depth: Int, connectingEdge: Edge)] = []
-        // Map from discovered globalId to the edge that first reached it
-        var connectingEdges: [UUID: Edge] = [:]
+        // EVERY edge that reached a discovered node this round — not just
+        // the first. Two memories are routinely linked twice (auto-connect
+        // writes relates_to, the user then adds part_of), and iteration
+        // order put the loose edge first: the cosine gate then judged the
+        // node on relates_to and dropped it, silently shadowing the
+        // structural edge that should have admitted it unconditionally.
+        // Admission is "ANY connecting edge passes the filter".
+        var connectingEdges: [UUID: [Edge]] = [:]
         let now = Date()
 
         for d in stride(from: 1, through: depth, by: 1) {
@@ -370,7 +376,9 @@ extension MemoryTools {
                     if !visited.contains(edge.targetGlobalId) {
                         visited.insert(edge.targetGlobalId)
                         nextFrontier.insert(edge.targetGlobalId)
-                        connectingEdges[edge.targetGlobalId] = edge
+                    }
+                    if nextFrontier.contains(edge.targetGlobalId) {
+                        connectingEdges[edge.targetGlobalId, default: []].append(edge)
                     }
                 }
                 // Incoming edges
@@ -379,7 +387,9 @@ extension MemoryTools {
                     if !visited.contains(edge.sourceGlobalId) {
                         visited.insert(edge.sourceGlobalId)
                         nextFrontier.insert(edge.sourceGlobalId)
-                        connectingEdges[edge.sourceGlobalId] = edge
+                    }
+                    if nextFrontier.contains(edge.sourceGlobalId) {
+                        connectingEdges[edge.sourceGlobalId, default: []].append(edge)
                     }
                 }
             }
@@ -390,15 +400,18 @@ extension MemoryTools {
                 // filter alone would leak tombstoned memories into recall's
                 // Connected section via traversal.
                 if let mem = db.objects(Memory.self).where({ $0.globalId == gid && $0.expiresAt > now && $0.deletedAt == nil }).first,
-                   let edge = connectingEdges[gid] {
+                   let edges = connectingEdges[gid], !edges.isEmpty {
                     // Hydrated by the fetch — the filter's embedding read and
                     // the caller's formatting reads (content up to 4x per
                     // large memory) serve from the snapshot.
                     mem.materialize()
-                    if let filter, !filter(mem, edge) {
+                    // The node is admitted if ANY of its connecting edges
+                    // passes; the edge that passed is the one reported (it
+                    // is the reason the node is here).
+                    guard let admitting = edges.first(where: { filter?(mem, $0) ?? true }) else {
                         continue  // excluded from results and frontier
                     }
-                    result.append((memory: mem, depth: d, connectingEdge: edge))
+                    result.append((memory: mem, depth: d, connectingEdge: admitting))
                     passingFrontier.insert(gid)
                 }
             }

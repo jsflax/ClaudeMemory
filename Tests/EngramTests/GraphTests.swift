@@ -182,7 +182,11 @@ import Foundation
         ]
     ))
     let output = text(from: result)
-    #expect(output.contains("Deleted 1 edge(s)"))
+    // Tombstone-era wording: shared edges tombstone rather than delete, so
+    // the message reports the partition — "Removed N edge(s) ... (1 deleted)"
+    // for purely-local edges like this one.
+    #expect(output.contains("Removed 1 edge(s)"))
+    #expect(output.contains("(1 deleted)"))
 }
 
 // MARK: - Graph

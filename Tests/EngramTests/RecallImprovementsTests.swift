@@ -275,12 +275,19 @@ import Foundation
         arguments: ["from": .string(idA), "to": .string(idB), "relation": .string("relates_to")]
     ))
 
-    // Recall about Swift concurrency with depth=1
+    // Recall about Swift concurrency with depth=1. limit 1 is load-bearing:
+    // on a 3-memory corpus the adaptive outlier filter degenerates (p75 of
+    // two distances IS the worst distance, so nothing gets pruned) and hub C
+    // squeaks into the DIRECT results at ~0.52 — from which B is admitted
+    // via its part_of edge, legitimately. Capping at 1 keeps the direct set
+    // to A, so the ONLY route to B is the relates_to edge this test is
+    // about.
     let result = try await tools.handle(CallTool.Parameters(
         name: "recall",
         arguments: [
             "query": .string("Swift async await structured concurrency task groups"),
             "depth": .int(1),
+            "limit": .int(1),
         ]
     ))
     let output = text(from: result)

@@ -781,26 +781,34 @@ struct IPCRelaySyncTests {
         newFilter.include(Edge.self)
         newFilter.include(SyncConfig.self)
 
-        // Wait for DELETEs to propagate through the chain
+        // Stage A4 semantics: narrowing emits MARKED filter-removal DELETEs
+        // that clear exactly ONE mirror (the first IPC hop) and stop dead —
+        // recorded synced-for-all-sync_ids on arrival, so the second hop
+        // never even hears about them. This test used to wait for the
+        // deletes to reach the CLOUD hop, which A4 deliberately prevents
+        // (un-syncing a project must not delete it from the cloud copy —
+        // the March data-loss incident's exact mechanism), so it hung
+        // forever. Only the first hop's deletes are awaited now.
         let syncedDeleteTask = await waitForChange(on: syncedConfig, table: "Memory", operation: .delete, count: 3)
-        let cloudDeleteTask = await waitForChange(on: cloudConfig, table: "Memory", operation: .delete, count: 3)
 
         local.updateSyncFilter(newFilter)
 
         try await syncedDeleteTask.value
-        try await cloudDeleteTask.value
 
-        // Give time for any relay-back to propagate
+        // Give time for any (incorrect) onward relay to propagate before
+        // asserting its absence.
         try await Task.sleep(for: .seconds(3))
 
-        // Synced and cloud should lose ProjectC (correct — they obey the filter)
+        // The first hop obeys the narrowed filter and clears its mirror.
         #expect(synced.objects(Memory.self).count == 2, "synced should have 2")
-        #expect(cloud.objects(Memory.self).count == 2, "cloud should have 2")
 
-        // *** CRITICAL ASSERTION ***
-        // localLattice must STILL have all 5 memories.
-        // If the DELETE relays back through the chain (cloud → synced → local),
-        // this assertion catches it.
+        // *** CRITICAL ASSERTIONS ***
+        // The marked deletes stop at the first hop: the cloud keeps every
+        // row (narrowing is "stop syncing", never a remote delete)…
+        let cloudCount = cloud.objects(Memory.self).count
+        #expect(cloudCount == 5,
+            "A4 violation: narrowing deletes relayed PAST the first hop — cloud has \(cloudCount) instead of 5")
+        // …and nothing boomerangs into the source.
         let localCount = local.objects(Memory.self).count
         #expect(localCount == 5,
             "DATA LOSS: local has \(localCount) instead of 5 — DELETE relayed back through chain")
