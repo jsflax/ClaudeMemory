@@ -24,13 +24,21 @@ public enum GroupDirectory {
         public let parentId: UUID?
         public let myRole: String?
         public let root: Bool?
+        /// Link-granted graph (no direct/subtree membership). Optional —
+        /// legacy groups.json files decode without it.
+        public let viaLink: Bool?
+        /// The team(s) whose links grant this graph.
+        public let linkedFrom: [UUID]?
 
-        public init(id: UUID, name: String, parentId: UUID?, myRole: String?, root: Bool?) {
+        public init(id: UUID, name: String, parentId: UUID?, myRole: String?,
+                    root: Bool?, viaLink: Bool? = nil, linkedFrom: [UUID]? = nil) {
             self.id = id
             self.name = name
             self.parentId = parentId
             self.myRole = myRole
             self.root = root
+            self.viaLink = viaLink
+            self.linkedFrom = linkedFrom
         }
     }
 

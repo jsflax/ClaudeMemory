@@ -17,13 +17,21 @@ public enum GroupDirectorySync {
         public let parentId: UUID?
         public let myRole: String?
         public let root: Bool
+        /// True when this graph is granted ONLY via a team link (no
+        /// direct/subtree membership). Additive — absent on old servers.
+        public let viaLink: Bool?
+        /// The team(s) whose links grant this graph.
+        public let linkedFrom: [UUID]?
 
-        public init(id: UUID, name: String, parentId: UUID?, myRole: String?, root: Bool) {
+        public init(id: UUID, name: String, parentId: UUID?, myRole: String?,
+                    root: Bool, viaLink: Bool? = nil, linkedFrom: [UUID]? = nil) {
             self.id = id
             self.name = name
             self.parentId = parentId
             self.myRole = myRole
             self.root = root
+            self.viaLink = viaLink
+            self.linkedFrom = linkedFrom
         }
     }
 
@@ -54,6 +62,8 @@ public enum GroupDirectorySync {
         let parentId: UUID?
         let myRole: String?
         let root: Bool
+        let viaLink: Bool?
+        let linkedFrom: [UUID]?
     }
     private struct MemberInfoDTO: Decodable {
         let userId: UUID
@@ -132,7 +142,8 @@ public enum GroupDirectorySync {
             selfUserId: selfId,
             groups: dtos.map {
                 Membership(id: $0.id, name: $0.name, parentId: $0.parentId,
-                           myRole: $0.myRole, root: $0.root)
+                           myRole: $0.myRole, root: $0.root,
+                           viaLink: $0.viaLink, linkedFrom: $0.linkedFrom)
             },
             members: members)
     }
@@ -205,6 +216,10 @@ public enum GroupDirectorySync {
             ]
             if let parentId = group.parentId { entry["parentId"] = parentId.uuidString }
             if let role = group.myRole { entry["myRole"] = role }
+            if group.viaLink == true { entry["viaLink"] = true }
+            if let linkedFrom = group.linkedFrom, !linkedFrom.isEmpty {
+                entry["linkedFrom"] = linkedFrom.map(\.uuidString)
+            }
             groupsJSON.append(entry)
         }
         var root: [String: Any] = [

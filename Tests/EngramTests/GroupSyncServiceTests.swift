@@ -241,6 +241,41 @@ private func waitUntil(_ timeout: TimeInterval = 15, _ condition: () -> Bool) as
     #expect(file?.members[teammate.uuidString] == "Ada Lovelace")
 }
 
+@Test func groupsJsonCarriesLinkProvenanceAndToleratesItsAbsence() throws {
+    let claudeDir = tempDir()
+    let selfId = UUID(), team = UUID(), concept = UUID()
+    let snapshot = GroupDirectorySync.Snapshot(
+        selfUserId: selfId,
+        groups: [
+            .init(id: team, name: "team-ios", parentId: nil, myRole: "member", root: true),
+            .init(id: concept, name: "mobile", parentId: nil, myRole: "member",
+                  root: true, viaLink: true, linkedFrom: [team]),
+        ],
+        members: [:])
+    try GroupDirectorySync.write(snapshot, claudeDir: claudeDir)
+    let path = (SyncService.syncedDbPath(claudeDir: claudeDir) as NSString)
+        .deletingLastPathComponent + "/groups.json"
+
+    let file = GroupDirectory.load(from: URL(fileURLWithPath: path))
+    let mobile = file?.groups.first { $0.id == concept }
+    #expect(mobile?.viaLink == true)
+    #expect(mobile?.linkedFrom == [team])
+    // Tree-membership entries stay unmarked.
+    #expect(file?.groups.first { $0.id == team }?.viaLink == nil)
+
+    // Legacy file WITHOUT the new keys still decodes (old daemon, new hooks).
+    let legacy = """
+    {"selfUserId":"\(selfId.uuidString)","updatedAt":"2026-08-05T12:00:00Z",
+     "groups":[{"id":"\(team.uuidString)","name":"team-ios","root":true}],
+     "members":{}}
+    """
+    let legacyURL = URL(fileURLWithPath: path + ".legacy")
+    try legacy.data(using: .utf8)!.write(to: legacyURL)
+    let legacyFile = GroupDirectory.load(from: legacyURL)
+    #expect(legacyFile?.groups.first?.viaLink == nil)
+    #expect(legacyFile?.groups.first?.name == "team-ios")
+}
+
 @Test func refreshMarkerIsConsumedExactlyOnce() throws {
     let claudeDir = tempDir()
     let syncDir = (SyncService.syncedDbPath(claudeDir: claudeDir) as NSString)
