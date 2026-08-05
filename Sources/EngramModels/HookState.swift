@@ -12,6 +12,13 @@ public final class HookState {
         /// teammates' group-shared memories from context injection.
         /// Absent/any-other-value = included (beta default is ON).
         case adviseIncludeGroupMemories = "advise.includeGroupMemories"
+        /// Embedding-space version of this database's stored vectors —
+        /// consumed by EmbeddingMigration. Rides IN the DB (it describes
+        /// the rows, so it must travel with them). Absent = v1. Older
+        /// binaries never hydrate this row: every HookState read is
+        /// key-filtered SQL-side, so an unknown enum value never reaches
+        /// their decoder.
+        case embeddingSpaceVersion = "embedding.spaceVersion"
     }
 
     /// The state key.

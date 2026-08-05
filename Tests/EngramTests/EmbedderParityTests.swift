@@ -37,29 +37,22 @@ struct EmbedderParityTests {
         return dot / (na.squareRoot() * nb.squareRoot())
     }
 
-    /// KNOWN DEFECT (Aug 5 2026): the currently-BUNDLED mlmodelc was exported
-    /// with CLS pooling (`co.swiftlm.pooling_strategy: "cls"` in its
-    /// metadata) — a different, weakly-discriminating vector space than
-    /// upstream paraphrase-MiniLM-L6-v2 (mean-pooled). TEI and
-    /// transformers.js agree with each other at cosine 1.0000 and diverge
-    /// from the bundled model at ~0.33–0.51.
-    ///
-    /// This test therefore takes the CoreML model path from
-    /// `FIXED_MODEL_PATH` (a mean-pooled re-export via SwiftLM's
-    /// export_embedding.py — verified ≥0.999 vs TEI) rather than the bundle.
-    /// Swapping the bundled model is the re-embed migration task: every
-    /// stored vector AND the tuned distance constants (conflict bands,
-    /// auto-connect, sampler novelty, web threshold) were calibrated on the
-    /// defective space.
+    /// History (Aug 5 2026): this gate caught the original bundled mlmodelc
+    /// having been exported with CLS pooling (`co.swiftlm.pooling_strategy:
+    /// "cls"`) — a defective, weakly-discriminating space diverging from
+    /// TEI/transformers.js at ~0.33–0.51 cosine. The bundle now ships the
+    /// mean-pooled re-export (embedding space v2) and this test holds the
+    /// BUNDLED model to ≥0.999 against TEI so the defect class cannot
+    /// regress. The stored-vector migration is EmbeddingMigration (daemon
+    /// startup sweep + `memory-sync migrate-embeddings`).
     @Test func coreMLAndTEIAgreeOnGoldenCorpus() async throws {
         guard let teiURL = ProcessInfo.processInfo.environment["TEI_URL"],
-              let url = URL(string: teiURL),
-              let modelPath = ProcessInfo.processInfo.environment["FIXED_MODEL_PATH"] else {
-            // Needs TEI + the mean-pooled model artifact — enforced in CI
-            // where both are provisioned; skipped on plain dev runs.
+              let url = URL(string: teiURL) else {
+            // Needs a TEI sidecar — provisioned in CI; skipped on plain
+            // dev runs.
             return
         }
-        let coreml = EmbeddingService(modelPath: modelPath)
+        let coreml = EmbeddingService()
         await coreml.load()
         let tei = HTTPEmbedder(endpoint: url)
 

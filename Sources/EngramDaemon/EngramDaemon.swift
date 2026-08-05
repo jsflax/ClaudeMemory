@@ -11,7 +11,8 @@ struct EngramDaemon: AsyncParsableCommand {
         abstract: "Engram sync daemon — relays memory changes to the cloud via WSS.",
         subcommands: [ExposeCommand.self, GroupsCommand.self,
                       WhoamiCommand.self, AcceptInviteCommand.self,
-                      CompactServerHistoryCommand.self]
+                      CompactServerHistoryCommand.self,
+                      MigrateEmbeddingsCommand.self]
     )
 
     @Option(name: .long, help: "Lattice log level: off, error, warning, info, debug")
@@ -239,6 +240,22 @@ struct EngramDaemon: AsyncParsableCommand {
         if !nuclearCompact {
             log("Compacting history before sync...")
             SyncService.compactBeforeSync(localLattice)
+        }
+
+        // 4b. Embedding-space migration (v2 mean-pooling, Aug 2026): re-embed
+        //     stored vectors with the fixed model before serving. The hub is
+        //     open WITH ipcTargets, so updated vectors relay to spokes/server
+        //     like any field update. Cheap no-op when the marker is current;
+        //     a failure logs and continues — recall degrades (mixed spaces)
+        //     but sync must not be held hostage by a model-load problem.
+        do {
+            let report = try await EmbeddingMigration.runIfNeeded(on: localLattice, log: log)
+            if report.reembedded > 0 {
+                DaemonStatus.write(state: "starting",
+                                   detail: "Re-embedded \(report.reembedded) memories (space v\(EmbeddingSpace.currentVersion)).")
+            }
+        } catch {
+            log("Embedding migration failed (will retry next start): \(error)")
         }
 
         // 5. Filters were applied at configuration time (above). Refresh
