@@ -423,7 +423,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = 2Z8M9MTEVV;
+				DEVELOPMENT_TEAM = 5Q68UZPXQG;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Sources/EngramVisualizer/Info.plist;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
@@ -452,7 +452,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = 2Z8M9MTEVV;
+				DEVELOPMENT_TEAM = 5Q68UZPXQG;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Sources/EngramVisualizer/Info.plist;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
@@ -508,7 +508,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = 2Z8M9MTEVV;
+				DEVELOPMENT_TEAM = 5Q68UZPXQG;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Sources/EngramVisualizer/Info.plist;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";

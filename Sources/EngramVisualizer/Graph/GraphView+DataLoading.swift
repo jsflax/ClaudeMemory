@@ -112,6 +112,12 @@ extension GraphView {
             guard let galaxy = galaxyRegistry.galaxies[spoke.galaxyId] else { continue }
             Task {
                 galaxy.setNodeFilter(Self.groupGalaxyFilter)
+                // effectiveProject (decision 13): resolve each author's
+                // local folder name to the group's canonical project, so
+                // one shared project clusters/labels as ONE project instead
+                // of one per member. Built from the spoke's own map table —
+                // rows sync live from other members.
+                galaxy.setProjectResolver(Self.groupProjectResolver(for: spoke.ref))
                 await galaxy.loadData()
                 // Live animation comes free: the spoke is daemon-written, and
                 // startObservers watches its AuditLog cross-process — the same
@@ -129,6 +135,27 @@ extension GraphView {
 
     /// Tombstoned rows are hidden for everyone, author included (decision 9).
     static let groupGalaxyFilter: @Sendable (Memory) -> Bool = { $0.deletedAt == nil }
+
+    /// Snapshot the spoke's GroupProjectMap into a resolver closure.
+    /// Snapshot rather than live query: the resolver runs on the observer's
+    /// background callback path per node. The map is tiny (one row per
+    /// member-project pair) and galaxies reload on membership churn, so a
+    /// stale snapshot costs at most one session of an old name.
+    static func groupProjectResolver(
+        for ref: LatticeThreadSafeReference
+    ) -> (@Sendable (UUID?, String) -> String)? {
+        guard let lattice = ref.resolve() else { return nil }
+        var map: [String: String] = [:]
+        for row in lattice.objects(GroupProjectMap.self).snapshot() {
+            map["\(row.memberUserId.uuidString)|\(row.localProject)"] = row.groupProject
+        }
+        guard !map.isEmpty else { return nil }
+        let captured = map
+        return { author, local in
+            guard let author else { return local }
+            return captured["\(author.uuidString)|\(local)"] ?? local
+        }
+    }
 
     /// Handle late-arriving synced galaxy when daemon connects.
     func handleSyncConnect() {
@@ -148,7 +175,8 @@ extension GraphView {
                 parentGalaxyId: spoke.parentId.flatMap {
                     attachedGroupIds.contains($0) ? "group:\($0.uuidString)" : nil
                 },
-                nodeFilter: Self.groupGalaxyFilter)
+                nodeFilter: Self.groupGalaxyFilter,
+                projectResolver: Self.groupProjectResolver(for: spoke.ref))
         }
         galaxyRegistry.rebuildNodeFilters()
     }

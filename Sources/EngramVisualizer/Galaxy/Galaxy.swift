@@ -91,6 +91,27 @@ actor Galaxy: Identifiable {
     nonisolated func setNodeFilter(_ filter: (@Sendable (Memory) -> Bool)?) {
         nodeFilterLock.withLock { $0 = filter }
     }
+
+    /// effectiveProject resolution (decision 13) for GROUP galaxies: members
+    /// derive `project` from their own folder names, so the same shared
+    /// project arrives under each author's local string. The resolver maps
+    /// (authorUserId, localProject) → the group's canonical name, so
+    /// clusters, labels, nebulae, and stats group by ONE project instead of
+    /// one per member. Nil (personal/synced) is identity. Same lock idiom as
+    /// nodeFilter — the observer path reads it off-actor.
+    private let projectResolverLock =
+        OSAllocatedUnfairLock<(@Sendable (_ author: UUID?, _ local: String) -> String)?>(initialState: nil)
+    nonisolated var projectResolver: (@Sendable (UUID?, String) -> String)? {
+        projectResolverLock.withLock { $0 }
+    }
+    nonisolated func setProjectResolver(_ resolver: (@Sendable (UUID?, String) -> String)?) {
+        projectResolverLock.withLock { $0 = resolver }
+    }
+
+    /// Resolved display project for a memory in this galaxy.
+    nonisolated func displayProject(_ memory: Memory) -> String {
+        projectResolver?(memory.authorUserId, memory.project) ?? memory.project
+    }
     
     // Per-galaxy mascot fleet (nil until Metal device is available)
     @MainActor var mascotFleet: MascotFleet?
@@ -160,7 +181,7 @@ actor Galaxy: Identifiable {
                 // post-load memory lands in every galaxy whose DB has it.
                 if let filter = self.nodeFilter, !filter(memory) { return }
                 let node = NodeData(
-                    id: gid, project: memory.project, topic: memory.topic,
+                    id: gid, project: self.displayProject(memory), topic: memory.topic,
                     label: extractLabel(content: memory.content, topic: memory.topic),
                     content: memory.content,
                     createdAt: memory.createdAt, lastAccessedAt: memory.lastAccessedAt,
@@ -176,7 +197,7 @@ actor Galaxy: Identifiable {
                     return
                 }
                 let node = NodeData(
-                    id: gid, project: memory.project, topic: memory.topic,
+                    id: gid, project: self.displayProject(memory), topic: memory.topic,
                     label: extractLabel(content: memory.content, topic: memory.topic),
                     content: memory.content,
                     createdAt: memory.createdAt, lastAccessedAt: memory.lastAccessedAt,
@@ -230,7 +251,7 @@ actor Galaxy: Identifiable {
             guard let gid = m.globalId, let pk = m.primaryKey else { continue }
             if let filter = nodeFilter, !filter(m) { continue }
             nodeBatch.append((pk, NodeData(
-                id: gid, project: m.project, topic: m.topic,
+                id: gid, project: displayProject(m), topic: m.topic,
                 label: extractLabel(content: m.content, topic: m.topic),
                 content: m.content,
                 createdAt: m.createdAt, lastAccessedAt: m.lastAccessedAt,

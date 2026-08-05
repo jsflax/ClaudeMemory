@@ -126,7 +126,8 @@ final class GalaxyRegistry {
                             latticeRef: LatticeThreadSafeReference,
                             hierarchyLevel: Int = 0,
                             parentGalaxyId: String? = nil,
-                            nodeFilter: (@Sendable (Memory) -> Bool)? = nil) {
+                            nodeFilter: (@Sendable (Memory) -> Bool)? = nil,
+                            projectResolver: (@Sendable (UUID?, String) -> String)? = nil) {
         guard galaxies[id] == nil else { return }
         // parentGalaxyId must reach the Galaxy init — it is what
         // interGalaxyConnections draws hierarchy lines from; dropping it
@@ -138,6 +139,8 @@ final class GalaxyRegistry {
 
         Task {
             if let filter = nodeFilter { galaxy.setNodeFilter(filter) }
+            // Before loadData — the loader snapshots it per node.
+            if let resolver = projectResolver { galaxy.setProjectResolver(resolver) }
             await galaxy.loadData()
             await galaxy.startObservers()
         }
