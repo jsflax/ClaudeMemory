@@ -29,6 +29,7 @@ let package = Package(
     products: [
         .library(name: "EngramKit", targets: ["EngramKit"]),
         .library(name: "EngramModels", targets: ["EngramModels"]),
+        .library(name: "EngramMemoryCore", targets: ["EngramMemoryCore"]),
         .library(name: "EngramFoundationModels", targets: ["EngramFoundationModels"]),
         .library(name: "EngramSceneKit", targets: ["EngramSceneKit"]),
         .library(name: "EngramMetalShaders", targets: ["EngramMetalShaders"]),
@@ -63,6 +64,19 @@ let package = Package(
         ),
         // Metal shader library. Plugin compiles .metal → metallib at build time.
         engramMetalShaders,
+        // Platform-portable memory contract: the MemoryService protocol, its
+        // DTOs, Principal/identity, shared ranking + fencing + content-word
+        // logic, and the Embedder seam. NO Apple-only frameworks, NO Lattice,
+        // NO MCP — this module MUST build on Linux (it is what engram-server
+        // consumes for the agents deployment). Apple conformances (CoreML
+        // embedder, NLTagger extractor, Lattice storage) live in EngramKit.
+        .target(
+            name: "EngramMemoryCore"
+        ),
+        .testTarget(
+            name: "EngramMemoryCoreTests",
+            dependencies: ["EngramMemoryCore"]
+        ),
         .target(
             name: "EngramModels",
             dependencies: [
@@ -76,6 +90,7 @@ let package = Package(
             name: "EngramKit",
             dependencies: [
                 "EngramModels",
+                "EngramMemoryCore",
                 .product(name: "MCP", package: "swift-sdk"),
                 .product(name: "Lattice", package: "lattice"),
                 .product(name: "SwiftLM", package: "SwiftLM"),
@@ -202,6 +217,7 @@ let package = Package(
             name: "EngramTests",
             dependencies: [
                 "EngramKit",
+                "EngramMemoryCore",
                 .product(name: "Lattice", package: "lattice"),
             ],
             swiftSettings: [

@@ -1,0 +1,37 @@
+name: Linux — EngramMemoryCore
+
+# The portable memory contract (EngramMemoryCore) is what engram-server's
+# agents deployment consumes on Linux. This gate keeps it Linux-clean —
+# no CoreML, no NaturalLanguage, no Lattice, no MCP may creep in.
+#
+# Build-only by design: `swift test` would build the entire test graph
+# (EngramKit → CoreML → fails on Linux). Test EXECUTION on Linux happens in
+# engram-server's CI, which depends on EngramMemoryCore as a product and
+# runs the contract suite there (increment 5). Compiling the test target
+# here still type-checks every test.
+
+on:
+  push:
+    branches: [main, "agents/**", "groups/**"]
+    paths:
+      - "Sources/EngramMemoryCore/**"
+      - "Tests/EngramMemoryCoreTests/**"
+      - "Package.swift"
+      - ".github/workflows/linux-core.yml"
+  pull_request:
+    paths:
+      - "Sources/EngramMemoryCore/**"
+      - "Tests/EngramMemoryCoreTests/**"
+      - "Package.swift"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: swift:6.0-noble
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build EngramMemoryCore (Linux)
+        run: swift build --target EngramMemoryCore
+      - name: Compile its tests (Linux)
+        run: swift build --target EngramMemoryCoreTests
