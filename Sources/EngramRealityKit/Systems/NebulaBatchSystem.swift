@@ -2,20 +2,35 @@ import RealityKit
 import AppKit
 import simd
 
-/// Per-project nebula particle emitter system.
+/// Nebula gas: per-(galaxy, project) cluster emitters, a single-color
+/// far-LOD gas mass per galaxy, and gas bridges connecting group galaxies
+/// to the personal one.
 ///
-/// Creates/updates/destroys nebula entities as projects appear/disappear.
-/// Uses RealityKit ParticleEmitterComponent for gaseous fog effect.
+/// Uses RealityKit ParticleEmitterComponent for the gaseous fog effect.
+///
+/// LOD: when the camera is far from a galaxy, its per-project nebulae fade
+/// out and one galaxy-sized single-color mass fades in — so a distant team
+/// reads as a colored body, and flying closer resolves it into its project
+/// clusters. Opacity rides OpacityComponent, written only when the factor
+/// moves past a threshold (per-frame component churn stalls RealityKit).
 @MainActor
 public final class NebulaBatchSystem {
     private var activeNebulae: [String: Entity] = [:]
+    private var nebulaRadii: [String: Float] = [:]
+    private var activeGalaxyGas: [String: Entity] = [:]
+    private var galaxyGasRadii: [String: Float] = [:]
+    private var activeBridges: [String: Entity] = [:]
     private var colorCache: [String: (start: NSColor, end: NSColor)] = [:]
     private var lastColorMapHash: Int = 0
+    /// Last applied LOD opacity per entity key — write-on-change only.
+    private var lastOpacity: [String: Float] = [:]
 
-    // Per-project node counts cached on topologyVersion — the inline
-    // full-node histogram cost O(n) dict ops per frame at 40k nodes.
-    private var cachedProjectSizes: [String: Int] = [:]
-    private var cachedSizesTopologyVersion: UInt64 = .max
+    /// Camera distances (to a galaxy's worldCenter) over which per-project
+    /// nebulae crossfade into the galaxy's single-color mass. Scaled by the
+    /// galaxy's own extent so a huge personal cloud doesn't flip to a blob
+    /// while you're still inside its suburbs.
+    private static let fadeStart: Float = 2600
+    private static let fadeEnd: Float = 5200
 
     public init() {}
 
@@ -23,101 +38,213 @@ public final class NebulaBatchSystem {
         container: Entity,
         dataProvider: SceneDataProvider,
         topologyChanged: Bool,
-        scaleFactor: Float
+        scaleFactor: Float,
+        cameraPosition: SIMD3<Float>
     ) {
-        let centroids = dataProvider.projectCentroids
         let colorMap = dataProvider.projectColorMap
-
-        // Invalidate color cache when colors change
         let colorHash = colorMap.hashValue
         if colorHash != lastColorMapHash {
             colorCache.removeAll()
             lastColorMapHash = colorHash
         }
 
-        // Determine which projects have nebulae (2+ nodes)
-        if dataProvider.topologyVersion != cachedSizesTopologyVersion {
-            var projectSizes: [String: Int] = [:]
-            for node in dataProvider.nodes {
-                projectSizes[node.project, default: 0] += 1
-            }
-            cachedProjectSizes = projectSizes
-            cachedSizesTopologyVersion = dataProvider.topologyVersion
+        let clusters = dataProvider.nebulaClusters.filter { $0.count >= 2 }
+        let galaxies = dataProvider.galaxySnapshots
+
+        // Per-galaxy far factor: 0 = fully resolved (project nebulae),
+        // 1 = fully far (single-color galaxy mass).
+        var farFactor: [String: Float] = [:]
+        for galaxy in galaxies {
+            let dist = simd_length(cameraPosition - galaxy.worldCenter)
+            let start = max(Self.fadeStart, galaxy.radius * 1.4)
+            let end = start + (Self.fadeEnd - Self.fadeStart)
+            farFactor[galaxy.id] = min(1, max(0, (dist - start) / max(1, end - start)))
         }
-        let projectSizes = cachedProjectSizes
 
-        let activeProjects = Set(centroids.keys.filter { (projectSizes[$0] ?? 0) >= 2 })
+        updateClusterNebulae(container: container, clusters: clusters,
+                             colorMap: colorMap, scaleFactor: scaleFactor,
+                             farFactor: farFactor)
+        updateGalaxyGas(container: container, galaxies: galaxies,
+                        scaleFactor: scaleFactor, farFactor: farFactor)
+        updateBridges(container: container, galaxies: galaxies,
+                      scaleFactor: scaleFactor)
+    }
 
-        // Remove nebulae for projects no longer active
-        for (project, entity) in activeNebulae where !activeProjects.contains(project) {
+    // MARK: - Per-cluster nebulae (near LOD)
+
+    private func updateClusterNebulae(
+        container: Entity,
+        clusters: [RKNebulaCluster],
+        colorMap: [String: SIMD3<Float>],
+        scaleFactor: Float,
+        farFactor: [String: Float]
+    ) {
+        let activeKeys = Set(clusters.map(\.key))
+        for (key, entity) in activeNebulae where !activeKeys.contains(key) {
             entity.removeFromParent()
-        }
-        for project in activeNebulae.keys where !activeProjects.contains(project) {
-            activeNebulae.removeValue(forKey: project)
+            activeNebulae.removeValue(forKey: key)
+            nebulaRadii.removeValue(forKey: key)
+            lastOpacity.removeValue(forKey: key)
         }
 
-        // Create/update nebulae for active projects
-        for project in activeProjects {
-            guard let centroid = centroids[project] else { continue }
-            let color = colorMap[project] ?? SIMD3<Float>(0.5, 0.5, 0.5)
+        for cluster in clusters {
+            let key = cluster.key
+            let color = colorMap[cluster.project] ?? SIMD3<Float>(0.5, 0.5, 0.5)
 
-            if let entity = activeNebulae[project] {
-                // Update position
-                entity.position = centroid * scaleFactor
+            if let entity = activeNebulae[key] {
+                entity.position = cluster.centroid * scaleFactor
+                // Clusters RESIZE now — the old system froze radius at
+                // creation, so anything created mid-load stayed invisible
+                // (radius ~40 against a spread of hundreds). Rebuild the
+                // emitter only past a 25% delta; the component write is the
+                // expensive part.
+                let known = nebulaRadii[key] ?? cluster.radius
+                if abs(cluster.radius - known) / max(known, 1) > 0.25 {
+                    let colors = nebulaColors(for: cluster.project, rgb: color)
+                    entity.components.set(makeNebulaEmitter(
+                        radius: cluster.radius, scaleFactor: scaleFactor,
+                        startColor: colors.start, endColor: colors.end))
+                    nebulaRadii[key] = cluster.radius
+                }
             } else {
-                // Create new nebula. The cluster radius (a full node scan per
-                // project) is only needed here — computing it in the shared
-                // path cost O(nodes × projects) per frame, 427ms at 40k×70,
-                // while existing nebulae never resize.
-                let radius = computeClusterRadius(
-                    project: project,
-                    centroid: centroid,
-                    nodes: dataProvider.nodes,
-                    positions: dataProvider.positions
-                )
                 let entity = Entity()
-                entity.name = "Nebula_\(project)"
-                entity.position = centroid * scaleFactor
-
-                let colors = nebulaColors(for: project, rgb: color)
-                let emitter = makeNebulaEmitter(
-                    radius: radius,
-                    scaleFactor: scaleFactor,
-                    startColor: colors.start,
-                    endColor: colors.end
-                )
-                entity.components.set(emitter)
+                entity.name = "Nebula_\(key)"
+                entity.position = cluster.centroid * scaleFactor
+                let colors = nebulaColors(for: cluster.project, rgb: color)
+                entity.components.set(makeNebulaEmitter(
+                    radius: cluster.radius, scaleFactor: scaleFactor,
+                    startColor: colors.start, endColor: colors.end))
                 entity.components.set(NebulaComponent(
-                    project: project,
+                    project: cluster.project,
                     color: SIMD4(color.x, color.y, color.z, 0.3),
-                    radius: radius
-                ))
-
+                    radius: cluster.radius))
                 container.addChild(entity)
-                activeNebulae[project] = entity
+                activeNebulae[key] = entity
+                nebulaRadii[key] = cluster.radius
+            }
+
+            // Near LOD: visible when close, gone when far.
+            setOpacity(key: key, entity: activeNebulae[key]!,
+                       opacity: 1 - (farFactor[cluster.galaxyId] ?? 0))
+        }
+    }
+
+    // MARK: - Per-galaxy single-color mass (far LOD)
+
+    private func updateGalaxyGas(
+        container: Entity,
+        galaxies: [RKGalaxySnapshot],
+        scaleFactor: Float,
+        farFactor: [String: Float]
+    ) {
+        let activeIds = Set(galaxies.filter { $0.nodeCount >= 2 }.map(\.id))
+        for (id, entity) in activeGalaxyGas where !activeIds.contains(id) {
+            entity.removeFromParent()
+            activeGalaxyGas.removeValue(forKey: id)
+            galaxyGasRadii.removeValue(forKey: id)
+            lastOpacity.removeValue(forKey: "gas|\(id)")
+        }
+
+        for galaxy in galaxies where galaxy.nodeCount >= 2 {
+            let key = "gas|\(galaxy.id)"
+            let radius = max(galaxy.radius * 0.9, 200)
+            if let entity = activeGalaxyGas[galaxy.id] {
+                entity.position = galaxy.worldCenter * scaleFactor
+                let known = galaxyGasRadii[galaxy.id] ?? radius
+                if abs(radius - known) / max(known, 1) > 0.25 {
+                    let colors = nebulaColors(for: key, rgb: galaxy.dominantColor)
+                    entity.components.set(makeNebulaEmitter(
+                        radius: radius, scaleFactor: scaleFactor,
+                        startColor: colors.start, endColor: colors.end,
+                        dense: true))
+                    galaxyGasRadii[galaxy.id] = radius
+                }
+            } else {
+                let entity = Entity()
+                entity.name = "GalaxyGas_\(galaxy.id)"
+                entity.position = galaxy.worldCenter * scaleFactor
+                let colors = nebulaColors(for: key, rgb: galaxy.dominantColor)
+                entity.components.set(makeNebulaEmitter(
+                    radius: radius, scaleFactor: scaleFactor,
+                    startColor: colors.start, endColor: colors.end,
+                    dense: true))
+                container.addChild(entity)
+                activeGalaxyGas[galaxy.id] = entity
+                galaxyGasRadii[galaxy.id] = radius
+            }
+            // Far LOD: the inverse of the clusters.
+            setOpacity(key: key, entity: activeGalaxyGas[galaxy.id]!,
+                       opacity: farFactor[galaxy.id] ?? 0)
+        }
+    }
+
+    // MARK: - Bridges (personal → group, parent → child)
+
+    private func updateBridges(
+        container: Entity,
+        galaxies: [RKGalaxySnapshot],
+        scaleFactor: Float
+    ) {
+        let byId = Dictionary(uniqueKeysWithValues: galaxies.map { ($0.id, $0) })
+        // Each group galaxy bridges FROM its attached parent group when one
+        // exists, else from the personal galaxy — mirroring the hierarchy.
+        var wanted: [(key: String, from: SIMD3<Float>, to: SIMD3<Float>, color: SIMD3<Float>)] = []
+        for galaxy in galaxies where galaxy.isGroup {
+            let source = galaxy.parentGalaxyId.flatMap { byId[$0] } ?? byId["personal"]
+            guard let source else { continue }
+            let steps = 4
+            for step in 1...steps {
+                let t = Float(step) / Float(steps + 1)
+                let center = source.worldCenter + (galaxy.worldCenter - source.worldCenter) * t
+                wanted.append((key: "bridge|\(galaxy.id)|\(step)",
+                               from: source.worldCenter, to: galaxy.worldCenter,
+                               color: galaxy.dominantColor))
+                _ = center
+            }
+        }
+
+        let wantedKeys = Set(wanted.map(\.key))
+        for (key, entity) in activeBridges where !wantedKeys.contains(key) {
+            entity.removeFromParent()
+            activeBridges.removeValue(forKey: key)
+        }
+
+        for item in wanted {
+            let step = Int(item.key.split(separator: "|").last.map(String.init) ?? "1") ?? 1
+            let t = Float(step) / 5.0
+            let center = item.from + (item.to - item.from) * t
+            // Thin at the middle, flaring toward both ends — a stream
+            // pouring out of the team into the personal sky.
+            let pinch = 1 - abs(t - 0.5) * 1.2
+            let radius = max(60, 140 * (1 - pinch * 0.45))
+
+            if let entity = activeBridges[item.key] {
+                entity.position = center * scaleFactor
+            } else {
+                let entity = Entity()
+                entity.name = "Bridge_\(item.key)"
+                entity.position = center * scaleFactor
+                let colors = nebulaColors(for: item.key, rgb: item.color)
+                entity.components.set(makeNebulaEmitter(
+                    radius: radius, scaleFactor: scaleFactor,
+                    startColor: colors.start, endColor: colors.end))
+                container.addChild(entity)
+                activeBridges[item.key] = entity
             }
         }
     }
 
     // MARK: - Helpers
 
-    private func computeClusterRadius(
-        project: String,
-        centroid: SIMD3<Float>,
-        nodes: [RKNodeSnapshot],
-        positions: [UUID: SIMD3<Float>]
-    ) -> Float {
-        var maxDist: Float = 0
-        for node in nodes where node.project == project {
-            if let pos = positions[node.id] {
-                maxDist = max(maxDist, simd_length(pos - centroid))
-            }
-        }
-        return maxDist + 40
+    private func setOpacity(key: String, entity: Entity, opacity: Float) {
+        let clamped = min(1, max(0, opacity))
+        if let last = lastOpacity[key], abs(last - clamped) < 0.05 { return }
+        entity.components.set(OpacityComponent(opacity: clamped))
+        lastOpacity[key] = clamped
     }
 
-    private func nebulaColors(for project: String, rgb: SIMD3<Float>) -> (start: NSColor, end: NSColor) {
-        if let cached = colorCache[project] { return cached }
+    private func nebulaColors(for key: String, rgb: SIMD3<Float>) -> (start: NSColor, end: NSColor) {
+        if let cached = colorCache[key] { return cached }
 
         let start = NSColor(
             red: CGFloat(min(1.0, rgb.x * 1.3 + 0.1)),
@@ -132,7 +259,7 @@ public final class NebulaBatchSystem {
             alpha: 0.005
         )
         let result = (start: start, end: end)
-        colorCache[project] = result
+        colorCache[key] = result
         return result
     }
 
@@ -140,7 +267,8 @@ public final class NebulaBatchSystem {
         radius: Float,
         scaleFactor: Float,
         startColor: NSColor,
-        endColor: NSColor
+        endColor: NSColor,
+        dense: Bool = false
     ) -> ParticleEmitterComponent {
         var emitter = ParticleEmitterComponent()
         let scaledR = radius * scaleFactor
@@ -158,10 +286,15 @@ public final class NebulaBatchSystem {
             idle: nil
         )
 
-        emitter.mainEmitter.birthRate = max(5, min(15, radius * 0.05))
+        // The far-LOD galaxy mass is DENSER: it stands in for many cluster
+        // nebulae at once, so its particle budget is higher and its puffs
+        // larger relative to radius.
+        emitter.mainEmitter.birthRate = dense
+            ? max(10, min(28, radius * 0.03))
+            : max(5, min(15, radius * 0.05))
         emitter.mainEmitter.lifeSpan = 15.0
         emitter.mainEmitter.lifeSpanVariation = 5.0
-        emitter.mainEmitter.size = max(0.03, scaledR * 0.55)
+        emitter.mainEmitter.size = max(0.03, scaledR * (dense ? 0.7 : 0.55))
         emitter.mainEmitter.sizeVariation = emitter.mainEmitter.size * 0.4
         emitter.mainEmitter.sizeMultiplierAtEndOfLifespan = 1.2
 

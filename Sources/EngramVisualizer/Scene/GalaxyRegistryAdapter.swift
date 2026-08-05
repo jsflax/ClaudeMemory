@@ -169,23 +169,84 @@ final class GalaxyRegistryAdapter: SceneDataProvider {
 
         // Project centroids — full scan throttled to every 30 frames (plus
         // topology changes): positions drift during settling, so anchors
-        // refresh continuously but not per frame.
+        // refresh continuously but not per frame. The SAME pass now also
+        // builds the (galaxy, project) nebula clusters and per-galaxy
+        // aggregates — this is the only layer holding nodeToGalaxy, the
+        // color map, and positions together, and folding them into one scan
+        // keeps the per-30-frame cost at O(n).
         frameCounter &+= 1
         if frameCentroids.isEmpty || lastTopologyVersion != centroidsTopologyVersion
             || frameCounter % 30 == 0 {
             let positions = registry.mergedPositions
+            let nodeToGalaxy = registry.nodeToGalaxy
             var sums: [String: (sum: SIMD3<Float>, count: Int)] = [:]
+            // (galaxyId|project) → accumulator; galaxyId → extent accumulator.
+            var clusterSums: [String: (galaxy: String, project: String, sum: SIMD3<Float>, count: Int)] = [:]
             for node in cachedNodes {
                 guard let pos = positions[node.id] else { continue }
                 let entry = sums[node.project] ?? (.zero, 0)
                 sums[node.project] = (entry.sum + pos, entry.count + 1)
+                let galaxy = nodeToGalaxy[node.id] ?? "personal"
+                let key = "\(galaxy)|\(node.project)"
+                let c = clusterSums[key] ?? (galaxy, node.project, .zero, 0)
+                clusterSums[key] = (galaxy, node.project, c.sum + pos, c.count + 1)
             }
             frameCentroids = sums.mapValues { $0.sum / Float($0.count) }
+
+            // Second O(n) pass for radii (needs the centroids from pass 1).
+            var clusterCentroids: [String: SIMD3<Float>] = [:]
+            for (key, c) in clusterSums {
+                clusterCentroids[key] = c.sum / Float(c.count)
+            }
+            var clusterMaxDist: [String: Float] = [:]
+            var galaxyMaxDist: [String: Float] = [:]
+            var galaxyCounts: [String: Int] = [:]
+            var galaxyProjectCounts: [String: [String: Int]] = [:]
+            let galaxyCenters = registry.galaxies.mapValues { $0.worldCenter }
+            for node in cachedNodes {
+                guard let pos = positions[node.id] else { continue }
+                let galaxy = nodeToGalaxy[node.id] ?? "personal"
+                let key = "\(galaxy)|\(node.project)"
+                if let centroid = clusterCentroids[key] {
+                    clusterMaxDist[key] = max(clusterMaxDist[key] ?? 0, simd_length(pos - centroid))
+                }
+                if let center = galaxyCenters[galaxy] {
+                    galaxyMaxDist[galaxy] = max(galaxyMaxDist[galaxy] ?? 0, simd_length(pos - center))
+                }
+                galaxyCounts[galaxy, default: 0] += 1
+                galaxyProjectCounts[galaxy, default: [:]][node.project, default: 0] += 1
+            }
+
+            frameNebulaClusters = clusterSums.map { key, c in
+                RKNebulaCluster(galaxyId: c.galaxy, project: c.project,
+                                centroid: clusterCentroids[key] ?? .zero,
+                                count: c.count,
+                                radius: (clusterMaxDist[key] ?? 0) + 40)
+            }
+            frameGalaxySnapshots = registry.galaxies.values.map { galaxy in
+                // Dominant color = largest project's color in THIS galaxy.
+                let dominant = galaxyProjectCounts[galaxy.id]?
+                    .max(by: { $0.value < $1.value })?.key
+                let color = dominant.flatMap { cachedColorMap[$0] } ?? SIMD3<Float>(0.5, 0.5, 0.6)
+                return RKGalaxySnapshot(
+                    id: galaxy.id,
+                    displayName: galaxy.displayName,
+                    worldCenter: galaxy.worldCenter,
+                    dominantColor: color,
+                    nodeCount: galaxyCounts[galaxy.id] ?? 0,
+                    radius: galaxyMaxDist[galaxy.id] ?? 300,
+                    parentGalaxyId: galaxy.parentGalaxyId)
+            }
             centroidsTopologyVersion = lastTopologyVersion
         }
     }
     private var centroidsTopologyVersion: UInt64 = .max
     private var frameCounter: UInt64 = 0
+    private var frameNebulaClusters: [RKNebulaCluster] = []
+    private var frameGalaxySnapshots: [RKGalaxySnapshot] = []
+
+    var nebulaClusters: [RKNebulaCluster] { frameNebulaClusters }
+    var galaxySnapshots: [RKGalaxySnapshot] { frameGalaxySnapshots }
 
     // MARK: - Snapshot Rebuilding
 

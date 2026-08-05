@@ -26,7 +26,11 @@ public final class CameraController: CameraProvider {
     @ObservationIgnored public private(set) var elevation: Float = 0.3
     @ObservationIgnored public private(set) var cameraTarget: SIMD3<Float> = .zero
 
-    public var orbitRadius: Float = 2.0
+    // Spawn WELL outside the universe: centerOnGraph refines this once data
+    // loads, but it used to default to 2.0 — and because the one-shot
+    // center call ran before any async load, its empty-positions guard left
+    // the camera parked ON the origin for the whole session.
+    public var orbitRadius: Float = 4800
     private let smoothing: Float = 0.2
     public var isDragging = false
 
@@ -148,8 +152,13 @@ public final class CameraController: CameraProvider {
         for (_, pos) in positions {
             maxDist = max(maxDist, simd_length(pos - centroid))
         }
-        // Everything in world space — CameraSystem applies scaleFactor when syncing to RK entity
-        orbitRadius = max(maxDist * 3.5, 800)
+        // Everything in world space — CameraSystem applies scaleFactor when
+        // syncing to RK entity. Floor raised from 800: with group galaxies
+        // stacked at levelSpacing=3000 the scene spans thousands of units,
+        // and the opening shot should read the whole sky (which also puts
+        // every galaxy past the nebula far-LOD threshold — you arrive to
+        // single-color masses and fly in to resolve them).
+        orbitRadius = max(maxDist * 3.5, 4200)
         targetCameraPos = centroid
         cameraTarget = centroid
     }

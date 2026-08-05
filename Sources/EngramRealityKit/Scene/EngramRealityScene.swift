@@ -38,6 +38,7 @@ public final class EngramRealityScene {
     public var edgeBatchEntity: ModelEntity?
     public var labelBatchEntity: ModelEntity?
     public let nebulaContainer: Entity
+    public let galaxyTitleContainer: Entity
     public let mascotContainer: Entity
     public var flowParticleEntity: ModelEntity?
     public let lightContainer: Entity
@@ -112,6 +113,7 @@ public final class EngramRealityScene {
     public let labelBatchSystem: LabelBatchSystem
     public let cameraSystem: CameraSystem
     public let nebulaBatchSystem: NebulaBatchSystem
+    public let galaxyTitleSystem: GalaxyTitleSystem
     public let mascotSystem: RKMascotSystem
     public let flowParticleSystem: RKFlowParticleSystem
     public let spatialAudioSystem: RKSpatialAudioSystem
@@ -164,6 +166,9 @@ public final class EngramRealityScene {
         self.nebulaContainer = Entity()
         nebulaContainer.name = "NebulaContainer"
 
+        self.galaxyTitleContainer = Entity()
+        galaxyTitleContainer.name = "GalaxyTitleContainer"
+
         self.mascotContainer = Entity()
         mascotContainer.name = "MascotContainer"
 
@@ -177,6 +182,7 @@ public final class EngramRealityScene {
         self.labelBatchSystem = LabelBatchSystem()
         self.cameraSystem = CameraSystem()
         self.nebulaBatchSystem = NebulaBatchSystem()
+        self.galaxyTitleSystem = GalaxyTitleSystem()
         self.mascotSystem = RKMascotSystem()
         self.flowParticleSystem = RKFlowParticleSystem()
         self.spatialAudioSystem = RKSpatialAudioSystem()
@@ -188,6 +194,7 @@ public final class EngramRealityScene {
         // Build entity hierarchy
         rootEntity.addChild(cameraEntity)
         rootEntity.addChild(nebulaContainer)
+        rootEntity.addChild(galaxyTitleContainer)
         rootEntity.addChild(mascotContainer)
         rootEntity.addChild(lightContainer)
 
@@ -390,11 +397,21 @@ public final class EngramRealityScene {
         sharedCmdBuf?.commit()
         phaseMark()
 
-        // 8. Nebula update
+        // 8. Nebula update — cameraPos drives the far-LOD crossfade
+        // (per-project gas near, one galaxy-colored mass far).
         nebulaBatchSystem.update(
             container: nebulaContainer,
             dataProvider: dataProvider,
             topologyChanged: topologyChanged,
+            scaleFactor: scaleFactor,
+            cameraPosition: cameraPos
+        )
+        phaseMark()
+
+        // 8b. Galaxy titles — glowing displayName above each galaxy.
+        galaxyTitleSystem.update(
+            container: galaxyTitleContainer,
+            dataProvider: dataProvider,
             scaleFactor: scaleFactor
         )
         phaseMark()

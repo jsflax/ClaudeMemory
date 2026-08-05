@@ -234,8 +234,27 @@ struct Graph3DView: View {
         // Audio is handled by RKSpatialAudioSystem inside EngramRealityScene
         mgr.soundEnabled = soundEnabled
 
-        // Center camera on graph
+        // Center camera on graph. At setup the async galaxy loads have
+        // rarely populated any positions, and centerOnGraph's empty guard
+        // silently no-ops — which used to strand the camera at its default
+        // orbit ON the origin for the whole session. Keep the immediate
+        // call (covers relaunch-with-cache), then retry until data exists
+        // so the fit-the-whole-sky framing actually runs.
         mgr.camera.centerOnGraph(positions: galaxyRegistry.mergedPositions)
+        if galaxyRegistry.mergedPositions.isEmpty {
+            let registry = galaxyRegistry
+            Task { @MainActor [weak mgr] in
+                for _ in 0..<120 {   // up to ~60s of load time
+                    try? await Task.sleep(for: .milliseconds(500))
+                    guard let mgr else { return }
+                    let positions = registry.mergedPositions
+                    if !positions.isEmpty {
+                        mgr.camera.centerOnGraph(positions: positions)
+                        return
+                    }
+                }
+            }
+        }
     }
 
     private func pushDataToRKScene() {

@@ -1,6 +1,64 @@
 import Foundation
 import simd
 
+/// Per-galaxy aggregate for render systems that think in GALAXIES rather
+/// than nodes: titles, far-LOD gas, and bridges. The provider flattens
+/// galaxy identity out of nodes at merge time, so anything galaxy-shaped
+/// has to travel separately.
+public struct RKGalaxySnapshot: Sendable {
+    public let id: String
+    public let displayName: String
+    public let worldCenter: SIMD3<Float>
+    /// Color of the galaxy's largest project — the single-color far gas.
+    public let dominantColor: SIMD3<Float>
+    public let nodeCount: Int
+    /// Max node distance from worldCenter — the galaxy's visual extent.
+    public let radius: Float
+    public let parentGalaxyId: String?
+
+    public var isGroup: Bool { id.hasPrefix("group:") }
+
+    public init(id: String, displayName: String, worldCenter: SIMD3<Float>,
+                dominantColor: SIMD3<Float>, nodeCount: Int, radius: Float,
+                parentGalaxyId: String?) {
+        self.id = id
+        self.displayName = displayName
+        self.worldCenter = worldCenter
+        self.dominantColor = dominantColor
+        self.nodeCount = nodeCount
+        self.radius = radius
+        self.parentGalaxyId = parentGalaxyId
+    }
+}
+
+/// One nebula-worthy cluster: a project's nodes WITHIN one galaxy.
+///
+/// Keyed by (galaxy, project), never bare project: a project whose rows
+/// span two galaxies (private rows stay personal while the rest render in
+/// synced/group) used to get ONE nebula at the cross-galaxy blended
+/// centroid — parked thousands of units off both clusters, which is why
+/// the personal cloud looked gasless.
+public struct RKNebulaCluster: Sendable {
+    public let galaxyId: String
+    public let project: String
+    public let centroid: SIMD3<Float>
+    public let count: Int
+    /// Live cluster radius — recomputed with the centroid pass, so nebulae
+    /// can RESIZE (creation-frozen radii left mid-load clusters invisible).
+    public let radius: Float
+
+    public var key: String { "\(galaxyId)|\(project)" }
+
+    public init(galaxyId: String, project: String, centroid: SIMD3<Float>,
+                count: Int, radius: Float) {
+        self.galaxyId = galaxyId
+        self.project = project
+        self.centroid = centroid
+        self.count = count
+        self.radius = radius
+    }
+}
+
 /// Core abstraction for all data the RealityKit scene needs per frame.
 ///
 /// EngramVisualizer implements this via GalaxyRegistryAdapter;
@@ -39,6 +97,11 @@ public protocol SceneDataProvider: AnyObject {
     /// Positions as a flat array indexed parallel to `nodes`. Avoids UUID dict lookups.
     var positionArray: [SIMD3<Float>] { get }
 
+    /// Per-galaxy aggregates (titles, far-LOD gas, bridges).
+    var galaxySnapshots: [RKGalaxySnapshot] { get }
+    /// Per-(galaxy, project) nebula clusters.
+    var nebulaClusters: [RKNebulaCluster] { get }
+
     /// Per-frame update — drain pending changes, tick simulation.
     func tick(dt: Float)
 }
@@ -46,5 +109,26 @@ public protocol SceneDataProvider: AnyObject {
 extension SceneDataProvider {
     public var positionArray: [SIMD3<Float>] {
         nodes.map { positions[$0.id] ?? .zero }
+    }
+
+    /// Defaults keep single-galaxy providers (EngramPreview's mock) working
+    /// unchanged: everything is one "main" galaxy, clusters derive from the
+    /// same projectCentroids the old nebula path used.
+    public var galaxySnapshots: [RKGalaxySnapshot] { [] }
+    public var nebulaClusters: [RKNebulaCluster] {
+        var counts: [String: Int] = [:]
+        for node in nodes { counts[node.project, default: 0] += 1 }
+        return projectCentroids.map { project, centroid in
+            var maxDist: Float = 0
+            for node in nodes where node.project == project {
+                if let pos = positions[node.id] {
+                    maxDist = max(maxDist, simd_length(pos - centroid))
+                }
+            }
+            return RKNebulaCluster(galaxyId: "main", project: project,
+                                   centroid: centroid,
+                                   count: counts[project] ?? 0,
+                                   radius: maxDist + 40)
+        }
     }
 }
