@@ -65,6 +65,9 @@ final class SyncManager {
                     migration: engramMigrations
                 )
             )
+            syncedLattice?.onQueryError { message in
+                print("[lattice] synced query failed (degraded to empty result): \(message)")
+            }
 
             wireSyncProgress()
             CLIInstaller.startDaemon()
@@ -375,6 +378,9 @@ final class SyncManager {
                 ) else {
                     log("Group galaxy: could not open spoke at \(spoke.path)")
                     continue
+                }
+                opened.onQueryError { [gid = spoke.groupId] message in
+                    print("[lattice] group \(gid) query failed (degraded to empty result): \(message)")
                 }
                 groupLattices[spoke.groupId.uuidString] = opened
                 lattice = opened

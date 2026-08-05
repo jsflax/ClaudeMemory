@@ -78,8 +78,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/jsflax/lattice.git",
       "state" : {
-        "revision" : "fb9269064b154646320509e36b7f8c02283bdde1",
-        "version" : "1.2.0"
+        "revision" : "08b3a2d3b9d5ea23c80ac908ab1096eb809d6f48",
+        "version" : "1.4.1"
       }
     },
     {
@@ -87,8 +87,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/jsflax/LatticeCore.git",
       "state" : {
-        "revision" : "2569a05376770247ae104df3ac3605ec2b0905d6",
-        "version" : "1.2.3"
+        "revision" : "37e4022263b537f1afe3141ee2d0c3a7b7a65095",
+        "version" : "1.2.4"
       }
     },
     {

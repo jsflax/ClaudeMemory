@@ -357,6 +357,15 @@ struct EngramDaemon: AsyncParsableCommand {
         // 8. Wire sync error, state, and progress logging
         // Lattice 1.x: the callback registrations became AsyncStreams.
         // Consume them in detached tasks that live as long as the daemon.
+        // Sealed-query failures (lattice 1.4.1) log rather than pass
+        // silently — a degraded read under memory pressure should be
+        // findable in the daemon log.
+        localLattice.onQueryError { message in
+            log("hub query failed (degraded to empty result): \(message)")
+        }
+        syncedLattice?.onQueryError { message in
+            log("synced query failed (degraded to empty result): \(message)")
+        }
         let ipcProgressStream = localLattice.syncProgressStream
         Task.detached {
             for await progress in ipcProgressStream {

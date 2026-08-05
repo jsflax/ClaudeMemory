@@ -85,6 +85,13 @@ struct EngramApp: App {
             Memory.self, Edge.self, Checkpoint.self, VisualizerConfig.self, SyncConfig.self, HookState.self,
             configuration: localConfig
         )
+        // Sealed-query failures (lattice 1.4.1): a query that fails under
+        // e.g. memory pressure returns EMPTY instead of crashing the app —
+        // this is the visibility channel for those, so a degraded load is
+        // diagnosable from the console instead of silent.
+        local.onQueryError { message in
+            print("[lattice] query failed (degraded to empty result): \(message)")
+        }
         localLattice = local
         lattice = local
 
