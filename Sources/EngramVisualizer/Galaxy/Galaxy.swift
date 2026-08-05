@@ -124,6 +124,15 @@ actor Galaxy: Identifiable {
     @MainActor var isLoaded = false
     @MainActor var isInitialLoad = true
 
+    /// Actor-isolated in-flight flag for loadData. The `isLoaded` guard alone
+    /// is racy: it hops to MainActor (a suspension point), so two callers —
+    /// onAppear's load and the daemon-connect re-load — can both read `false`
+    /// and each run a full-DB scan. The scans serialize on this actor (no
+    /// data race), but doubling multi-GB scans is exactly the page-cache
+    /// pressure that triggered the sqlite OOM crash. Checked and set
+    /// synchronously on the actor, before any await — no window.
+    private var loadInFlight = false
+
     @MainActor init(id: String, displayName: String, lattice: LatticeThreadSafeReference,
          hierarchyLevel: Int = 0, parentGalaxyId: String? = nil) {
         self.id = id
@@ -213,7 +222,12 @@ actor Galaxy: Identifiable {
     /// Reads ALL data — visual filtering (hiddenProjects, etc.) happens during
     /// drain via DrainConfig. Only `nodeFilter` (structural partition) is applied here.
     func loadData() async {
-        // Guard against duplicate loads (onAppear + syncManager.didConnect can both fire)
+        // Guard against duplicate loads (onAppear + syncManager.didConnect can
+        // both fire). loadInFlight is checked/set synchronously on the actor
+        // — airtight; the isLoaded check alone suspends and lets both through.
+        guard !loadInFlight else { return }
+        loadInFlight = true
+        defer { loadInFlight = false }
         guard await !isLoaded else { return }
 
         let batchSize = 50
