@@ -356,7 +356,7 @@ import Foundation
 
     // Both should be close to existing memories — low distances
     for excerpt in excerpts {
-        #expect(excerpt.minDistance < 0.30,
+        #expect(excerpt.minDistance < TranscriptSampler.defaultNoveltyThreshold,
                 "Pure paraphrase should be close to existing memory, got \(excerpt.minDistance)")
     }
 }

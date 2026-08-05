@@ -11,7 +11,7 @@ public func findMemoryClusters(
     in lattice: Lattice,
     project: String? = nil,
     topic: String? = nil,
-    distanceThreshold: Double = 0.547,  // L2 equivalent of cosine 0.15
+    distanceThreshold: Double = 0.775,  // v2: L2 of cosine-similarity 0.70 — topical-cluster band
     jaccardThreshold: Double = 0.2,
     minClusterSize: Int = 2,
     maxClusters: Int = 10,
@@ -120,7 +120,7 @@ extension MemoryTools {
         let a = try args.decode(FindClustersArgs.self)
         let minSize = a.minClusterSize?.value ?? 3
         // Convert user-facing cosine percentage to L2 distance: L2 = sqrt(2 * cosine)
-        let cosineThreshold = Double(a.distanceThreshold?.value ?? 15) / 100.0
+        let cosineThreshold = Double(a.distanceThreshold?.value ?? 30) / 100.0
         let threshold = sqrt(2.0 * cosineThreshold)
         let maxClusters = a.maxClusters?.value ?? 10
 

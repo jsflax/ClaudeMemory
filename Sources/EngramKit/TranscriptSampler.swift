@@ -42,10 +42,13 @@ public struct TranscriptSampler {
     /// Below this threshold, the excerpt is too similar to existing memories
     /// and is filtered out before reaching the assessment stage.
     /// Calibrated from test data:
-    ///   - Pure paraphrases: 0.20–0.23 (should be filtered)
-    ///   - Subtle new insight in same topic: 0.31+ (should pass)
-    ///   - Different subtopic: 0.42+ (easily passes)
-    public static let defaultNoveltyThreshold: Double = 0.28
+    ///   - Pure paraphrases: 0.53–0.69 (should be filtered)
+    ///   - Subtle new insight in same topic: ~0.8+ (should pass)
+    ///   - Different subtopic: ~1.0+ (easily passes)
+    ///
+    /// v2 space (Aug 2026 mean-pooling fix): anchors re-measured; the old
+    /// 0.28 belonged to the compressed CLS-pooled space.
+    public static let defaultNoveltyThreshold: Double = 0.72
 
     public static func sample(
         transcriptPath: String,

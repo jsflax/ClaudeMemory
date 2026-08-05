@@ -77,18 +77,22 @@ public enum RecallRanking {
 /// Duplicate/conflict detection thresholds (remember-time), shared verbatim.
 public enum ConflictThresholds {
     /// L2 distance below which two memories are conflict candidates.
-    /// L2 equivalents of cosine 0.12 (same project) / 0.05 (cross-scope)
-    /// over normalized vectors.
+    /// v2-space values (Aug 2026 mean-pooling fix), calibrated on a 27k-row
+    /// production graph: same-project NN p50 0.37 (dupe mass), paraphrases
+    /// 0.53–0.69, NN p95 0.75.
     public static func l2Threshold(sameProject: Bool) -> Double {
-        sameProject ? 0.49 : 0.316
+        sameProject ? 0.55 : 0.45
     }
 
     /// A conflict candidate must ALSO share terms: Jaccard ≥ 0.4.
     public static let jaccardThreshold = 0.4
 
-    /// Auto-connect band: [conflict threshold, 0.632) — L2 of cosine 0.20.
-    /// Related-but-distinct memories get `relates_to` edges, top 3.
-    public static let autoConnectUpperBound = 0.632
+    /// Auto-connect band: [conflict threshold, 1.00) — related-but-distinct
+    /// memories get `relates_to` edges, top 3. Upper bound = cosine
+    /// similarity 0.5, the "meaningfully related" bar in the calibrated v2
+    /// space (query-relevance envelope tops out ≈ L2 1.05); the top-3 cap
+    /// contains noise.
+    public static let autoConnectUpperBound = 1.00
 }
 
 /// Term-overlap similarity — tokenization must stay IDENTICAL across

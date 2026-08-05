@@ -1810,7 +1810,7 @@ import Foundation
     let r2 = try await tools.handle(CallTool.Parameters(
         name: "remember",
         arguments: [
-            "content": .string("User login flow validates credentials against the PostgreSQL users table"),
+            "content": .string("JWT token validation runs in the auth middleware before every request"),  // v2 space: L2 0.89 to the base memory — mid auto-connect band
             "project": .string("AuthApp"),
         ]
     ))
@@ -2083,7 +2083,7 @@ import Foundation
     let m4 = try await tools.handle(CallTool.Parameters(
         name: "remember",
         arguments: [
-            "content": .string("Editor eyedropper tool uses I key shortcut for quick tile picking from the canvas"),
+            "content": .string("The tile palette eyedropper samples a rendered tile from the isometric map into the current selection"),  // v2 space: L2 0.95/0.82 to two hub children — both mid auto-connect band
             "project": .string("InferTest"),
             "force": .bool(true),
         ]

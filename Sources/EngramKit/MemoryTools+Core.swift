@@ -151,7 +151,7 @@ extension MemoryTools {
             if a.force != true {
                 let conflicts = candidates.filter { match in
                     let sameProject = match.object.project == project
-                    let threshold = sameProject ? 0.49 : 0.316  // L2 equivalents of cosine 0.12/0.05
+                    let threshold = sameProject ? 0.55 : 0.45  // v2 space (Aug 2026): near-dupe band from 27k-row calibration — same-project NN p50 0.37, paraphrases 0.53–0.69
                     guard match.distance < threshold else { return false }
                     return jaccardSimilarity(content, match.object.content) >= 0.4
                 }
@@ -176,8 +176,8 @@ extension MemoryTools {
             // Gather auto-connect candidates (beyond conflict zone, within relatedness threshold)
             autoConnectCandidates = candidates.compactMap { match in
                 let sameProject = match.object.project == project
-                let conflictThreshold = sameProject ? 0.49 : 0.316  // L2 equivalents of cosine 0.12/0.05
-                guard match.distance >= conflictThreshold && match.distance < 0.632 else { return nil }  // L2 of cosine 0.20
+                let conflictThreshold = sameProject ? 0.55 : 0.45  // v2 space: see remember-time comment
+                guard match.distance >= conflictThreshold && match.distance < 1.00 else { return nil }  // v2: related band upper = cosine 0.5; top-3 cap contains noise
                 return (object: match.object, distance: match.distance)
             }
             autoConnectCandidates.sort { $0.distance < $1.distance }
@@ -593,7 +593,7 @@ extension MemoryTools {
 
             // Knowledge gap detection — signal when recall results are weak
             let avgDistance = filtered.map(\.distance).reduce(0, +) / Double(max(filtered.count, 1))
-            if avgDistance > 0.374 {  // L2 equivalent of cosine 0.07 for normalized vectors
+            if avgDistance > 1.05 {  // v2: relevant query→memory hits measure 0.86–1.05; beyond = weak
                 output = "⚠️ Weak recall (avg distance: \(String(format: "%.3f", avgDistance)), count: \(filtered.count)). Results may not be closely related to the query.\n\n" + output
             }
 
@@ -632,7 +632,7 @@ extension MemoryTools {
                         // own full 384-float BLOB SELECT per candidate.
                         let emb = mem.embedding
                         guard emb.dimensions > 0 else { return false }
-                        return Double(emb.cosineDistance(to: queryVec)) <= 0.15
+                        return Double(emb.cosineDistance(to: queryVec)) <= 0.55  // v2: query-relevance envelope (L2 ≈ 1.05)
                     }
                 )
                 // The in-traversal filter is @Sendable and can't consult

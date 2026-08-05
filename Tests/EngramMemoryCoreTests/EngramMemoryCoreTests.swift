@@ -85,10 +85,10 @@ struct RankingTests {
         // verbatim; a change here without a deliberate re-tune is a bug.
         #expect(RecallRanking.sameProjectBoost == 0.7)
         #expect(RecallRanking.globalScopeBoost == 0.85)
-        #expect(ConflictThresholds.l2Threshold(sameProject: true) == 0.49)
-        #expect(ConflictThresholds.l2Threshold(sameProject: false) == 0.316)
+        #expect(ConflictThresholds.l2Threshold(sameProject: true) == 0.55)
+        #expect(ConflictThresholds.l2Threshold(sameProject: false) == 0.45)
         #expect(ConflictThresholds.jaccardThreshold == 0.4)
-        #expect(ConflictThresholds.autoConnectUpperBound == 0.632)
+        #expect(ConflictThresholds.autoConnectUpperBound == 1.00)
     }
 
     @Test func frequencyBoostIsCappedAt15Percent() {
