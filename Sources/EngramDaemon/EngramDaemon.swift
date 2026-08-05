@@ -9,7 +9,9 @@ struct EngramDaemon: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "memory-sync",
         abstract: "Engram sync daemon — relays memory changes to the cloud via WSS.",
-        subcommands: [ExposeCommand.self, GroupsCommand.self]
+        subcommands: [ExposeCommand.self, GroupsCommand.self,
+                      WhoamiCommand.self, AcceptInviteCommand.self,
+                      CompactServerHistoryCommand.self]
     )
 
     @Option(name: .long, help: "Lattice log level: off, error, warning, info, debug")
@@ -537,7 +539,7 @@ enum DaemonStatus {
 
 // MARK: - Credential Loading
 
-private struct SyncCredentials {
+struct SyncCredentials {
     let token: String
     let endpoint: String
     /// ws(s):// base — group channels append /sync/group/<id>.
@@ -555,7 +557,7 @@ private struct SyncCredentials {
     }
 }
 
-private func readCredentials(claudeDir: String, endpointOverride: String?) -> SyncCredentials? {
+func readCredentials(claudeDir: String, endpointOverride: String?) -> SyncCredentials? {
     guard let token = keychainLoad(service: "io.engram.app", account: "auth_token") else {
         return nil
     }
@@ -564,7 +566,7 @@ private func readCredentials(claudeDir: String, endpointOverride: String?) -> Sy
 }
 
 /// Minimal Keychain read (no dependency on KeychainHelper from Visualizer)
-private func keychainLoad(service: String, account: String) -> String? {
+func keychainLoad(service: String, account: String) -> String? {
     let query: [String: Any] = [
         kSecClass as String: kSecClassGenericPassword,
         kSecAttrService as String: service,

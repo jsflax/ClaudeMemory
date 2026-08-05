@@ -265,7 +265,18 @@ final class AccountService {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
 
             let (data, response) = try await URLSession.shared.data(for: request)
-            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else { return }
+            guard let http = response as? HTTPURLResponse else { return }
+            // An expired/revoked token must surface as SIGNED OUT — this
+            // used to silently return, leaving the cached profile rendering
+            // "signed in" while every API call (and eventually the daemon's
+            // reconnect) failed with 401. Only 401 signs out; transient
+            // server errors must never destroy a working session.
+            if http.statusCode == 401 {
+                errorMessage = "Session expired — please sign in again."
+                signOut()
+                return
+            }
+            guard http.statusCode == 200 else { return }
 
             userProfile = try JSONDecoder().decode(UserProfile.self, from: data)
         } catch {
