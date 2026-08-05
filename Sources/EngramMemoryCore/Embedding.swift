@@ -12,7 +12,9 @@ public protocol Embedder: Sendable {
     /// nil = embedder unavailable (callers degrade: recall falls back to
     /// FTS, remember enters the pending-embedding state).
     func embed(text: String) async throws -> [Float]?
-    var dimension: Int { get }
+    /// `get async` so actor conformances (the CoreML EmbeddingService) can
+    /// witness it with isolated state.
+    var dimension: Int { get async }
 }
 
 /// Client for a text-embeddings-inference (TEI) `/embed` endpoint.
