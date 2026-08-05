@@ -86,6 +86,18 @@ struct ExposeCommand: AsyncParsableCommand {
                 stamped += 1
             }
             if stamped > 0 { print("Attributed \(stamped) previously-unattributed memories to you.") }
+
+            // decision 13: record the local→group project mapping in the
+            // spoke so every member's recall/boost resolves this project
+            // canonically. Headless parity with the visualizer toggle.
+            let spokePath = NSHomeDirectory()
+                + "/.claude/sync/group-\(gid.uuidString).sqlite"
+            if GroupProjectMapWriter.upsert(spokePath: spokePath, me: me,
+                                            localProject: project) {
+                print("Recorded project mapping '\(project)' in the group spoke.")
+            } else {
+                print("Spoke not created yet — the daemon will record the project mapping when it opens the spoke.")
+            }
         }
 
         let action = unshare ? "No longer sharing" : "Sharing"

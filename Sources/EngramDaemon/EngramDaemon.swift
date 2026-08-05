@@ -315,6 +315,18 @@ struct EngramDaemon: AsyncParsableCommand {
                 continue
             }
             groupSpokes[membership.id] = spoke
+            // decision 13 backstop: an exposure recorded while the spoke did
+            // not exist yet (visualizer toggle or `memory-sync expose` before
+            // the daemon's first multi-spoke run) has its GroupProjectMap row
+            // written HERE, when the spoke first opens. Idempotent upsert.
+            if let me = selfUserId {
+                let gidString = membership.id.uuidString
+                for config in localLattice.objects(SyncConfig.self).snapshot()
+                    where config.exposedGroups.contains(gidString) {
+                    GroupProjectMapWriter.upsert(into: spoke, me: me,
+                                                 localProject: config.project) { log($0) }
+                }
+            }
             DaemonStatus.writeSpoke(groupId: membership.id, name: membership.name,
                                     state: billing == "past_due" ? "past_due" : "connected",
                                     detail: billing == "past_due"

@@ -233,6 +233,43 @@ public actor MemoryTools {
         return resident
     }
 
+    /// Spoke-residency memo for provenance: which group spoke (if any) a
+    /// row lives in. Keyed alongside hubResidency with the same staleness
+    /// argument — a row cannot MOVE between spokes mid-session (each spoke
+    /// mirrors one group DB; membership changes retire whole spoke files,
+    /// and the per-call stat() guard drops retired spokes from the union).
+    private var spokeResidency: [UUID: UUID?] = [:]
+
+    /// The groupId of the spoke a row lives in, or nil for hub-resident /
+    /// unknown rows. One indexed point lookup per live spoke, memoized.
+    /// Powers the recall `[via:GroupName]` provenance marker — "which of my
+    /// graphs did this memory come from".
+    func spokeResidentGroupId(_ globalId: UUID) -> UUID? {
+        if let cached = spokeResidency[globalId] { return cached }
+        var found: UUID? = nil
+        for spoke in liveGroupSpokes() {
+            if spoke.lattice.objects(Memory.self)
+                .where({ $0.globalId == globalId }).first != nil {
+                found = spoke.groupId
+                break
+            }
+        }
+        if spokeResidency.count > 4096 { spokeResidency.removeAll() }
+        spokeResidency[globalId] = found
+        return found
+    }
+
+    /// ` [via:GroupName]` for spoke-resident rows, "" otherwise. Renders
+    /// AFTER `[by:]` — the recall-log parser anchors on `[id:` plus the
+    /// first bracket pair, so trailing markers are invisible to it.
+    func viaMarker(for globalId: UUID) -> String {
+        guard !groupSpokes.isEmpty,
+              let gid = spokeResidentGroupId(globalId) else { return "" }
+        let name = GroupDirectory.groupName(for: gid)
+            ?? String(gid.uuidString.prefix(8))
+        return " [via:\(name)]"
+    }
+
     /// Per-memory content cap inside the advise fence.
     static let foreignContentCap = 700
 

@@ -577,11 +577,16 @@ extension MemoryTools {
                 let isForeign = isForeignAuthored(m)
                 let badge = isForeign
                     ? " [by:\(GroupDirectory.badgeName(for: m.authorUserId))]" : ""
+                // Graph provenance: spoke-resident rows carry the group's
+                // name — "which of my graphs did this come from" is part of
+                // proving multi-graph recall works. After [by:] so the
+                // recall-log parser's first-bracket anchor is untouched.
+                let via = viaMarker(for: mGid)
                 // Advise-injection path: foreign content renders inside the
                 // escape-hardened indentation fence.
                 let body = (isForeign && fenceForeignContent)
                     ? Self.fencedForeignContent(m.content) : m.content
-                return "[id:\(mGid.uuidString)] [\(m.project)/\(m.topic)]\(badge) (distance: \(dist)\(impInfo)\(expires)\(created)) \(body)"
+                return "[id:\(mGid.uuidString)] [\(m.project)/\(m.topic)]\(badge)\(via) (distance: \(dist)\(impInfo)\(expires)\(created)) \(body)"
             }
 
             var output = lines.joined(separator: "\n\n")
@@ -665,18 +670,19 @@ extension MemoryTools {
 
                         let connBadge = isForeignAuthored(m)
                             ? " [by:\(GroupDirectory.badgeName(for: m.authorUserId))]" : ""
+                        let connVia = viaMarker(for: memGlobalId)
                         // Small memories shown in full; large ones get a compact preview
                         if isForeignAuthored(m) && fenceForeignContent {
-                            output += "\n\n[id:\(memGlobalId.uuidString)] [\(m.project)/\(m.topic)]\(connBadge)\(expires)\(edgeInfo) \(Self.fencedForeignContent(m.content))"
+                            output += "\n\n[id:\(memGlobalId.uuidString)] [\(m.project)/\(m.topic)]\(connBadge)\(connVia)\(expires)\(edgeInfo) \(Self.fencedForeignContent(m.content))"
                         } else if m.content.count <= 500 {
-                            output += "\n\n[id:\(memGlobalId.uuidString)] [\(m.project)/\(m.topic)]\(connBadge)\(expires)\(edgeInfo) \(m.content)"
+                            output += "\n\n[id:\(memGlobalId.uuidString)] [\(m.project)/\(m.topic)]\(connBadge)\(connVia)\(expires)\(edgeInfo) \(m.content)"
                         } else {
                             let firstLine = m.content.split(separator: "\n", maxSplits: 1).first.map(String.init) ?? m.content
                             let preview = String(firstLine.prefix(120))
                             let charCount = m.content.count
                             let sectionCount = m.content.components(separatedBy: "\n").filter { $0.hasPrefix("## ") || $0.hasPrefix("### ") }.count
                             let sizeInfo = sectionCount > 0 ? "\(sectionCount) sections, \(charCount) chars" : "\(charCount) chars"
-                            output += "\n\n[id:\(memGlobalId.uuidString)] [\(m.project)/\(m.topic)]\(connBadge) (\(sizeInfo)\(expires))\(edgeInfo) \(preview)\(charCount > 120 ? "..." : "")"
+                            output += "\n\n[id:\(memGlobalId.uuidString)] [\(m.project)/\(m.topic)]\(connBadge)\(connVia) (\(sizeInfo)\(expires))\(edgeInfo) \(preview)\(charCount > 120 ? "..." : "")"
                         }
                     }
                 }
@@ -741,9 +747,10 @@ extension MemoryTools {
                 guard let mGid = m.globalId else { continue }
                 let badge = isForeign
                     ? " [by:\(GroupDirectory.badgeName(for: m.authorUserId))]" : ""
+                let via = viaMarker(for: mGid)
                 let body = (isForeign && fenceForeignContent)
                     ? Self.fencedForeignContent(m.content) : m.content
-                lines.append("[id:\(mGid.uuidString)] [\(m.project)/\(m.topic)]\(badge)\(ftsInfo)\(expires)\(created) \(body)")
+                lines.append("[id:\(mGid.uuidString)] [\(m.project)/\(m.topic)]\(badge)\(via)\(ftsInfo)\(expires)\(created) \(body)")
             }
             if lines.isEmpty {
                 return CallTool.Result(content: [.text("No memories found.")], isError: false)
@@ -1175,9 +1182,14 @@ extension MemoryTools {
         let projectFilter = a.project
         let db = readLattice(for: projectFilter)
 
+        // decision 13: a project rollup must count teammates' rows for the
+        // SAME canonical group project even when their local folder name
+        // differs — resolve through the GroupProjectMap like recall does.
+        let resolvedProjects = projectFilter.map { resolveQueryProjects($0).sorted() }
+
         var base = db.objects(Memory.self).distinct(by: \.globalId).where { $0.deletedAt == nil }  // tombstone filter
-        if let projectFilter {
-            base = base.where { $0.project == projectFilter }
+        if let resolvedProjects {
+            base = base.where { $0.project.in(resolvedProjects) }
         }
         // Maintenance/opt-out guard: even counts and topic/project NAMES of
         // foreign rows stay invisible (a hostile topic string is a short
@@ -1217,8 +1229,8 @@ extension MemoryTools {
         var topicLines: [String] = []
         for mem in topicGrouped {
             var countQuery = db.objects(Memory.self).distinct(by: \.globalId).where { $0.topic == mem.topic && $0.deletedAt == nil }
-            if let projectFilter {
-                countQuery = countQuery.where { $0.project == projectFilter }
+            if let resolvedProjects {
+                countQuery = countQuery.where { $0.project.in(resolvedProjects) }
             }
             if excludeForeignAuthored {
                 countQuery = countQuery.where { $0.authorUserId == nil || $0.authorUserId == me }
@@ -1270,9 +1282,13 @@ extension MemoryTools {
         let projectFilter = a.project
         let db = readLattice(for: projectFilter)
 
+        // decision 13: resolve the filter through the group project map
+        // (same contract as stats — teammates' local names count too).
+        let resolvedProjects = projectFilter.map { resolveQueryProjects($0).sorted() }
+
         var base = db.objects(Memory.self).distinct(by: \.globalId).where { $0.deletedAt == nil }  // tombstone filter
-        if let projectFilter {
-            base = base.where { $0.project == projectFilter }
+        if let resolvedProjects {
+            base = base.where { $0.project.in(resolvedProjects) }
         }
         let me = currentUserId
         if excludeForeignAuthored {
@@ -1287,8 +1303,8 @@ extension MemoryTools {
         var lines: [String] = []
         for memory in grouped {
             var countQuery = db.objects(Memory.self).distinct(by: \.globalId).where { $0.topic == memory.topic && $0.deletedAt == nil }
-            if let projectFilter {
-                countQuery = countQuery.where { $0.project == projectFilter }
+            if let resolvedProjects {
+                countQuery = countQuery.where { $0.project.in(resolvedProjects) }
             }
             if excludeForeignAuthored {
                 countQuery = countQuery.where { $0.authorUserId == nil || $0.authorUserId == me }

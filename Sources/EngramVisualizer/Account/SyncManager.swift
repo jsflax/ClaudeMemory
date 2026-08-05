@@ -252,38 +252,15 @@ final class SyncManager {
         /// project; the registry entry is created server-side by the
         /// caller). The spoke is daemon-created — absent before the daemon's
         /// first multi-spoke run, and that's fine: exposure is recorded in
-        /// SyncConfig and the daemon writes maps for missing spokes later.
+        /// SyncConfig and the daemon's spoke-open backstop writes the map
+        /// row when the spoke appears (GroupProjectMapWriter is the shared
+        /// path — visualizer, `memory-sync expose`, and the daemon).
         private func writeGroupProjectMap(groupId: UUID, localProject: String, me: UUID) {
             let spokePath = NSHomeDirectory()
                 + "/.claude/sync/group-\(groupId.uuidString).sqlite"
-            guard FileManager.default.fileExists(atPath: spokePath) else { return }
-            // migration: must match every other Engram DB open — without it
-            // the open runs at target_schema_version 1 and LatticeCore
-            // rejects a daemon-created (current-version) spoke as "newer
-            // than this binary supports".
-            guard let spoke = try? Lattice(
-                Memory.self, Edge.self, GroupProjectMap.self,
-                configuration: .init(fileURL: URL(fileURLWithPath: spokePath),
-                                     migration: engramMigrations)
-            ) else {
-                print("[SyncManager] group spoke open failed for \(spokePath) — GroupProjectMap upsert skipped")
-                return
-            }
-            if let existing = spoke.objects(GroupProjectMap.self)
-                .where({ $0.memberUserId == me && $0.localProject == localProject })
-                .first {
-                if existing.groupProject != localProject {
-                    existing.groupProject = localProject
-                    existing.updatedAt = Date()
-                }
-            } else {
-                do {
-                    try spoke.add(GroupProjectMap(memberUserId: me,
-                                                  localProject: localProject,
-                                                  groupProject: localProject))
-                } catch {
-                    print("[SyncManager] writeGroupProjectMap: insert failed: \(error)")
-                }
+            GroupProjectMapWriter.upsert(spokePath: spokePath, me: me,
+                                         localProject: localProject) {
+                print("[SyncManager] \($0)")
             }
         }
     }
