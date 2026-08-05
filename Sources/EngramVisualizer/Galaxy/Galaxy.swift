@@ -51,6 +51,14 @@ struct DrainConfig: Sendable {
 
 /// Encapsulates one complete graph data pipeline: Lattice + RenderStore + Simulation + EmbeddingProjection.
 /// Each Galaxy renders as a separate cluster in the 3D world.
+/// Serializes the cluster pass across all galaxies. The body is deliberately
+/// synchronous — no suspension points, so actor reentrancy cannot interleave
+/// two galaxies' passes.
+private actor ClusterPassGate {
+    static let shared = ClusterPassGate()
+    func run<T: Sendable>(_ body: @Sendable () -> T) -> T { body() }
+}
+
 actor Galaxy: Identifiable {
     let id: String                        // e.g. "personal", "synced", "team-a-bob"
     let displayName: String
@@ -285,17 +293,27 @@ actor Galaxy: Identifiable {
         // 3. Mark finalize — drain loop will recomputeDerivedData + wake sim
         pendingUpdate.withLock { $0.finalize = true }
 
-        // 4. Cluster computation off main actor — push result into update buffer
+        // 4. Cluster computation off main actor — push result into update buffer.
+        // Serialized ACROSS galaxies: the per-project vector queries are the
+        // most allocation-heavy phase of a load, and three galaxies running
+        // them concurrently over multi-GB DBs is what pushed the SQLite page
+        // cache to ~1GB and into transient OOM (crash 2026-08-05). Nodes and
+        // edges above still load fully in parallel; only this tail is gated.
         var allProjects = Set<String>()
         for batch in pendingUpdate.withLock({ $0.bulkNodeBatches }) {
             for (_, node) in batch { allProjects.insert(node.project) }
         }
-        var clusters: [[UUID]] = []
-        for project in allProjects {
-            let projectClusters = findMemoryClusters(in: bgLattice, project: project, minClusterSize: 2, neighborLimit: 20).clusters
-            clusters.append(contentsOf: projectClusters)
+        let projects = allProjects
+        let finalClusters = await ClusterPassGate.shared.run { [ref] in
+            guard let lat = ref.resolve() else { return [[UUID]]() }
+            var clusters: [[UUID]] = []
+            for project in projects {
+                clusters.append(contentsOf: findMemoryClusters(
+                    in: lat, project: project,
+                    minClusterSize: 2, neighborLimit: 20).clusters)
+            }
+            return clusters
         }
-        let finalClusters = clusters
         pendingUpdate.withLock { $0.clusterGroups = finalClusters }
     }
     
