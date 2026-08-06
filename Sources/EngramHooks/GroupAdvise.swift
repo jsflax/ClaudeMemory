@@ -1,5 +1,7 @@
 import ArgumentParser
+#if canImport(EngramKit)
 import EngramModels
+#endif
 
 /// Per-device opt-out for teammates' group-shared memories in hook context
 /// injection (advise/on-start/pre-tool). Default is ON (beta posture,
@@ -15,6 +17,12 @@ struct GroupAdvise: ParsableCommand {
     var mode: String = "status"
 
     func run() throws {
+        #if !canImport(EngramKit)
+        // Remote backend: fencing is always on server-side; the per-device
+        // lattice knob has no meaning in a sandbox.
+        print("group-advise is a local-backend setting; the remote backend always fences teammates' memories server-side.")
+        return
+        #else
         switch mode {
         case "on", "off":
             let value = mode == "on" ? "true" : "false"
@@ -35,5 +43,6 @@ struct GroupAdvise: ParsableCommand {
         default:
             throw ValidationError("expected 'on', 'off', or 'status'")
         }
+        #endif
     }
 }

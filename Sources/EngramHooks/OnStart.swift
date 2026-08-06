@@ -1,7 +1,10 @@
 import ArgumentParser
+import EngramMemoryCore
+import Foundation
+#if canImport(EngramKit)
 import EngramKit
 import Lattice
-import Foundation
+#endif
 
 /// SessionStart hook: recalls project context and checks maintenance.
 struct OnStart: AsyncParsableCommand {
@@ -28,16 +31,27 @@ struct OnStart: AsyncParsableCommand {
         var sections: [String] = []
 
         // Recall project context
-        if let tools = await initMemoryTools() {
-            if let result = try await tools.directRecall(
-                query: "project overview \(proj)",
-                project: project,
-                depth: 1,
-                limit: 5
-            ) {
+        if let remote = RemoteConfig.active {
+            if let result = await RemoteMemory.recallRendered(
+                remote, query: "project overview \(proj)",
+                project: remote.project ?? project) {
                 logRecalledMemories(result, hook: "OnStart")
                 sections.append("## Project context\n\n\(result)")
             }
+        } else {
+            #if canImport(EngramKit)
+            if let tools = await initMemoryTools() {
+                if let result = try await tools.directRecall(
+                    query: "project overview \(proj)",
+                    project: project,
+                    depth: 1,
+                    limit: 5
+                ) {
+                    logRecalledMemories(result, hook: "OnStart")
+                    sections.append("## Project context\n\n\(result)")
+                }
+            }
+            #endif
         }
 
         guard !sections.isEmpty else { return }

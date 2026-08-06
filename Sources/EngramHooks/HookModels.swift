@@ -1,4 +1,4 @@
-import EngramKit
+import EngramMemoryCore
 import Foundation
 
 // MARK: - Hook Input Models

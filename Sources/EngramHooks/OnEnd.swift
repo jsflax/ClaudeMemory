@@ -1,7 +1,10 @@
 import ArgumentParser
+import EngramMemoryCore
+import Foundation
+#if canImport(EngramKit)
 import EngramKit
 import Lattice
-import Foundation
+#endif
 
 /// SessionEnd hook: cleans up per-session state.
 struct OnEnd: AsyncParsableCommand {
@@ -23,11 +26,17 @@ struct OnEnd: AsyncParsableCommand {
         }
 
         guard let sessionId = input.sessionId, !sessionId.isEmpty else { return }
-        guard let lattice = openLattice() else { return }
 
-        if let state = lattice.objects(SessionState.self).where({ $0.sessionId == sessionId }).first {
-            lattice.delete(state)
-            hookLog("Cleaned up session state for \(sessionId)")
+        if RemoteConfig.active != nil {
+            removeFileSessionCounters(sessionId: sessionId)
+        } else {
+            #if canImport(EngramKit)
+            guard let lattice = openLattice() else { return }
+            if let state = lattice.objects(SessionState.self).where({ $0.sessionId == sessionId }).first {
+                lattice.delete(state)
+                hookLog("Cleaned up session state for \(sessionId)")
+            }
+            #endif
         }
 
         // Clean up session recall and debug logs used by the statusline.

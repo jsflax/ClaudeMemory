@@ -1,3 +1,4 @@
+import EngramMemoryCore
 import Foundation
 import Lattice
 
@@ -48,7 +49,7 @@ public struct TranscriptSampler {
     ///
     /// v2 space (Aug 2026 mean-pooling fix): anchors re-measured; the old
     /// 0.28 belonged to the compressed CLS-pooled space.
-    public static let defaultNoveltyThreshold: Double = 0.72
+    public static let defaultNoveltyThreshold: Double = SamplerThresholds.novelty
 
     public static func sample(
         transcriptPath: String,
@@ -130,38 +131,9 @@ public struct TranscriptSampler {
     // MARK: - JSONL Parsing
 
     /// Extract assistant text content blocks from a Claude Code transcript JSONL.
-    /// Returns an array of text strings (one per assistant text block).
+    /// Delegates to the portable parser (EngramMemoryCore.TranscriptExcerpts)
+    /// shared with the remote/Linux hooks.
     public static func extractAssistantTextBlocks(from path: String) -> [String] {
-        guard let data = FileManager.default.contents(atPath: path),
-              let contents = String(data: data, encoding: .utf8) else {
-            return []
-        }
-
-        var blocks: [String] = []
-
-        for line in contents.components(separatedBy: .newlines) {
-            guard !line.isEmpty else { continue }
-            guard let lineData = line.data(using: .utf8) else { continue }
-
-            // Parse the JSONL line
-            guard let obj = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
-                  let type = obj["type"] as? String, type == "assistant",
-                  let message = obj["message"] as? [String: Any],
-                  let content = message["content"] as? [[String: Any]] else {
-                continue
-            }
-
-            // Extract text blocks (skip thinking, tool_use, etc.)
-            for item in content {
-                guard let itemType = item["type"] as? String, itemType == "text",
-                      let text = item["text"] as? String,
-                      !text.isEmpty else {
-                    continue
-                }
-                blocks.append(text)
-            }
-        }
-
-        return blocks
+        TranscriptExcerpts.assistantTextBlocks(from: path)
     }
 }

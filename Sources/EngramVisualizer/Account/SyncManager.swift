@@ -1,4 +1,5 @@
 import Combine
+import EngramMemoryCore
 import EngramKit
 import EngramModels
 import Foundation
@@ -490,7 +491,7 @@ final class SyncManager {
     private static let reconciliationLogPath = NSHomeDirectory() + "/.claude/sync-reconciliation.log"
 
     private static let reconciliationSystemPrompt: String = loadAgentSystemPrompt(
-        name: "sync-reconciliation",
+        name: "sync-reconciliation", bundle: engramKitResourceBundle,
         fallback: """
         You are a sync reconciliation agent. Reconcile duplicate and conflicting memories after cross-device sync.
         1. Run find_clusters(project, distance_threshold: 12, min_cluster_size: 2). If none, exit.

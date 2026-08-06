@@ -1,7 +1,10 @@
 import ArgumentParser
+import EngramMemoryCore
+import Foundation
+#if canImport(EngramKit)
 import EngramKit
 import Lattice
-import Foundation
+#endif
 
 /// PostToolUseFailure hook: nudges learning and maintenance. Skips expensive recall to stay within timeout.
 struct OnFailure: AsyncParsableCommand {

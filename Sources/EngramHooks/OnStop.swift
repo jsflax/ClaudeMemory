@@ -1,6 +1,9 @@
 import ArgumentParser
-import EngramKit
+import EngramMemoryCore
 import Foundation
+#if canImport(EngramKit)
+import EngramKit
+#endif
 
 /// Stop hook: spawns a fire-and-forget `memory-hooks sample-gate` subprocess that
 /// checks transcript novelty before deciding whether to spawn the expensive session-learner.
@@ -37,9 +40,8 @@ struct OnStop: AsyncParsableCommand {
         let project = projectName(from: input.cwd) ?? "unknown"
 
         // Mark as sent so the Advise hook skips its learning nudge
-        withSessionState(sessionId: input.sessionId) { state in
+        updateSessionCounters(sessionId: input.sessionId) { state in
             state.stopNudgeSent = true
-            state.updatedAt = Date()
         }
 
         do {

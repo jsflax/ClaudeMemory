@@ -167,15 +167,21 @@ let package = Package(
                 .linkedFramework("RealityKit"),
             ]
         ),
+        // Builds on BOTH platforms: macOS gets the local lattice backend
+        // (EngramKit — Apple-only by B6); Linux builds only the portable
+        // closure (EngramMemoryCore) and runs the REMOTE backend against
+        // engram-server. Cxx interop rides the Apple-only deps.
         .executableTarget(
             name: "EngramHooks",
             dependencies: [
-                "EngramKit",
+                "EngramMemoryCore",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
-                .product(name: "Lattice", package: "lattice"),
+                .target(name: "EngramKit", condition: .when(platforms: [.macOS])),
+                .product(name: "Lattice", package: "lattice",
+                         condition: .when(platforms: [.macOS])),
             ],
             swiftSettings: [
-                .interoperabilityMode(.Cxx),
+                .interoperabilityMode(.Cxx, .when(platforms: [.macOS])),
             ]
         ),
         .executableTarget(

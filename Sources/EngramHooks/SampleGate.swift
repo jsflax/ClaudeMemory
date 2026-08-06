@@ -1,7 +1,10 @@
 import ArgumentParser
+import EngramMemoryCore
+import Foundation
+#if canImport(EngramKit)
 import EngramKit
 import Lattice
-import Foundation
+#endif
 
 /// Gate command: runs TranscriptSampler to check if a transcript contains novel content.
 /// If novel excerpts are found, spawns the session-learner `claude` subprocess.
@@ -27,7 +30,7 @@ struct SampleGate: AsyncParsableCommand {
     // MARK: - Session Learner Config (moved from OnStop)
 
     private static let sessionLearnerSystemPrompt: String = loadAgentSystemPrompt(
-        name: "session-learner",
+        name: "session-learner", bundle: agentPromptBundle,
         fallback: """
         You are a session learning agent. Your job is to review what happened in a coding session and store the key insights as memories for future recall.
 
@@ -46,7 +49,11 @@ struct SampleGate: AsyncParsableCommand {
         """
     )
 
-    private static let allowedTools = "mcp__memory__*,Read,Grep,Glob,Bash"
+    private static var allowedTools: String {
+        RemoteConfig.active != nil
+            ? "mcp__engram__*,Read,Grep,Glob,Bash"
+            : "mcp__memory__*,Read,Grep,Glob,Bash"
+    }
     private static let logPath = NSHomeDirectory() + "/.claude/session-learner.log"
     private static let gateLogPath = NSHomeDirectory() + "/.claude/sample-gate.log"
 
@@ -59,6 +66,12 @@ struct SampleGate: AsyncParsableCommand {
             return
         }
 
+        if let remote = RemoteConfig.active {
+            try await runRemote(remote)
+            return
+        }
+
+        #if canImport(EngramKit)
         // Open Lattice and embedding service
         guard let lattice = openLattice() else {
             gateLog("sample-gate: no lattice database, falling through to spawn learner")
@@ -101,6 +114,34 @@ struct SampleGate: AsyncParsableCommand {
 
         try spawnLearner(excerptHint: hint)
         gateLog("sample-gate: spawned session-learner for project \(project)")
+        #endif
+    }
+
+    /// Remote backend: candidate extraction is portable; novelty scoring
+    /// happens server-side (TEI embed + KNN against the agent's graph via
+    /// POST /sample-gate). Endpoint unreachable → fail OPEN (spawn).
+    private func runRemote(_ remote: RemoteConfig) async throws {
+        let candidates = TranscriptExcerpts.candidates(from: transcriptPath)
+        guard !candidates.isEmpty else {
+            gateLog("sample-gate(remote): no substantive excerpts, skipping learner")
+            return
+        }
+        guard let verdicts = await RemoteMemory.sampleGate(remote, texts: candidates) else {
+            gateLog("sample-gate(remote): /sample-gate unreachable — failing open to spawn learner")
+            try spawnLearner(excerptHint: nil)
+            return
+        }
+        let novel = verdicts.filter(\.novel).sorted { $0.distance > $1.distance }
+        guard !novel.isEmpty else {
+            gateLog("sample-gate(remote): 0/\(candidates.count) novel, skipping learner")
+            return
+        }
+        gateLog("sample-gate(remote): \(novel.count)/\(candidates.count) novel (best distance: \(String(format: "%.3f", novel.first?.distance ?? 0)))")
+        let hint = novel.prefix(5).enumerated()
+            .map { i, verdict in "[\(i + 1)] \(candidates[verdict.index])" }
+            .joined(separator: "\n\n")
+        try spawnLearner(excerptHint: hint)
+        gateLog("sample-gate(remote): spawned session-learner for project \(project)")
     }
 
     // MARK: - Learner Spawning

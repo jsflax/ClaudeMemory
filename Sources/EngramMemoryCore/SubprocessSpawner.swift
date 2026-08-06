@@ -87,18 +87,20 @@ public func stripFrontmatter(_ content: String) -> String {
 ///
 /// Searches in order:
 /// 1. `~/.claude/agents/<name>.md` (user-installed override)
-/// 2. `Bundle.module` SPM resource (bundled .md files)
+/// 2. An optional resource bundle (EngramKit passes its SPM bundle; the
+///    portable/Linux hooks pass nil — sandboxes have no installed agents)
 ///
 /// Falls back to the provided inline default if neither source exists.
-public func loadAgentSystemPrompt(name: String, fallback: String) -> String {
+public func loadAgentSystemPrompt(name: String, bundle: Bundle? = nil,
+                                  fallback: String) -> String {
     // 1. User-installed override (hot-editable without rebuild)
     let userPath = NSHomeDirectory() + "/.claude/agents/\(name).md"
     if let content = try? String(contentsOfFile: userPath, encoding: .utf8) {
         return stripFrontmatter(content)
     }
 
-    // 2. Bundled SPM resource
-    if let url = Bundle.module.url(forResource: name, withExtension: "md"),
+    // 2. Bundled resource
+    if let url = bundle?.url(forResource: name, withExtension: "md"),
        let content = try? String(contentsOf: url, encoding: .utf8) {
         return stripFrontmatter(content)
     }

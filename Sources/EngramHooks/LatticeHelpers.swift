@@ -1,6 +1,11 @@
+import EngramMemoryCore
+import Foundation
+#if canImport(EngramKit)
 import EngramKit
 import Lattice
-import Foundation
+#endif
+
+#if canImport(EngramKit)
 
 /// Open Lattice with the full schema at the default database path.
 func openLattice(sessionId: String? = nil) -> Lattice? {
@@ -162,7 +167,7 @@ func withSessionState<T>(sessionId: String?, _ body: (SessionState) -> T) -> T? 
     return withExtendedLifetime(lattice) { body(state) }
 }
 
-// MARK: - Per-Session Debug Log (wrapper that uses sessionId param over global)
+#endif
 
 // MARK: - ANSI Colors
 
@@ -417,9 +422,8 @@ private let learningNudgeInterval = 30
 /// Increments the tool call counter and returns a learning nudge only when threshold is crossed.
 /// Use this for high-frequency hooks (PostToolUseFailure) to avoid habituation.
 func throttledLearningNudge(project: String, sessionId: String?) -> String? {
-    let shouldNudge = withSessionState(sessionId: sessionId) { state -> Bool in
+    let shouldNudge = updateSessionCounters(sessionId: sessionId) { state -> Bool in
         state.toolCallCount += 1
-        state.updatedAt = Date()
 
         let lastNudgeAt = state.learningNudgeLastToolCount
         let threshold = lastNudgeAt == 0 ? learningNudgeInitialThreshold : learningNudgeInterval

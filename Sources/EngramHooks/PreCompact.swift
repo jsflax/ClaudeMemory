@@ -1,7 +1,10 @@
 import ArgumentParser
+import EngramMemoryCore
+import Foundation
+#if canImport(EngramKit)
 import EngramKit
 import Lattice
-import Foundation
+#endif
 
 /// PreCompact hook: spawns session-learner on auto-compaction to capture knowledge
 /// before context is summarized. The learner reads the full transcript from disk.
@@ -12,7 +15,7 @@ struct PreCompact: AsyncParsableCommand {
     )
 
     private static let sessionLearnerSystemPrompt: String = loadAgentSystemPrompt(
-        name: "session-learner",
+        name: "session-learner", bundle: agentPromptBundle,
         fallback: """
         You are a session learning agent. Your job is to review what happened in a coding session and store the key insights as memories for future recall.
 
@@ -31,7 +34,13 @@ struct PreCompact: AsyncParsableCommand {
         """
     )
 
-    private static let allowedTools = "mcp__memory__*,Read,Grep,Glob,Bash"
+    /// Local sessions mount the memory MCP as "memory"; sandboxes mount the
+    /// remote server as "engram" — the learner's allowlist must match.
+    private static var allowedTools: String {
+        RemoteConfig.active != nil
+            ? "mcp__engram__*,Read,Grep,Glob,Bash"
+            : "mcp__memory__*,Read,Grep,Glob,Bash"
+    }
     private static let logPath = NSHomeDirectory() + "/.claude/session-learner.log"
 
     func run() async throws {

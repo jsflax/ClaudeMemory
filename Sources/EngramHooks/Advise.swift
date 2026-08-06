@@ -1,7 +1,10 @@
 import ArgumentParser
+import EngramMemoryCore
+import Foundation
+#if canImport(EngramKit)
 import EngramKit
 import Lattice
-import Foundation
+#endif
 
 /// UserPromptSubmit hook: recalls relevant memories, nudges learning and maintenance.
 struct Advise: AsyncParsableCommand {
@@ -39,6 +42,24 @@ struct Advise: AsyncParsableCommand {
 
         var sections: [String] = []
 
+        if let remote = RemoteConfig.active {
+            // Remote backend: the server does distillation, ranking,
+            // fencing, and budgeting; gate-less by design (it runs once per
+            // agent event). Returns the full "## Relevant memories" block.
+            if let block = await RemoteMemory.advise(
+                remote, prompt: prompt, project: remote.project ?? project) {
+                sessionLog("Advise(remote): block \(block.count) chars", sessionId: sid)
+                logRecalledMemories(block, hook: "Advise", sessionId: sid)
+                sections.append(block)
+            } else {
+                sessionLog("Advise(remote): no block", sessionId: sid)
+                if let sid, !sid.isEmpty { writeSessionRecallSkip(sessionId: sid) }
+            }
+            appendNudgesAndEmit(input: input, project: proj, sections: &sections)
+            return
+        }
+
+        #if canImport(EngramKit)
         // Gate: classify whether this prompt is worth recalling memories for.
         sessionLog("Advise: running recall gate", sessionId: sid)
         let gate = try? RecallGateClassifier()
@@ -88,18 +109,26 @@ struct Advise: AsyncParsableCommand {
             }
         }
 
-        // Spawn maintenance subprocess if threshold crossed (fire-and-forget)
+        // Spawn maintenance subprocess if threshold crossed (fire-and-forget).
+        // Local-only: the server owns hygiene for the shared PG store.
         spawnMaintenanceIfNeeded(project: proj, cwd: input.cwd)
+        #endif
 
+        appendNudgesAndEmit(input: input, project: proj, sections: &sections)
+    }
+
+    /// Shared tail for both backends: the stop-hook handshake, the learning
+    /// nudge, and the hook output envelope.
+    private func appendNudgesAndEmit(input: UserPromptSubmitInput, project: String,
+                                     sections: inout [String]) {
         // Learning nudge — skip if stop hook just fired (session-learner already spawned)
-        let consumedStopNudge = withSessionState(sessionId: input.sessionId) { state -> Bool in
+        let consumedStopNudge = updateSessionCounters(sessionId: input.sessionId) { state -> Bool in
             guard state.stopNudgeSent else { return false }
             state.stopNudgeSent = false
-            state.updatedAt = Date()
             return true
         }
         if consumedStopNudge != true {
-            sections.append(learningNudge(project: proj))
+            sections.append(learningNudge(project: project))
         }
 
         let output = HookOutput(
@@ -108,14 +137,15 @@ struct Advise: AsyncParsableCommand {
                 additionalContext: sections.joined(separator: "\n\n")
             )
         )
-        try writeOutput(output)
+        try? writeOutput(output)
     }
 
+    #if canImport(EngramKit)
     // MARK: - Maintenance Subprocess
 
     /// The maintenance system prompt, loaded from agents/memory-maintenance.md or inlined.
     private static let maintenanceSystemPrompt: String = loadAgentSystemPrompt(
-        name: "memory-maintenance",
+        name: "memory-maintenance", bundle: agentPromptBundle,
         fallback: """
         You are a memory maintenance agent. Your job is to analyze the memory database and improve its organization for better recall quality.
 
@@ -200,4 +230,5 @@ struct Advise: AsyncParsableCommand {
             hookLog("Advise: failed to spawn memory-maintenance: \(error)")
         }
     }
+    #endif
 }
