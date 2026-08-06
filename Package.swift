@@ -30,6 +30,7 @@ let package = Package(
         .library(name: "EngramKit", targets: ["EngramKit"]),
         .library(name: "EngramModels", targets: ["EngramModels"]),
         .library(name: "EngramMemoryCore", targets: ["EngramMemoryCore"]),
+        .library(name: "EngramMemoryContract", targets: ["EngramMemoryContract"]),
         .library(name: "EngramFoundationModels", targets: ["EngramFoundationModels"]),
         .library(name: "EngramSceneKit", targets: ["EngramSceneKit"]),
         .library(name: "EngramMetalShaders", targets: ["EngramMetalShaders"]),
@@ -75,6 +76,17 @@ let package = Package(
         ),
         .testTarget(
             name: "EngramMemoryCoreTests",
+            dependencies: ["EngramMemoryCore"]
+        ),
+        // The MemoryService contract: one executable spec both backends must
+        // pass — Lattice in-proc (EngramTests) and Postgres (engram-server's
+        // suite, increment 5). A LIBRARY, not a test target, because test
+        // targets aren't importable across packages; each repo's test target
+        // wraps `MemoryServiceContract.run` in its own @Test. Linux-clean
+        // like EngramMemoryCore (no Testing import — checks report typed
+        // violations).
+        .target(
+            name: "EngramMemoryContract",
             dependencies: ["EngramMemoryCore"]
         ),
         .target(
@@ -218,6 +230,7 @@ let package = Package(
             dependencies: [
                 "EngramKit",
                 "EngramMemoryCore",
+                "EngramMemoryContract",
                 .product(name: "Lattice", package: "lattice"),
             ],
             swiftSettings: [

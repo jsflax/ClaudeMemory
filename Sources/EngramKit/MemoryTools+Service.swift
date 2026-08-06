@@ -61,13 +61,15 @@ extension MemoryTools: MemoryService {
     }
 
     public func graph(_ request: GraphRequest) async throws -> GraphResult {
+        // Resolve BEFORE rendering: a missing/hard-deleted id is a typed
+        // notFound, not whatever prose the handler renders for it.
+        guard let (root, _) = findMemory(id: request.id) else {
+            throw MemoryServiceError.notFound(request.id)
+        }
         let result = try handleGraph([
             "id": .string(request.id.uuidString),
             "depth": .int(request.depth),
         ])
-        guard let (root, _) = findMemory(id: request.id) else {
-            throw MemoryServiceError.notFound(request.id)
-        }
         // v1: rendered text + root record; typed node/edge sets firm up as
         // handleGraph is decomposed (the transport only needs the text).
         return GraphResult(root: record(from: root), nodes: [], edges: [],
@@ -79,7 +81,7 @@ extension MemoryTools: MemoryService {
     public func remember(_ request: RememberRequest) async throws -> RememberResult {
         var args: [String: Value] = [
             "content": .string(request.content),
-            "isPrivate": .bool(request.isPrivate),
+            "is_private": .bool(request.isPrivate),
         ]
         if let topic = request.topic { args["topic"] = .string(topic) }
         if let project = request.project { args["project"] = .string(project) }
@@ -136,11 +138,13 @@ extension MemoryTools: MemoryService {
         ]))
     }
 
-    public func merge(ids: [UUID], into target: UUID?) async throws -> ToolReply {
+    public func merge(ids: [UUID], content: String, topic: String?, project: String?) async throws -> ToolReply {
         var args: [String: Value] = [
             "ids": .array(ids.map { .string($0.uuidString) }),
+            "content": .string(content),
         ]
-        if let target { args["into"] = .string(target.uuidString) }
+        if let topic { args["topic"] = .string(topic) }
+        if let project { args["project"] = .string(project) }
         return Self.reply(try await handleMerge(args))
     }
 
@@ -173,21 +177,23 @@ extension MemoryTools: MemoryService {
         return Self.reply(try handleEndEpisode(args.isEmpty ? nil : args))
     }
 
-    public func recallEpisode(query: String) async throws -> ToolReply {
-        Self.reply(try handleRecallEpisode(["query": .string(query)]))
+    public func recallEpisode(id: UUID, limit: Int?) async throws -> ToolReply {
+        var args: [String: Value] = ["episode_id": .string(id.uuidString)]
+        if let limit { args["limit"] = .int(limit) }
+        return Self.reply(try handleRecallEpisode(args))
     }
 
     public func listEpisodes(limit: Int?) async throws -> ToolReply {
         Self.reply(try handleListEpisodes(limit.map { ["limit": .int($0)] }))
     }
 
-    public func checkpoint(description: String, sessionKey: String?) async throws -> ToolReply {
+    public func checkpoint(title: String, sessionKey: String?) async throws -> ToolReply {
         _ = sessionKey
-        return Self.reply(try handleCheckpoint(["description": .string(description)]))
+        return Self.reply(try handleCheckpoint(["title": .string(title)]))
     }
 
-    public func resume(taskId: String?) async throws -> ToolReply {
-        Self.reply(try handleResume(taskId.map { ["task_id": .string($0)] }))
+    public func resume(taskId: Int) async throws -> ToolReply {
+        Self.reply(try handleResume(["task_id": .int(taskId)]))
     }
 
     public func listTasks() async throws -> ToolReply {
@@ -198,18 +204,27 @@ extension MemoryTools: MemoryService {
         Self.reply(try await handleFindClusters(project.map { ["project": .string($0)] }))
     }
 
-    public func detectCommunities() async throws -> ToolReply {
-        Self.reply(try await handleDetectCommunities(nil))
+    public func detectCommunities(project: String) async throws -> ToolReply {
+        Self.reply(try await handleDetectCommunities(["project": .string(project)]))
     }
 
-    public func organize(apply: Bool) async throws -> ToolReply {
-        Self.reply(try await handleOrganize(apply ? ["apply": .bool(true)] : nil))
-    }
-
-    public func consolidate(ids: [UUID], force: Bool) async throws -> ToolReply {
+    public func organize(ids: [UUID], label: String, project: String?, summary: String?) async throws -> ToolReply {
         var args: [String: Value] = [
             "ids": .array(ids.map { .string($0.uuidString) }),
+            "label": .string(label),
         ]
+        if let project { args["project"] = .string(project) }
+        if let summary { args["summary"] = .string(summary) }
+        return Self.reply(try await handleOrganize(args))
+    }
+
+    public func consolidate(ids: [UUID], content: String, topic: String?, project: String?, force: Bool) async throws -> ToolReply {
+        var args: [String: Value] = [
+            "ids": .array(ids.map { .string($0.uuidString) }),
+            "content": .string(content),
+        ]
+        if let topic { args["topic"] = .string(topic) }
+        if let project { args["project"] = .string(project) }
         if force { args["force"] = .bool(true) }
         return Self.reply(try await handleConsolidate(args))
     }

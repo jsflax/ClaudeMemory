@@ -349,7 +349,9 @@ public protocol MemoryService: Sendable {
     func forget(_ request: ForgetRequest) async throws -> ToolReply
     func connect(_ request: ConnectRequest) async throws -> ToolReply
     func disconnect(_ request: ConnectRequest) async throws -> ToolReply
-    func merge(ids: [UUID], into: UUID?) async throws -> ToolReply
+    /// Merge `ids` into one memory whose body is `content` (the tool's
+    /// replacement-content semantics — there is no "absorb into target").
+    func merge(ids: [UUID], content: String, topic: String?, project: String?) async throws -> ToolReply
 
     // Rendered-text surface (structured in 1b as handlers migrate).
     // `sessionKey` scopes conversational state (episodes) — the CLI passes
@@ -360,17 +362,20 @@ public protocol MemoryService: Sendable {
 
     func beginEpisode(title: String, sessionKey: String?) async throws -> ToolReply
     func endEpisode(summary: String?, sessionKey: String?) async throws -> ToolReply
-    func recallEpisode(query: String) async throws -> ToolReply
+    func recallEpisode(id: UUID, limit: Int?) async throws -> ToolReply
     func listEpisodes(limit: Int?) async throws -> ToolReply
 
-    func checkpoint(description: String, sessionKey: String?) async throws -> ToolReply
-    func resume(taskId: String?) async throws -> ToolReply
+    func checkpoint(title: String, sessionKey: String?) async throws -> ToolReply
+    func resume(taskId: Int) async throws -> ToolReply
     func listTasks() async throws -> ToolReply
 
     func findClusters(project: String?) async throws -> ToolReply
-    func detectCommunities() async throws -> ToolReply
-    func organize(apply: Bool) async throws -> ToolReply
-    func consolidate(ids: [UUID], force: Bool) async throws -> ToolReply
+    func detectCommunities(project: String) async throws -> ToolReply
+    /// Group `ids` under a labeled hub memory (part_of edges to a new hub).
+    func organize(ids: [UUID], label: String, project: String?, summary: String?) async throws -> ToolReply
+    /// Collapse `ids` into one memory with `content`; `force` is required
+    /// when the cluster contains foreign-authored rows.
+    func consolidate(ids: [UUID], content: String, topic: String?, project: String?, force: Bool) async throws -> ToolReply
 
     func vacuum() async throws -> ToolReply
     func trainVectors() async throws -> ToolReply

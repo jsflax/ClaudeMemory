@@ -22,7 +22,9 @@ public actor MemoryTools {
     /// Synced database (memory-synced.sqlite) — reads go here for synced projects.
     /// Contains cross-device data relayed by the sync daemon. Nil if no synced DB exists.
     package let syncedLattice: Lattice?
-    package let embedder: EmbeddingService
+    /// `any Embedder` (not the concrete CoreML actor): the contract suite
+    /// injects a deterministic embedder; production passes EmbeddingService.
+    package let embedder: any Embedder
 
     /// Tracks the currently active episode globalId for this session.
     var activeEpisodeId: UUID? = nil
@@ -104,7 +106,7 @@ public actor MemoryTools {
     public init(localRef: LatticeThreadSafeReference,
                 syncedRef: LatticeThreadSafeReference?,
                 groupRefs: [GroupSpokeRef] = [],
-                embedder: EmbeddingService,
+                embedder: any Embedder,
                 identity: any IdentityProviding = GroupDirectoryIdentityProvider()) {
         guard let local = localRef.resolve() else {
             fatalError("Failed to resolve local lattice reference")
