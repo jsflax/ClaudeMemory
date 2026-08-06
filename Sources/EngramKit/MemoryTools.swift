@@ -1,3 +1,4 @@
+import EngramMemoryCore
 import Lattice
 import MCP
 import Foundation
@@ -63,11 +64,17 @@ public actor MemoryTools {
     /// participates in every recall, including project-less ones.
     package let groupSpokes: [(groupId: UUID, path: String, lattice: Lattice)]
 
+    /// The authenticated identity this instance operates as. Injected, not
+    /// ambient (increment 1b): the CLI/hook default reads groups.json; a
+    /// hosted service constructs one per authenticated request.
+    let identity: any IdentityProviding
+
     /// Resolves sendable references inside the actor's isolation domain.
     public init(localRef: LatticeThreadSafeReference,
                 syncedRef: LatticeThreadSafeReference?,
                 groupRefs: [GroupSpokeRef] = [],
-                embedder: EmbeddingService) {
+                embedder: EmbeddingService,
+                identity: any IdentityProviding = GroupDirectoryIdentityProvider()) {
         guard let local = localRef.resolve() else {
             fatalError("Failed to resolve local lattice reference")
         }
@@ -78,6 +85,7 @@ public actor MemoryTools {
             return (groupId: spoke.groupId, path: spoke.path, lattice: lattice)
         }
         self.embedder = embedder
+        self.identity = identity
         // Hard default, not opt-in: any MemoryTools living inside the
         // maintenance subprocess tree excludes foreign content everywhere.
         self.excludeForeignAuthored = Self.maintenanceEnvironmentDetected
@@ -163,7 +171,7 @@ public actor MemoryTools {
     /// daemon-authored groups.json (never the Keychain; short-lived
     /// processes can't reliably read it). Nil when signed out — writers
     /// stamp nil and the daemon-start backfill sweep repairs later.
-    var currentUserId: UUID? { GroupDirectory.currentUserId() }
+    var currentUserId: UUID? { identity.currentPrincipal().id }
 
     // MARK: - Foreign-content hardening (prompt-injection surface)
 
