@@ -1,3 +1,4 @@
+import EngramMemoryCore
 import Lattice
 import MCP
 import Foundation
@@ -141,9 +142,11 @@ extension MemoryTools {
                 .where { $0.expiresAt > Date() && $0.topic != "episode" && $0.deletedAt == nil }
                 .where { $0.project == project || $0.project == "global" }
             log("[remember] query built, calling nearest() with embedding dim=\(embeddingVec.count)")
-            // Array() materializes once — see the recall nearest() comment.
-            let candidates = Array(baseQuery
-                .nearest(to: embeddingVec, on: \.embedding, limit: 8, distance: .l2))
+            // snapshot() materializes atomically — see the recall nearest()
+            // comment.
+            let candidates = baseQuery
+                .nearest(to: embeddingVec, on: \.embedding, limit: 8, distance: .l2)
+                .snapshot()
             log("[remember] nearest() returned")
             log("[remember] nearest query returned \(candidates.count) candidates")
 
@@ -199,6 +202,7 @@ extension MemoryTools {
         try localLattice.add(memory)
         log("[remember] add() complete")
 
+        lastRememberedId = memory.globalId
         guard let memoryGlobalId = memory.globalId else {
             throw MCPError.internalError("Failed to persist memory — globalId is nil after add()")
         }
@@ -385,6 +389,8 @@ extension MemoryTools {
     // MARK: - recall
 
     func handleRecall(_ args: [String: Value]?) async throws -> CallTool.Result {
+        lastRecallHits = []
+        lastRecallMode = .vector
         let a = try args.decode(RecallArgs.self)
         guard !a.query.isEmpty else {
             throw MCPError.invalidParams("'query' is required")
@@ -443,14 +449,19 @@ extension MemoryTools {
 
             log("[recall] Running nearest() with fetchLimit=\(fetchLimit)")
             sessionLog("[recall] Running nearest() fetchLimit=\(fetchLimit)")
-            // Materialize ONCE via the iterator. Collection operations (.map,
+            // snapshot() executes the KNN query ONCE and builds the array
+            // from that single result set. Collection operations (.map,
             // .filter) on live Results go through the re-querying subscript:
             // if a concurrent writer (daemon relay, another session) shrinks
             // the result set mid-iteration, the subscript traps "Index out of
-            // bounds" — this was the production MCP recall crash
-            // (crash-99579.log, Apr 9).
-            let nearest = Array(results
-                .nearest(to: embedding, on: \.embedding, limit: fetchLimit, distance: .l2))
+            // bounds" — the production MCP recall crash (crash-99579.log,
+            // Apr 9). `Array.init` has the mirror-image trap: it reserves
+            // from `count` and dies with "more than 'count' elements" when a
+            // concurrent writer GROWS the set between the count and the copy
+            // (test-runner signal-5 crashes, Aug 5–6).
+            let nearest = results
+                .nearest(to: embedding, on: \.embedding, limit: fetchLimit, distance: .l2)
+                .snapshot()
             log("[recall] nearest() returned \(nearest.count) results")
             sessionLog("[recall] nearest() returned \(nearest.count) results")
 
@@ -540,6 +551,18 @@ extension MemoryTools {
             let filtered = topResults.filter { $0.distance <= threshold }
             log("[recall] After outlier filter: \(filtered.count) results (threshold=\(String(format: "%.3f", threshold)))")
             sessionLog("[recall] Outlier filter: \(filtered.count) results")
+
+            // Structured capture: direct hits in boosted order, BEFORE the
+            // access-stat bump — the bump's writes invalidate the row caches,
+            // so a post-bump read would re-issue one SELECT per field.
+            // Traversal hits append below.
+            lastRecallHits = filtered.compactMap { hit in
+                guard hit.object.globalId != nil else { return nil }
+                return RecallHit(memory: record(from: hit.object),
+                                 distance: hit.distance,
+                                 depth: 0,
+                                 isForeign: isForeignAuthored(hit.object))
+            }
 
             // Access-stat bumps are DEFERRED to one batched transaction after
             // the output is composed (see below) — the old per-loop
@@ -656,6 +679,10 @@ extension MemoryTools {
                     for mem in connected {
                         let m = mem.memory
                         guard let memGlobalId = m.globalId else { continue }
+                        lastRecallHits.append(RecallHit(memory: record(from: m),
+                                                        distance: 0,
+                                                        depth: mem.depth,
+                                                        isForeign: isForeignAuthored(m)))
 
                         let expires = m.expiresAt == .distantFuture ? "" : ", expires: \(Self.dateFormatter.string(from: m.expiresAt))"
 
@@ -713,6 +740,7 @@ extension MemoryTools {
             sessionLog("[recall] DONE, returning \(output.count) chars")
             return CallTool.Result(content: [.text(output)], isError: false)
         } else {
+            lastRecallMode = .fullText
             log("[recall] No embedding available, falling back to FTS5")
             // Degraded mode: FTS5 full-text search (no embedding model loaded)
             let contentWords = Self.extractContentWords(from: query)
@@ -745,6 +773,10 @@ extension MemoryTools {
                 let expires = m.expiresAt == .distantFuture ? "" : ", expires: \(Self.dateFormatter.string(from: m.expiresAt))"
                 let created = hasTemporalFilter ? ", created: \(Self.dateFormatter.string(from: m.createdAt))" : ""
                 guard let mGid = m.globalId else { continue }
+                lastRecallHits.append(RecallHit(memory: record(from: m),
+                                                distance: 0,
+                                                depth: 0,
+                                                isForeign: isForeign))
                 let badge = isForeign
                     ? " [by:\(GroupDirectory.badgeName(for: m.authorUserId))]" : ""
                 let via = viaMarker(for: mGid)

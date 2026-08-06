@@ -69,6 +69,37 @@ public actor MemoryTools {
     /// hosted service constructs one per authenticated request.
     let identity: any IdentityProviding
 
+    /// Structured mirror of the last recall — populated by handleRecall at
+    /// its return sites, read SYNCHRONOUSLY by the MemoryService
+    /// conformance right after the awaited call returns. Actor isolation
+    /// makes that safe: there is no suspension point between the final
+    /// write and the read, so an interleaved recall cannot cross-wire it.
+    var lastRecallHits: [RecallHit] = []
+    var lastRecallMode: RecallMode = .vector
+
+    /// The globalId of the last remembered row — same capture contract.
+    var lastRememberedId: UUID?
+
+    /// DTO mapping for the contract surface (never leaks live rows).
+    func record(from m: Memory) -> MemoryRecord {
+        MemoryRecord(
+            id: m.globalId ?? UUID(),
+            content: m.content,
+            topic: m.topic,
+            project: m.project,
+            source: m.source,
+            importance: m.importance,
+            accessCount: m.accessCount,
+            isPrivate: m.isPrivate,
+            authorUserId: m.authorUserId,
+            createdAt: m.createdAt,
+            modifiedAt: m.modifiedAt,
+            lastAccessedAt: m.lastAccessedAt,
+            expiresAt: m.expiresAt == .distantFuture ? nil : m.expiresAt,
+            deletedAt: m.deletedAt,
+            deletedBy: m.deletedBy)
+    }
+
     /// Resolves sendable references inside the actor's isolation domain.
     public init(localRef: LatticeThreadSafeReference,
                 syncedRef: LatticeThreadSafeReference?,
