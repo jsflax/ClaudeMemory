@@ -98,10 +98,24 @@ struct RecallPerfRegressionTests {
         #expect(output.contains("distance:"), "recall returned no results: \(output.prefix(200))")
         // Pre-rewrite, a recall of this shape issued ~250-300 statements
         // (one per field per direct + connected memory, content re-read 4x,
-        // embedding BLOBs twice per traversal candidate). Budget covers:
-        // KNN + routing + traversal edge/candidate queries (Cursor batch +
-        // tail per loop) + ONE bump transaction + slack.
-        #expect(used <= 120, "recall issued \(used) SQL statements — statement-budget regression")
+        // embedding BLOBs twice per traversal candidate).
+        //
+        // Recalibrated for embedding space v2 (Aug 2026): the wider v2
+        // relevance bands admit more rows into traversal and the access-stat
+        // bump, so the per-row sections grew with ROW COUNT, not with
+        // per-field regressions. Measured breakdown at 160 total for this
+        // fixture (12 direct / 6 connected / 11 bumped):
+        //   KNN + snapshot hydration   ~25
+        //   direct materialize          12   (1/row, by design)
+        //   graph traversal             ~40  (edges + candidate hydration)
+        //   access-stat bump txn        ~82  (~7.5/row — the known fat: each
+        //        property set + increment issues its own statement cluster;
+        //        a Lattice-side bulk UPDATE..WHERE IN would collapse this)
+        //   everything else              ~0  (boost, capture, render ride
+        //        the row caches)
+        // Budget = measured + slack; still an order of magnitude under the
+        // pre-rewrite O(fields × memories) failure mode this test guards.
+        #expect(used <= 180, "recall issued \(used) SQL statements — statement-budget regression")
     }
 
     // 2. Access stats: every direct AND connected memory is bumped exactly
