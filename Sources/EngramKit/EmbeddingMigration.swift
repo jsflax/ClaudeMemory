@@ -60,17 +60,23 @@ public enum EmbeddingMigration {
 
     /// Sweep `lattice` if its stored space version is behind. `force` runs
     /// the sweep regardless of the marker (calibration / repair).
+    /// `useMarker: false` = markerless mode for GROUP SPOKES: their schema
+    /// is [Memory, Edge, GroupProjectMap] and must stay that way — opening
+    /// them with HookState would create the table locally, and the group
+    /// relay's write-policy DENIES unlisted tables, nacking the entry and
+    /// wedging the spoke's upload channel. Markerless sweeps always run.
     @discardableResult
     public static func runIfNeeded(
         on lattice: Lattice,
         embedder: EmbeddingService? = nil,
         force: Bool = false,
+        useMarker: Bool = true,
         batchSize: Int = 64,
         log: @escaping @Sendable (String) -> Void = { _ in }
     ) async throws -> Report {
         var report = Report()
-        let stored = storedVersion(in: lattice)
-        guard force || stored < EmbeddingSpace.currentVersion else {
+        let stored = useMarker ? storedVersion(in: lattice) : 1
+        guard force || !useMarker || stored < EmbeddingSpace.currentVersion else {
             report.skipped = true
             return report
         }
@@ -118,7 +124,7 @@ public enum EmbeddingMigration {
         // Marker only after a complete pass; failures leave it unset so the
         // next run retries (re-embedding completed rows is idempotent).
         if report.failed == 0 {
-            try setStoredVersion(EmbeddingSpace.currentVersion, in: lattice)
+            if useMarker { try setStoredVersion(EmbeddingSpace.currentVersion, in: lattice) }
         } else {
             log("Embedding migration: \(report.failed) rows failed — marker NOT advanced; next run retries")
         }
