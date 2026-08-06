@@ -229,4 +229,110 @@ struct GroupTopologyRecallTests {
         #expect(!out.contains("sourdough"),
                 "unrelated graph's rows surfaced — cross-arm rowid borrow")
     }
+
+    /// A spoke hydrated purely by sync-apply has rows but NO vec index (the
+    /// apply path never creates the vec0 tables or their maintenance
+    /// triggers), so its arm contributes nothing to semantic recall. The
+    /// from-scratch heal is red-first proven in latticecore
+    /// (SyncOnlyVecReconcileTests: reconcile-on-open + vacuum_vec0); a
+    /// client fixture cannot HOLD the dark state deterministically because
+    /// stripping the index bumps the schema cookie, forcing the next open
+    /// down the DDL path that rebuilds it. What THIS test guards end-to-end:
+    /// the vacuum tool reaches group spokes (it historically only touched
+    /// local + synced), and a spoke whose index was destroyed ends up fully
+    /// recalled — [by:]/[via:] included — after open + vacuum.
+    @Test func vacuum_coversGroupSpokes() async throws {
+        let savedURL = GroupDirectory.fileURL
+        defer { GroupDirectory.fileURL = savedURL }
+
+        let me = UUID(), remy = UUID()
+        let dir = FileManager.default.temporaryDirectory
+            .appending(path: "engram-spokeheal-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let gid = UUID()
+        let spokePath = dir.appending(path: "group-\(gid.uuidString).sqlite").path
+
+        // Populate through a scoped handle (vec built by triggers), close it,
+        // then strip every vec artifact — the exact on-disk state sync-apply
+        // leaves behind.
+        try await {
+            let writer = try Lattice(Memory.self, Edge.self, GroupProjectMap.self,
+                                     configuration: .init(fileURL: URL(fileURLWithPath: spokePath)))
+            for text in ["beta rollout: remy says the spoke ships gradual rollout flags",
+                         "beta rollout: remy wants the kill switch wired before launch"] {
+                try await addMemory(text, project: "demo", author: remy, to: writer)
+            }
+            writer.checkpoint()
+        }()
+        try stripVecIndex(atPath: spokePath)
+
+        let spoke = try Lattice(Memory.self, Edge.self, GroupProjectMap.self,
+                                configuration: .init(fileURL: URL(fileURLWithPath: spokePath)))
+        #expect(spoke.objects(Memory.self).count == 2, "rows must survive the strip")
+
+        let local = try Lattice(Memory.self, Edge.self, Checkpoint.self, HookState.self,
+                                SyncConfig.self,
+                                configuration: .init(fileURL: dir.appending(path: "memory.sqlite")))
+        try await addMemory("beta rollout: my local note about the flag dashboard",
+                            project: "demo", author: me, to: local)
+
+        let file = GroupDirectory.GroupsFile(
+            selfUserId: me, updatedAt: Date(),
+            groups: [.init(id: gid, name: "mobile", parentId: nil,
+                           myRole: "member", root: true)],
+            members: [remy.uuidString: "Remy"])
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let fileURL = dir.appending(path: "groups.json")
+        try encoder.encode(file).write(to: fileURL)
+        GroupDirectory.fileURL = fileURL
+
+        let embedder = sharedEmbedder
+        if await !embedder.isLoaded { await embedder.load() }
+        let tools = MemoryTools(
+            localRef: local.sendableReference, syncedRef: nil,
+            groupRefs: [.init(groupId: gid, path: spokePath, ref: spoke.sendableReference)],
+            embedder: embedder)
+
+        // The vacuum surface must report spoke coverage…
+        let healed = text(from: try await tools.handle(CallTool.Parameters(name: "vacuum")))
+        #expect(healed.contains("1 group spoke(s) reindexed"))
+
+        // …and the spoke whose index was destroyed is fully recalled.
+        let lit = text(from: try await tools.handle(CallTool.Parameters(
+            name: "recall",
+            arguments: ["query": .string("beta rollout"), "project": .string("demo")])))
+        #expect(lit.contains("flag dashboard"), "local arm must still function")
+        #expect(lit.contains("gradual rollout"), "spoke must contribute to recall")
+        #expect(lit.contains("kill switch wired"))
+        #expect(lit.contains("[by:Remy]"))
+        #expect(lit.contains("[via:mobile]"))
+    }
+}
+
+/// Removes the vec0 virtual table, its shadow tables, and its maintenance
+/// triggers from a closed lattice file — reproducing a spoke hydrated purely
+/// by sync-apply, which INSERTs rows without ever creating the vec index.
+/// Goes through the sqlite3 CLI: Apple's system SQLite has
+/// SQLITE_DBCONFIG_DEFENSIVE on by default (blocking writable_schema), and
+/// the escape hatch `sqlite3_db_config` is variadic — uncallable from Swift.
+private func stripVecIndex(atPath path: String) throws {
+    struct StripError: Error { let message: String }
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
+    p.arguments = [
+        path,
+        ".dbconfig defensive off",
+        #"PRAGMA writable_schema=ON; DELETE FROM sqlite_master WHERE name LIKE '\_Memory\_embedding\_vec%' ESCAPE '\'; PRAGMA writable_schema=OFF; VACUUM;"#,
+    ]
+    let err = Pipe()
+    p.standardError = err
+    p.standardOutput = Pipe()
+    try p.run()
+    p.waitUntilExit()
+    guard p.terminationStatus == 0 else {
+        let msg = String(data: err.fileHandleForReading.readDataToEndOfFile(),
+                         encoding: .utf8) ?? "?"
+        throw StripError(message: "sqlite3 exited \(p.terminationStatus): \(msg)")
+    }
 }

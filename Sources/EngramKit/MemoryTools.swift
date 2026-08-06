@@ -145,7 +145,7 @@ public actor MemoryTools {
     /// Live spokes for this read: `stat()` per call, so a revoked spoke
     /// (renamed `.revoked` by the daemon) drops out of the union at the next
     /// recall rather than at process exit.
-    private func liveGroupSpokes() -> [(groupId: UUID, path: String, lattice: Lattice)] {
+    func liveGroupSpokes() -> [(groupId: UUID, path: String, lattice: Lattice)] {
         groupSpokes.filter { FileManager.default.fileExists(atPath: $0.path) }
     }
 
