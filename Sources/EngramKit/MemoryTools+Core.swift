@@ -1254,7 +1254,19 @@ extension MemoryTools {
             synced._vacuumVec0(Memory(), for: \.embedding)
             synced.vacuum()
         }
-        return CallTool.Result(content: [.text("Vacuum complete: WAL checkpointed, vector index rebuilt, database compacted.")], isError: false)
+        // Group spokes too (increment-4 contract): a spoke populated purely
+        // by sync-apply has NO vec sidecar — the apply path inserts rows
+        // without indexing them, and recall's multi-arm KNN silently skips
+        // arms with no vec table. Checkpoint + index rebuild only; never
+        // tombstone GC (that's server/admin-owned).
+        var spokeCount = 0
+        for spoke in liveGroupSpokes() {
+            spoke.lattice.checkpoint()
+            spoke.lattice._vacuumVec0(Memory(), for: \.embedding)
+            spokeCount += 1
+        }
+        let spokeNote = spokeCount > 0 ? " \(spokeCount) group spoke(s) reindexed." : ""
+        return CallTool.Result(content: [.text("Vacuum complete: WAL checkpointed, vector index rebuilt, database compacted.\(spokeNote)")], isError: false)
     }
 
     // MARK: - train_vectors
@@ -1269,10 +1281,16 @@ extension MemoryTools {
             synced.checkpoint()
             syncedCount = synced.objects(Memory.self).count
         }
-        let detail = syncedCount > 0
-            ? "local: \(localCount), synced: \(syncedCount)"
-            : "\(localCount) vectors"
-        return CallTool.Result(content: [.text("Vector index trained (\(detail)).")], isError: false)
+        var spokeTotal = 0
+        for spoke in liveGroupSpokes() {
+            spoke.lattice._vacuumVec0(Memory(), for: \.embedding)
+            spoke.lattice.checkpoint()
+            spokeTotal += spoke.lattice.objects(Memory.self).count
+        }
+        var parts = ["local: \(localCount)"]
+        if syncedCount > 0 { parts.append("synced: \(syncedCount)") }
+        if spokeTotal > 0 { parts.append("group spokes: \(spokeTotal)") }
+        return CallTool.Result(content: [.text("Vector index trained (\(parts.joined(separator: ", "))).")], isError: false)
     }
 
     // MARK: - list_topics
