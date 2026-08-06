@@ -56,6 +56,23 @@ public enum RecallRanking {
         }
     }
 
+    /// Feedback-weighted adjustment (increment 12, the loop-closing
+    /// actuator). Positive signals (used/helpful) pull the distance DOWN,
+    /// capped at 15% — same magnitude as the frequency boost, so feedback
+    /// can re-order near-ties but never overrule semantic relevance.
+    /// Negative signals (ignored/harmful) push it UP, capped at 25% — a
+    /// consistently harmful memory should lose to anything comparable.
+    /// Log-scaled: the tenth signal matters far less than the first.
+    ///
+    /// Backends without a feedback store (the on-device lattice conformance
+    /// today) pass zeros and get exactly 1.0 — the WEIGHTS live here so the
+    /// day feedback syncs to devices, ranking already agrees.
+    public static func feedbackBoost(positive: Int, negative: Int) -> Double {
+        let up = min(log2(1.0 + Double(max(positive, 0))) * 0.05, 0.15)
+        let down = min(log2(1.0 + Double(max(negative, 0))) * 0.08, 0.25)
+        return 1.0 - up + down
+    }
+
     /// The full boosted distance — the ranking key (ascending).
     public static func boostedDistance(
         l2Distance: Double,
@@ -63,7 +80,9 @@ public enum RecallRanking {
         accessCount: Int,
         importance: Int,
         daysSinceAccess: Double,
-        daysSinceCreation: Double
+        daysSinceCreation: Double,
+        feedbackPositive: Int = 0,
+        feedbackNegative: Int = 0
     ) -> Double {
         l2Distance
             * projectBoost(scope)
@@ -71,6 +90,7 @@ public enum RecallRanking {
             * importanceBoost(importance: importance)
             * recencyBoost(daysSinceAccess: daysSinceAccess)
             * stalenessPenalty(accessCount: accessCount, daysSinceCreation: daysSinceCreation)
+            * feedbackBoost(positive: feedbackPositive, negative: feedbackNegative)
     }
 }
 
