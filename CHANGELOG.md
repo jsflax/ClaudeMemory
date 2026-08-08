@@ -4,6 +4,83 @@ All notable changes to Engram are documented in this file.
 
 > Formerly "ClaudeMemory" — renamed in v0.12.0 to be tool-agnostic.
 
+## [0.14.0] - 2026-08-08
+
+Groups: shared memory for teams. Your personal graph stays yours; each
+group you join adds a shared graph that recall reads alongside it. Also
+ships embedding space v2 (better semantic matching, automatic migration)
+and a deep round of crash and recall-correctness fixes.
+
+### Added
+- **Groups — shared memory graphs for teams.** Organizations are trees
+  (an org root, teams, sub-teams); membership anywhere in a subtree
+  implies membership above it. Each group syncs to its own on-device
+  graph, recall unions your personal graph with every membership graph
+  in one query, and shared results are attributed (`[by:Name]`) and
+  provenanced (`[via:group]`). Reads are membership-scoped; *exposure*
+  is a separate, explicit per-project control over what leaves the
+  machine. Invites, roles (owner/admin/member), per-seat billing, and
+  admin tooling live on engramdb.io; the visualizer renders each group
+  as its own galaxy with author rows, management UI, and per-group
+  exposure controls.
+- **Team → concept links (a graph of graphs).** A team can link to a
+  shared concept graph (say, `mobile`) and every member gains
+  member-level access through the link — one hop, same organization,
+  no per-person joins. Linked graphs join the recall union like any
+  membership graph. Creating a link takes admin on both ends; severing
+  it takes admin on either end and revokes access immediately.
+- **Embedding space v2.** The bundled model switches to mean-pooled
+  paraphrase-MiniLM (held to ≥0.999 parity with the reference server
+  implementation by a regression gate), with recall/dedupe thresholds
+  recalibrated from 27k rows of production data. Existing memories are
+  re-embedded by an idempotent, version-marked sweep that runs at
+  daemon startup and — for machines without a running daemon, including
+  signed-out and free-tier installs — as a background backstop when the
+  memory server starts. Shared group graphs converge as each author's
+  machine migrates and relays its re-embedded vectors (a manual
+  `memory-sync migrate-embeddings` sweep exists for repair and offline
+  copies).
+- **Prompt-injection fence for shared content.** Teammate-authored
+  memories injected into hook context are wrapped in a "data, not
+  instructions" fence with a length cap, and the maintenance
+  subprocess never sees foreign-authored content at all.
+- **Linux hooks.** `memory-hooks` builds on Linux — the full hook
+  suite works in remote and sandboxed sessions.
+- **EngramMemoryCore.** The memory contract (recall/advise/remember
+  over structured captures) is now a portable module with an
+  executable conformance suite, shared by the local tools and server
+  backends.
+
+### Fixed
+- **Crashes under system memory pressure** (latticecore 1.2.2–1.2.5).
+  A purged sqlite page cache could SIGSEGV column-name reads; C++
+  database errors escaping through the Swift bridge killed the app
+  with SIGTRAP. All Swift-facing read, transaction, lookup, and
+  maintenance surfaces are now sealed — errors surface as errors, not
+  crashes. Also fixed the Xcode lockfile pinning that had quietly kept
+  app builds on old, unfixed dependency versions.
+- **Recall could silently miss shared-graph memories** (latticecore
+  1.2.6–1.2.8). Four independent defects, each enough to hide teammate
+  content: multi-graph KNN keyed candidates by per-database rowid, so
+  colliding rowids across graphs surfaced wrong rows with borrowed
+  distances (now keyed by global identity); a graph hydrated purely by
+  sync never got a vector index at all (now created and backfilled
+  automatically at open, and `vacuum` covers group graphs); the
+  multi-database union view mapped columns by position, so filters
+  read scrambled values and dropped valid rows (now projected by name);
+  and the query planner could drive the vector index as a join's inner
+  side under filters, returning nothing (the KNN now runs isolated).
+- **Graph traversal edge shadowing** — a loose (distance-gated) edge
+  discovered before a structural edge to the same memory no longer
+  suppresses it, so `part_of`/`relates_to` connections always surface.
+- **Expired sign-in surfaces as signed-out** instead of a silently
+  failing sync, and the CLI gains `account` subcommands to inspect and
+  repair auth state.
+- **Group galaxies resolve canonical project names** across members
+  (a teammate's differently-named checkout of the same repo lands in
+  the same galaxy), and nebula rendering gained titles, bridges, LOD,
+  and a per-galaxy gas fix.
+
 ## [0.13.3] - 2026-07-08
 
 Performance release: kills the sync-daemon busy-spin, the unbounded WAL
