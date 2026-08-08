@@ -104,7 +104,10 @@ struct PreCompact: AsyncParsableCommand {
                 model: "sonnet",
                 envGuard: (key: "CLAUDE_MEMORY_LEARNER", value: "1"),
                 logPath: Self.logPath,
-                cwd: input.cwd
+                cwd: input.cwd,
+                // Remote mode: explicit --mcp-config (cwd-independent wiring)
+                // that also tags the learner's ops for analytics attribution.
+                extraClaudeArgs: RemoteConfig.active?.learnerMcpArgs ?? ""
             )
             hookLog("PreCompact hook: spawned session-learner CLI for project \(project)")
         } catch {

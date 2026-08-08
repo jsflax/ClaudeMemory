@@ -107,6 +107,9 @@ enum RemoteMemory {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("2025-03-26", forHTTPHeaderField: "MCP-Protocol-Version")
+        // Analytics attribution: the hook binary shares the agent's token, so
+        // without this its ops are indistinguishable from the agent's own.
+        request.setValue("memory-hooks", forHTTPHeaderField: "X-Engram-Client")
 
         // Continuation-based (not the async overloads): identical behavior
         // on Darwin and corelibs-foundation.
@@ -127,5 +130,46 @@ enum RemoteMemory {
             }
             task.resume()
         }
+    }
+}
+
+extension RemoteConfig {
+    /// Write (or refresh) an MCP config for spawned learner subprocesses and
+    /// return its path. Passed via `--mcp-config` + `--strict-mcp-config` so
+    /// the learner's tooling does NOT depend on a `.mcp.json` existing in its
+    /// cwd (bare-mode sandbox agents have none — the orchestrator passes the
+    /// main agent its config as a CLI flag the learner never inherits).
+    ///
+    /// The `X-Engram-Client: session-learner` header is the analytics
+    /// attribution: learner ops become distinguishable rows in `memory_ops`,
+    /// so "did the learner run?" is a dashboard query, not a sandbox exec.
+    func writeLearnerMcpConfig() -> String? {
+        let dir = NSHomeDirectory() + "/.claude"
+        let path = dir + "/learner-mcp.json"
+        let config: [String: Any] = [
+            "mcpServers": [
+                "engram": [
+                    "type": "http",
+                    "url": baseURL.appendingPathComponent("mcp").absoluteString,
+                    "headers": [
+                        "Authorization": "Bearer \(token)",
+                        "X-Engram-Client": "session-learner",
+                    ],
+                ]
+            ]
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: config) else { return nil }
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        guard FileManager.default.createFile(
+            atPath: path, contents: data,
+            attributes: [.posixPermissions: 0o600]) else { return nil }
+        return path
+    }
+
+    /// CLI flags for a learner spawn: explicit MCP config when it can be
+    /// written, empty (fall back to cwd discovery) when it can't.
+    var learnerMcpArgs: String {
+        guard let path = writeLearnerMcpConfig() else { return "" }
+        return "--mcp-config '\(path)' --strict-mcp-config"
     }
 }

@@ -24,6 +24,9 @@ public func rotateFileIfNeeded(_ path: String, maxBytes: Int = 256 * 1024) {
 ///   - envGuard: Environment variable set on the subprocess to prevent recursion.
 ///   - logPath: Absolute path to the log file for stdout/stderr capture.
 ///   - cwd: Optional working directory for the subprocess.
+///   - extraClaudeArgs: Optional extra CLI flags (already shell-safe), e.g. an
+///     explicit `--mcp-config` so the subprocess doesn't depend on cwd
+///     discovery.
 ///   - postCommand: Optional shell command to run after `claude` exits (regardless of exit code).
 public func spawnClaudeSubprocess(
     prompt: String,
@@ -33,6 +36,7 @@ public func spawnClaudeSubprocess(
     envGuard: (key: String, value: String),
     logPath: String,
     cwd: String? = nil,
+    extraClaudeArgs: String = "",
     postCommand: String? = nil
 ) throws {
     let escapedPrompt = prompt.replacingOccurrences(of: "'", with: "'\\''")
@@ -48,6 +52,7 @@ public func spawnClaudeSubprocess(
       --no-session-persistence \
       --output-format text \
       --append-system-prompt '\(escapedSystemPrompt)' \
+      \(extraClaudeArgs) \
       >> '\(logPath)' 2>&1\(postCommand.map { "; \($0)" } ?? "")
     """
 

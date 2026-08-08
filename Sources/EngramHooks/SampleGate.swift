@@ -155,7 +155,10 @@ struct SampleGate: AsyncParsableCommand {
             model: "sonnet",
             envGuard: (key: "CLAUDE_MEMORY_LEARNER", value: "1"),
             logPath: Self.logPath,
-            cwd: cwd
+            cwd: cwd,
+            // Remote mode: explicit --mcp-config (cwd-independent wiring) that
+            // also tags the learner's ops for analytics attribution.
+            extraClaudeArgs: RemoteConfig.active?.learnerMcpArgs ?? ""
         )
     }
 
