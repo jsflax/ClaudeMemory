@@ -109,6 +109,26 @@ let tools = MemoryTools(
     embedder: embedder
 )
 
+// v2 embedding-space backstop: the daemon owns the migration for
+// subscribed/grouped users, but signed-out and daemon-less machines would
+// otherwise embed QUERIES in the new space against rows stored in the old
+// one — silent recall degradation with no error anywhere. Marker-checked,
+// idempotent, and batch-committed, so racing a concurrent daemon sweep is
+// harmless (identical vectors, identical marker). Detached at background
+// priority: must never delay server startup.
+Task.detached(priority: .background) { [ref = localLattice.sendableReference] in
+    guard let lattice = ref.resolve() else { return }
+    do {
+        let report = try await EmbeddingMigration.runIfNeeded(
+            on: lattice, embedder: embedder, log: log)
+        if report.reembedded > 0 {
+            log("Embedding backstop: re-embedded \(report.reembedded) rows to space v\(EmbeddingSpace.currentVersion)")
+        }
+    } catch {
+        log("Embedding backstop failed (daemon or next start retries): \(error)")
+    }
+}
+
 let server = Server(
     name: "memory",
     version: "1.0.0",

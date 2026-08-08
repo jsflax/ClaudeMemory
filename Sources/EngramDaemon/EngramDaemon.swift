@@ -177,6 +177,29 @@ struct EngramDaemon: AsyncParsableCommand {
             // clean exit, and the user may subscribe or accept an invite at
             // any moment. Idle and re-check on the same cadence as the
             // membership poll.
+            //
+            // Free tier still deserves the current embedding space: without
+            // this sweep, an updated binary embeds QUERIES with the new
+            // model while stored rows stay in the old space — silent recall
+            // degradation with no error anywhere. Plain open (no IPC):
+            // there is nothing to relay to, and close() evicts the cache
+            // entry so a later entitlement restart reopens fresh.
+            do {
+                let sweepConfig = Lattice.Configuration(
+                    fileURL: URL(fileURLWithPath: dbPath),
+                    migration: engramMigrations)
+                let sweepLattice = try Lattice(
+                    Memory.self, Edge.self, Checkpoint.self,
+                    HookState.self, SessionState.self, SyncConfig.self,
+                    configuration: sweepConfig)
+                let report = try await EmbeddingMigration.runIfNeeded(on: sweepLattice, log: log)
+                if report.reembedded > 0 {
+                    log("Embedding migration (idle path): re-embedded \(report.reembedded) memories")
+                }
+                sweepLattice.close()
+            } catch {
+                log("Embedding migration (idle path) failed (will retry next start): \(error)")
+            }
             log("No personal subscription and no group memberships — idling until entitlements change")
             DaemonStatus.write(state: "idle",
                                detail: "No active subscription or group membership.")
