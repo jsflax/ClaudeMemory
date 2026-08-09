@@ -12,7 +12,8 @@ struct EngramDaemon: AsyncParsableCommand {
         subcommands: [ExposeCommand.self, GroupsCommand.self,
                       WhoamiCommand.self, AcceptInviteCommand.self,
                       CompactServerHistoryCommand.self,
-                      MigrateEmbeddingsCommand.self]
+                      MigrateEmbeddingsCommand.self,
+                      RepairAuditCommand.self]
     )
 
     @Option(name: .long, help: "Lattice log level: off, error, warning, info, debug")
@@ -440,7 +441,7 @@ struct EngramDaemon: AsyncParsableCommand {
         Task.detached {
             for await progress in wssProgressStream {
                 if progress.isUploading {
-                    log("WSS upload: \(progress.acked)/\(progress.totalUpload) (\(progress.pendingUpload) pending)")
+                    log("WSS upload [\(progress.syncId)]: \(progress.acked)/\(progress.totalUpload) (\(progress.pendingUpload) pending)")
                 }
                 // Record last activity + pending depth for the health file. A
                 // fully-acked idle progress event is the "caught up" signal.
@@ -538,6 +539,22 @@ struct EngramDaemon: AsyncParsableCommand {
         while true {
             try await Task.sleep(for: .seconds(3600))
             withExtendedLifetime(syncConfigObserver) {}
+            // Periodic compaction (Aug 2026 incident, fix 2d): floors now
+            // advance between restarts (empty-pass advance in the core), so
+            // startup-only compaction left reclaimed history sitting until
+            // the next daemon restart — run it hourly. Bounded checkpoint
+            // after: compaction deletes are WAL writes, and the unbounded
+            // TRUNCATE variant would hold the writer gate against readers.
+            let hubDeleted = localLattice.compactHistory()
+            localLattice.checkpointBounded()
+            var syncedDeleted: Int64 = 0
+            if let synced = syncedLattice {
+                syncedDeleted = synced.compactHistory()
+                synced.checkpointBounded()
+            }
+            if hubDeleted > 0 || syncedDeleted > 0 {
+                log("Hourly compaction: hub -\(hubDeleted) rows, synced -\(syncedDeleted) rows")
+            }
         }
     }
 }

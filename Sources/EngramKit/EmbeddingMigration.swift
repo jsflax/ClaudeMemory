@@ -95,6 +95,7 @@ public enum EmbeddingMigration {
 
         var batch: [(Memory, [Float])] = []
         var processed = 0
+        var batchesSinceCheckpoint = 0
         func flush() throws {
             guard !batch.isEmpty else { return }
             let pending = batch
@@ -105,6 +106,18 @@ public enum EmbeddingMigration {
             }
             report.reembedded += pending.count
             batch.removeAll(keepingCapacity: true)
+            // Keep the WAL bounded DURING the sweep: each batch rewrites
+            // full rows (embedding blobs + audit payloads), and readers
+            // (visualizer galaxy scans, hook recalls) pay O(WAL) per
+            // statement — the un-checkpointed sweep starved the visualizer
+            // for the whole migration window (Aug 2026 field report).
+            // Bounded variant: fails fast under a held reader instead of
+            // stalling the sweep on the writer gate.
+            batchesSinceCheckpoint += 1
+            if batchesSinceCheckpoint >= 8 {  // ~512 rows ≈ 8-16MB of WAL
+                lattice.checkpointBounded()
+                batchesSinceCheckpoint = 0
+            }
         }
 
         for mem in rows {
