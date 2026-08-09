@@ -44,24 +44,29 @@ struct RepairAuditCommand: AsyncParsableCommand {
         let hubPath = claudeDir + "/memory.sqlite"
 
         // ---- Quiesce gate -------------------------------------------------
-        // Daemon: its flock is authoritative.
+        // Only for the real run: --dry-run modifies nothing, and "close every
+        // Claude session before you may LOOK at whether you're affected" is
+        // exactly backwards for the command people reach for first.
         let lockPath = claudeDir + "/engram-sync.lock"
-        let lockFd = open(lockPath, O_CREAT | O_RDWR, 0o600)
+        let lockFd = dryRun ? -1 : open(lockPath, O_CREAT | O_RDWR, 0o600)
         defer { if lockFd >= 0 { close(lockFd) } }
-        if lockFd >= 0, flock(lockFd, LOCK_EX | LOCK_NB) != 0 {
-            print("✗ The sync daemon is running. Stop it first:")
-            print("    launchctl bootout gui/$(id -u)/io.engram.sync")
-            throw ExitCode.failure
-        }
-        // Any other holder of the hub (MCP servers from open Claude Code
-        // sessions, Engram.app). lsof is the honest check — a repair from
-        // inside a Claude session would otherwise always pass.
-        let holders = Self.otherHolders(of: hubPath)
-        if !holders.isEmpty && !force {
-            print("✗ Other processes hold the memory database (close them or re-run with --force):")
-            for h in holders { print("    \(h)") }
-            print("  Likely: open Claude Code sessions (their memory MCP servers) or Engram.app.")
-            throw ExitCode.failure
+        if !dryRun {
+            // Daemon: its flock is authoritative.
+            if lockFd >= 0, flock(lockFd, LOCK_EX | LOCK_NB) != 0 {
+                print("✗ The sync daemon is running. Stop it first:")
+                print("    launchctl bootout gui/$(id -u)/io.engram.sync")
+                throw ExitCode.failure
+            }
+            // Any other holder of the hub (MCP servers from open Claude Code
+            // sessions, Engram.app). lsof is the honest check — a repair from
+            // inside a Claude session would otherwise always pass.
+            let holders = Self.otherHolders(of: hubPath)
+            if !holders.isEmpty && !force {
+                print("✗ Other processes hold the memory database (close them or re-run with --force):")
+                for h in holders { print("    \(h)") }
+                print("  Likely: open Claude Code sessions (their memory MCP servers) or Engram.app.")
+                throw ExitCode.failure
+            }
         }
 
         // ---- The four database files -------------------------------------

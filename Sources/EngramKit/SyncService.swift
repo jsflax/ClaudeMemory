@@ -40,8 +40,38 @@ public enum SyncService {
     /// Uses slot-aware compaction — only deletes entries all synchronizers have confirmed.
     public static func compactBeforeSync(_ lattice: Lattice) {
         lattice.compactHistory()
-        lattice.checkpoint()
+        // Bounded, not the 30s-writer-gate variant: this runs at daemon
+        // startup on databases that may still have live readers (MCP
+        // servers, the visualizer). On a repaired/healthy database it is a
+        // no-op; on a bloated one it caps the WAL instead of stalling.
+        lattice.checkpointBounded()
     }
+
+    /// Self-heal for machines carrying the Aug 2026 audit-log explosion
+    /// (4.7M rows / 11GB WAL observed). Runs at daemon startup so users
+    /// who never run `memory-sync repair-audit` recover automatically:
+    /// with the fixed core, compaction actually deletes (channel floors
+    /// now advance), and the timestamp normalization repairs rows the old
+    /// apply path minted as TEXT in the REAL column — invisible to every
+    /// date-based query and to age-based compaction.
+    ///
+    /// Deliberately NOT vacuumed here: VACUUM needs exclusive access and
+    /// only reclaims DISK; the freed pages are reused either way, so
+    /// performance is restored without it. `repair-audit` (quiesced) is
+    /// the tool for people who want the disk back.
+    public static func healAuditLog(_ lattice: Lattice, log: (String) -> Void = { _ in }) {
+        let before = lattice.objects(AuditLog.self).count
+        guard before > auditHealThreshold else { return }
+        let normalized = lattice.normalizeAuditTimestamps()
+        let deleted = lattice.compactHistory()
+        lattice.checkpointBounded()
+        log("Audit heal: \(before) rows → compacted \(deleted), normalized \(normalized) timestamps")
+    }
+
+    /// Above this many audit rows, a database is carrying more history than
+    /// healthy churn explains and the startup heal is worth its cost.
+    /// (Healthy hubs sit in the low thousands between compactions.)
+    static let auditHealThreshold = 100_000
 
     // MARK: - Groups (increment 3)
 

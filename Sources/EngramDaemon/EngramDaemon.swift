@@ -264,6 +264,10 @@ struct EngramDaemon: AsyncParsableCommand {
         if !nuclearCompact {
             log("Compacting history before sync...")
             SyncService.compactBeforeSync(localLattice)
+            // Self-heal a machine carrying the Aug 2026 audit explosion:
+            // users who never run `memory-sync repair-audit` recover on
+            // their next daemon start. No-op below the threshold.
+            SyncService.healAuditLog(localLattice, log: log)
         }
 
         // 4b. Embedding-space migration (v2 mean-pooling, Aug 2026): re-embed
@@ -356,6 +360,37 @@ struct EngramDaemon: AsyncParsableCommand {
                 continue
             }
             groupSpokes[membership.id] = spoke
+            // Embedding-space convergence for SHARED graphs. The hub sweep
+            // (step 4b) never touches spokes, so after the v2 cutover a
+            // member queries in v2 against spoke rows still written in v1 —
+            // shared memories silently vanish from recall while personal
+            // ones rank fine (observed live: [via:] rows gone until the
+            // spoke was swept, then back at 0.587).
+            //
+            // Markerless by necessity (a spoke's schema is
+            // [Memory, Edge, GroupProjectMap]; writing HookState there
+            // would be denied by the group relay's write policy and wedge
+            // the channel), so a sentinel FILE keeps it once-per-space —
+            // otherwise every daemon start would re-embed and re-upload
+            // every teammate's rows. Rows arriving later from members still
+            // on v1 converge when THEIR daemon re-embeds and relays.
+            let sweptMarker = claudeDir + "/sync/.embed-v\(EmbeddingSpace.currentVersion)-"
+                + membership.id.uuidString
+            if !FileManager.default.fileExists(atPath: sweptMarker) {
+                do {
+                    let report = try await EmbeddingMigration.runIfNeeded(
+                        on: spoke, useMarker: false, log: log)
+                    FileManager.default.createFile(atPath: sweptMarker, contents: nil)
+                    if report.reembedded > 0 {
+                        log("Group spoke re-embedded to space v\(EmbeddingSpace.currentVersion): \(membership.name) (\(report.reembedded) rows)")
+                    }
+                } catch {
+                    // No marker written — retried next start. A spoke stuck
+                    // in the old space degrades shared recall but must never
+                    // block sync.
+                    log("Group spoke re-embed failed (\(membership.name)): \(error)")
+                }
+            }
             // decision 13 backstop: an exposure recorded while the spoke did
             // not exist yet (visualizer toggle or `memory-sync expose` before
             // the daemon's first multi-spoke run) has its GroupProjectMap row

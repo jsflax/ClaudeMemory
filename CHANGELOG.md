@@ -4,6 +4,46 @@ All notable changes to Engram are documented in this file.
 
 > Formerly "ClaudeMemory" — renamed in v0.12.0 to be tool-agnostic.
 
+## [0.14.1] - 2026-08-09
+
+Fixes a sync-history defect that could make the memory database grow
+without bound — and repairs affected databases automatically. If your
+machine felt slow after 0.14.0 (a stalled first launch, laggy project
+list, hanging sync toggles, or hook timeouts), this is the fix.
+
+### Fixed
+- **Sync history could grow without bound.** Four defects compounded:
+  every schema migration re-recorded the entire database into the sync
+  history; a shared-graph channel that matched nothing could never
+  advance its cursor, which in turn vetoed *all* history cleanup; the
+  cleanup itself keyed off a value that skips ahead of un-uploaded work,
+  so it deleted nothing rather than risk deleting too much; and the
+  uploader re-sent each batch before its acknowledgements could arrive
+  (16-26× amplification). On the worst affected machine: 4.7M history
+  rows for 28K memories, an 11GB write-ahead log, and a sync daemon that
+  never finished uploading. Fixed at the source, with the compounding
+  cleanup veto removed.
+- **Automatic repair.** Affected databases are compacted at the next
+  daemon start (no action needed), and history is now compacted hourly
+  rather than only at startup. `memory-sync repair-audit` is the opt-in
+  tool that additionally reclaims disk — it backs up every database
+  first, refuses to run unless the daemon is stopped and no other
+  process holds the files, and reports exactly what it changed. On the
+  affected machine: 5.3GB → 844MB with byte-identical recall results.
+- **First launch after the 0.14.0 upgrade stalled the app** — the
+  one-time re-embedding sweep never flushed its write-ahead log, so
+  every reader (the visualizer's graph load, recall) crawled for the
+  duration and local-only projects appeared missing. The sweep now
+  checkpoints as it goes.
+- **Memory recall in hooks is time-budgeted.** A degraded database could
+  make the prompt hook run until the harness killed it — silently, with
+  no context and no explanation. Recall now gets a budget derived from
+  the hook's own configured timeout; on overrun it says so in one line
+  instead of stalling your prompt or vanishing.
+- **Sync progress logs identify their channel** — several sync channels
+  share one log stream, and unlabeled interleaved counters made this
+  incident far harder to diagnose than it should have been.
+
 ## [0.14.0] - 2026-08-08
 
 Groups: shared memory for teams. Your personal graph stays yours; each

@@ -1278,13 +1278,25 @@ extension MemoryTools {
     // MARK: - vacuum
 
     func handleVacuum() throws -> CallTool.Result {
+        // Checkpoint AFTER the VACUUM as well as before. SQLite's VACUUM
+        // rewrites the entire database through the WAL, so a vacuum on an
+        // 800MB database appends ~800MB of WAL — and without a trailing
+        // checkpoint it STAYS there, making every subsequent read pay the
+        // O(WAL) page-lookup penalty. Measured: repeat `vacuum` calls grew
+        // a freshly repaired hub's WAL to 5.77GB, undoing the repair's
+        // benefit. Bounded variant on the trailing call: other readers
+        // (hooks, the visualizer) may hold snapshots, and a 30s writer-gate
+        // stall inside an MCP tool call is worse than a large-but-shrinking
+        // WAL.
         localLattice.checkpoint()
         localLattice._vacuumVec0(Memory(), for: \.embedding)
         localLattice.vacuum()
+        localLattice.checkpointBounded()
         if let synced = syncedLattice {
             synced.checkpoint()
             synced._vacuumVec0(Memory(), for: \.embedding)
             synced.vacuum()
+            synced.checkpointBounded()
         }
         // Group spokes too (increment-4 contract): a spoke populated purely
         // by sync-apply has NO vec sidecar — the apply path inserts rows
@@ -1295,6 +1307,7 @@ extension MemoryTools {
         for spoke in liveGroupSpokes() {
             spoke.lattice.checkpoint()
             spoke.lattice._vacuumVec0(Memory(), for: \.embedding)
+            spoke.lattice.checkpointBounded()
             spokeCount += 1
         }
         let spokeNote = spokeCount > 0 ? " \(spokeCount) group spoke(s) reindexed." : ""
