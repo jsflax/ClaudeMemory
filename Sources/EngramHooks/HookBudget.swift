@@ -1,0 +1,104 @@
+import Foundation
+
+/// Time budgets for hook-side memory operations.
+///
+/// A hook that waits on a degraded database rides all the way to the
+/// harness's kill timeout — the user's prompt stalls, and the harness kill
+/// is SILENT (no context, no explanation). The budget keeps the hook's
+/// slow path both bounded and visible.
+///
+/// The budget is DYNAMIC: a fraction of this hook's own registered timeout
+/// in ~/.claude/settings.json, so operators tune one number and the budget
+/// follows. `ENGRAM_HOOK_RECALL_BUDGET_MS` overrides for tests and repair
+/// sessions.
+enum HookBudget {
+
+    /// Fraction of the registered hook timeout granted to recall — the
+    /// rest is headroom for model load, the gate, nudges, and I/O.
+    private static let recallFraction = 0.6
+    /// Floor keeps a tight registration from starving a healthy first run
+    /// (embedding model load is ~1-2s cold); ceiling keeps a generous
+    /// registration from re-creating the stall this exists to prevent.
+    private static let floorSeconds = 3.0
+    private static let ceilingSeconds = 15.0
+
+    /// The recall budget in seconds for `event` (e.g. "UserPromptSubmit").
+    static func recallBudget(event: String) -> Double {
+        if let raw = ProcessInfo.processInfo.environment["ENGRAM_HOOK_RECALL_BUDGET_MS"],
+           let ms = Double(raw), ms > 0 {
+            return ms / 1000.0
+        }
+        let registered = registeredTimeout(event: event) ?? 60.0
+        return min(max(registered * recallFraction, floorSeconds), ceilingSeconds)
+    }
+
+    /// This binary's own registered timeout for `event`, from settings.json.
+    /// Returns nil when unregistered/unreadable (caller falls back to the
+    /// harness default of 60s).
+    static func registeredTimeout(event: String) -> Double? {
+        let url = URL(fileURLWithPath: NSHomeDirectory() + "/.claude/settings.json")
+        guard let data = try? Data(contentsOf: url),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let hooks = root["hooks"] as? [String: Any],
+              let matchers = hooks[event] as? [[String: Any]] else { return nil }
+        for matcher in matchers {
+            guard let entries = matcher["hooks"] as? [[String: Any]] else { continue }
+            for entry in entries {
+                guard let command = entry["command"] as? String,
+                      command.contains("memory-hooks") else { continue }
+                if let t = entry["timeout"] as? Double { return t }
+                if let t = entry["timeout"] as? Int { return Double(t) }
+                return nil  // registered without a timeout → harness default
+            }
+        }
+        return nil
+    }
+
+    enum Outcome<T: Sendable>: Sendable {
+        case completed(T)
+        case failed(any Error)
+        case deadlineExceeded
+    }
+
+    /// Race `work` against the budget. On deadline, the caller proceeds
+    /// (visibly degraded) IMMEDIATELY — deliberately unstructured, because a
+    /// task group would await the non-cancellable C++ query to completion
+    /// (cancellation is cooperative), re-creating the stall this exists to
+    /// prevent. The orphaned work task dies with the short-lived hook
+    /// process; SQLite handles a mid-statement process exit safely. The
+    /// Lattice query-deadline primitive (planned, 1.3.0) upgrades this from
+    /// "stop waiting" to "interrupt the statement".
+    /// Resume-once guard for the unstructured race below.
+    private final class Once: @unchecked Sendable {
+        private let lock = NSLock()
+        private var resumed = false
+        func claim() -> Bool {
+            lock.lock(); defer { lock.unlock() }
+            if resumed { return false }
+            resumed = true
+            return true
+        }
+    }
+
+    static func race<T: Sendable>(
+        seconds: Double,
+        _ work: @escaping @Sendable () async throws -> T
+    ) async throws -> Outcome<T> {
+        let once = Once()
+        return await withCheckedContinuation { cont in
+            let workTask = Task {
+                let outcome: Outcome<T>
+                do { outcome = .completed(try await work()) }
+                catch { outcome = .failed(error) }
+                if once.claim() { cont.resume(returning: outcome) }
+            }
+            Task {
+                try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+                if once.claim() {
+                    workTask.cancel()  // cooperative best-effort; orphan dies with the process
+                    cont.resume(returning: Outcome.deadlineExceeded)
+                }
+            }
+        }
+    }
+}

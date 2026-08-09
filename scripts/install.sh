@@ -119,28 +119,28 @@ HOOKS_CONFIG='{
       "hooks": [{
         "type": "command",
         "command": "'"$INSTALL_DIR"'/memory-hooks on-start 2>/dev/null",
-        "timeout": 300
+        "timeout": 30
       }]
     }],
     "UserPromptSubmit": [{
       "hooks": [{
         "type": "command",
         "command": "'"$INSTALL_DIR"'/memory-hooks advise 2>/dev/null",
-        "timeout": 300
+        "timeout": 15
       }]
     }],
     "Stop": [{
       "hooks": [{
         "type": "command",
         "command": "'"$INSTALL_DIR"'/memory-hooks on-stop 2>/dev/null",
-        "timeout": 300
+        "timeout": 30
       }]
     }],
     "PostToolUseFailure": [{
       "hooks": [{
         "type": "command",
         "command": "'"$INSTALL_DIR"'/memory-hooks on-failure 2>/dev/null",
-        "timeout": 300
+        "timeout": 30
       }]
     }],
     "PreToolUse": [{
@@ -148,7 +148,7 @@ HOOKS_CONFIG='{
       "hooks": [{
         "type": "command",
         "command": "'"$INSTALL_DIR"'/memory-hooks pre-tool 2>/dev/null",
-        "timeout": 300
+        "timeout": 30
       }]
     }],
     "PreCompact": [{
@@ -163,7 +163,7 @@ HOOKS_CONFIG='{
       "hooks": [{
         "type": "command",
         "command": "'"$INSTALL_DIR"'/memory-hooks on-end 2>/dev/null",
-        "timeout": 300
+        "timeout": 30
       }]
     }]
   }

@@ -71,35 +71,57 @@ struct Advise: AsyncParsableCommand {
         if shouldRecall {
             sessionLog("Advise: calling initMemoryTools", sessionId: sid)
             currentSessionId = sid
-            if let tools = await initMemoryTools(sessionId: sid) {
+            // Recall must be FAST OR ABSENT — a degraded database (WAL bloat,
+            // contention) must never ride to the harness's kill timeout and
+            // stall the user's prompt. Budget = a fraction of THIS hook's own
+            // registered timeout (read from settings.json), so tightening the
+            // registration tightens the budget with it. Degradation is
+            // VISIBLE: a one-line notice in the injected context, never a
+            // silent absence. The Lattice query-deadline primitive (1.3.0)
+            // will upgrade this from "stop waiting" to "interrupt the query".
+            let budget = HookBudget.recallBudget(event: "UserPromptSubmit")
+            // The budget covers the WHOLE slow path — tools init (model load
+            // + DB opens, which pay the same degraded-database costs as the
+            // query) AND the recall itself. Timeline evidence: on a bloated
+            // hub, init alone took 10s before any query ran.
+            hookLog("Advise: running budgeted recall (budget \(budget)s)")
+            let outcome = try await HookBudget.race(seconds: budget) { () -> String? in
+                guard let tools = await initMemoryTools(sessionId: sid) else {
+                    hookLog("Advise: failed to initialize memory tools")
+                    return nil
+                }
                 // Extract content words to focus the embedding on key concepts.
                 // Raw prose averages all concepts into a poor vector neighborhood.
                 let contentWords = MemoryTools.extractContentWords(from: prompt)
                 let recallQuery = contentWords.isEmpty ? prompt : contentWords.joined(separator: " ")
-                sessionLog("Advise: calling directRecall (query: \(String(recallQuery.prefix(60)))...)", sessionId: sid)
                 hookLog("Advise: running directRecall (query: \(String(recallQuery.prefix(80)))...)")
-                do {
-                    if let result = try await tools.directRecall(
-                        query: recallQuery,
-                        project: project,
-                        depth: 1,
-                        limit: 5
-                    ) {
-                        sessionLog("Advise: directRecall returned \(result.count) chars", sessionId: sid)
-                        logRecalledMemories(result, hook: "Advise", sessionId: sid)
-                        sessionLog("Advise: logRecalledMemories done, recall log written", sessionId: sid)
-                        sections.append("## Relevant memories\n\n\(result)")
-                    } else {
-                        sessionLog("Advise: directRecall returned nil", sessionId: sid)
-                        hookLog("Advise: recall returned nil")
-                    }
-                } catch {
-                    sessionLog("Advise: directRecall FAILED: \(error)", sessionId: sid)
-                    hookLog("Advise: recall failed: \(error)")
-                }
-            } else {
-                sessionLog("Advise: initMemoryTools returned nil", sessionId: sid)
-                hookLog("Advise: failed to initialize memory tools")
+                return try await tools.directRecall(
+                    query: recallQuery,
+                    project: project,
+                    depth: 1,
+                    limit: 5
+                )
+            }
+            switch outcome {
+            case .completed(let result?):
+                sessionLog("Advise: directRecall returned \(result.count) chars", sessionId: sid)
+                logRecalledMemories(result, hook: "Advise", sessionId: sid)
+                sessionLog("Advise: logRecalledMemories done, recall log written", sessionId: sid)
+                sections.append("## Relevant memories\n\n\(result)")
+            case .completed(nil):
+                sessionLog("Advise: recall returned nil (or tools init failed)", sessionId: sid)
+                hookLog("Advise: recall returned nil")
+            case .failed(let error):
+                sessionLog("Advise: directRecall FAILED: \(error)", sessionId: sid)
+                hookLog("Advise: recall failed: \(error)")
+            case .deadlineExceeded:
+                sessionLog("Advise: recall EXCEEDED \(budget)s budget — degrading visibly", sessionId: sid)
+                hookLog("Advise: recall exceeded \(budget)s budget — skipped (db degraded?)")
+                sections.append(
+                    "⚠️ Memory recall skipped this turn — exceeded its \(String(format: "%.0f", budget))s budget. " +
+                    "The memory database is responding slowly (maintenance or repair may be needed); " +
+                    "memories are intact and recall resumes when the database recovers.")
+                if let sid, !sid.isEmpty { writeSessionRecallSkip(sessionId: sid) }
             }
         } else {
             hookLog("Advise: skipped recall (conversational filler)")
@@ -138,6 +160,14 @@ struct Advise: AsyncParsableCommand {
             )
         )
         try? writeOutput(output)
+        // Hard exit: a one-shot hook must not pay teardown costs. Lattice
+        // deinit runs a close-time checkpoint that took 11s against a
+        // bloated WAL (timeline evidence) — on top of a met budget, that
+        // alone can blow the harness registration. stdout is already
+        // flushed (unbuffered fd write); an orphaned budgeted query dies
+        // here, and SQLite handles process death safely. Maintenance
+        // children survive exec-style.
+        Foundation.exit(0)
     }
 
     #if canImport(EngramKit)
