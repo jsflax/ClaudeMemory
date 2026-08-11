@@ -283,47 +283,30 @@ enum CLIInstaller {
 
     // MARK: - settings.json (hooks)
 
+    /// Register our hooks without stepping on the user's settings.
+    ///
+    /// The merge itself is `HookSettingsMerge` — a pure function on parsed
+    /// dictionaries, so it can be tested without touching the real
+    /// `~/.claude/settings.json`. All this does is the file I/O around it.
     private static func installSettings() {
         let fm = FileManager.default
-        let hooksConfig = InstallConfig.hooksSettings(installDir: installDir)
+        let shipped = InstallConfig.hooksSettings(installDir: installDir)
 
+        let payload: [String: Any]
         if fm.fileExists(atPath: settingsPath) {
-            // Merge into existing settings
+            // A settings.json we cannot parse is left ALONE: overwriting it
+            // would destroy hand-written configuration we never read.
             guard let data = fm.contents(atPath: settingsPath),
-                  var existing = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+                  let existing = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
             else { return }
-
-            // Merge permissions.allow
-            if var existingPerms = existing["permissions"] as? [String: Any],
-               var existingAllow = existingPerms["allow"] as? [String] {
-                if !existingAllow.contains("mcp__memory__*") {
-                    existingAllow.append("mcp__memory__*")
-                    existingPerms["allow"] = existingAllow
-                    existing["permissions"] = existingPerms
-                }
-            } else {
-                existing["permissions"] = hooksConfig["permissions"]
-            }
-
-            // Replace hooks, keep our hooks up to date
-            var hooks = hooksConfig["hooks"] as! [String: Any]
-            if var existingHooks = existing["hooks"] as? [String: Any] {
-                // Overwrite our hook keys, preserve any user-added hooks
-                for (key, value) in hooks {
-                    existingHooks[key] = value
-                }
-                hooks = existingHooks
-            }
-            existing["hooks"] = hooks
-
-            if let json = try? JSONSerialization.data(withJSONObject: existing, options: [.prettyPrinted, .sortedKeys]) {
-                try? json.write(to: URL(fileURLWithPath: settingsPath))
-            }
+            payload = HookSettingsMerge.merged(existingSettings: existing, shipped: shipped)
         } else {
-            // Create new settings file
-            if let json = try? JSONSerialization.data(withJSONObject: hooksConfig, options: [.prettyPrinted, .sortedKeys]) {
-                try? json.write(to: URL(fileURLWithPath: settingsPath))
-            }
+            payload = shipped
+        }
+
+        if let json = try? JSONSerialization.data(withJSONObject: payload,
+                                                  options: [.prettyPrinted, .sortedKeys]) {
+            try? json.write(to: URL(fileURLWithPath: settingsPath))
         }
     }
 

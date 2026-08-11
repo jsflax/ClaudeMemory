@@ -4,9 +4,51 @@ import Foundation
 
 // MARK: - Clustering Algorithm
 
+/// Term-overlap tokenizer — must stay IDENTICAL to `jaccardSimilarity`'s
+/// (lowercased, split on non-alphanumerics, tokens ≥ 3 chars). Clustering
+/// tokenizes each memory ONCE instead of re-tokenizing both sides of every
+/// candidate pair.
+private func clusterTokens(_ s: String) -> Set<String> {
+    Set(
+        s.lowercased()
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { $0.count >= 3 }
+    )
+}
+
+/// `jaccardSimilarity` over pre-tokenized term sets.
+private func clusterJaccard(_ a: Set<String>, _ b: Set<String>) -> Double {
+    guard !a.isEmpty || !b.isEmpty else { return 0.0 }
+    return Double(a.intersection(b).count) / Double(a.union(b).count)
+}
+
 /// Compute semantic clusters from memories using embedding similarity + Jaccard term overlap.
-/// Uses Lattice `.nearest()` for vector search and greedy seed-based clustering.
-/// Returns clusters (arrays of memory primary keys) and pairwise distance cache.
+/// Runs an in-process k-NN pass over the candidate snapshot, then greedy
+/// seed-based clustering. Returns clusters (arrays of memory global ids) and
+/// a pairwise distance cache.
+///
+/// The neighbour pass used to issue one Lattice `.nearest()` (vec0 KNN) call
+/// per memory. That cost one multi-KB prepared statement per memory — the
+/// bridge inlines the query vector as a hex blob literal, once per attached
+/// schema arm — plus a live `SELECT col WHERE id = ?` per field per candidate
+/// row: 20,802 statements for a 200-memory fixture, and the visualizer runs
+/// this once per project on every graph load (28K memories ⇒ ~28K KNN queries,
+/// each MATCHing the WHOLE vector table). It was also WRONG at scale: vec0
+/// takes the global top-2k and post-filters by the project predicate, so a
+/// busy neighbouring project could evict a memory's real same-project
+/// neighbours (pinned by `clusters_neighborsAreProjectScoped`).
+///
+/// The candidate set is already in hand — `baseQuery` gets snapshotted either
+/// way — so the k-NN runs over that array: ONE materialized snapshot, zero
+/// further SQL. Distances are accumulated directly rather than through the
+/// |a|²+|b|²−2a·b Gram identity (which cancels catastrophically in Float32
+/// exactly where this code cares most — near-duplicate pairs), with an
+/// early-out as soon as the running sum passes the distance threshold, and
+/// each pair visited once and offered to both endpoints.
+///
+/// Equivalence: `{b ∈ topK(a) : d(a,b) ≤ T}` is precisely "the K closest
+/// b with d(a,b) ≤ T", so bounding the search by T up front and keeping the
+/// K best yields the same neighbour set the truncate-then-threshold shape did.
 public func findMemoryClusters(
     in lattice: Lattice,
     project: String? = nil,
@@ -23,7 +65,10 @@ public func findMemoryClusters(
     var baseQuery = lattice.objects(Memory.self).distinct(by: \.globalId).where { $0.expiresAt > now && $0.deletedAt == nil }
     if let project { baseQuery = baseQuery.where { $0.project == project } }
     if let topic { baseQuery = baseQuery.where { $0.topic == topic } }
-    var memories = baseQuery.snapshot()
+    // ONE materialized snapshot: the query already hydrated every row, so the
+    // embedding / content / author reads below cost no further SQL (a live
+    // model handle serves each property read with its own SELECT).
+    var memories = baseQuery.materializedSnapshot()
     // Maintenance guard: the maintenance subprocess must never receive
     // foreign-authored content in cluster listings (its prompts are a
     // Bash-capable injection target). Handlers pass their exclusion policy
@@ -34,41 +79,111 @@ public func findMemoryClusters(
 
     guard memories.count >= minClusterSize else { return ([], [:]) }
 
-    let memoryMap: [UUID: Memory] = Dictionary(
-        uniqueKeysWithValues: memories.compactMap { m in
-            guard let gid = m.globalId, !m.embedding.isEmpty else { return nil }
-            return (gid, m)
+    // Flatten the candidate set into parallel arrays: ids, term sets, and one
+    // contiguous embedding matrix. `embedding` is read exactly once per row.
+    var ids: [UUID] = []
+    var terms: [Set<String>] = []
+    var flat: [Float] = []
+    var dims = -1
+    var seen = Set<UUID>()
+    ids.reserveCapacity(memories.count)
+    terms.reserveCapacity(memories.count)
+    for mem in memories {
+        guard let gid = mem.globalId else { continue }
+        let vec = mem.embedding.elements
+        guard !vec.isEmpty else { continue }
+        if dims < 0 {
+            dims = vec.count
+            flat.reserveCapacity(memories.count * dims)
         }
-    )
-    let validIds = Set(memoryMap.keys)
-    guard validIds.count >= minClusterSize else { return ([], [:]) }
+        // A vec0 table carries ONE dimension, so rows left behind by an
+        // embedding-space migration were never comparable to the current
+        // space under the old KNN either — skip rather than mis-measure.
+        guard vec.count == dims else { continue }
+        // `distinct(by: globalId)` should already guarantee this; a set
+        // insert is cheaper than the trap `Dictionary(uniqueKeysWithValues:)`
+        // took on a duplicate.
+        guard seen.insert(gid).inserted else { continue }
+        ids.append(gid)
+        terms.append(clusterTokens(mem.content))
+        flat.append(contentsOf: vec)
+    }
 
-    // Build neighbor map using Lattice vector search per memory.
-    // For each memory, run .nearest() to find neighbors within the distance threshold
-    // AND Jaccard term overlap >= threshold. This prevents same-project memories about different
-    // subsystems from clustering together just because they share project vocabulary.
-    var neighborMap: [UUID: [UUID]] = [:]
-    var distanceCache: [UUID: [UUID: Double]] = [:]
+    // Named to avoid shadowing the `n` the greedy loop below binds.
+    let candidateCount = ids.count
+    let validIds = seen
+    guard candidateCount >= minClusterSize else { return ([], [:]) }
 
-    for (memId, mem) in memoryMap {
-        let matches = baseQuery
-            .nearest(to: mem.embedding, on: \.embedding, limit: neighborLimit ?? memories.count, distance: .l2)
+    // Build the neighbor map: for each memory, the k nearest others within
+    // the distance threshold AND with Jaccard term overlap >= threshold. The
+    // term test keeps same-project memories about different subsystems from
+    // clustering together just because they share project vocabulary.
+    let k = Swift.max(1, Swift.min(neighborLimit ?? candidateCount, candidateCount))
+    let threshold2 = Float(distanceThreshold * distanceThreshold)
 
-        var neighbors: [UUID] = []
-        var dists: [UUID: Double] = [:]
-        for match in matches {
-            guard let nId = match.object.globalId else { continue }
-            guard nId != memId, validIds.contains(nId) else { continue }
-            let dist = match.distances["embedding"] ?? 1.0
-            if dist <= distanceThreshold {
-                let jaccard = jaccardSimilarity(mem.content, match.object.content)
-                guard jaccard >= jaccardThreshold else { continue }
-                neighbors.append(nId)
-                dists[nId] = dist
+    // Per-row k-best, kept ascending by distance. Sized by what actually
+    // falls within the threshold, so an unbounded `neighborLimit` (nil) does
+    // not pre-allocate an n×n matrix.
+    var best = [[(idx: Int, dist: Float)]](repeating: [], count: candidateCount)
+
+    func offer(_ row: Int, _ other: Int, _ dist: Float) {
+        let existing = best[row].count
+        if existing == k, dist >= best[row][existing - 1].dist { return }
+        var pos = existing
+        while pos > 0, best[row][pos - 1].dist > dist { pos -= 1 }
+        best[row].insert((idx: other, dist: dist), at: pos)
+        if best[row].count > k { best[row].removeLast() }
+    }
+
+    if dims > 0 {
+        flat.withUnsafeBufferPointer { buf in
+            guard let base = buf.baseAddress else { return }
+            for i in 0..<candidateCount {
+                let a = base + i * dims
+                for j in (i + 1)..<candidateCount {
+                    let b = base + j * dims
+                    // Squared L2 with an early-out: the partial sum is
+                    // monotonic, so once it passes the threshold the pair
+                    // can never qualify. Checked every 32 lanes to keep the
+                    // inner loop tight.
+                    var sum: Float = 0
+                    var d = 0
+                    var rejected = false
+                    while d < dims {
+                        let end = Swift.min(d + 32, dims)
+                        var lane: Float = 0
+                        while d < end {
+                            let delta = a[d] - b[d]
+                            lane += delta * delta
+                            d += 1
+                        }
+                        sum += lane
+                        if sum > threshold2 { rejected = true; break }
+                    }
+                    guard !rejected else { continue }
+                    let dist = sum.squareRoot()
+                    offer(i, j, dist)
+                    offer(j, i, dist)
+                }
             }
         }
-        neighborMap[memId] = neighbors
-        distanceCache[memId] = dists
+    }
+
+    var neighborMap: [UUID: [UUID]] = [:]
+    var distanceCache: [UUID: [UUID: Double]] = [:]
+    neighborMap.reserveCapacity(candidateCount)
+    distanceCache.reserveCapacity(candidateCount)
+    for i in 0..<candidateCount {
+        var neighbors: [UUID] = []
+        var dists: [UUID: Double] = [:]
+        for candidate in best[i] {
+            guard clusterJaccard(terms[i], terms[candidate.idx]) >= jaccardThreshold else { continue }
+            let nId = ids[candidate.idx]
+            neighbors.append(nId)
+            dists[nId] = Double(candidate.dist)
+        }
+        neighborMap[ids[i]] = neighbors
+        distanceCache[ids[i]] = dists
     }
 
     // Greedy clustering: pick memory with most unassigned neighbors as seed
@@ -142,11 +257,13 @@ extension MemoryTools {
             return CallTool.Result(content: [.text("No clusters found. Memories are too dissimilar at distance threshold \(Int(threshold * 100)) (try increasing distance_threshold).")], isError: false)
         }
 
-        // Fetch memory data for formatting
+        // Fetch memory data for formatting. materialize(): the lookup query
+        // already hydrated the row, so the topic/content/author reads in the
+        // formatting loop below cost no further SQL.
         var memoryMap: [UUID: Memory] = [:]
         for gid in Set(result.clusters.flatMap({ $0 })) {
             if let mem = db.objects(Memory.self).where({ $0.globalId == gid }).first {
-                memoryMap[gid] = mem
+                memoryMap[gid] = mem.materialize()
             }
         }
 

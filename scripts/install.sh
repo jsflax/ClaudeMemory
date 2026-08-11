@@ -105,6 +105,13 @@ else
 fi
 
 # Register hooks with Claude Code
+#
+# Timeouts MUST match Sources/EngramKit/InstallConfig.swift — the app
+# installer and this script write the same registrations, and a disagreement
+# means whichever ran last wins. 60s on UserPromptSubmit is a BACKSTOP, not a
+# working budget: advise self-limits to a fraction of its registered timeout
+# and degrades visibly. A 5s registration made the harness kill the hook
+# mid-recall with no output at all.
 echo "Registering hooks..."
 SETTINGS_FILE="$HOME/.claude/settings.json"
 HOOKS_CONFIG='{
@@ -119,28 +126,28 @@ HOOKS_CONFIG='{
       "hooks": [{
         "type": "command",
         "command": "'"$INSTALL_DIR"'/memory-hooks on-start 2>/dev/null",
-        "timeout": 30
+        "timeout": 5
       }]
     }],
     "UserPromptSubmit": [{
       "hooks": [{
         "type": "command",
         "command": "'"$INSTALL_DIR"'/memory-hooks advise 2>/dev/null",
-        "timeout": 15
+        "timeout": 60
       }]
     }],
     "Stop": [{
       "hooks": [{
         "type": "command",
         "command": "'"$INSTALL_DIR"'/memory-hooks on-stop 2>/dev/null",
-        "timeout": 30
+        "timeout": 5
       }]
     }],
     "PostToolUseFailure": [{
       "hooks": [{
         "type": "command",
         "command": "'"$INSTALL_DIR"'/memory-hooks on-failure 2>/dev/null",
-        "timeout": 30
+        "timeout": 5
       }]
     }],
     "PreToolUse": [{
@@ -148,7 +155,7 @@ HOOKS_CONFIG='{
       "hooks": [{
         "type": "command",
         "command": "'"$INSTALL_DIR"'/memory-hooks pre-tool 2>/dev/null",
-        "timeout": 30
+        "timeout": 5
       }]
     }],
     "PreCompact": [{
@@ -156,29 +163,126 @@ HOOKS_CONFIG='{
       "hooks": [{
         "type": "command",
         "command": "'"$INSTALL_DIR"'/memory-hooks pre-compact 2>/dev/null",
-        "timeout": 30
+        "timeout": 3
       }]
     }],
     "SessionEnd": [{
       "hooks": [{
         "type": "command",
         "command": "'"$INSTALL_DIR"'/memory-hooks on-end 2>/dev/null",
-        "timeout": 30
+        "timeout": 5
       }]
     }]
   }
 }'
 
+# Per-HOOK merge, mirroring Sources/EngramKit/HookSettingsMerge.swift.
+#
+# The old `$existing * $new` deep merge replaced each event's hook ARRAY
+# wholesale, so every `curl | sh` re-install reset a timeout the user had
+# raised and dropped any of their own hooks registered under an event key we
+# also ship. A registration is OURS if its command names our binary and
+# subcommand ("memory-hooks advise") — matched path-independently, so a moved
+# install updates in place instead of appending a duplicate. Ours gets its
+# command refreshed and keeps max(existing, shipped) as its timeout;
+# everything else is left exactly as found.
+HOOKS_MERGE_JQ='
+# "…/bin/memory-hooks advise 2>/dev/null" -> "memory-hooks advise"
+def hook_identity:
+  (. // "")
+  | gsub("[\"'"'"'`]"; "")
+  | [splits("[[:space:]]+")]
+  | map(select(length > 0))
+  | . as $t
+  | ( first(
+        range(0; ([($t | length) - 1, 0] | max)) as $i
+        | select(($t[$i] | split("/") | last) == "memory-hooks")
+        | select((($t[$i + 1] // "") | length) > 0)
+        | select((($t[$i + 1] // "") | startswith("-")) | not)
+        | "memory-hooks " + $t[$i + 1]
+      ) ) // null;
+
+def as_number: if type == "number" then . elif type == "string" then (tonumber? // null) else null end;
+
+# One existing entry, refreshed from the shipped one.
+def refresh($shipped):
+  .command = $shipped.command
+  | (if (.type == null and $shipped.type != null) then .type = $shipped.type else . end)
+  | ( [ (.timeout | as_number), ($shipped.timeout | as_number) ] | map(select(. != null)) ) as $ts
+  | (if ($ts | length) > 0 then .timeout = ($ts | max) else . end);
+
+# groups -> groups with $entry applied, or null when ours is not registered yet.
+def apply_entry($entry; $matcher):
+  . as $groups
+  | ($entry.command | hook_identity) as $id
+  # `// null` matters: an empty `first(...)` produces no output at all, and
+  # `empty as $x | …` would make the whole event vanish.
+  | ( first(
+        range(0; $groups | length) as $gi
+        | range(0; ($groups[$gi].hooks // []) | length) as $ei
+        | select($id != null and (($groups[$gi].hooks[$ei].command // "") | hook_identity) == $id)
+        | {gi: $gi, ei: $ei}
+      ) // null ) as $hit
+  | if $hit == null then null
+    else
+      ( $groups | .[$hit.gi].hooks[$hit.ei] |= refresh($entry) )
+      # The matcher belongs to the GROUP, which may also hold the users own
+      # hooks — retarget it only when ours is the sole occupant.
+      | (if ((($groups[$hit.gi].hooks // []) | length) == 1 and $matcher != null)
+         then .[$hit.gi].matcher = $matcher else . end)
+    end;
+
+def merge_groups($shippedGroups):
+  reduce $shippedGroups[] as $sg (
+    .;
+    . as $groups
+    | ( reduce ($sg.hooks // [])[] as $e ({g: $groups, un: []};
+          (.g | apply_entry($e; $sg.matcher)) as $next
+          | if $next == null then .un += [$e] else .g = $next end
+        ) ) as $acc
+    | if ($acc.un | length) > 0
+      then $acc.g + [ ($sg | .hooks = $acc.un) ]
+      else $acc.g
+      end
+  );
+
+def merged_hooks($shippedHooks):
+  reduce ($shippedHooks | keys_unsorted[]) as $event (
+    .;
+    .[$event] = ( (if (.[$event] | type) == "array" then .[$event] else [] end)
+                  | merge_groups($shippedHooks[$event]) )
+  );
+
+# permissions.allow is a union, never a replacement — replacing the object
+# used to take any "deny" list with it. Order is preserved so the user sees
+# their own list unchanged.
+( if (.permissions | type) == "object"
+  then .permissions.allow = ( ((.permissions.allow // []) ) as $a
+                              | if ($a | index("mcp__memory__*")) then $a
+                                else $a + ["mcp__memory__*"] end )
+  else .permissions = $new.permissions
+  end )
+| .hooks = ( (if (.hooks | type) == "object" then .hooks else {} end)
+             | merged_hooks($new.hooks) )
+# Only seed autoMemoryEnabled; a user who turned it on keeps it on.
+| (if has("autoMemoryEnabled") then . else .autoMemoryEnabled = $new.autoMemoryEnabled end)
+'
+
 if [ -f "$SETTINGS_FILE" ]; then
     if command -v jq &>/dev/null; then
-        # Merge hooks (overwrite ours, preserve user-added), append permission if missing
-        jq -s '
-            (.[0] // {}) as $existing | (.[1] // {}) as $new |
-            $existing * $new |
-            .permissions.allow = (($existing.permissions.allow // []) + ($new.permissions.allow // []) | unique)
-        ' "$SETTINGS_FILE" <(echo "$HOOKS_CONFIG") > "$SETTINGS_FILE.tmp"
-        mv "$SETTINGS_FILE.tmp" "$SETTINGS_FILE"
-        echo "Merged hooks into $SETTINGS_FILE"
+        # Write through a temp file and only replace settings.json once jq has
+        # succeeded AND produced something — the old unconditional `mv` handed
+        # the user an empty settings.json on any jq error.
+        if jq --argjson new "$HOOKS_CONFIG" "$HOOKS_MERGE_JQ" \
+             "$SETTINGS_FILE" > "$SETTINGS_FILE.tmp" && [ -s "$SETTINGS_FILE.tmp" ]; then
+            mv "$SETTINGS_FILE.tmp" "$SETTINGS_FILE"
+            echo "Merged hooks into $SETTINGS_FILE"
+        else
+            rm -f "$SETTINGS_FILE.tmp"
+            echo "Warning: could not merge hooks into $SETTINGS_FILE — left it untouched."
+            echo "Hook config:"
+            echo "$HOOKS_CONFIG"
+        fi
     else
         echo "Warning: jq not found. Please manually add hooks to $SETTINGS_FILE"
         echo "Hook config:"

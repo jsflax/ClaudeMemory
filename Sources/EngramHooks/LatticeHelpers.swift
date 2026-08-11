@@ -7,26 +7,54 @@ import Lattice
 
 #if canImport(EngramKit)
 
+/// Requested Lattice log verbosity for the hook path.
+///
+/// Verbose Lattice logging used to be HARDCODED to `.debug` here, with a
+/// per-session log FILE — synchronous file I/O inside the hook's timed
+/// window, on a path that runs on every prompt. In the field that produced
+/// single 93MB session logs and a 748MB `~/.claude/memory-logs`. It is now
+/// opt-in through the same switch the MCP server uses (Sources/Engram/
+/// main.swift): ENGRAM_LATTICE_LOG_LEVEL = off|error|warning|info|debug.
+///
+/// Unset ⇒ errors only, written to stderr, which the harness already
+/// captures into hooks.log — so genuine failures stay visible and nothing
+/// touches the log directory.
+private let latticeLogLevelEnv: String? =
+    ProcessInfo.processInfo.environment["ENGRAM_LATTICE_LOG_LEVEL"]?.lowercased()
+
+/// Applied once per process, the first time a Lattice is opened.
+private let latticeLogLevelApplied: Bool = {
+    switch latticeLogLevelEnv {
+    case "off": Lattice.setLogLevel(.off)
+    case "warning", "warn": Lattice.setLogLevel(.warn)
+    case "info": Lattice.setLogLevel(.info)
+    case "debug": Lattice.setLogLevel(.debug)
+    default: Lattice.setLogLevel(.error)
+    }
+    return true
+}()
+
+/// Point Lattice's log at this session's file — ONLY when logging was asked
+/// for. Writing the file is the expensive half, so an unset (or "off") env
+/// var leaves Lattice logging to stderr and never creates the directory.
+private func configureLatticeLogging(sessionId: String?) {
+    _ = latticeLogLevelApplied
+    guard let level = latticeLogLevelEnv, level != "off" else { return }
+    guard let sid = sessionId ?? ProcessInfo.processInfo.environment["CLAUDE_SESSION_ID"],
+          !sid.isEmpty else { return }
+    let fm = FileManager.default
+    if !fm.fileExists(atPath: memoryLogsDir) {
+        try? fm.createDirectory(atPath: memoryLogsDir, withIntermediateDirectories: true)
+    }
+    Lattice.setLogFile(URL(fileURLWithPath: memoryLogsDir + "/lattice-\(sid).log"))
+}
+
 /// Open Lattice with the full schema at the default database path.
 func openLattice(sessionId: String? = nil) -> Lattice? {
     let dbPath = defaultDbPath
     guard FileManager.default.fileExists(atPath: dbPath) else { return nil }
 
-    // Always set up lattice debug logging so errors are captured even
-    // for short-lived hooks that crash before initMemoryTools runs.
-    // Always enable debug logging — stderr is captured in hooks.log
-    Lattice.setLogLevel(.debug)
-
-    if let sid = sessionId ?? ProcessInfo.processInfo.environment["CLAUDE_SESSION_ID"], !sid.isEmpty {
-        let logDir = NSHomeDirectory() + "/.claude/memory-logs"
-        let logPath = logDir + "/lattice-\(sid).log"
-        let fm = FileManager.default
-        if !fm.fileExists(atPath: logDir) {
-            try? fm.createDirectory(atPath: logDir, withIntermediateDirectories: true)
-        }
-        Lattice.setLogLevel(.debug)
-        Lattice.setLogFile(URL(fileURLWithPath: logPath))
-    }
+    configureLatticeLogging(sessionId: sessionId)
 
     return try? Lattice(
         Memory.self, Edge.self, Checkpoint.self, HookState.self, SessionState.self,
@@ -62,18 +90,8 @@ func initMemoryTools(sessionId: String? = nil) async -> MemoryTools? {
         sessionLog("initMemoryTools: synced lattice \(synced != nil ? "opened" : "FAILED to open") at \(syncedDbPath)", sessionId: sessionId)
     }
 
-    // Per-session Lattice debug logging
-    if let sid = sessionId, !sid.isEmpty {
-        let logPath = memoryLogsDir + "/lattice-\(sid).log"
-        let logURL = URL(fileURLWithPath: logPath)
-        let fm = FileManager.default
-        if !fm.fileExists(atPath: memoryLogsDir) {
-            try? fm.createDirectory(atPath: memoryLogsDir, withIntermediateDirectories: true)
-        }
-        Lattice.setLogLevel(.debug)
-        Lattice.setLogFile(logURL)
-        sessionLog("initMemoryTools: lattice debug logging → \(logPath)", sessionId: sessionId)
-    }
+    // Per-session Lattice logging — opt-in, see `configureLatticeLogging`.
+    configureLatticeLogging(sessionId: sessionId)
 
     // Group spokes — the same membership-scoped union the MCP server reads.
     // Without these the advise hook injects only personal memories, which is
@@ -120,17 +138,19 @@ func currentMemoryCount() -> Int? {
     return lattice.count(Memory.self)
 }
 
-/// Read a global HookState value by key.
-func getHookState(key: HookState.Key) -> String? {
-    guard let lattice = openLattice() else { return nil }
-    return lattice.objects(HookState.self)
+/// Read a global HookState value by key from an ALREADY-OPEN lattice.
+///
+/// Every open/close pair pays a PRAGMA optimize and a PASSIVE checkpoint, so
+/// call sites that touch several keys in a row must share one handle rather
+/// than reach for the convenience overloads below.
+func getHookState(_ lattice: Lattice, key: HookState.Key) -> String? {
+    lattice.objects(HookState.self)
         .where { $0.key == key }
         .first?.value
 }
 
-/// Write a global HookState value by key (upsert).
-func setHookState(key: HookState.Key, value: String) {
-    guard let lattice = openLattice() else { return }
+/// Write a global HookState value by key (upsert) on an already-open lattice.
+func setHookState(_ lattice: Lattice, key: HookState.Key, value: String) {
     if let existing = lattice.objects(HookState.self).where({ $0.key == key }).first {
         existing.value = value
         existing.updatedAt = Date()
@@ -140,6 +160,18 @@ func setHookState(key: HookState.Key, value: String) {
         do { try lattice.add(HookState(key: key, value: value)) }
         catch { hookLog("setHookState(\(key)) failed: \(error)") }
     }
+}
+
+/// Read a global HookState value by key, opening the database for it.
+func getHookState(key: HookState.Key) -> String? {
+    guard let lattice = openLattice() else { return nil }
+    return getHookState(lattice, key: key)
+}
+
+/// Write a global HookState value by key (upsert), opening the database for it.
+func setHookState(key: HookState.Key, value: String) {
+    guard let lattice = openLattice() else { return }
+    setHookState(lattice, key: key, value: value)
 }
 
 /// Get or create the SessionState row for a given session ID.

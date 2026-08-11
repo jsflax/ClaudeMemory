@@ -199,12 +199,43 @@ struct Advise: AsyncParsableCommand {
     private static let maintenanceLogPath = NSHomeDirectory() + "/.claude/memory-maintenance.log"
 
     /// Check if maintenance threshold is crossed and spawn the subprocess if so.
-    /// Uses AuditLog row count since last run — immune to concurrent-process counter clobbering.
+    /// Counts AuditLog rows since last run — immune to concurrent-process
+    /// counter clobbering.
+    ///
+    /// This runs AFTER the recall budget is satisfied and is itself
+    /// UNBUDGETED, so every cost in it lands on the user's prompt latency.
+    /// Two used to dominate:
+    ///
+    /// 1. Up to six Lattice open/close cycles per prompt — one at the top of
+    ///    the function plus one per `getHookState`/`setHookState` — each
+    ///    paying a PRAGMA optimize and a PASSIVE checkpoint on close, even
+    ///    when the very first short-circuit was about to return. Now: ONE
+    ///    handle, and the already-active / cooldown short-circuits run
+    ///    before anything else touches the database.
+    ///
+    /// 2. `COUNT(*) WHERE tableName = 'Memory' AND timestamp > since` over a
+    ///    3.96M-row audit log. The only usable index leads on `tableName`, so
+    ///    that walked every Memory audit row and fetched each row's
+    ///    `timestamp` from the table — 3.8s warm on the reporting user's
+    ///    database. And it ran on EVERY prompt once past the cooldown, not
+    ///    once per window: the cooldown is measured from the last SPAWN, so
+    ///    a database that never reaches the threshold pays it forever.
+    ///
+    /// The window is now anchored on the audit primary key recorded at the
+    /// last spawn instead of on a timestamp. `id > watermark` is a rowid
+    /// restriction the index can answer, so the count never leaves the index
+    /// for the rows it rejects: 0.05s on that same database, a 75x cut, and
+    /// exact — not an estimate.
+    ///
+    /// The row filter deliberately keeps BOTH halves of the trigger's
+    /// meaning: `tableName == "Memory"` AND local origin. A bare
+    /// `head - watermark` delta would count sync-applied rows, so any sync
+    /// drain would spawn a maintenance subprocess on every cooldown.
     private func spawnMaintenanceIfNeeded(project: String, cwd: String?) {
         guard let lattice = openLattice() else { return }
 
         let lastRunTimestamp = Double(
-            getHookState(key: .maintenanceLastRunTimestamp) ?? "0"
+            getHookState(lattice, key: .maintenanceLastRunTimestamp) ?? "0"
         ) ?? 0
         let since = Date(timeIntervalSince1970: lastRunTimestamp)
 
@@ -213,26 +244,45 @@ struct Advise: AsyncParsableCommand {
         // completion, so a SIGKILL mid-run used to leave it stuck at "1" and
         // disable maintenance forever. lastRunTimestamp is set alongside the
         // flag, so an "active" older than an hour is a corpse, not a run.
-        if getHookState(key: .maintenanceActive) == "1" {
+        if getHookState(lattice, key: .maintenanceActive) == "1" {
             let flagAge = Date().timeIntervalSince(since)
             if flagAge < 3600 { return }
-            setHookState(key: .maintenanceActive, value: "0")
+            setHookState(lattice, key: .maintenanceActive, value: "0")
         }
 
         // Enforce minimum cooldown to prevent maintenance's own writes from re-triggering
         guard Date().timeIntervalSince(since) >= maintenanceCooldownSeconds else { return }
 
+        // Head of the audit log. Monotonic (INTEGER PRIMARY KEY AUTOINCREMENT),
+        // and a descending walk stops on the first row.
+        let headId = lattice.objects(AuditLog.self)
+            .sortedBy(\.primaryKey, order: .reverse)
+            .first?.primaryKey ?? 0
+
+        guard let stored = getHookState(lattice, key: .maintenanceAuditWatermark),
+              let watermark = Int64(stored) else {
+            // First evaluation on this database, or the first after upgrading
+            // from the timestamp-window trigger. Anchor at the current head
+            // rather than pay the 3.8s reconstruction of a window we are
+            // about to stop using; the cost is at most one deferred
+            // maintenance run, once.
+            setHookState(lattice, key: .maintenanceAuditWatermark, value: String(headId))
+            hookLog("Advise: seeded maintenance audit watermark at \(headId)")
+            return
+        }
+
         let delta = lattice.objects(AuditLog.self)
-            .where { $0.tableName == "Memory" && $0.timestamp > since }
+            .where { $0.primaryKey > watermark && $0.tableName == "Memory" && $0.isFromRemote == false }
             .count
 
         guard delta >= maintenanceThreshold else { return }
 
         // Update baseline immediately to prevent re-spawning on next advise call
-        setHookState(key: .maintenanceLastRunTimestamp, value: String(Date().timeIntervalSince1970))
+        setHookState(lattice, key: .maintenanceLastRunTimestamp, value: String(Date().timeIntervalSince1970))
+        setHookState(lattice, key: .maintenanceAuditWatermark, value: String(headId))
 
         // Signal the visualizer that maintenance is active
-        setHookState(key: .maintenanceActive, value: "1")
+        setHookState(lattice, key: .maintenanceActive, value: "1")
 
         let prompt = """
         Perform maintenance on the memory database. Focus on project "\(project)".
