@@ -91,19 +91,6 @@ jobs:
       - name: Build CLI release binaries
         run: swift build -c release
 
-      - name: Package CLI tarball
-        run: |
-          mkdir -p staging/agents
-          cp .build/release/Engram staging/memory
-          cp .build/release/EngramHooks staging/memory-hooks
-          cp .build/release/EngramDaemon staging/memory-sync
-          cp -R .build/release/Engram_EngramKit.bundle staging/
-          cp -R .build/release/swift-transformers_Hub.bundle staging/
-          cp -R .build/release/SwiftLM_SwiftLM.bundle staging/
-          cp agents/*.md staging/agents/
-          cp -R skills staging/skills
-          cd staging && tar czf ../engram-macos-arm64.tar.gz *
-
       - name: Import signing certificate
         if: env.DEVELOPER_ID_CERT_BASE64 != ''
         env:
@@ -213,6 +200,32 @@ jobs:
 
           # Re-codesign the .app (no --deep)
           sign "$APP"
+
+      # Runs AFTER signing so the tarball ships Developer-ID-signed binaries.
+      # Unsigned CLI binaries are dead on arrival for the daemon: launchd
+      # spawns memory-sync in a context where the keychain ACL prompt cannot
+      # display, so an ad-hoc/unsigned binary wedges forever inside
+      # SecItemCopyMatching (0.14.1 field incident). When the cert is absent
+      # (forks), the tarball still builds — just unsigned, as before.
+      - name: Package CLI tarball
+        run: |
+          mkdir -p staging/agents
+          if [ -d "build/export/Engram.app/Contents/Resources/cli" ]; then
+            CLI="build/export/Engram.app/Contents/Resources/cli"
+            cp "$CLI/memory" staging/memory
+            cp "$CLI/memory-hooks" staging/memory-hooks
+            cp "$CLI/memory-sync" staging/memory-sync
+          else
+            cp .build/release/Engram staging/memory
+            cp .build/release/EngramHooks staging/memory-hooks
+            cp .build/release/EngramDaemon staging/memory-sync
+          fi
+          cp -R .build/release/Engram_EngramKit.bundle staging/
+          cp -R .build/release/swift-transformers_Hub.bundle staging/
+          cp -R .build/release/SwiftLM_SwiftLM.bundle staging/
+          cp agents/*.md staging/agents/
+          cp -R skills staging/skills
+          cd staging && tar czf ../engram-macos-arm64.tar.gz *
 
       - name: Create DMG
         if: env.DEVELOPER_ID_CERT_BASE64 != ''

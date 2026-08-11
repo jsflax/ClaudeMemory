@@ -39,7 +39,12 @@ public enum InstallConfig {
             "permissions": ["allow": ["mcp__memory__*"]],
             "hooks": [
                 "SessionStart": [["hooks": [["type": "command", "command": "\(installDir)/memory-hooks on-start 2>/dev/null", "timeout": 5]]]],
-                "UserPromptSubmit": [["hooks": [["type": "command", "command": "\(installDir)/memory-hooks advise 2>/dev/null", "timeout": 5]]]],
+                // 60s is a BACKSTOP, not the working budget: advise self-limits
+                // to 60% of this registered timeout capped at 15s (HookBudget)
+                // and emits a visible degradation note when it trips. A 5s
+                // registration made the harness kill the hook mid-recall with
+                // no output at all — silent memory loss every slow turn.
+                "UserPromptSubmit": [["hooks": [["type": "command", "command": "\(installDir)/memory-hooks advise 2>/dev/null", "timeout": 60]]]],
                 "Stop": [["hooks": [["type": "command", "command": "\(installDir)/memory-hooks on-stop 2>/dev/null", "timeout": 5]]]],
                 "PostToolUseFailure": [["hooks": [["type": "command", "command": "\(installDir)/memory-hooks on-failure 2>/dev/null", "timeout": 5]]]],
                 "PreToolUse": [["matcher": "Agent", "hooks": [["type": "command", "command": "\(installDir)/memory-hooks pre-tool 2>/dev/null", "timeout": 5]]]],
