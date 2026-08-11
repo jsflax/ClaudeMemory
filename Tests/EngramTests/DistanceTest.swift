@@ -6,7 +6,17 @@ import MCP
 import Foundation
 
 /// Test that distances are correct from attached vs non-attached recalls.
+///
+/// Opt-in like the other live-HOME tests (PerfTests, AttachRaceTest, IVFTests):
+/// this opens the developer's REAL memory.sqlite + memory-synced.sqlite and
+/// ATTACHes across them, so it races every MCP server, hook, and daemon
+/// connection on the machine. Ungated it failed a release-verification run
+/// with "Failed to begin transaction: database is locked" after exhausting the
+/// 30s busy timeout — a scary-looking failure with nothing wrong in the code
+/// — and passed alone moments later. It never ran on CI anyway (no ~/.claude
+/// there), so gating costs no coverage that existed.
 @Test func distance_attachedVsLocal() async throws {
+    guard ProcessInfo.processInfo.environment["ENGRAM_ALLOW_PROD_DB_TESTS"] == "1" else { return }
     let localPath = URL(fileURLWithPath: NSHomeDirectory())
         .appending(path: ".claude/memory.sqlite")
     let syncedPath = URL(fileURLWithPath: NSHomeDirectory())
