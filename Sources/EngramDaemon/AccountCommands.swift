@@ -10,10 +10,19 @@ import Foundation
 /// Shared plumbing: token + a JSON call helper.
 private func requireCredentials(endpoint: String?) throws -> SyncCredentials {
     let claudeDir = NSHomeDirectory() + "/.claude"
-    guard let creds = readCredentials(claudeDir: claudeDir, endpointOverride: endpoint) else {
+    switch readCredentials(claudeDir: claudeDir, endpointOverride: endpoint,
+                           timeout: keychainInteractiveDeadline) {
+    case .found(let creds):
+        return creds
+    case .notFound:
         throw ValidationError("No auth token in the Keychain — sign in via the Engram app first.")
+    case .timedOut:
+        // Distinct from "no token": the item is there, securityd just won't
+        // hand it over to a binary whose signature the ACL doesn't accept.
+        // Say so — a bare "not signed in" sends people to re-authenticate
+        // over and over against a wall.
+        throw ValidationError(keychainBlockedDiagnostic())
     }
-    return creds
 }
 
 private func call(

@@ -79,14 +79,23 @@ jobs:
           --skip "recall_connectedMemory_showsEdgeRelation"
           --skip "recall_graphTraversal_relatesToDoesNotLeakViaUnrelatedStructuralEdge"
           --skip "recall_statementBudget"
+          --skip "clusters_statementBudget"
 
-      # The statement-budget regression test reads the process-global SQL
-      # statement counter; suites running in parallel pollute every
-      # measurement window (sustained, not bursty — min-of-N can't rescue
-      # it). It runs alone in a quiet invocation instead.
-      - name: Run statement-budget regression (serial)
-        timeout-minutes: 5
-        run: swift test --skip-build --filter "recall_statementBudget"
+      # Statement-budget regressions read the process-global SQL statement
+      # counter; suites running in parallel pollute every measurement window
+      # (sustained, not bursty — min-of-N can't rescue it). They run alone in
+      # a quiet invocation instead.
+      #
+      # Both budget tests must be here, and must run in ONE invocation each
+      # other's absence: the clustering budget test issues thousands of
+      # statements by design, so leaving it in the parallel run drove
+      # recall_statementBudget to 698 against its 180 pin — a failure that
+      # looks exactly like a recall regression and isn't one.
+      - name: Run statement-budget regressions (serial)
+        timeout-minutes: 10
+        run: |
+          swift test --skip-build --filter "recall_statementBudget"
+          swift test --skip-build --filter "clusters_statementBudget"
 
       - name: Build CLI release binaries
         run: swift build -c release

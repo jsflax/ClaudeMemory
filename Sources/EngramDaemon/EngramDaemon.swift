@@ -26,6 +26,16 @@ struct EngramDaemon: AsyncParsableCommand {
     var nuclearCompact: Bool = false
 
     func run() async throws {
+        // Route the sync engine's own diagnostics into the daemon log (B5).
+        // During the Aug 2026 audit-explosion incident the core emitted the
+        // warning that would have named the problem outright — "upload floor
+        // stalled below audit id N for >5min" — and it went to a stderr
+        // nobody was reading, while the daemon log showed only healthy-
+        // looking upload counters. Warnings and errors now land in the same
+        // file as everything else the daemon says; --log-level still opts
+        // into the noisier levels.
+        openDaemonLogForLattice()
+        Lattice.setLogLevel(.warn)
         if let logLevel {
             switch logLevel.lowercased() {
             case "debug": Lattice.setLogLevel(.debug)
@@ -59,17 +69,36 @@ struct EngramDaemon: AsyncParsableCommand {
         // keychain for up to 10 minutes (20 × 30s) before giving up.
         var credentials: SyncCredentials?
         let credRetryLimit = 20
-        for attempt in 0..<credRetryLimit {
-            if let c = readCredentials(claudeDir: claudeDir, endpointOverride: endpoint) {
+        credentialPoll: for attempt in 0..<credRetryLimit {
+            switch readCredentials(claudeDir: claudeDir, endpointOverride: endpoint) {
+            case .found(let c):
                 credentials = c
-                break
+                break credentialPoll
+
+            case .timedOut:
+                // A wedged keychain read is NOT "not signed in yet". The
+                // blocked thread can never be reclaimed (SecItemCopyMatching
+                // is not cancellable), so retrying would leak one stuck
+                // thread per attempt across ten minutes and still never
+                // produce a token. Diagnose loudly, publish a state the
+                // visualizer can render, and exit NON-ZERO so launchd
+                // restarts us on its ThrottleInterval backoff instead of
+                // leaving a silent zombie process behind.
+                log("Keychain read BLOCKED. \(keychainBlockedDiagnostic())")
+                DaemonStatus.write(state: "keychain_blocked",
+                                   detail: keychainBlockedSummary)
+                flock(lockFd, LOCK_UN)
+                close(lockFd)
+                throw ExitCode.failure
+
+            case .notFound:
+                if attempt == 0 {
+                    DaemonStatus.write(state: "waiting_for_auth",
+                                       detail: "No credentials yet — sign in via the Visualizer.")
+                    log("No auth credentials found — polling keychain (up to 10 min)...")
+                }
+                sleep(30)
             }
-            if attempt == 0 {
-                DaemonStatus.write(state: "waiting_for_auth",
-                                   detail: "No credentials yet — sign in via the Visualizer.")
-                log("No auth credentials found — polling keychain (up to 10 min)...")
-            }
-            sleep(30)
         }
         guard let credentials else {
             log("No auth credentials after \(credRetryLimit) attempts. Exiting; relaunch after sign-in.")
@@ -670,27 +699,123 @@ struct SyncCredentials {
     }
 }
 
-func readCredentials(claudeDir: String, endpointOverride: String?) -> SyncCredentials? {
-    guard let token = keychainLoad(service: "io.engram.app", account: "auth_token") else {
-        return nil
-    }
-    let endpoint = endpointOverride ?? "https://engramdb.io"
-    return SyncCredentials(token: token, endpoint: endpoint)
+/// Outcome of a bounded Keychain read.
+///
+/// `.timedOut` is deliberately NOT collapsed into `.notFound`: the daemon's
+/// startup poll waits ten minutes for a sign-in, and reading a wedged
+/// keychain as "no token yet" would spin up twenty permanently-blocked
+/// threads and still end in the same nothing. See `keychainLoad`.
+enum KeychainReadResult {
+    case found(String)
+    case notFound
+    case timedOut
 }
 
-/// Minimal Keychain read (no dependency on KeychainHelper from Visualizer)
-func keychainLoad(service: String, account: String) -> String? {
-    let query: [String: Any] = [
-        kSecClass as String: kSecClassGenericPassword,
-        kSecAttrService as String: service,
-        kSecAttrAccount as String: account,
-        kSecReturnData as String: true,
-        kSecMatchLimit as String: kSecMatchLimitOne,
-    ]
-    var result: AnyObject?
-    let status = SecItemCopyMatching(query as CFDictionary, &result)
-    guard status == errSecSuccess, let data = result as? Data else { return nil }
-    return String(data: data, encoding: .utf8)
+/// Same three states, one level up.
+enum CredentialsResult {
+    case found(SyncCredentials)
+    case notFound
+    case timedOut
+}
+
+/// How long the daemon waits for securityd before declaring the read wedged.
+/// Unattended: nobody can answer an authorization prompt, so a read that
+/// hasn't returned by now never will.
+let keychainReadDeadline: TimeInterval = 10
+
+/// Interactive subcommands (`whoami`, `accept-invite`, …) run in a real UI
+/// session where the authorization prompt CAN appear — leave a human time to
+/// click Allow rather than bailing out from under them.
+let keychainInteractiveDeadline: TimeInterval = 60
+
+func readCredentials(claudeDir: String, endpointOverride: String?,
+                     timeout: TimeInterval = keychainReadDeadline) -> CredentialsResult {
+    switch keychainLoad(service: "io.engram.app", account: "auth_token", timeout: timeout) {
+    case .found(let token):
+        let endpoint = endpointOverride ?? "https://engramdb.io"
+        return .found(SyncCredentials(token: token, endpoint: endpoint))
+    case .notFound:
+        return .notFound
+    case .timedOut:
+        return .timedOut
+    }
+}
+
+/// One line for the status file / sidebar, which truncates hard.
+let keychainBlockedSummary =
+    "Keychain read blocked — code signature vs. keychain ACL mismatch. Reinstall from the signed DMG."
+
+/// The full story, for the log — this failure mode is invisible otherwise.
+func keychainBlockedDiagnostic() -> String {
+    let binary = ProcessInfo.processInfo.arguments.first ?? "<memory-sync>"
+    return """
+        SecItemCopyMatching did not return within \(Int(keychainReadDeadline))s. \
+        That happens when the running binary's code signature does not satisfy the ACL on the \
+        keychain item: macOS wants to show an authorization prompt, and under launchd there is no \
+        UI session to show it in, so the call never comes back. Likeliest cause: this daemon is an \
+        ad-hoc-signed local build, or the keychain item was written by a differently-signed copy of \
+        the app. Fix: reinstall from the signed DMG (or re-sign this build with the same identity), \
+        or delete the 'io.engram.app' keychain item and sign in again. Inspect the signature with: \
+        codesign -dv --verbose=4 \(binary)
+        """
+}
+
+/// Minimal Keychain read (no dependency on KeychainHelper from Visualizer),
+/// with a hard deadline.
+///
+/// `SecItemCopyMatching` is a synchronous, NON-CANCELLABLE mach round-trip to
+/// securityd. If the item's ACL doesn't accept our code signature, securityd
+/// waits on an interactive authorization that can never arrive under launchd,
+/// and the call blocks forever. Proven live (Aug 2026) with `sample <pid>`:
+/// the daemon's main thread sat in EngramDaemon.run → keychainLoad →
+/// SecItemCopyMatching → mach_msg indefinitely. Process alive, no log line,
+/// no sync, nothing to diagnose from — hours of debugging.
+///
+/// So the read runs on a detached thread and the caller waits on a bounded
+/// semaphore. On timeout that thread stays blocked FOREVER — inherent, the
+/// syscall cannot be cancelled — which is precisely why the caller must exit
+/// the process rather than retry.
+func keychainLoad(service: String, account: String,
+                  timeout: TimeInterval = keychainReadDeadline) -> KeychainReadResult {
+    /// Hand-off box. Written only on the reader thread, read only after the
+    /// semaphore says the write happened; the lock keeps it sound even in the
+    /// timeout case, where the reader may still write into an abandoned box.
+    final class Box: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value: KeychainReadResult = .notFound
+        func set(_ newValue: KeychainReadResult) {
+            lock.lock(); value = newValue; lock.unlock()
+        }
+        func get() -> KeychainReadResult {
+            lock.lock(); defer { lock.unlock() }; return value
+        }
+    }
+    let box = Box()
+    let done = DispatchSemaphore(value: 0)
+
+    let reader = Thread {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        if status == errSecSuccess, let data = result as? Data,
+           let token = String(data: data, encoding: .utf8) {
+            box.set(.found(token))
+        } else {
+            box.set(.notFound)
+        }
+        done.signal()
+    }
+    reader.name = "io.engram.keychain-read"
+    reader.start()
+
+    guard done.wait(timeout: .now() + timeout) == .success else { return .timedOut }
+    return box.get()
 }
 
 // MARK: - Group spoke lifecycle
@@ -835,6 +960,20 @@ private func startMembershipPoll(
 }
 
 // MARK: - Logging
+
+/// Point LatticeCore's C++ logger at the daemon log file (B5).
+///
+/// The core logs through a `FILE*`; the handle is deliberately leaked for the
+/// process lifetime — it must outlive every sync thread that writes through
+/// it, and the daemon's exit paths are not the only way this process dies.
+/// Append mode so it interleaves with `log(_:)`'s own writes rather than
+/// truncating them.
+private func openDaemonLogForLattice() {
+    let logPath = NSHomeDirectory() + "/.claude/sync-daemon.log"
+    guard let handle = fopen(logPath, "a") else { return }
+    setvbuf(handle, nil, _IOLBF, 0)  // line-buffered: warnings appear as they happen
+    Lattice.setLogFile(handle)
+}
 
 private func log(_ message: String) {
     let ts = ISO8601DateFormatter().string(from: Date())

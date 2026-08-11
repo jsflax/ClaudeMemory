@@ -8,6 +8,12 @@ public final class HookState {
     public enum Key: String, Codable, Sendable {
         case maintenanceLastRunTimestamp = "maintenance.lastRunTimestamp"
         case maintenanceActive = "maintenance.active"
+        /// AuditLog primary key at the last maintenance spawn. The trigger
+        /// counts qualifying audit rows ABOVE this watermark instead of
+        /// scanning every `tableName = 'Memory'` row for a timestamp window
+        /// — the rowid restriction keeps the count off the table pages
+        /// (measured on a 3.96M-row audit log: 3.8s → 0.05s).
+        case maintenanceAuditWatermark = "maintenance.auditWatermark"
         /// Per-device opt-out: when "false", the advise hook excludes
         /// teammates' group-shared memories from context injection.
         /// Absent/any-other-value = included (beta default is ON).

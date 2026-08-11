@@ -4,6 +4,83 @@ All notable changes to Engram are documented in this file.
 
 > Formerly "ClaudeMemory" — renamed in v0.12.0 to be tool-agnostic.
 
+## [0.14.2] - 2026-08-11
+
+Finishes the job 0.14.1 started. 0.14.1 stopped sync history from being
+*created* without bound, but two defects kept it from being *cleaned up*,
+and a third made the app itself crash while syncing. If your database
+grew again after 0.14.1, if the app quit unexpectedly while the sidebar
+or graph was open, or if sync seemed stuck at "uploading" forever, this
+is the fix.
+
+### Fixed
+- **Sync could get permanently stuck partway through an upload.** When an
+  acknowledgement arrived later than the uploader's patience allowed, the
+  upload was resent — correctly — but the entry stayed marked as
+  outstanding forever afterward. That frozen marker is the same one that
+  gates history cleanup, so a single late acknowledgement could stop a
+  machine from ever cleaning up its history again. On the affected
+  machine two channels were frozen with 245,550 entries above them that
+  the database had already recorded as delivered. Late acknowledgements
+  now resolve properly, and every upload pass reconciles its outstanding
+  list against what the database actually says.
+- **Receiving an update that changes nothing no longer records history.**
+  Two synced machines could hand each other the same unchanged rows
+  indefinitely, and each machine recorded a full history entry per
+  arrival. One machine took on 2.3 million such entries in four hours.
+  Updates that would not change a single value are now recognized and
+  acknowledged without being recorded — with a durable receipt so
+  re-delivery still can't apply stale data over a newer local edit.
+- **The app could crash while sync was running.** Every batch of changes
+  spawned its own delivery task on a thread with a small stack, and a
+  busy sync (hundreds of thousands of rows) spawned thousands of them at
+  once; deep enough into the work, the app ran out of stack and quit.
+  Delivery now runs on one dedicated thread with room to work.
+- **Reading a memory's fields no longer costs one database query per
+  field.** Loading a row's values now fetches the whole row once. This
+  was the innermost layer of the crash above, and it makes the graph,
+  the sidebar, and recall meaningfully faster.
+- **Uploads are acknowledged far faster.** The server was writing tens of
+  thousands of diagnostic log lines per batch — inside the database
+  transaction, on the connection thread everyone else shared — which
+  dominated the time to acknowledge an upload and stalled unrelated
+  connections. Applying an upload now happens off that shared thread,
+  with the per-row logging where it belongs, and acknowledgements are no
+  longer sent for acknowledgements (a pointless round trip that ran
+  forever).
+- **Catch-up can no longer come back empty.** A client whose last-known
+  position had been cleaned up on the server received *nothing* on
+  reconnect, silently and permanently. It now receives full history.
+- **The sync daemon no longer hangs silently when it can't read your
+  credentials.** A signature mismatch made the keychain read wait for a
+  prompt that can never appear in the background, leaving a daemon that
+  looked alive and did nothing. It now gives up, explains the likely
+  cause, and restarts.
+- **Installing or upgrading no longer resets your hook timeouts.** Any
+  value you raised was overwritten on every app launch; a too-short
+  timeout means the prompt hook is killed mid-recall and your memories
+  quietly don't arrive. Both installers (the app and `install.sh`) now
+  merge per hook — your raised timeouts and any hooks of your own under
+  the same events survive — instead of replacing whole sections.
+- **Related memories could go missing from a project's clusters.** The
+  similarity search asked for the closest matches *globally* and only
+  then narrowed to the project, so a busy neighbouring project could use
+  up every slot and a project's own related memories would never be
+  found — losing an entire cluster from the graph. The search is now
+  scoped before it ranks.
+- **Clustering a project got dramatically cheaper**: 20,802 database
+  queries down to 601 for a 200-memory project (~1.2s → ~0.16s), because
+  neighbour comparison no longer round-trips to the database per memory.
+  This is the work that made opening a large graph slow.
+- **The prompt hook no longer writes a debug log on every prompt.** It
+  was on unconditionally — 93MB single log files, 748MB accumulated —
+  and the writing happened inside the window your prompt waits on. Set
+  `ENGRAM_LATTICE_LOG_LEVEL` if you want it back.
+- **The prompt hook's maintenance check no longer scans the whole
+  history.** It counted matching rows by timestamp over the entire audit
+  log — 3.8 seconds on a large database, *after* the recall budget was
+  already spent. It now compares against a saved position: 0.05s.
+
 ## [0.14.1] - 2026-08-09
 
 Fixes a sync-history defect that could make the memory database grow
