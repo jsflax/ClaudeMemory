@@ -3,12 +3,12 @@
     <channel>
         <title>Engram</title>
         <item>
-            <title>0.14.1</title>
-            <pubDate>Mon, 10 Aug 2026 14:23:29 +0000</pubDate>
-            <sparkle:version>10</sparkle:version>
-            <sparkle:shortVersionString>0.14.1</sparkle:shortVersionString>
+            <title>0.14.2</title>
+            <pubDate>Tue, 11 Aug 2026 14:03:19 +0000</pubDate>
+            <sparkle:version>11</sparkle:version>
+            <sparkle:shortVersionString>0.14.2</sparkle:shortVersionString>
             <sparkle:minimumSystemVersion>15.0</sparkle:minimumSystemVersion>
-            <enclosure url="https://github.com/jsflax/Engram/releases/download/v0.14.1/Engram-0.14.1.dmg" length="137289495" type="application/octet-stream" sparkle:edSignature="kJGzbCfliRlSxrClonOS9KAY8xnVCWc2/LfYULWfTbJQcwSVZFzt7tzqLQt1JevANqXHFs2rNQtqVtkTVPbTCQ=="/>
+            <enclosure url="https://github.com/jsflax/Engram/releases/download/v0.14.2/Engram-0.14.2.dmg" length="137418741" type="application/octet-stream" sparkle:edSignature="qEWqfvAonOqreWJXfcFLUQnayz6eeIyuTUF1chTnDZLk6mnznPBUdWGSdD0+p1NeoJz4E4zpESULc7EAQMTeDg=="/>
         </item>
     </channel>
 </rss>
