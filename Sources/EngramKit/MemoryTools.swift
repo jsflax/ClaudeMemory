@@ -1184,6 +1184,16 @@ public actor MemoryTools {
 
     public func handle(_ params: CallTool.Parameters) async throws -> CallTool.Result {
         log("Tool call: \(params.name)")
+        // Release WAL read marks after EVERY tool call (H2.2, Aug 2026
+        // incident): an MCP process that answered one call and then sat
+        // idle kept its read generations pinned, and a pinned read mark
+        // means no checkpoint can reclaim frames — the hub WAL grew to
+        // 16GB, twice. `retireAllGenerations()` LATCHES (§3.6): later
+        // reads serve unpinned-tolerant and never re-pin, which is exactly
+        // right for a request/response server — between calls this process
+        // holds ZERO read marks and the daemon's checkpoints always
+        // advance. Covers the error path too, hence `defer`.
+        defer { retireAllReadMarks() }
         let result: CallTool.Result
         do {
             result = try await dispatch(params)
@@ -1193,6 +1203,20 @@ public actor MemoryTools {
         }
         log("Tool \(params.name) completed")
         return result
+    }
+
+    /// Every lattice this instance can hold a read generation on: the hub,
+    /// the personal synced mirror, the group spokes, and the attach-cache
+    /// union handles built over them.
+    private func retireAllReadMarks() {
+        localLattice.retireAllGenerations()
+        syncedLattice?.retireAllGenerations()
+        for spoke in groupSpokes {
+            spoke.lattice.retireAllGenerations()
+        }
+        for union in attachCache.values {
+            union.retireAllGenerations()
+        }
     }
 
     private func dispatch(_ params: CallTool.Parameters) async throws -> CallTool.Result {
