@@ -89,18 +89,32 @@ func initMemoryTools(sessionId: String? = nil) async -> MemoryTools? {
     // memories: readLattice saw syncedLattice == nil and every synced
     // project silently fell back to local-only. Plain open, no WSS/IPC —
     // the daemon owns sync; hooks only read.
+    //
+    // Gated on POLICY, not just file existence (R3): readLattice only ever
+    // attaches the synced DB for a project whose SyncConfig policy is .sync
+    // (project row or the "_default" fallback), so when NO row says .sync
+    // this open is pure cost — and against a daemon mid-catch-up it is the
+    // cost that wedges the hook. The hub handle is already open; one
+    // indexed read decides.
     var syncedRef: LatticeThreadSafeReference?
     let claudeDir = (defaultDbPath as NSString).deletingLastPathComponent
     let syncedDbPath = SyncService.syncedDbPath(claudeDir: claudeDir)
     if FileManager.default.fileExists(atPath: syncedDbPath) {
-        let synced = try? Lattice(
-            Memory.self, Edge.self, SyncConfig.self,
-            configuration: .init(fileURL: URL(fileURLWithPath: syncedDbPath),
-                                 migration: engramMigrations,
-                                 busyTimeoutMs: hookBusyTimeoutMs)
-        )
-        syncedRef = synced?.sendableReference
-        sessionLog("initMemoryTools: synced lattice \(synced != nil ? "opened" : "FAILED to open") at \(syncedDbPath)", sessionId: sessionId)
+        let syncPolicyInPlay = lattice.objects(SyncConfig.self)
+            .where { $0.policy == .sync }
+            .first != nil
+        if syncPolicyInPlay {
+            let synced = try? Lattice(
+                Memory.self, Edge.self, SyncConfig.self,
+                configuration: .init(fileURL: URL(fileURLWithPath: syncedDbPath),
+                                     migration: engramMigrations,
+                                     busyTimeoutMs: hookBusyTimeoutMs)
+            )
+            syncedRef = synced?.sendableReference
+            sessionLog("initMemoryTools: synced lattice \(synced != nil ? "opened" : "FAILED to open") at \(syncedDbPath)", sessionId: sessionId)
+        } else {
+            sessionLog("initMemoryTools: synced DB present but no SyncConfig row has policy .sync — skipping the synced open", sessionId: sessionId)
+        }
     }
 
     // Per-session Lattice logging — opt-in, see `configureLatticeLogging`.
