@@ -619,8 +619,68 @@ struct EngramDaemon: AsyncParsableCommand {
             if hubDeleted > 0 || syncedDeleted > 0 {
                 log("Hourly compaction: hub -\(hubDeleted) rows, synced -\(syncedDeleted) rows")
             }
+            // H4 (Aug 2026 incident): self-diagnose a pinned hub WAL, so
+            // the next wedged-reader recurrence is a log line and a status
+            // field instead of a two-day mystery.
+            diagnoseWalPinned(dbPath: dbPath)
         }
     }
+}
+
+// MARK: - WAL Self-Diagnosis
+
+/// A WAL past 1GB whose `nBackfill` sits far below `mxFrame` means the
+/// hourly checkpoints are NOT reclaiming frames: some process is pinning a
+/// read mark the checkpointer cannot pass (orphaned read keepers in idle
+/// MCP/hook processes held the hub WAL at 16GB, twice). The wal-index
+/// header read is two file reads of the `-shm` — no SQLite API, no locks —
+/// so this is safe to run on every hourly pass. When pinned, log a LOUD
+/// warn naming the WAL size, the backfill lag, and every PID `lsof` sees
+/// holding the database, and surface the same summary on DaemonStatus.
+private func diagnoseWalPinned(dbPath: String) {
+    let walSizeThreshold: UInt64 = 1 << 30  // 1GB
+    guard let attrs = try? FileManager.default.attributesOfItem(atPath: dbPath + "-wal"),
+          let walSize = (attrs[.size] as? NSNumber)?.uint64Value,
+          walSize > walSizeThreshold else {
+        DaemonStatus.setWalWarning(nil)
+        return
+    }
+    guard let snapshot = WalIndex.read(shmPath: dbPath + "-shm") else {
+        // Missing/short/unstable header (a writer mid-update): not a
+        // verdict either way — keep any prior warning and retry next pass.
+        log("WAL diagnosis: WAL is \(walSize >> 20)MB but the -shm header was unreadable — retrying next pass")
+        return
+    }
+    // "Far below": less than half the WAL backfilled. A healthy WAL sits at
+    // nBackfill == mxFrame moments after every checkpoint; a pinned one
+    // stalls while mxFrame keeps climbing.
+    guard snapshot.mxFrame > 0, snapshot.nBackfill < snapshot.mxFrame / 2 else {
+        DaemonStatus.setWalWarning(nil)
+        return
+    }
+    let holders = lsofPids(dbPath: dbPath)
+    let summary = "hub WAL pinned: \(walSize >> 20)MB, nBackfill \(snapshot.nBackfill)/\(snapshot.mxFrame) frames"
+        + " — a reader is holding a WAL read mark checkpoints cannot pass; holder PIDs: "
+        + (holders.isEmpty ? "none visible to lsof" : holders.joined(separator: ", "))
+    log("WARN: \(summary)")
+    DaemonStatus.setWalWarning(summary)
+}
+
+/// PIDs holding the database open (main file, `-wal`, or `-shm`), via
+/// `lsof -t`. Best-effort: an lsof failure just means an empty list.
+private func lsofPids(dbPath: String) -> [String] {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+    process.arguments = ["-t", dbPath, dbPath + "-wal", dbPath + "-shm"]
+    let stdout = Pipe()
+    process.standardOutput = stdout
+    process.standardError = FileHandle.nullDevice
+    do { try process.run() } catch { return [] }
+    process.waitUntilExit()
+    let text = String(data: stdout.fileHandleForReading.readDataToEndOfFile(),
+                      encoding: .utf8) ?? ""
+    let pids = Set(text.split(whereSeparator: \.isNewline).map(String.init))
+    return pids.sorted { (Int($0) ?? 0) < (Int($1) ?? 0) }
 }
 
 // MARK: - Daemon Status File
@@ -656,6 +716,24 @@ enum DaemonStatus {
     nonisolated(unsafe) private static var lastKnownState: String?
     nonisolated(unsafe) private static var lastKnownDetail: String?
 
+    /// H4: sticky WAL-pinned warning from the hourly self-diagnosis.
+    /// Present in the status file while the condition holds; cleared (and
+    /// re-published) when a pass finds the WAL healthy again.
+    nonisolated(unsafe) private static var walWarning: String?
+
+    static func setWalWarning(_ warning: String?) {
+        lock.lock()
+        let changed = walWarning != warning
+        walWarning = warning
+        let state = lastKnownState
+        let detail = lastKnownDetail
+        lock.unlock()
+        // Re-publish only on transitions — the healthy hourly pass must not
+        // rewrite the file just to keep saying "no warning".
+        guard changed else { return }
+        write(state: state ?? "running", detail: detail)
+    }
+
     static func write(state: String,
                       detail: String?,
                       pendingUpload: Int? = nil,
@@ -673,6 +751,7 @@ enum DaemonStatus {
         if let detail { obj["detail"] = detail }
         if let pendingUpload { obj["pendingUpload"] = pendingUpload }
         if let lastSyncAt { obj["lastSyncAt"] = lastSyncAt }
+        if let walWarning { obj["walWarning"] = walWarning }
         if !spokes.isEmpty { obj["groups"] = spokes }
         guard let data = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted]) else { return }
         try? data.write(to: URL(fileURLWithPath: path), options: [.atomic])
