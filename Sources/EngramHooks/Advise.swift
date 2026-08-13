@@ -6,6 +6,15 @@ import EngramKit
 import Lattice
 #endif
 
+/// Synchronous blocking sleep for the watchdog test seam: models a C++
+/// frame stuck in an uninterruptible lock wait, so it must genuinely BLOCK
+/// the thread (Task.sleep would suspend cooperatively — the opposite of the
+/// failure being simulated). Isolated here because `Thread.sleep` is
+/// (rightly) unavailable to async contexts.
+private func blockingWedge(seconds: TimeInterval) {
+    Thread.sleep(forTimeInterval: seconds)
+}
+
 /// UserPromptSubmit hook: recalls relevant memories, nudges learning and maintenance.
 struct Advise: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
@@ -59,7 +68,19 @@ struct Advise: AsyncParsableCommand {
         let budget = HookBudget.recallBudget(event: "UserPromptSubmit")
         let deadline = hookStart.addingTimeInterval(budget)
 
-        var sections: [String] = []
+        // H1.6: the section accumulator doubles as the UNCONDITIONAL
+        // watchdog. Armed here — before ANY lattice/DB touch — with an OS
+        // thread deadline of budget+2s: the budgets above stop WAITING on a
+        // wedged database, but only the watchdog still runs when a C++
+        // frame is stuck in an uninterruptible lock wait and the
+        // cooperative pool is starved. Whatever has accumulated by then
+        // ships, with a one-line notice, exit 0.
+        let watchdog = HookWatchdog(eventName: "UserPromptSubmit")
+        watchdog.arm(
+            firesAt: hookStart.addingTimeInterval(budget + 2),
+            notice: "⚠️ Memory hook watchdog: the memory system did not finish within "
+                + "\(String(format: "%.0f", budget))s+2s; emitting partial context and exiting. "
+                + "Memories are intact; recall resumes when the database recovers.")
 
         if let remote = RemoteConfig.active {
             // Remote backend: the server does distillation, ranking,
@@ -69,14 +90,13 @@ struct Advise: AsyncParsableCommand {
                 remote, prompt: prompt, project: remote.project ?? project) {
                 sessionLog("Advise(remote): block \(block.count) chars", sessionId: sid)
                 logRecalledMemories(block, hook: "Advise", sessionId: sid)
-                sections.append(block)
+                watchdog.append(block)
             } else {
                 sessionLog("Advise(remote): no block", sessionId: sid)
                 if let sid, !sid.isEmpty { writeSessionRecallSkip(sessionId: sid) }
             }
             await appendNudgesAndEmit(input: input, project: proj, deadline: deadline,
-                                      sections: &sections)
-            return
+                                      watchdog: watchdog)
         }
 
         #if canImport(EngramKit)
@@ -127,7 +147,7 @@ struct Advise: AsyncParsableCommand {
                 sessionLog("Advise: directRecall returned \(result.count) chars", sessionId: sid)
                 logRecalledMemories(result, hook: "Advise", sessionId: sid)
                 sessionLog("Advise: logRecalledMemories done, recall log written", sessionId: sid)
-                sections.append("## Relevant memories\n\n\(result)")
+                watchdog.append("## Relevant memories\n\n\(result)")
             case .completed(nil):
                 sessionLog("Advise: recall returned nil (or tools init failed)", sessionId: sid)
                 hookLog("Advise: recall returned nil")
@@ -138,7 +158,7 @@ struct Advise: AsyncParsableCommand {
                 recallBlewBudget = true
                 sessionLog("Advise: recall EXCEEDED \(budget)s budget — degrading visibly", sessionId: sid)
                 hookLog("Advise: recall exceeded \(budget)s budget — skipped (db degraded?)")
-                sections.append(
+                watchdog.append(
                     "⚠️ Memory recall skipped this turn — exceeded its \(String(format: "%.0f", budget))s budget. " +
                     "The memory database is responding slowly (maintenance or repair may be needed); " +
                     "memories are intact and recall resumes when the database recovers.")
@@ -178,8 +198,19 @@ struct Advise: AsyncParsableCommand {
         }
         #endif
 
+        // TEST SEAM (child-process watchdog test): simulate the incident's
+        // uninterruptible C++ lock wait on the main path — a blocking sleep
+        // no budget race can interrupt, in the exact place the unbudgeted
+        // tail used to wedge. Inert without the env var; while it holds,
+        // only the watchdog can end this process.
+        if let raw = ProcessInfo.processInfo.environment["ENGRAM_TEST_ADVISE_WEDGE_MS"],
+           let wedgeMs = Double(raw), wedgeMs > 0 {
+            hookLog("Advise: TEST wedge engaged (\(Int(wedgeMs))ms)")
+            blockingWedge(seconds: wedgeMs / 1000.0)
+        }
+
         await appendNudgesAndEmit(input: input, project: proj, deadline: deadline,
-                                  sections: &sections)
+                                  watchdog: watchdog)
     }
 
     /// Shared tail for both backends: the stop-hook handshake, the learning
@@ -192,7 +223,7 @@ struct Advise: AsyncParsableCommand {
     /// store misses lattice-side stop-nudge state; the worst case is one
     /// redundant learning nudge on an already-degraded turn.
     private func appendNudgesAndEmit(input: UserPromptSubmitInput, project: String,
-                                     deadline: Date, sections: inout [String]) async {
+                                     deadline: Date, watchdog: HookWatchdog) async -> Never {
         // Learning nudge — skip if stop hook just fired (session-learner already spawned)
         let sessionId = input.sessionId
         let consumeStopNudge: @Sendable (inout SessionCounters) -> Bool = { state in
@@ -218,24 +249,17 @@ struct Advise: AsyncParsableCommand {
             }
         }
         if consumedStopNudge != true {
-            sections.append(learningNudge(project: project))
+            watchdog.append(learningNudge(project: project))
         }
 
-        let output = HookOutput(
-            hookSpecificOutput: HookSpecificOutput(
-                hookEventName: "UserPromptSubmit",
-                additionalContext: sections.joined(separator: "\n\n")
-            )
-        )
-        try? writeOutput(output)
-        // Hard exit: a one-shot hook must not pay teardown costs. Lattice
-        // deinit runs a close-time checkpoint that took 11s against a
-        // bloated WAL (timeline evidence) — on top of a met budget, that
-        // alone can blow the harness registration. stdout is already
-        // flushed (unbuffered fd write); an orphaned budgeted query dies
-        // here, and SQLite handles process death safely. Maintenance
-        // children survive exec-style.
-        Foundation.exit(0)
+        // Hard exit (inside the watchdog's one-shot emit): a one-shot hook
+        // must not pay teardown costs. Lattice deinit runs a close-time
+        // checkpoint that took 11s against a bloated WAL (timeline
+        // evidence) — on top of a met budget, that alone can blow the
+        // harness registration. stdout is already flushed (unbuffered fd
+        // write); an orphaned budgeted query dies here, and SQLite handles
+        // process death safely. Maintenance children survive exec-style.
+        watchdog.completeNormally()
     }
 
     #if canImport(EngramKit)
