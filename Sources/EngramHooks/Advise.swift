@@ -13,6 +13,10 @@ struct Advise: AsyncParsableCommand {
     )
 
     func run() async throws {
+        // The hook's ONE absolute deadline is anchored here — everything
+        // this process does (recall AND the tail) shares it.
+        let hookStart = Date()
+
         // Guard against recursion: maintenance subprocess sets this env var
         if ProcessInfo.processInfo.environment["CLAUDE_MEMORY_MAINTENANCE"] != nil {
             return
@@ -40,6 +44,21 @@ struct Advise: AsyncParsableCommand {
         sessionLog("Advise: START sessionId=\(sid ?? "nil"), project=\(proj)", sessionId: sid)
         hookLog("Advise: project=\(proj), prompt=\(String(prompt.prefix(80)))...")
 
+        // Recall must be FAST OR ABSENT — a degraded database (WAL bloat,
+        // contention) must never ride to the harness's kill timeout and
+        // stall the user's prompt. Budget = a fraction of THIS hook's own
+        // registered timeout (read from settings.json), so tightening the
+        // registration tightens the budget with it. The deadline is
+        // ABSOLUTE, from hook start: recall and the post-recall tail
+        // (maintenance check, session counters) spend from the same
+        // account, so a slow recall leaves the tail less, and a consumed
+        // budget leaves it nothing (Aug 2026 incident: the UNBUDGETED tail
+        // blocked on the same wedged database and rode to the 60s kill).
+        // Degradation is VISIBLE: a one-line notice in the injected
+        // context, never a silent absence.
+        let budget = HookBudget.recallBudget(event: "UserPromptSubmit")
+        let deadline = hookStart.addingTimeInterval(budget)
+
         var sections: [String] = []
 
         if let remote = RemoteConfig.active {
@@ -55,7 +74,8 @@ struct Advise: AsyncParsableCommand {
                 sessionLog("Advise(remote): no block", sessionId: sid)
                 if let sid, !sid.isEmpty { writeSessionRecallSkip(sessionId: sid) }
             }
-            appendNudgesAndEmit(input: input, project: proj, sections: &sections)
+            await appendNudgesAndEmit(input: input, project: proj, deadline: deadline,
+                                      sections: &sections)
             return
         }
 
@@ -76,21 +96,16 @@ struct Advise: AsyncParsableCommand {
         if shouldRecall {
             sessionLog("Advise: calling initMemoryTools", sessionId: sid)
             currentSessionId = sid
-            // Recall must be FAST OR ABSENT — a degraded database (WAL bloat,
-            // contention) must never ride to the harness's kill timeout and
-            // stall the user's prompt. Budget = a fraction of THIS hook's own
-            // registered timeout (read from settings.json), so tightening the
-            // registration tightens the budget with it. Degradation is
-            // VISIBLE: a one-line notice in the injected context, never a
-            // silent absence. The Lattice query-deadline primitive (1.3.0)
-            // will upgrade this from "stop waiting" to "interrupt the query".
-            let budget = HookBudget.recallBudget(event: "UserPromptSubmit")
             // The budget covers the WHOLE slow path — tools init (model load
             // + DB opens, which pay the same degraded-database costs as the
             // query) AND the recall itself. Timeline evidence: on a bloated
-            // hub, init alone took 10s before any query ran.
+            // hub, init alone took 10s before any query ran. The Lattice
+            // query-deadline primitive (1.3.0) will upgrade this from "stop
+            // waiting" to "interrupt the query".
             hookLog("Advise: running budgeted recall (budget \(budget)s)")
-            let outcome = try await HookBudget.race(seconds: budget) { () -> String? in
+            let outcome = try await HookBudget.race(
+                seconds: max(0, deadline.timeIntervalSinceNow)
+            ) { () -> String? in
                 guard let tools = await initMemoryTools(sessionId: sid) else {
                     hookLog("Advise: failed to initialize memory tools")
                     return nil
@@ -143,25 +158,64 @@ struct Advise: AsyncParsableCommand {
         // database that just failed to answer inside its budget — in the
         // Aug 2026 incident that open blocked on the connection mutex held
         // by the orphaned recall, riding the hook to the harness's 60s kill.
+        // And never PAST the deadline: the tail spends only what recall
+        // left in the shared budget.
         if recallBlewBudget {
             hookLog("Advise: recall blew its budget — skipping the maintenance check")
         } else {
-            spawnMaintenanceIfNeeded(project: proj, cwd: input.cwd)
+            let remaining = deadline.timeIntervalSinceNow
+            if remaining <= 0 {
+                hookLog("Advise: no budget left for the maintenance check — skipping")
+            } else {
+                let outcome = try? await HookBudget.race(seconds: remaining) {
+                    spawnMaintenanceIfNeeded(project: proj, cwd: input.cwd)
+                }
+                if case .deadlineExceeded = outcome {
+                    hookLog("Advise: maintenance check exceeded the remaining "
+                        + "\(String(format: "%.1f", remaining))s budget — abandoned")
+                }
+            }
         }
         #endif
 
-        appendNudgesAndEmit(input: input, project: proj, sections: &sections)
+        await appendNudgesAndEmit(input: input, project: proj, deadline: deadline,
+                                  sections: &sections)
     }
 
     /// Shared tail for both backends: the stop-hook handshake, the learning
     /// nudge, and the hook output envelope.
+    ///
+    /// `deadline` is the hook's one absolute deadline: the lattice-backed
+    /// session counters answer only inside it. Past it — or on overrun —
+    /// the FILE-backed store (SessionCounters.swift) answers instead, so a
+    /// wedged database cannot hold the output envelope hostage. The file
+    /// store misses lattice-side stop-nudge state; the worst case is one
+    /// redundant learning nudge on an already-degraded turn.
     private func appendNudgesAndEmit(input: UserPromptSubmitInput, project: String,
-                                     sections: inout [String]) {
+                                     deadline: Date, sections: inout [String]) async {
         // Learning nudge — skip if stop hook just fired (session-learner already spawned)
-        let consumedStopNudge = updateSessionCounters(sessionId: input.sessionId) { state -> Bool in
+        let sessionId = input.sessionId
+        let consumeStopNudge: @Sendable (inout SessionCounters) -> Bool = { state in
             guard state.stopNudgeSent else { return false }
             state.stopNudgeSent = false
             return true
+        }
+        let remaining = deadline.timeIntervalSinceNow
+        let consumedStopNudge: Bool?
+        if remaining <= 0 {
+            hookLog("Advise: no budget left for lattice session counters — using the file store")
+            consumedStopNudge = fileSessionCounters(sessionId: sessionId, consumeStopNudge)
+        } else {
+            let outcome = try? await HookBudget.race(seconds: remaining) {
+                updateSessionCounters(sessionId: sessionId, consumeStopNudge)
+            }
+            if case .completed(let value) = outcome {
+                consumedStopNudge = value
+            } else {
+                hookLog("Advise: session counters exceeded the remaining "
+                    + "\(String(format: "%.1f", remaining))s budget — falling back to the file store")
+                consumedStopNudge = fileSessionCounters(sessionId: sessionId, consumeStopNudge)
+            }
         }
         if consumedStopNudge != true {
             sections.append(learningNudge(project: project))
@@ -216,9 +270,10 @@ struct Advise: AsyncParsableCommand {
     /// Counts AuditLog rows since last run — immune to concurrent-process
     /// counter clobbering.
     ///
-    /// This runs AFTER the recall budget is satisfied and is itself
-    /// UNBUDGETED, so every cost in it lands on the user's prompt latency.
-    /// Two used to dominate:
+    /// This runs AFTER recall, inside whatever remains of the hook's one
+    /// absolute deadline (it used to be UNBUDGETED — every cost landed on
+    /// the user's prompt latency, and on a wedged database it rode to the
+    /// harness kill). Two costs used to dominate:
     ///
     /// 1. Up to six Lattice open/close cycles per prompt — one at the top of
     ///    the function plus one per `getHookState`/`setHookState` — each
