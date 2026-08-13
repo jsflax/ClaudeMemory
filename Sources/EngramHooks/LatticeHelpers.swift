@@ -7,6 +7,17 @@ import Lattice
 
 #if canImport(EngramKit)
 
+/// Statement-level SQLite busy timeout for every hook-opened Lattice.
+///
+/// Lattice's default is 30s — a headless-server number. A hook is the
+/// opposite of headless: it sits INSIDE the user's prompt latency, under a
+/// budget of a few seconds, so a lock held by a mid-catch-up sync daemon
+/// must surface as a fast failure the budget machinery can degrade around,
+/// never a 30s wait (Aug 2026 incident: advise rode the lock all the way to
+/// the harness's 60s kill). One constant, passed at every open site below;
+/// the attach clone inherits it from the hub configuration.
+let hookBusyTimeoutMs = 2000
+
 /// Requested Lattice log verbosity for the hook path.
 ///
 /// Verbose Lattice logging used to be HARDCODED to `.debug` here, with a
@@ -58,7 +69,8 @@ func openLattice(sessionId: String? = nil) -> Lattice? {
 
     return try? Lattice(
         Memory.self, Edge.self, Checkpoint.self, HookState.self, SessionState.self,
-        configuration: .init(fileURL: URL(fileURLWithPath: dbPath), migration: engramMigrations)
+        configuration: .init(fileURL: URL(fileURLWithPath: dbPath), migration: engramMigrations,
+                             busyTimeoutMs: hookBusyTimeoutMs)
     )
 }
 
@@ -84,7 +96,8 @@ func initMemoryTools(sessionId: String? = nil) async -> MemoryTools? {
         let synced = try? Lattice(
             Memory.self, Edge.self, SyncConfig.self,
             configuration: .init(fileURL: URL(fileURLWithPath: syncedDbPath),
-                                 migration: engramMigrations)
+                                 migration: engramMigrations,
+                                 busyTimeoutMs: hookBusyTimeoutMs)
         )
         syncedRef = synced?.sendableReference
         sessionLog("initMemoryTools: synced lattice \(synced != nil ? "opened" : "FAILED to open") at \(syncedDbPath)", sessionId: sessionId)
@@ -102,7 +115,8 @@ func initMemoryTools(sessionId: String? = nil) async -> MemoryTools? {
         guard let lattice = try? Lattice(
             Memory.self, Edge.self, GroupProjectMap.self,
             configuration: .init(fileURL: URL(fileURLWithPath: spoke.path),
-                                 migration: engramMigrations)
+                                 migration: engramMigrations,
+                                 busyTimeoutMs: hookBusyTimeoutMs)
         ) else {
             sessionLog("initMemoryTools: FAILED to open group spoke at \(spoke.path)", sessionId: sessionId)
             continue
