@@ -60,6 +60,11 @@ struct Advise: AsyncParsableCommand {
         }
 
         #if canImport(EngramKit)
+        // Whether recall rode past its budget. A database that just failed
+        // to answer inside its own budget is the LAST database that should
+        // be handed more work — the tail below branches on this.
+        var recallBlewBudget = false
+
         // Gate: classify whether this prompt is worth recalling memories for.
         sessionLog("Advise: running recall gate", sessionId: sid)
         let gate = try? RecallGateClassifier()
@@ -115,6 +120,7 @@ struct Advise: AsyncParsableCommand {
                 sessionLog("Advise: directRecall FAILED: \(error)", sessionId: sid)
                 hookLog("Advise: recall failed: \(error)")
             case .deadlineExceeded:
+                recallBlewBudget = true
                 sessionLog("Advise: recall EXCEEDED \(budget)s budget — degrading visibly", sessionId: sid)
                 hookLog("Advise: recall exceeded \(budget)s budget — skipped (db degraded?)")
                 sections.append(
@@ -133,7 +139,15 @@ struct Advise: AsyncParsableCommand {
 
         // Spawn maintenance subprocess if threshold crossed (fire-and-forget).
         // Local-only: the server owns hygiene for the shared PG store.
-        spawnMaintenanceIfNeeded(project: proj, cwd: input.cwd)
+        // NEVER after a blown budget: the check itself re-opens the same
+        // database that just failed to answer inside its budget — in the
+        // Aug 2026 incident that open blocked on the connection mutex held
+        // by the orphaned recall, riding the hook to the harness's 60s kill.
+        if recallBlewBudget {
+            hookLog("Advise: recall blew its budget — skipping the maintenance check")
+        } else {
+            spawnMaintenanceIfNeeded(project: proj, cwd: input.cwd)
+        }
         #endif
 
         appendNudgesAndEmit(input: input, project: proj, sections: &sections)
