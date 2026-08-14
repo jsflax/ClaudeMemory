@@ -4,6 +4,51 @@ All notable changes to Engram are documented in this file.
 
 > Formerly "ClaudeMemory" — renamed in v0.12.0 to be tool-agnostic.
 
+## [0.14.3] - 2026-08-13
+
+0.14.2 fixed sync's correctness diseases; this release fixes its
+*availability* diseases. If your prompt hook was killed at 60 seconds
+with nothing to show for it, if the sync database's write-ahead log grew
+to gigabytes while the daemon ran, or if machine-to-machine sync sat
+"pending" forever while the log filled with UNIQUE-constraint errors,
+this is the fix.
+
+### Fixed
+- **The prompt hook can no longer hang to the harness's kill.** Three
+  layers, so no single failure wedges it again: hook database opens now
+  use a 2-second lock patience instead of the library's 30 (and the
+  library now honors that setting for transaction starts, which it
+  previously ignored — two hidden 30-second waits were the whole 60
+  seconds); everything after recall runs against one absolute deadline
+  and falls back to file-backed state on overrun; and an unconditional
+  watchdog thread ships whatever was gathered and exits cleanly at
+  budget+2s even if a database call is stuck in native code and cannot
+  be interrupted. Worst case is now a slightly degraded answer two
+  seconds late, never a silent 60-second death.
+- **Idle helper processes no longer pin the write-ahead log.** Each MCP
+  server that had answered even one call kept a read snapshot open
+  indefinitely, and one held snapshot is enough to stop checkpoints from
+  reclaiming ANY log space — the log hit 16GB twice this way. Two fixes:
+  the internal maintenance timer no longer disarms itself in a narrow
+  race while a snapshot is being created (the bug that made snapshots
+  immortal), and every tool call now releases all read snapshots when it
+  finishes — an idle helper holds zero.
+- **Machine-to-machine sync no longer livelocks under load.** Applying
+  received changes fought a vector-index maintenance path that blindly
+  rewrote index rows it didn't need to touch — tens of thousands of
+  constraint failures hammering the write lock. Index reconciliation now
+  checks before writing (the common case is now a lock-free read), and a
+  batch that fails mid-apply keeps credit for the chunks that committed
+  instead of being re-sent in full forever. The stuck machine's four
+  frozen windows drain on first reconnect.
+- **The daemon now says so when the log is pinned.** If the write-ahead
+  log passes 1GB while checkpointing is stuck, the daemon logs which
+  processes are holding it — the last two occurrences of this took days
+  to diagnose from the outside; the next one is a log line.
+- **Sync log lines now say which side wrote them.** The hub and the
+  mirror sides of the same channel logged under one identical label from
+  one process, which misdirected diagnosis in two incidents running.
+
 ## [0.14.2] - 2026-08-11
 
 Finishes the job 0.14.1 started. 0.14.1 stopped sync history from being
