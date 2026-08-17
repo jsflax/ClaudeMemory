@@ -14,6 +14,10 @@ struct OnFailure: AsyncParsableCommand {
     )
 
     func run() async throws {
+        // Guard against recursion from maintenance/learner subprocesses
+        // (this hook previously had NO guard at all).
+        if isMemorySubprocess() { return }
+
         let inputData = readStdin()
         guard !inputData.isEmpty else { return }
 
@@ -32,8 +36,9 @@ struct OnFailure: AsyncParsableCommand {
 
         var sections: [String] = []
 
-        // Learning nudge
-        if let nudge = throttledLearningNudge(project: proj, sessionId: input.sessionId) {
+        // Learning nudge (suppressed when an orchestrator owns learning)
+        if !learnerIsOrchestrated(),
+           let nudge = throttledLearningNudge(project: proj, sessionId: input.sessionId) {
             sections.append(nudge)
         }
 

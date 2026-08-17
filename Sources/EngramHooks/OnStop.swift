@@ -13,14 +13,29 @@ struct OnStop: AsyncParsableCommand {
         abstract: "Gate session-learner on transcript novelty (Stop hook)"
     )
 
-    /// Path to the memory-hooks binary (installed at ~/.claude/bin/).
-    private static let hooksBin = NSHomeDirectory() + "/.claude/bin/memory-hooks"
+    /// Path to the memory-hooks binary: THIS running executable, falling
+    /// back to the Mac install location. The previous hardcoded
+    /// ~/.claude/bin path exec-127'd in every sandbox (where the binary is
+    /// installed at /usr/local/bin/memory-hooks): each box Stop hook
+    /// "fired" and the gate spawn silently died — production sample_gate
+    /// ops sat at 0 the whole launch (Aug 13 incident).
+    private static var hooksBin: String {
+        if let own = Bundle.main.executablePath,
+           FileManager.default.isExecutableFile(atPath: own) {
+            return own
+        }
+        return NSHomeDirectory() + "/.claude/bin/memory-hooks"
+    }
 
     func run() async throws {
         // Guard against infinite recursion
         if ProcessInfo.processInfo.environment["CLAUDE_MEMORY_LEARNER"] != nil {
             return
         }
+        // Orchestrated mode: the sandbox orchestrator invokes sample-gate
+        // itself after the run's artifact posts — a second spawn path here
+        // would double-fire the learner.
+        if learnerIsOrchestrated() { return }
 
         let inputData = readStdin()
         guard !inputData.isEmpty else { return }

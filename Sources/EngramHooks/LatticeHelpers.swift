@@ -459,6 +459,29 @@ func cleanupSessionLogs(sessionId: String) {
     }
 }
 
+// MARK: - Recursion / Orchestration Guards
+
+/// True inside a spawned learner or maintenance subprocess — their own
+/// hooks must stay silent, or a learner gets nudged to spawn a learner
+/// (observed in the Aug 13 workup incident: only OnStop/PreCompact checked
+/// the learner variable; Advise/PreTool checked maintenance only, and
+/// OnFailure checked nothing).
+func isMemorySubprocess() -> Bool {
+    let env = ProcessInfo.processInfo.environment
+    return env["CLAUDE_MEMORY_LEARNER"] != nil
+        || env["CLAUDE_MEMORY_MAINTENANCE"] != nil
+}
+
+/// True when an orchestrator (overlord, in agent sandboxes) owns learner
+/// triggering: it runs `memory-hooks sample-gate` itself after the run's
+/// artifact is posted. All in-session learning NUDGES and in-binary learner
+/// SPAWNS stand down — a mid-run nudge lands in the billed, customer-facing
+/// transcript (it became workup's posted Linear "diagnosis"), and a second
+/// spawn path would double-fire the learner.
+func learnerIsOrchestrated() -> Bool {
+    ProcessInfo.processInfo.environment["ENGRAM_LEARNER_ORCHESTRATED"] == "1"
+}
+
 // MARK: - Shared Nudges
 
 /// Returns the learning nudge for the given project (always fires).

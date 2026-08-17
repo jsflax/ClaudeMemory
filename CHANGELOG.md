@@ -4,6 +4,37 @@ All notable changes to Engram are documented in this file.
 
 > Formerly "ClaudeMemory" — renamed in v0.12.0 to be tool-agnostic.
 
+## [Unreleased]
+
+Hook-side half of the agents-platform "learner nudge" incident fix
+(Aug 13: mid-run nudges became the workup agent's posted Linear
+"diagnosis"; see the engram-server/overlord waves for the other half).
+
+### Fixed
+- **A learner can no longer be nudged to spawn a learner.** The advise
+  and pre-tool hooks guarded only against the maintenance subprocess
+  (`CLAUDE_MEMORY_MAINTENANCE`) and the failure hook guarded against
+  nothing; all three now also stand down inside a spawned learner
+  (`CLAUDE_MEMORY_LEARNER`), matching the stop/pre-compact hooks.
+- **The stop hook's sample-gate spawn now resolves the hooks binary from
+  the running executable** instead of the hardcoded Mac install path
+  (`~/.claude/bin/memory-hooks`). In sandboxes the binary lives at
+  `/usr/local/bin/memory-hooks`, so every sandbox Stop event exec-127'd
+  silently — the learner pipeline never ran in a sandbox even once.
+
+### Added
+- **Orchestrated-learner mode** (`ENGRAM_LEARNER_ORCHESTRATED=1`): when
+  an orchestrator owns learner triggering (agent sandboxes, where it
+  invokes `memory-hooks sample-gate` itself after the run's artifact is
+  posted), all in-session learning nudges are suppressed — a mid-run
+  nudge lands in the billed, customer-facing transcript — and the
+  stop/pre-compact spawn paths stand down so the learner can't
+  double-fire. Local (Mac) behavior is unchanged.
+- **Spawned subprocesses are bounded.** The detached learner runs with
+  `--max-turns 15` and a 12-minute wall-clock kill (portable sh watcher;
+  macOS has no `timeout(1)`); maintenance gets wider bounds (40 turns /
+  30 minutes). Previously both were unbounded on the host's API key.
+
 ## [0.14.3] - 2026-08-13
 
 0.14.2 fixed sync's correctness diseases; this release fixes its

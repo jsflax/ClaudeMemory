@@ -26,8 +26,8 @@ struct Advise: AsyncParsableCommand {
         // this process does (recall AND the tail) shares it.
         let hookStart = Date()
 
-        // Guard against recursion: maintenance subprocess sets this env var
-        if ProcessInfo.processInfo.environment["CLAUDE_MEMORY_MAINTENANCE"] != nil {
+        // Guard against recursion: learner/maintenance subprocesses set env vars
+        if isMemorySubprocess() {
             return
         }
 
@@ -248,7 +248,10 @@ struct Advise: AsyncParsableCommand {
                 consumedStopNudge = fileSessionCounters(sessionId: sessionId, consumeStopNudge)
             }
         }
-        if consumedStopNudge != true {
+        // In orchestrated mode (sandboxes) the nudge NEVER fires: the
+        // orchestrator runs sample-gate itself post-run, and a mid-run
+        // nudge would land in the billed transcript.
+        if consumedStopNudge != true && !learnerIsOrchestrated() {
             watchdog.append(learningNudge(project: project))
         }
 
@@ -396,7 +399,11 @@ struct Advise: AsyncParsableCommand {
                 envGuard: (key: "CLAUDE_MEMORY_MAINTENANCE", value: "1"),
                 logPath: Self.maintenanceLogPath,
                 cwd: cwd,
-                postCommand: "'\(hooksBin)' clear-maintenance"
+                postCommand: "'\(hooksBin)' clear-maintenance",
+                // Maintenance legitimately runs long (consolidate/organize
+                // sweeps) — keep bounds well above the learner defaults.
+                maxTurns: 40,
+                wallClockSeconds: 1800
             )
             hookLog("Advise: spawned memory-maintenance subprocess (ops delta: \(delta))")
         } catch {

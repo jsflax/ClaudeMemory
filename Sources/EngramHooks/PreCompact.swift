@@ -47,6 +47,8 @@ struct PreCompact: AsyncParsableCommand {
         if ProcessInfo.processInfo.environment["CLAUDE_MEMORY_LEARNER"] != nil {
             return
         }
+        // Orchestrated mode: learner spawning belongs to the orchestrator.
+        if learnerIsOrchestrated() { return }
 
         let inputData = readStdin()
         guard !inputData.isEmpty else { return }

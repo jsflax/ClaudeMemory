@@ -20,7 +20,7 @@ struct PreTool: AsyncParsableCommand {
 
     func run() async throws {
         // Guard against recursion from maintenance/learner subprocesses
-        if ProcessInfo.processInfo.environment["CLAUDE_MEMORY_MAINTENANCE"] != nil { return }
+        if isMemorySubprocess() { return }
 
         let inputData = readStdin()
         guard !inputData.isEmpty else { return }
@@ -93,8 +93,11 @@ struct PreTool: AsyncParsableCommand {
             }
         }
 
-        // Learning nudge (throttled, supplements the per-prompt nudge from Advise)
-        if let nudge = throttledLearningNudge(project: proj, sessionId: input.sessionId) {
+        // Learning nudge (throttled, supplements the per-prompt nudge from
+        // Advise). Suppressed in orchestrated mode — see learningNudge's
+        // Advise call site.
+        if !learnerIsOrchestrated(),
+           let nudge = throttledLearningNudge(project: proj, sessionId: input.sessionId) {
             sections.append(nudge)
         }
 

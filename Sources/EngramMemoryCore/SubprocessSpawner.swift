@@ -28,6 +28,11 @@ public func rotateFileIfNeeded(_ path: String, maxBytes: Int = 256 * 1024) {
 ///     explicit `--mcp-config` so the subprocess doesn't depend on cwd
 ///     discovery.
 ///   - postCommand: Optional shell command to run after `claude` exits (regardless of exit code).
+///   - maxTurns: Agentic turn bound passed as `--max-turns` — a detached
+///     learner must not be able to run away on the host's API key.
+///   - wallClockSeconds: Hard kill after this long, via a portable sh
+///     watcher (macOS has no `timeout(1)`); pairs with maxTurns so one
+///     wedged tool call can't hold the process open either.
 public func spawnClaudeSubprocess(
     prompt: String,
     systemPrompt: String,
@@ -37,7 +42,9 @@ public func spawnClaudeSubprocess(
     logPath: String,
     cwd: String? = nil,
     extraClaudeArgs: String = "",
-    postCommand: String? = nil
+    postCommand: String? = nil,
+    maxTurns: Int = 15,
+    wallClockSeconds: Int = 720
 ) throws {
     let escapedPrompt = prompt.replacingOccurrences(of: "'", with: "'\\''")
     let escapedSystemPrompt = systemPrompt.replacingOccurrences(of: "'", with: "'\\''")
@@ -49,11 +56,15 @@ public func spawnClaudeSubprocess(
     claude -p '\(escapedPrompt)' \
       --model \(model) \
       --allowedTools '\(allowedTools)' \
+      --max-turns \(maxTurns) \
       --no-session-persistence \
       --output-format text \
       --append-system-prompt '\(escapedSystemPrompt)' \
       \(extraClaudeArgs) \
-      >> '\(logPath)' 2>&1\(postCommand.map { "; \($0)" } ?? "")
+      >> '\(logPath)' 2>&1 & CPID=$!; \
+    ( sleep \(wallClockSeconds) && kill "$CPID" 2>/dev/null \
+      && echo '===== killed at \(wallClockSeconds)s wall-clock bound =====' >> '\(logPath)' ) & WPID=$!; \
+    wait "$CPID"; kill "$WPID" 2>/dev/null\(postCommand.map { "; \($0)" } ?? "")
     """
 
     let sh = Process()
