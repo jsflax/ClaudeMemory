@@ -51,8 +51,17 @@ public func spawnClaudeSubprocess(
 
     rotateFileIfNeeded(logPath)
 
+    // Per-run temp capture, appended to the log on completion: keeps
+    // concurrent spawns from interleaving AND lets the failure checks below
+    // grep THIS run's output only (grepping the shared log would re-match a
+    // previous run's errors forever).
+    // `;` separators, NOT `&&`: `a && b & ` backgrounds the whole chain
+    // (POSIX precedence), which would leave $T set only inside the
+    // backgrounded subshell and make the wall-clock kill hit the wrapper
+    // instead of claude.
     let shellCommand = """
-    echo '===== started at '\\''\(ISO8601DateFormatter().string(from: Date()))'\\'' =====' >> '\(logPath)' && \
+    T=$(mktemp) || exit 1; \
+    echo '===== started at '\\''\(ISO8601DateFormatter().string(from: Date()))'\\'' =====' >> '\(logPath)'; \
     claude -p '\(escapedPrompt)' \
       --model \(model) \
       --allowedTools '\(allowedTools)' \
@@ -61,10 +70,15 @@ public func spawnClaudeSubprocess(
       --output-format text \
       --append-system-prompt '\(escapedSystemPrompt)' \
       \(extraClaudeArgs) \
-      >> '\(logPath)' 2>&1 & CPID=$!; \
+      > "$T" 2>&1 & CPID=$!; \
     ( sleep \(wallClockSeconds) && kill "$CPID" 2>/dev/null \
-      && echo '===== killed at \(wallClockSeconds)s wall-clock bound =====' >> '\(logPath)' ) & WPID=$!; \
-    wait "$CPID"; kill "$WPID" 2>/dev/null\(postCommand.map { "; \($0)" } ?? "")
+      && echo '===== killed at \(wallClockSeconds)s wall-clock bound =====' >> "$T" ) & WPID=$!; \
+    wait "$CPID"; RC=$?; kill "$WPID" 2>/dev/null; cat "$T" >> '\(logPath)'; \
+    if grep -qi 'not logged in\\|invalid api key\\|please run /login' "$T"; then \
+      echo '===== ERROR: spawned claude is NOT AUTHENTICATED — the subprocess died before doing anything. Headless/env-auth setups strip ANTHROPIC_API_KEY/CLAUDE_CODE_OAUTH_TOKEN from hook children; use credential-file auth in CLAUDE_CONFIG_DIR, or spawn from a non-hook process. =====' >> '\(logPath)'; \
+    elif [ "$RC" -ne 0 ]; then \
+      echo "===== ERROR: spawned claude exited $RC =====" >> '\(logPath)'; \
+    fi; rm -f "$T"\(postCommand.map { "; \($0)" } ?? "")
     """
 
     let sh = Process()
